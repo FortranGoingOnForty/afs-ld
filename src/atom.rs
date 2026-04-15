@@ -321,6 +321,14 @@ fn atomize_regular_section(
         return;
     }
 
+    // Literal sections split on content boundaries (null for `__cstring`,
+    // fixed-size chunks for `__literal4/8/16`) independent of symbol
+    // labels. Sprint 24's ICF uses the per-atom content for dedup.
+    if atom_section.is_literal() {
+        atomize_literal_section(input_id, section_idx, sect, syms, atom_section, table, out);
+        return;
+    }
+
     // With subsections_via_symbols and at least one split point, walk the
     // sorted symbols and emit one atom per non-alt_entry boundary.
     if syms.is_empty() {
@@ -398,6 +406,145 @@ fn atomize_regular_section(
 
         // Advance past the primary and its folded alt_entries.
         i = find_next_non_alt_entry(syms, i + 1).unwrap_or(syms.len());
+    }
+}
+
+/// Split a literal section into atoms. `__cstring` splits at null-byte
+/// terminators (variable-length); `__literal4/8/16` split at fixed-width
+/// boundaries. Owner symbols attach at exact offsets where a symbol
+/// points.
+fn atomize_literal_section(
+    input_id: InputId,
+    section_idx: u8,
+    sect: &InputSection,
+    syms: &[(usize, &InputSymbol)],
+    atom_section: AtomSection,
+    table: &mut AtomTable,
+    out: &mut ObjectAtomization,
+) {
+    match atom_section {
+        AtomSection::CStringLiterals => {
+            atomize_cstring(input_id, section_idx, sect, syms, atom_section, table, out)
+        }
+        AtomSection::Literal4 => {
+            atomize_fixed_literal(input_id, section_idx, sect, syms, 4, atom_section, table, out)
+        }
+        AtomSection::Literal8 => {
+            atomize_fixed_literal(input_id, section_idx, sect, syms, 8, atom_section, table, out)
+        }
+        AtomSection::Literal16 => {
+            atomize_fixed_literal(input_id, section_idx, sect, syms, 16, atom_section, table, out)
+        }
+        _ => unreachable!("atomize_literal_section called with non-literal kind"),
+    }
+}
+
+fn atomize_cstring(
+    input_id: InputId,
+    section_idx: u8,
+    sect: &InputSection,
+    syms: &[(usize, &InputSymbol)],
+    atom_section: AtomSection,
+    table: &mut AtomTable,
+    out: &mut ObjectAtomization,
+) {
+    let mut offset = 0usize;
+    while offset < sect.data.len() {
+        let relative_nul = sect.data[offset..]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(sect.data.len() - offset);
+        let end = offset + relative_nul + 1;
+        let end = end.min(sect.data.len());
+        let data = sect.data[offset..end].to_vec();
+        let size = (end - offset) as u32;
+
+        let owner_idx = syms
+            .iter()
+            .find(|(_, s)| s.value() as usize == offset)
+            .map(|(i, _)| *i);
+
+        let mut flags = AtomFlags::default().with(AtomFlags::LITERAL);
+        if let Some(idx) = owner_idx {
+            flags.set(symbol_flags(syms[idx].1).bits());
+        }
+
+        let atom = Atom {
+            id: AtomId(0),
+            origin: input_id,
+            input_section: section_idx,
+            section: atom_section,
+            input_offset: offset as u32,
+            size,
+            align_pow2: sect.align_pow2 as u8,
+            owner: owner_idx.map(|i| SymbolId(i as u32)),
+            alt_entries: Vec::new(),
+            data,
+            flags,
+            parent_of: None,
+        };
+        let id = table.push(atom);
+        out.atoms.push(id);
+        if let Some(idx) = owner_idx {
+            out.owner_by_sym.push((idx, id));
+        }
+        offset = end;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn atomize_fixed_literal(
+    input_id: InputId,
+    section_idx: u8,
+    sect: &InputSection,
+    syms: &[(usize, &InputSymbol)],
+    chunk_size: usize,
+    atom_section: AtomSection,
+    table: &mut AtomTable,
+    out: &mut ObjectAtomization,
+) {
+    let section_size = sect.size as usize;
+    let mut offset = 0usize;
+    while offset < section_size {
+        let end = (offset + chunk_size).min(section_size);
+        let data_end = end.min(sect.data.len());
+        let data = if offset < data_end {
+            sect.data[offset..data_end].to_vec()
+        } else {
+            Vec::new()
+        };
+        let size = (end - offset) as u32;
+
+        let owner_idx = syms
+            .iter()
+            .find(|(_, s)| s.value() as usize == offset)
+            .map(|(i, _)| *i);
+
+        let mut flags = AtomFlags::default().with(AtomFlags::LITERAL);
+        if let Some(idx) = owner_idx {
+            flags.set(symbol_flags(syms[idx].1).bits());
+        }
+
+        let atom = Atom {
+            id: AtomId(0),
+            origin: input_id,
+            input_section: section_idx,
+            section: atom_section,
+            input_offset: offset as u32,
+            size,
+            align_pow2: sect.align_pow2 as u8,
+            owner: owner_idx.map(|i| SymbolId(i as u32)),
+            alt_entries: Vec::new(),
+            data,
+            flags,
+            parent_of: None,
+        };
+        let id = table.push(atom);
+        out.atoms.push(id);
+        if let Some(idx) = owner_idx {
+            out.owner_by_sym.push((idx, id));
+        }
+        offset = end;
     }
 }
 

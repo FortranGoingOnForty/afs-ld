@@ -116,6 +116,111 @@ opaque_id!(
     SymbolId
 );
 
+// ---------------------------------------------------------------------------
+// Symbol sum type.
+//
+// Every state a name can be in during resolution:
+//   * Undefined — referenced but not yet satisfied
+//   * Defined — an object file provides a concrete body at `atom + value`
+//   * Common — tentative definition (`N_UNDF + N_EXT + n_value>0`); picks
+//     a winner by size/alignment, then morphs into Defined during atomization
+//   * DylibImport — resolved from a dylib's export trie / TBD
+//   * LazyArchive — name covered by a not-yet-fetched archive member
+//   * LazyObject — name covered by a not-yet-loaded `--start-lib` object
+//   * Alias — `N_INDR` pointing at another name; Sprint 8's resolver
+//     flattens the chain when the target becomes available
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Symbol {
+    Undefined {
+        name: Istr,
+        origin: InputId,
+        weak_ref: bool,
+    },
+    Defined {
+        name: Istr,
+        origin: InputId,
+        atom: AtomId,
+        value: u64,
+        weak: bool,
+        private_extern: bool,
+        no_dead_strip: bool,
+    },
+    Common {
+        name: Istr,
+        origin: InputId,
+        size: u64,
+        align_pow2: u8,
+    },
+    DylibImport {
+        name: Istr,
+        dylib: DylibId,
+        ordinal: u16,
+        weak_import: bool,
+    },
+    LazyArchive {
+        name: Istr,
+        archive: ArchiveId,
+        member: MemberId,
+    },
+    LazyObject {
+        name: Istr,
+        origin: InputId,
+    },
+    Alias {
+        name: Istr,
+        aliased: Istr,
+    },
+}
+
+impl Symbol {
+    pub fn name(&self) -> Istr {
+        match self {
+            Symbol::Undefined { name, .. }
+            | Symbol::Defined { name, .. }
+            | Symbol::Common { name, .. }
+            | Symbol::DylibImport { name, .. }
+            | Symbol::LazyArchive { name, .. }
+            | Symbol::LazyObject { name, .. }
+            | Symbol::Alias { name, .. } => *name,
+        }
+    }
+
+    pub fn kind(&self) -> SymbolKindTag {
+        match self {
+            Symbol::Undefined { .. } => SymbolKindTag::Undefined,
+            Symbol::Defined { .. } => SymbolKindTag::Defined,
+            Symbol::Common { .. } => SymbolKindTag::Common,
+            Symbol::DylibImport { .. } => SymbolKindTag::DylibImport,
+            Symbol::LazyArchive { .. } => SymbolKindTag::LazyArchive,
+            Symbol::LazyObject { .. } => SymbolKindTag::LazyObject,
+            Symbol::Alias { .. } => SymbolKindTag::Alias,
+        }
+    }
+
+    /// True for `Defined` without the weak flag — ld's "strong" category,
+    /// the only one where duplicates are an error.
+    pub fn is_strong_defined(&self) -> bool {
+        matches!(self, Symbol::Defined { weak: false, .. })
+    }
+
+    pub fn is_weak_defined(&self) -> bool {
+        matches!(self, Symbol::Defined { weak: true, .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SymbolKindTag {
+    Undefined,
+    Defined,
+    Common,
+    DylibImport,
+    LazyArchive,
+    LazyObject,
+    Alias,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +275,103 @@ mod tests {
             assert_eq!(h1, h2);
         }
         assert_eq!(s.len(), 1000);
+    }
+
+    // ---- Symbol variant tests ----
+
+    fn n(i: u32) -> Istr {
+        Istr(i)
+    }
+
+    #[test]
+    fn symbol_kind_tags_match_variants() {
+        let undef = Symbol::Undefined {
+            name: n(0),
+            origin: InputId(0),
+            weak_ref: false,
+        };
+        assert_eq!(undef.kind(), SymbolKindTag::Undefined);
+
+        let defined = Symbol::Defined {
+            name: n(1),
+            origin: InputId(0),
+            atom: AtomId(0),
+            value: 0,
+            weak: false,
+            private_extern: false,
+            no_dead_strip: false,
+        };
+        assert_eq!(defined.kind(), SymbolKindTag::Defined);
+        assert!(defined.is_strong_defined());
+        assert!(!defined.is_weak_defined());
+
+        let weak = Symbol::Defined {
+            name: n(2),
+            origin: InputId(0),
+            atom: AtomId(0),
+            value: 0,
+            weak: true,
+            private_extern: false,
+            no_dead_strip: false,
+        };
+        assert!(weak.is_weak_defined());
+        assert!(!weak.is_strong_defined());
+
+        assert_eq!(
+            Symbol::Common {
+                name: n(3),
+                origin: InputId(0),
+                size: 8,
+                align_pow2: 3
+            }
+            .kind(),
+            SymbolKindTag::Common
+        );
+        assert_eq!(
+            Symbol::DylibImport {
+                name: n(4),
+                dylib: DylibId(0),
+                ordinal: 1,
+                weak_import: false
+            }
+            .kind(),
+            SymbolKindTag::DylibImport
+        );
+        assert_eq!(
+            Symbol::LazyArchive {
+                name: n(5),
+                archive: ArchiveId(0),
+                member: MemberId(0)
+            }
+            .kind(),
+            SymbolKindTag::LazyArchive
+        );
+        assert_eq!(
+            Symbol::LazyObject {
+                name: n(6),
+                origin: InputId(0)
+            }
+            .kind(),
+            SymbolKindTag::LazyObject
+        );
+        assert_eq!(
+            Symbol::Alias {
+                name: n(7),
+                aliased: n(0)
+            }
+            .kind(),
+            SymbolKindTag::Alias
+        );
+    }
+
+    #[test]
+    fn symbol_name_returns_istr_across_variants() {
+        let sym = Symbol::Common {
+            name: n(42),
+            origin: InputId(0),
+            size: 16,
+            align_pow2: 4,
+        };
+        assert_eq!(sym.name(), n(42));
     }
 }

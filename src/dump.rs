@@ -11,8 +11,8 @@ use crate::archive::{Archive, Flavor, SpecialMember};
 use crate::input::ObjectFile;
 use crate::macho::constants::*;
 use crate::macho::reader::{
-    BuildVersionCmd, DysymtabCmd, LinkEditDataCmd, LoadCommand, MachHeader64, Section64Header,
-    Segment64, SymtabCmd,
+    BuildVersionCmd, DylibCmd, DysymtabCmd, LinkEditDataCmd, LoadCommand, MachHeader64,
+    RpathCmd, Section64Header, Segment64, SymtabCmd,
 };
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind};
 use crate::section::InputSection;
@@ -106,6 +106,8 @@ fn write_command(w: &mut impl Write, idx: usize, cmd: &LoadCommand) -> io::Resul
         LoadCommand::Dysymtab(d) => write_dysymtab(w, d),
         LoadCommand::BuildVersion(b) => write_build_version(w, b),
         LoadCommand::LinkerOptimizationHint(l) => write_linkedit_data(w, l, "LOH"),
+        LoadCommand::Dylib(d) => write_dylib(w, d),
+        LoadCommand::Rpath(r) => write_rpath(w, r),
         LoadCommand::Raw { cmd, data, .. } => {
             writeln!(
                 w,
@@ -115,6 +117,21 @@ fn write_command(w: &mut impl Write, idx: usize, cmd: &LoadCommand) -> io::Resul
             )
         }
     }
+}
+
+fn write_dylib(w: &mut impl Write, d: &DylibCmd) -> io::Result<()> {
+    writeln!(
+        w,
+        "  name={:?} timestamp={} current={} compat={}",
+        d.name,
+        d.timestamp,
+        version_str(d.current_version),
+        version_str(d.compatibility_version)
+    )
+}
+
+fn write_rpath(w: &mut impl Write, r: &RpathCmd) -> io::Result<()> {
+    writeln!(w, "  path={:?}", r.path)
 }
 
 fn write_segment64(w: &mut impl Write, s: &Segment64) -> io::Result<()> {

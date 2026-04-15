@@ -129,6 +129,11 @@ pub enum LoadCommand {
     Dysymtab(DysymtabCmd),
     BuildVersion(BuildVersionCmd),
     LinkerOptimizationHint(LinkEditDataCmd),
+    /// `LC_ID_DYLIB` + every `LC_*_DYLIB` variant share the same wire
+    /// format. The `cmd` field on the inner struct discriminates.
+    Dylib(DylibCmd),
+    /// `LC_RPATH` — one runtime-search path per entry.
+    Rpath(RpathCmd),
     /// A load command whose payload we haven't decoded yet. Preserves bytes
     /// verbatim for byte-level round-trip.
     Raw { cmd: u32, cmdsize: u32, data: Vec<u8> },
@@ -142,6 +147,8 @@ impl LoadCommand {
             LoadCommand::Dysymtab(_) => LC_DYSYMTAB,
             LoadCommand::BuildVersion(_) => LC_BUILD_VERSION,
             LoadCommand::LinkerOptimizationHint(_) => LC_LINKER_OPTIMIZATION_HINT,
+            LoadCommand::Dylib(d) => d.cmd,
+            LoadCommand::Rpath(_) => LC_RPATH,
             LoadCommand::Raw { cmd, .. } => *cmd,
         }
     }
@@ -153,6 +160,8 @@ impl LoadCommand {
             LoadCommand::Dysymtab(_) => DysymtabCmd::WIRE_SIZE,
             LoadCommand::BuildVersion(b) => b.wire_size(),
             LoadCommand::LinkerOptimizationHint(_) => LinkEditDataCmd::WIRE_SIZE,
+            LoadCommand::Dylib(d) => d.wire_size(),
+            LoadCommand::Rpath(r) => r.wire_size(),
             LoadCommand::Raw { cmdsize, .. } => *cmdsize,
         }
     }
@@ -416,6 +425,12 @@ fn decode_command(cmd: u32, cmdsize: u32, payload: &[u8]) -> Result<LoadCommand,
         LC_LINKER_OPTIMIZATION_HINT => Ok(LoadCommand::LinkerOptimizationHint(
             LinkEditDataCmd::parse(LC_LINKER_OPTIMIZATION_HINT, cmdsize, payload)?,
         )),
+        LC_ID_DYLIB
+        | LC_LOAD_DYLIB
+        | LC_LOAD_WEAK_DYLIB
+        | LC_REEXPORT_DYLIB
+        | LC_LOAD_UPWARD_DYLIB => Ok(LoadCommand::Dylib(DylibCmd::parse(cmd, cmdsize, payload)?)),
+        LC_RPATH => Ok(LoadCommand::Rpath(RpathCmd::parse(cmdsize, payload)?)),
         _ => Ok(LoadCommand::Raw {
             cmd,
             cmdsize,
@@ -435,6 +450,8 @@ pub fn write_commands(cmds: &[LoadCommand], out: &mut Vec<u8>) {
             LoadCommand::Dysymtab(d) => d.write(out),
             LoadCommand::BuildVersion(b) => b.write(out),
             LoadCommand::LinkerOptimizationHint(l) => l.write(LC_LINKER_OPTIMIZATION_HINT, out),
+            LoadCommand::Dylib(d) => d.write(out),
+            LoadCommand::Rpath(r) => r.write(out),
             LoadCommand::Raw { cmd, cmdsize, data } => {
                 out.extend_from_slice(&cmd.to_le_bytes());
                 out.extend_from_slice(&cmdsize.to_le_bytes());
@@ -677,6 +694,175 @@ impl BuildVersionCmd {
             out.extend_from_slice(&t.version.to_le_bytes());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// dylib_command — LC_ID_DYLIB / LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB /
+// LC_REEXPORT_DYLIB / LC_LOAD_UPWARD_DYLIB all share the same 16-byte
+// dylib struct + variable null-terminated name, padded to 8-byte alignment.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DylibCmd {
+    /// Which LC_*_DYLIB variant this entry is.
+    pub cmd: u32,
+    /// Install name / load path — relative (e.g. `@rpath/libfoo.dylib`) or
+    /// absolute (`/usr/lib/libSystem.B.dylib`).
+    pub name: String,
+    /// Timestamp is historically `time_t`; writers typically store `2` for
+    /// reproducibility, so we preserve raw for round-trip.
+    pub timestamp: u32,
+    /// X.Y.Z packed as `0xXXXXYYZZ`.
+    pub current_version: u32,
+    pub compatibility_version: u32,
+}
+
+impl DylibCmd {
+    /// 8 (lc header) + 16 (dylib struct) + name + null + pad-to-8.
+    pub fn wire_size(&self) -> u32 {
+        let tail = pad8(16 + self.name.len() + 1);
+        (8 + tail) as u32
+    }
+
+    pub fn parse(cmd: u32, cmdsize: u32, payload: &[u8]) -> Result<Self, ReadError> {
+        if payload.len() < 16 {
+            return Err(ReadError::Truncated {
+                need: 16,
+                have: payload.len(),
+                context: "dylib_command body",
+            });
+        }
+        let name_off_in_cmd = u32_le(&payload[0..4]) as usize;
+        let timestamp = u32_le(&payload[4..8]);
+        let current_version = u32_le(&payload[8..12]);
+        let compatibility_version = u32_le(&payload[12..16]);
+        // Offset is relative to cmd start; payload is post-header by 8 bytes.
+        if name_off_in_cmd < 8 || name_off_in_cmd - 8 > payload.len() {
+            return Err(ReadError::BadCmdsize {
+                cmd,
+                cmdsize,
+                at_offset: 0,
+                reason: "dylib_command name offset out of range",
+            });
+        }
+        let name_start = name_off_in_cmd - 8;
+        let name_bytes = &payload[name_start..];
+        let nul = name_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(ReadError::BadCmdsize {
+                cmd,
+                cmdsize,
+                at_offset: 0,
+                reason: "dylib_command name is not null-terminated",
+            })?;
+        let name = std::str::from_utf8(&name_bytes[..nul])
+            .map_err(|_| ReadError::BadCmdsize {
+                cmd,
+                cmdsize,
+                at_offset: 0,
+                reason: "dylib_command name is not UTF-8",
+            })?
+            .to_string();
+        Ok(DylibCmd {
+            cmd,
+            name,
+            timestamp,
+            current_version,
+            compatibility_version,
+        })
+    }
+
+    pub fn write(&self, out: &mut Vec<u8>) {
+        // `name` always sits at offset 24 from the start of the LC.
+        let name_offset: u32 = 24;
+        out.extend_from_slice(&self.cmd.to_le_bytes());
+        out.extend_from_slice(&self.wire_size().to_le_bytes());
+        out.extend_from_slice(&name_offset.to_le_bytes());
+        out.extend_from_slice(&self.timestamp.to_le_bytes());
+        out.extend_from_slice(&self.current_version.to_le_bytes());
+        out.extend_from_slice(&self.compatibility_version.to_le_bytes());
+        out.extend_from_slice(self.name.as_bytes());
+        out.push(0);
+        let padded = pad8(16 + self.name.len() + 1);
+        let pad = padded - (16 + self.name.len() + 1);
+        for _ in 0..pad {
+            out.push(0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rpath_command — one `-rpath` search path each.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpathCmd {
+    pub path: String,
+}
+
+impl RpathCmd {
+    /// 8 (lc header) + 4 (path offset) + path + null + pad-to-8.
+    pub fn wire_size(&self) -> u32 {
+        let tail = pad8(4 + self.path.len() + 1);
+        (8 + tail) as u32
+    }
+
+    pub fn parse(cmdsize: u32, payload: &[u8]) -> Result<Self, ReadError> {
+        if payload.len() < 4 {
+            return Err(ReadError::Truncated {
+                need: 4,
+                have: payload.len(),
+                context: "rpath_command body",
+            });
+        }
+        let off_in_cmd = u32_le(&payload[0..4]) as usize;
+        if off_in_cmd < 8 || off_in_cmd - 8 > payload.len() {
+            return Err(ReadError::BadCmdsize {
+                cmd: LC_RPATH,
+                cmdsize,
+                at_offset: 0,
+                reason: "rpath_command path offset out of range",
+            });
+        }
+        let start = off_in_cmd - 8;
+        let bytes = &payload[start..];
+        let nul = bytes.iter().position(|&b| b == 0).ok_or(ReadError::BadCmdsize {
+            cmd: LC_RPATH,
+            cmdsize,
+            at_offset: 0,
+            reason: "rpath_command path is not null-terminated",
+        })?;
+        let path = std::str::from_utf8(&bytes[..nul])
+            .map_err(|_| ReadError::BadCmdsize {
+                cmd: LC_RPATH,
+                cmdsize,
+                at_offset: 0,
+                reason: "rpath_command path is not UTF-8",
+            })?
+            .to_string();
+        Ok(RpathCmd { path })
+    }
+
+    pub fn write(&self, out: &mut Vec<u8>) {
+        let off: u32 = 12; // 8 (header) + 4 (path offset field)
+        out.extend_from_slice(&LC_RPATH.to_le_bytes());
+        out.extend_from_slice(&self.wire_size().to_le_bytes());
+        out.extend_from_slice(&off.to_le_bytes());
+        out.extend_from_slice(self.path.as_bytes());
+        out.push(0);
+        let padded = pad8(4 + self.path.len() + 1);
+        let pad = padded - (4 + self.path.len() + 1);
+        for _ in 0..pad {
+            out.push(0);
+        }
+    }
+}
+
+/// Round `n` up to the next multiple of 8.
+#[inline]
+fn pad8(n: usize) -> usize {
+    (n + 7) & !7
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,6 +1292,106 @@ mod tests {
         write_header(&hdr, &mut reemit);
         write_commands(&parsed, &mut reemit);
         assert_eq!(reemit, image);
+    }
+
+    #[test]
+    fn dylib_cmd_round_trip_byte_equal() {
+        let cmd = DylibCmd {
+            cmd: LC_LOAD_DYLIB,
+            name: "/usr/lib/libSystem.B.dylib".into(),
+            timestamp: 2,
+            current_version: (1 << 16) | (2 << 8) | 3,
+            compatibility_version: 1 << 16,
+        };
+        let mut wire = Vec::new();
+        cmd.write(&mut wire);
+        // cmdsize: 8 + 16 + name.len()+1 padded to 8 → 8 + 16 + 32 = 56
+        assert_eq!(wire.len() % 8, 0);
+        assert_eq!(wire.len(), cmd.wire_size() as usize);
+
+        // Strip the LC header before feeding to parse.
+        let decoded = DylibCmd::parse(LC_LOAD_DYLIB, cmd.wire_size(), &wire[8..]).unwrap();
+        assert_eq!(decoded, cmd);
+    }
+
+    #[test]
+    fn dylib_cmd_through_dispatcher_all_variants() {
+        for kind in [
+            LC_ID_DYLIB,
+            LC_LOAD_DYLIB,
+            LC_LOAD_WEAK_DYLIB,
+            LC_REEXPORT_DYLIB,
+            LC_LOAD_UPWARD_DYLIB,
+        ] {
+            let cmd = DylibCmd {
+                cmd: kind,
+                name: format!("@rpath/lib{:x}.dylib", kind & 0xff),
+                timestamp: 7,
+                current_version: (1 << 16) | 5,
+                compatibility_version: 1 << 16,
+            };
+            let mut wire = Vec::new();
+            cmd.write(&mut wire);
+
+            let hdr = MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: 0,
+                filetype: MH_DYLIB,
+                ncmds: 1,
+                sizeofcmds: cmd.wire_size(),
+                flags: 0,
+                reserved: 0,
+            };
+            let mut image = Vec::new();
+            write_header(&hdr, &mut image);
+            image.extend_from_slice(&wire);
+            let parsed = parse_commands(&hdr, &image).unwrap();
+            assert!(matches!(&parsed[0], LoadCommand::Dylib(d) if d == &cmd));
+
+            let mut reemit = Vec::new();
+            write_header(&hdr, &mut reemit);
+            write_commands(&parsed, &mut reemit);
+            assert_eq!(reemit, image);
+        }
+    }
+
+    #[test]
+    fn rpath_round_trip() {
+        let cmd = RpathCmd {
+            path: "@executable_path/../Frameworks".into(),
+        };
+        let mut wire = Vec::new();
+        cmd.write(&mut wire);
+        assert_eq!(wire.len() % 8, 0);
+
+        let hdr = MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: 0,
+            filetype: MH_EXECUTE,
+            ncmds: 1,
+            sizeofcmds: cmd.wire_size(),
+            flags: 0,
+            reserved: 0,
+        };
+        let mut image = Vec::new();
+        write_header(&hdr, &mut image);
+        image.extend_from_slice(&wire);
+        let parsed = parse_commands(&hdr, &image).unwrap();
+        assert!(matches!(&parsed[0], LoadCommand::Rpath(r) if r == &cmd));
+    }
+
+    #[test]
+    fn dylib_cmd_bad_name_offset_errors() {
+        // Name offset points past the buffer.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&9999u32.to_le_bytes()); // bad name offset
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let err = DylibCmd::parse(LC_LOAD_DYLIB, 32, &payload).unwrap_err();
+        assert!(matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("name offset")));
     }
 
     #[test]

@@ -44,6 +44,7 @@ pub const LC_DYLD_INFO_ONLY: u32 = 0x22 | LC_REQ_DYLD;
 pub const LC_DYLD_CHAINED_FIXUPS: u32 = 0x34 | LC_REQ_DYLD;
 pub const LC_DYLD_EXPORTS_TRIE: u32 = 0x33 | LC_REQ_DYLD;
 pub const LC_MAIN: u32 = 0x28 | LC_REQ_DYLD;
+pub const LC_LOAD_UPWARD_DYLIB: u32 = 0x23 | LC_REQ_DYLD;
 
 // Section type nibble (flags & 0xff)
 pub const SECTION_TYPE_MASK: u32 = 0x0000_00ff;

@@ -107,6 +107,126 @@ pub fn write_header(hdr: &MachHeader64, out: &mut Vec<u8>) {
 }
 
 // ---------------------------------------------------------------------------
+// Load commands.
+//
+// Every command starts with `cmd: u32` + `cmdsize: u32` (the "load_command"
+// header). `cmdsize` is 8-byte aligned and counts both those 8 header bytes
+// plus the payload. Specific command kinds get their own variants as each
+// commit in this sprint decodes them; unknown-to-us kinds live in
+// `LoadCommand::Raw` forever so round-trips survive.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadCommand {
+    /// A load command whose payload we haven't decoded yet. Preserves bytes
+    /// verbatim for byte-level round-trip.
+    Raw { cmd: u32, cmdsize: u32, data: Vec<u8> },
+}
+
+impl LoadCommand {
+    pub fn cmd(&self) -> u32 {
+        match self {
+            LoadCommand::Raw { cmd, .. } => *cmd,
+        }
+    }
+
+    pub fn cmdsize(&self) -> u32 {
+        match self {
+            LoadCommand::Raw { cmdsize, .. } => *cmdsize,
+        }
+    }
+}
+
+/// Parse the `header.ncmds` load commands that follow a `mach_header_64`.
+/// The slice must cover the full file (or at least through `sizeofcmds`);
+/// offsets are always relative to the start of the mach-o image.
+pub fn parse_commands(
+    header: &MachHeader64,
+    bytes: &[u8],
+) -> Result<Vec<LoadCommand>, ReadError> {
+    let cmds_end = HEADER_SIZE
+        .checked_add(header.sizeofcmds as usize)
+        .ok_or(ReadError::Truncated {
+            need: usize::MAX,
+            have: bytes.len(),
+            context: "load-command region (sizeofcmds overflows)",
+        })?;
+    if bytes.len() < cmds_end {
+        return Err(ReadError::Truncated {
+            need: cmds_end,
+            have: bytes.len(),
+            context: "load-command region",
+        });
+    }
+
+    let mut out = Vec::with_capacity(header.ncmds as usize);
+    let mut cursor = HEADER_SIZE;
+    for _ in 0..header.ncmds {
+        if cursor + 8 > cmds_end {
+            return Err(ReadError::Truncated {
+                need: 8,
+                have: cmds_end.saturating_sub(cursor),
+                context: "load_command header (cmd + cmdsize)",
+            });
+        }
+        let cmd = u32_le(&bytes[cursor..cursor + 4]);
+        let cmdsize = u32_le(&bytes[cursor + 4..cursor + 8]);
+        if cmdsize < 8 {
+            return Err(ReadError::BadCmdsize {
+                cmd,
+                cmdsize,
+                at_offset: cursor,
+                reason: "smaller than 8-byte header",
+            });
+        }
+        if !cmdsize.is_multiple_of(8) {
+            return Err(ReadError::BadCmdsize {
+                cmd,
+                cmdsize,
+                at_offset: cursor,
+                reason: "not 8-byte aligned",
+            });
+        }
+        let end = cursor
+            .checked_add(cmdsize as usize)
+            .ok_or(ReadError::BadCmdsize {
+                cmd,
+                cmdsize,
+                at_offset: cursor,
+                reason: "cmdsize overflow",
+            })?;
+        if end > cmds_end {
+            return Err(ReadError::BadCmdsize {
+                cmd,
+                cmdsize,
+                at_offset: cursor,
+                reason: "overruns sizeofcmds",
+            });
+        }
+        let data = bytes[cursor + 8..end].to_vec();
+        out.push(LoadCommand::Raw { cmd, cmdsize, data });
+        cursor = end;
+    }
+
+    Ok(out)
+}
+
+/// Write a sequence of load commands back to wire form. Paired with
+/// `parse_commands` so `write_commands(parse_commands(hdr, bytes)?, &mut out)`
+/// produces byte-identical output to the original region.
+pub fn write_commands(cmds: &[LoadCommand], out: &mut Vec<u8>) {
+    for c in cmds {
+        match c {
+            LoadCommand::Raw { cmd, cmdsize, data } => {
+                out.extend_from_slice(&cmd.to_le_bytes());
+                out.extend_from_slice(&cmdsize.to_le_bytes());
+                out.extend_from_slice(data);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Little-endian primitive readers. `u*_le(slice)` panics on short slices; every
 // caller in this module pre-checks length via `Truncated` diagnostics.
 // ---------------------------------------------------------------------------
@@ -187,5 +307,101 @@ mod tests {
         bytes[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
         let err = parse_header(&bytes).unwrap_err();
         assert!(matches!(err, ReadError::UnsupportedCpu { got: 0x0100_0007 }));
+    }
+
+    /// Synthesize a mach-o image with `n` load commands, each of size
+    /// `cmdsize` (must include the 8-byte header).
+    fn synth_image(ncmds: u32, cmds: &[(u32, u32, &[u8])]) -> Vec<u8> {
+        let sizeofcmds: u32 = cmds.iter().map(|(_, sz, _)| *sz).sum();
+        let mut image = Vec::new();
+        let hdr = MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: 0,
+            filetype: MH_OBJECT,
+            ncmds,
+            sizeofcmds,
+            flags: 0,
+            reserved: 0,
+        };
+        write_header(&hdr, &mut image);
+        for (cmd, sz, payload) in cmds {
+            image.extend_from_slice(&cmd.to_le_bytes());
+            image.extend_from_slice(&sz.to_le_bytes());
+            image.extend_from_slice(payload);
+        }
+        image
+    }
+
+    #[test]
+    fn round_trip_two_raw_commands() {
+        // Two fake commands of size 16 each (8 header + 8 payload).
+        let payload_a = [0xAAu8; 8];
+        let payload_b = [0xBBu8; 8];
+        let image = synth_image(
+            2,
+            &[(0xDEAD_BEEF, 16, &payload_a), (0xCAFE_F00D, 16, &payload_b)],
+        );
+        let hdr = parse_header(&image).unwrap();
+        let cmds = parse_commands(&hdr, &image).unwrap();
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].cmd(), 0xDEAD_BEEF);
+        assert_eq!(cmds[0].cmdsize(), 16);
+        assert_eq!(cmds[1].cmd(), 0xCAFE_F00D);
+
+        let mut out = Vec::new();
+        write_header(&hdr, &mut out);
+        write_commands(&cmds, &mut out);
+        assert_eq!(out, image);
+    }
+
+    #[test]
+    fn cmdsize_below_header_errors() {
+        let image = synth_image(1, &[(0x1234, 4, &[])]);
+        let hdr = MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: 0,
+            filetype: MH_OBJECT,
+            ncmds: 1,
+            sizeofcmds: 4, // too small for even the header
+            flags: 0,
+            reserved: 0,
+        };
+        let err = parse_commands(&hdr, &image).unwrap_err();
+        assert!(matches!(err, ReadError::Truncated { .. }));
+    }
+
+    #[test]
+    fn cmdsize_unaligned_errors() {
+        // cmdsize = 10 — not 8-aligned.
+        let image = synth_image(1, &[(0x1234, 10, &[0u8; 2])]);
+        let hdr = parse_header(&image).unwrap();
+        let err = parse_commands(&hdr, &image).unwrap_err();
+        assert!(matches!(
+            err,
+            ReadError::BadCmdsize { cmd: 0x1234, cmdsize: 10, reason, .. } if reason.contains("aligned")
+        ));
+    }
+
+    #[test]
+    fn cmdsize_overrun_errors() {
+        // sizeofcmds says 8, but the command claims 16 bytes.
+        let mut image = Vec::new();
+        let hdr = MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: 0,
+            filetype: MH_OBJECT,
+            ncmds: 1,
+            sizeofcmds: 8,
+            flags: 0,
+            reserved: 0,
+        };
+        write_header(&hdr, &mut image);
+        image.extend_from_slice(&0x1234u32.to_le_bytes());
+        image.extend_from_slice(&16u32.to_le_bytes());
+        let err = parse_commands(&hdr, &image).unwrap_err();
+        assert!(matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("overruns")));
     }
 }

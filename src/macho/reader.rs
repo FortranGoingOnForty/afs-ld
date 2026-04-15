@@ -121,6 +121,8 @@ pub enum LoadCommand {
     Segment64(Segment64),
     Symtab(SymtabCmd),
     Dysymtab(DysymtabCmd),
+    BuildVersion(BuildVersionCmd),
+    LinkerOptimizationHint(LinkEditDataCmd),
     /// A load command whose payload we haven't decoded yet. Preserves bytes
     /// verbatim for byte-level round-trip.
     Raw { cmd: u32, cmdsize: u32, data: Vec<u8> },
@@ -132,6 +134,8 @@ impl LoadCommand {
             LoadCommand::Segment64(_) => LC_SEGMENT_64,
             LoadCommand::Symtab(_) => LC_SYMTAB,
             LoadCommand::Dysymtab(_) => LC_DYSYMTAB,
+            LoadCommand::BuildVersion(_) => LC_BUILD_VERSION,
+            LoadCommand::LinkerOptimizationHint(_) => LC_LINKER_OPTIMIZATION_HINT,
             LoadCommand::Raw { cmd, .. } => *cmd,
         }
     }
@@ -141,6 +145,8 @@ impl LoadCommand {
             LoadCommand::Segment64(s) => s.wire_size(),
             LoadCommand::Symtab(_) => SymtabCmd::WIRE_SIZE,
             LoadCommand::Dysymtab(_) => DysymtabCmd::WIRE_SIZE,
+            LoadCommand::BuildVersion(b) => b.wire_size(),
+            LoadCommand::LinkerOptimizationHint(_) => LinkEditDataCmd::WIRE_SIZE,
             LoadCommand::Raw { cmdsize, .. } => *cmdsize,
         }
     }
@@ -398,6 +404,12 @@ fn decode_command(cmd: u32, cmdsize: u32, payload: &[u8]) -> Result<LoadCommand,
         LC_SEGMENT_64 => Ok(LoadCommand::Segment64(Segment64::parse(cmdsize, payload)?)),
         LC_SYMTAB => Ok(LoadCommand::Symtab(SymtabCmd::parse(cmdsize, payload)?)),
         LC_DYSYMTAB => Ok(LoadCommand::Dysymtab(DysymtabCmd::parse(cmdsize, payload)?)),
+        LC_BUILD_VERSION => Ok(LoadCommand::BuildVersion(BuildVersionCmd::parse(
+            cmdsize, payload,
+        )?)),
+        LC_LINKER_OPTIMIZATION_HINT => Ok(LoadCommand::LinkerOptimizationHint(
+            LinkEditDataCmd::parse(LC_LINKER_OPTIMIZATION_HINT, cmdsize, payload)?,
+        )),
         _ => Ok(LoadCommand::Raw {
             cmd,
             cmdsize,
@@ -415,6 +427,8 @@ pub fn write_commands(cmds: &[LoadCommand], out: &mut Vec<u8>) {
             LoadCommand::Segment64(s) => s.write(out),
             LoadCommand::Symtab(s) => s.write(out),
             LoadCommand::Dysymtab(d) => d.write(out),
+            LoadCommand::BuildVersion(b) => b.write(out),
+            LoadCommand::LinkerOptimizationHint(l) => l.write(LC_LINKER_OPTIMIZATION_HINT, out),
             LoadCommand::Raw { cmd, cmdsize, data } => {
                 out.extend_from_slice(&cmd.to_le_bytes());
                 out.extend_from_slice(&cmdsize.to_le_bytes());
@@ -573,6 +587,138 @@ impl DysymtabCmd {
         ] {
             out.extend_from_slice(&v.to_le_bytes());
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LC_BUILD_VERSION
+// ---------------------------------------------------------------------------
+
+/// `build_tool_version` — 8 bytes: tool kind + version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildTool {
+    pub tool: u32,
+    pub version: u32,
+}
+
+/// `build_version_command` — 16-byte fixed header + N × 8-byte tool records.
+/// `minos` / `sdk` are packed X.Y.Z: `(X << 16) | (Y << 8) | Z`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildVersionCmd {
+    pub platform: u32,
+    pub minos: u32,
+    pub sdk: u32,
+    pub tools: Vec<BuildTool>,
+}
+
+impl BuildVersionCmd {
+    const BASE: usize = 16; // platform + minos + sdk + ntools
+    const TOOL: usize = 8;
+
+    pub fn wire_size(&self) -> u32 {
+        (8 + Self::BASE + Self::TOOL * self.tools.len()) as u32
+    }
+
+    pub fn parse(cmdsize: u32, payload: &[u8]) -> Result<Self, ReadError> {
+        if payload.len() < Self::BASE {
+            return Err(ReadError::Truncated {
+                need: Self::BASE,
+                have: payload.len(),
+                context: "build_version_command",
+            });
+        }
+        let platform = u32_le(&payload[0..4]);
+        let minos = u32_le(&payload[4..8]);
+        let sdk = u32_le(&payload[8..12]);
+        let ntools = u32_le(&payload[12..16]);
+
+        let body_needed = Self::BASE + Self::TOOL * ntools as usize;
+        if payload.len() < body_needed {
+            return Err(ReadError::BadCmdsize {
+                cmd: LC_BUILD_VERSION,
+                cmdsize,
+                at_offset: 0,
+                reason: "ntools requires more bytes than cmdsize accommodates",
+            });
+        }
+
+        let mut tools = Vec::with_capacity(ntools as usize);
+        for i in 0..ntools as usize {
+            let off = Self::BASE + i * Self::TOOL;
+            tools.push(BuildTool {
+                tool: u32_le(&payload[off..off + 4]),
+                version: u32_le(&payload[off + 4..off + 8]),
+            });
+        }
+
+        Ok(BuildVersionCmd {
+            platform,
+            minos,
+            sdk,
+            tools,
+        })
+    }
+
+    pub fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&LC_BUILD_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.wire_size().to_le_bytes());
+        out.extend_from_slice(&self.platform.to_le_bytes());
+        out.extend_from_slice(&self.minos.to_le_bytes());
+        out.extend_from_slice(&self.sdk.to_le_bytes());
+        out.extend_from_slice(&(self.tools.len() as u32).to_le_bytes());
+        for t in &self.tools {
+            out.extend_from_slice(&t.tool.to_le_bytes());
+            out.extend_from_slice(&t.version.to_le_bytes());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// linkedit_data_command — shared wire format for LC_LINKER_OPTIMIZATION_HINT,
+// LC_FUNCTION_STARTS, LC_DATA_IN_CODE, LC_CODE_SIGNATURE, LC_DYLD_EXPORTS_TRIE,
+// LC_DYLD_CHAINED_FIXUPS. Only the LOH variant is decoded this sprint; the
+// others adopt this same struct as they come online.
+// ---------------------------------------------------------------------------
+
+/// `linkedit_data_command` — 8 bytes: file offset + size pointing into
+/// `__LINKEDIT`. The actual payload at `(dataoff, datasize)` is decoded by
+/// whichever sprint owns the target section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkEditDataCmd {
+    pub dataoff: u32,
+    pub datasize: u32,
+}
+
+impl LinkEditDataCmd {
+    pub const WIRE_SIZE: u32 = 8 + 8;
+
+    pub fn parse(cmd: u32, cmdsize: u32, payload: &[u8]) -> Result<Self, ReadError> {
+        if cmdsize != Self::WIRE_SIZE {
+            return Err(ReadError::BadCmdsize {
+                cmd,
+                cmdsize,
+                at_offset: 0,
+                reason: "linkedit_data_command cmdsize must be 16",
+            });
+        }
+        if payload.len() < 8 {
+            return Err(ReadError::Truncated {
+                need: 8,
+                have: payload.len(),
+                context: "linkedit_data_command",
+            });
+        }
+        Ok(LinkEditDataCmd {
+            dataoff: u32_le(&payload[0..4]),
+            datasize: u32_le(&payload[4..8]),
+        })
+    }
+
+    pub fn write(&self, cmd: u32, out: &mut Vec<u8>) {
+        out.extend_from_slice(&cmd.to_le_bytes());
+        out.extend_from_slice(&Self::WIRE_SIZE.to_le_bytes());
+        out.extend_from_slice(&self.dataoff.to_le_bytes());
+        out.extend_from_slice(&self.datasize.to_le_bytes());
     }
 }
 
@@ -889,6 +1035,106 @@ mod tests {
 
         let parsed = parse_commands(&hdr, &image).unwrap();
         assert!(matches!(parsed[0], LoadCommand::Dysymtab(c) if c == cmd));
+    }
+
+    #[test]
+    fn build_version_round_trip() {
+        // Minimal: no tools. `minos` / `sdk` are X.Y.Z packed as 0xXXXXYYZZ;
+        // 11.0.0 / 14.0.0 collapse to just `<major> << 16`.
+        let cmd = BuildVersionCmd {
+            platform: PLATFORM_MACOS,
+            minos: 11 << 16,
+            sdk: 14 << 16,
+            tools: vec![],
+        };
+        let mut wire = Vec::new();
+        cmd.write(&mut wire);
+        assert_eq!(wire.len(), (8 + 16) as usize);
+        let decoded = BuildVersionCmd::parse(cmd.wire_size(), &wire[8..]).unwrap();
+        assert_eq!(decoded, cmd);
+
+        // With two tool records.
+        let cmd2 = BuildVersionCmd {
+            platform: PLATFORM_MACOS,
+            minos: (11 << 16) | (3 << 8),
+            sdk: (14 << 16) | (2 << 8),
+            tools: vec![
+                BuildTool { tool: 3, version: 0x0001_0002 },
+                BuildTool { tool: 4, version: 0x0002_0003 },
+            ],
+        };
+        let mut wire2 = Vec::new();
+        cmd2.write(&mut wire2);
+        assert_eq!(wire2.len(), (8 + 16 + 16) as usize);
+        let decoded2 = BuildVersionCmd::parse(cmd2.wire_size(), &wire2[8..]).unwrap();
+        assert_eq!(decoded2, cmd2);
+    }
+
+    #[test]
+    fn build_version_through_dispatcher() {
+        let cmd = BuildVersionCmd {
+            platform: PLATFORM_MACOS,
+            minos: (11 << 16),
+            sdk: (14 << 16),
+            tools: vec![BuildTool { tool: 3, version: 1 }],
+        };
+        let mut wire = Vec::new();
+        cmd.write(&mut wire);
+        let hdr = MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: 0,
+            filetype: MH_OBJECT,
+            ncmds: 1,
+            sizeofcmds: cmd.wire_size(),
+            flags: 0,
+            reserved: 0,
+        };
+        let mut image = Vec::new();
+        write_header(&hdr, &mut image);
+        image.extend_from_slice(&wire);
+
+        let parsed = parse_commands(&hdr, &image).unwrap();
+        assert!(matches!(&parsed[0], LoadCommand::BuildVersion(b) if b == &cmd));
+
+        let mut reemit = Vec::new();
+        write_header(&hdr, &mut reemit);
+        write_commands(&parsed, &mut reemit);
+        assert_eq!(reemit, image);
+    }
+
+    #[test]
+    fn loh_round_trip() {
+        let cmd = LinkEditDataCmd {
+            dataoff: 0x4000,
+            datasize: 0x80,
+        };
+        let mut wire = Vec::new();
+        cmd.write(LC_LINKER_OPTIMIZATION_HINT, &mut wire);
+        assert_eq!(wire.len(), LinkEditDataCmd::WIRE_SIZE as usize);
+
+        let decoded =
+            LinkEditDataCmd::parse(LC_LINKER_OPTIMIZATION_HINT, LinkEditDataCmd::WIRE_SIZE, &wire[8..]).unwrap();
+        assert_eq!(decoded, cmd);
+
+        let hdr = MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: 0,
+            filetype: MH_OBJECT,
+            ncmds: 1,
+            sizeofcmds: LinkEditDataCmd::WIRE_SIZE,
+            flags: 0,
+            reserved: 0,
+        };
+        let mut image = Vec::new();
+        write_header(&hdr, &mut image);
+        image.extend_from_slice(&wire);
+        let parsed = parse_commands(&hdr, &image).unwrap();
+        assert!(matches!(
+            &parsed[0],
+            LoadCommand::LinkerOptimizationHint(l) if l == &cmd
+        ));
     }
 
     #[test]

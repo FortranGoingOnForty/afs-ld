@@ -373,10 +373,40 @@ fn align_to(value: u64, align: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::atom::{Atom, AtomFlags, AtomSection, AtomTable};
+    use crate::resolve::{AtomId, InputId, SymbolTable};
     use crate::section::{
-        Layout, OutputSection, OutputSectionId, OutputSegment, Prot, SectionKind, PAGE_SIZE,
+        build_layout, Layout, OutputSection, OutputSectionId, OutputSegment, Prot, SectionKind,
+        PAGE_SIZE,
     };
+
+    fn synth_atom(
+        origin: InputId,
+        input_offset: u32,
+        size: u32,
+        align_pow2: u8,
+        section: AtomSection,
+        data: &[u8],
+    ) -> Atom {
+        Atom {
+            id: AtomId(0),
+            origin,
+            input_section: 1,
+            section,
+            input_offset,
+            size,
+            align_pow2,
+            owner: None,
+            alt_entries: Vec::new(),
+            relocs: Vec::new(),
+            data: data.to_vec(),
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        }
+    }
 
     #[test]
     fn segment_command_preserves_reserved_section_fields() {
@@ -445,5 +475,88 @@ mod tests {
             ids.iter().position(|cmd| *cmd == LC_BUILD_VERSION)
                 < ids.iter().position(|cmd| *cmd == LC_SOURCE_VERSION)
         );
+    }
+
+    #[test]
+    fn layout_and_writer_are_deterministic_across_hundred_runs() {
+        let mut baseline: Option<Vec<u8>> = None;
+
+        for _ in 0..100 {
+            let mut atoms = AtomTable::new();
+            atoms.push(synth_atom(
+                InputId(1),
+                0,
+                8,
+                3,
+                AtomSection::Data,
+                &0x1122_3344_5566_7788u64.to_le_bytes(),
+            ));
+            atoms.push(synth_atom(
+                InputId(0),
+                4,
+                4,
+                2,
+                AtomSection::Text,
+                &[0xc0, 0x03, 0x5f, 0xd6],
+            ));
+            atoms.push(synth_atom(
+                InputId(0),
+                0,
+                3,
+                0,
+                AtomSection::CStringLiterals,
+                b"hi\0",
+            ));
+            atoms.push(synth_atom(
+                InputId(0),
+                24,
+                16,
+                3,
+                AtomSection::ZeroFill,
+                &[],
+            ));
+            atoms.push(synth_atom(
+                InputId(0),
+                16,
+                8,
+                3,
+                AtomSection::Data,
+                &0x99aa_bbcc_ddee_ff00u64.to_le_bytes(),
+            ));
+
+            let layout = build_layout(OutputKind::Executable, &atoms, &SymbolTable::new());
+            let opts = LinkOptions {
+                output: Some(PathBuf::from("deterministic-a.out")),
+                ..LinkOptions::default()
+            };
+            let plan = WritePlan {
+                dylibs: vec![DylibCmd {
+                    cmd: LC_LOAD_DYLIB,
+                    name: "/usr/lib/libSystem.B.dylib".into(),
+                    timestamp: 2,
+                    current_version: 0,
+                    compatibility_version: 0,
+                }],
+                rpaths: vec!["@executable_path/../lib".into()],
+                uuid: Some([0x5a; 16]),
+                source_version: Some(0),
+            };
+
+            let mut bytes = Vec::new();
+            write_with_atoms_and_plan(
+                &layout,
+                &atoms,
+                OutputKind::Executable,
+                &opts,
+                &plan,
+                &mut bytes,
+            )
+            .expect("write deterministic executable");
+
+            match &baseline {
+                Some(expected) => assert_eq!(&bytes, expected),
+                None => baseline = Some(bytes),
+            }
+        }
     }
 }

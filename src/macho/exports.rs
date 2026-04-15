@@ -63,51 +63,77 @@ impl ExportEntry {
     }
 }
 
-/// Owned export-trie blob; decoded lazily via `entries()`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ExportTrie {
-    raw: Vec<u8>,
+/// The linker-side "exports view" of a dylib. Either a wire-form trie
+/// (from `MH_DYLIB` via `LC_DYLD_INFO_ONLY` or `LC_DYLD_EXPORTS_TRIE`) or
+/// a pre-flattened list (from a TAPI `.tbd`). Both kinds answer the same
+/// two questions: `entries()` (iterate all) and `lookup(name)` (find one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exports {
+    Trie(Vec<u8>),
+    Flat(Vec<ExportEntry>),
 }
 
-impl ExportTrie {
+impl Default for Exports {
+    fn default() -> Self {
+        Exports::empty()
+    }
+}
+
+impl Exports {
     pub fn empty() -> Self {
-        ExportTrie::default()
+        Exports::Flat(Vec::new())
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        ExportTrie { raw: bytes.to_vec() }
+    pub fn from_trie_bytes(bytes: &[u8]) -> Self {
+        Exports::Trie(bytes.to_vec())
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.raw
+    pub fn from_entries(entries: Vec<ExportEntry>) -> Self {
+        Exports::Flat(entries)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.raw.is_empty()
+        match self {
+            Exports::Trie(b) => b.is_empty(),
+            Exports::Flat(e) => e.is_empty(),
+        }
     }
 
-    /// Decode every terminal in the trie. Iteration is pre-order; entries are
-    /// produced in whatever order the trie visits them (usually lexicographic
-    /// by exported name, since ld emits sorted children, but callers should
-    /// not rely on this across writers).
+    /// Wire bytes for the trie variant; empty slice for flat.
+    pub fn trie_bytes(&self) -> &[u8] {
+        match self {
+            Exports::Trie(b) => b,
+            Exports::Flat(_) => &[],
+        }
+    }
+
+    /// Decode every export. For the trie variant this walks the tree; for
+    /// flat it clones the stored vec. Cycle-safe on the trie side.
     pub fn entries(&self) -> Result<Vec<ExportEntry>, ReadError> {
-        if self.raw.is_empty() {
-            return Ok(Vec::new());
+        match self {
+            Exports::Trie(raw) => {
+                if raw.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut out = Vec::new();
+                let mut visited = std::collections::HashSet::new();
+                walk(raw, 0, String::new(), &mut out, &mut visited, 0)?;
+                Ok(out)
+            }
+            Exports::Flat(v) => Ok(v.clone()),
         }
-        let mut out = Vec::new();
-        let mut visited = std::collections::HashSet::new();
-        walk(&self.raw, 0, String::new(), &mut out, &mut visited, 0)?;
-        Ok(out)
     }
 
-    /// Walk the trie following `name`'s byte path. Returns the terminal entry
-    /// if `name` resolves, `None` if the walk terminates at a non-terminal
-    /// node.
     pub fn lookup(&self, name: &str) -> Result<Option<ExportEntry>, ReadError> {
-        if self.raw.is_empty() {
-            return Ok(None);
+        match self {
+            Exports::Trie(raw) => {
+                if raw.is_empty() {
+                    return Ok(None);
+                }
+                lookup(raw, 0, name.as_bytes(), 0)
+            }
+            Exports::Flat(v) => Ok(v.iter().find(|e| e.name == name).cloned()),
         }
-        lookup(&self.raw, 0, name.as_bytes(), 0)
     }
 }
 
@@ -352,7 +378,7 @@ mod tests {
 
     #[test]
     fn empty_trie_yields_no_entries() {
-        let trie = ExportTrie::empty();
+        let trie = Exports::empty();
         assert!(trie.entries().unwrap().is_empty());
         assert!(trie.lookup("_anything").unwrap().is_none());
     }
@@ -378,7 +404,7 @@ mod tests {
         let mut trie_bytes = root;
         trie_bytes.extend_from_slice(&leaf);
 
-        let trie = ExportTrie::from_bytes(&trie_bytes);
+        let trie = Exports::from_trie_bytes(&trie_bytes);
         let entries = trie.entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "_foo");
@@ -409,7 +435,7 @@ mod tests {
         let mut trie_bytes = root;
         trie_bytes.extend_from_slice(&leaf);
 
-        let trie = ExportTrie::from_bytes(&trie_bytes);
+        let trie = Exports::from_trie_bytes(&trie_bytes);
         let entries = trie.entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "_alias");
@@ -436,7 +462,7 @@ mod tests {
         let root = encode_root_with_children(&[("_foo", root_header_len as u64)], 256);
         let mut trie_bytes = root;
         trie_bytes.extend_from_slice(&leaf);
-        let trie = ExportTrie::from_bytes(&trie_bytes);
+        let trie = Exports::from_trie_bytes(&trie_bytes);
         assert!(trie.lookup("_bar").unwrap().is_none());
         assert!(trie.lookup("_foo").unwrap().is_some());
     }
@@ -445,7 +471,7 @@ mod tests {
     fn malformed_child_offset_errors() {
         // Root claims a child at offset 1000 but trie is tiny.
         let root = encode_root_with_children(&[("_x", 1000)], 256);
-        let trie = ExportTrie::from_bytes(&root);
+        let trie = Exports::from_trie_bytes(&root);
         assert!(trie.entries().is_err());
     }
 }

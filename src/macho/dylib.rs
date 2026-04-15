@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use super::constants::*;
-use super::exports::ExportTrie;
+use super::exports::Exports;
 use super::reader::{parse_commands, parse_header, LoadCommand, MachHeader64, ReadError, SymtabCmd};
 
 /// How a consumer loaded this dylib. The filetype of the dylib itself is
@@ -60,7 +60,7 @@ pub struct DylibFile {
     pub dependencies: Vec<DylibDependency>,
     pub rpaths: Vec<String>,
     pub symtab: Option<SymtabCmd>,
-    pub exports: ExportTrie,
+    pub exports: Exports,
 }
 
 impl DylibFile {
@@ -110,7 +110,7 @@ impl DylibFile {
             }
         }
 
-        let exports = locate_exports_trie(&commands, file_bytes)?;
+        let exports = locate_exports(&commands, file_bytes)?;
 
         Ok(DylibFile {
             path,
@@ -129,11 +129,12 @@ impl DylibFile {
 
 /// Locate the export-trie bytes in either `LC_DYLD_INFO_ONLY.export_*` or
 /// `LC_DYLD_EXPORTS_TRIE` (chained-fixups era). Dylibs built by older
-/// toolchains may have no export trie; in that case return an empty trie.
-fn locate_exports_trie(
+/// toolchains may have no export trie; in that case return an empty
+/// `Exports::Flat(vec![])` so downstream `entries()` works uniformly.
+fn locate_exports(
     commands: &[LoadCommand],
     file_bytes: &[u8],
-) -> Result<ExportTrie, ReadError> {
+) -> Result<Exports, ReadError> {
     for cmd in commands {
         match cmd {
             LoadCommand::DyldInfoOnly(d) if d.export_size != 0 => {
@@ -145,10 +146,10 @@ fn locate_exports_trie(
             _ => {}
         }
     }
-    Ok(ExportTrie::empty())
+    Ok(Exports::empty())
 }
 
-fn trie_slice(file_bytes: &[u8], off: u32, size: u32) -> Result<ExportTrie, ReadError> {
+fn trie_slice(file_bytes: &[u8], off: u32, size: u32) -> Result<Exports, ReadError> {
     let start = off as usize;
     let end = start
         .checked_add(size as usize)
@@ -164,7 +165,7 @@ fn trie_slice(file_bytes: &[u8], off: u32, size: u32) -> Result<ExportTrie, Read
             context: "export trie",
         });
     }
-    Ok(ExportTrie::from_bytes(&file_bytes[start..end]))
+    Ok(Exports::from_trie_bytes(&file_bytes[start..end]))
 }
 
 /// Look up the 1-based ordinal of a dependency by its install name. Used by

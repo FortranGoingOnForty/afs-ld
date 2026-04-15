@@ -968,6 +968,138 @@ pub fn seed_all(inputs: &Inputs, table: &mut SymbolTable) -> Result<SeedReport, 
     Ok(report)
 }
 
+// ---------------------------------------------------------------------------
+// Fixed-point fetch loop.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub enum FetchError {
+    Read(ReadError),
+    Archive(ArchiveError),
+    MemberNotFound {
+        archive: ArchiveId,
+        member: MemberId,
+    },
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Read(e) => write!(f, "{e}"),
+            FetchError::Archive(e) => write!(f, "{e}"),
+            FetchError::MemberNotFound { archive, member } => write!(
+                f,
+                "archive #{} has no member at ar_hdr offset 0x{:x}",
+                archive.0, member.0
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
+
+impl From<ReadError> for FetchError {
+    fn from(e: ReadError) -> Self {
+        FetchError::Read(e)
+    }
+}
+
+impl From<ArchiveError> for FetchError {
+    fn from(e: ArchiveError) -> Self {
+        FetchError::Archive(e)
+    }
+}
+
+impl From<SeedError> for FetchError {
+    fn from(e: SeedError) -> Self {
+        match e {
+            SeedError::Read(r) => FetchError::Read(r),
+            SeedError::Archive(a) => FetchError::Archive(a),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DrainReport {
+    pub fetched_members: usize,
+    pub duplicates: Vec<InsertError>,
+}
+
+/// Pull `pending`'s member, register it as a new `ObjectInput`, and seed
+/// its symbols. Returns any new `PendingFetch` entries triggered by the
+/// inserted object's own undefined references. Returns an empty Vec when
+/// the target member has already been fetched (de-dup against concurrent
+/// pending entries).
+fn fetch_and_ingest_one(
+    inputs: &mut Inputs,
+    table: &mut SymbolTable,
+    pending: PendingFetch,
+    report: &mut DrainReport,
+) -> Result<Vec<PendingFetch>, FetchError> {
+    // Phase 1: verify the slot still needs this member, and peel off the
+    // owned data we need from the archive before mutating the registry.
+    let (logical_path, member_bytes) = {
+        let ai = &inputs.archives[pending.archive.0 as usize];
+        if ai.fetched.contains(&pending.member.0) {
+            return Ok(Vec::new());
+        }
+        let slot_is_still_lazy = matches!(
+            table.symbols[pending.id.0 as usize],
+            Symbol::LazyArchive { .. }
+        );
+        if !slot_is_still_lazy {
+            // A strong Defined beat us to the slot — no fetch required.
+            return Ok(Vec::new());
+        }
+        let archive = Archive::open(&ai.path, &ai.bytes)?;
+        let member = archive
+            .member_at_offset(pending.member.0)
+            .ok_or(FetchError::MemberNotFound {
+                archive: pending.archive,
+                member: pending.member,
+            })?;
+        let logical = format!("{}({})", ai.path.display(), member.name);
+        (logical, member.body.to_vec())
+    };
+
+    // Phase 2: register the fetched bytes as a fresh `ObjectInput` and
+    // mark the member as consumed. `seed_object` will fail fast if the
+    // member's Mach-O bytes are malformed.
+    inputs.archives[pending.archive.0 as usize]
+        .fetched
+        .insert(pending.member.0);
+    let input_id = InputId(inputs.objects.len() as u32);
+    inputs.objects.push(ObjectInput {
+        path: PathBuf::from(logical_path),
+        bytes: member_bytes,
+    });
+    report.fetched_members += 1;
+
+    // Phase 3: seed symbols from the fetched member. New
+    // `PendingArchiveFetch` outcomes bubble back up to the outer loop.
+    let mut sub_report = SeedReport::default();
+    seed_object(inputs, input_id, table, &mut sub_report)?;
+    report.duplicates.extend(sub_report.duplicates);
+    Ok(sub_report.pending_fetches)
+}
+
+/// Drive the fetch queue to a fixed point. Each fetched member's own
+/// undefined references may trigger additional pending fetches — drain
+/// those too until the queue is empty.
+pub fn drain_fetches(
+    inputs: &mut Inputs,
+    table: &mut SymbolTable,
+    initial: Vec<PendingFetch>,
+) -> Result<DrainReport, FetchError> {
+    let mut queue = initial;
+    let mut report = DrainReport::default();
+    while let Some(p) = queue.pop() {
+        let new_pending = fetch_and_ingest_one(inputs, table, p, &mut report)?;
+        queue.extend(new_pending);
+    }
+    Ok(report)
+}
+
 /// Turn a wire-form `InputSymbol` into a resolver-side `Symbol`. Returns
 /// `None` for kinds the resolver does not track (currently: aliases with
 /// unresolved target strx — Sprint 8's resolver defers those for now).

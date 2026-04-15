@@ -364,6 +364,130 @@ fn encode_addend_prefix(offset: i32, addend: i64, length: u8) -> Result<RawReloc
     })
 }
 
+/// Per-kind expected `r_length` (in bit-width form). `Unsigned` / `Subtractor`
+/// are the only kinds that validly carry both `Word` and `Quad`; every other
+/// kind is always `Word` (one 4-byte instruction).
+fn kind_expects_word_only(k: RelocKind) -> bool {
+    !matches!(k, RelocKind::Unsigned | RelocKind::Subtractor)
+}
+
+/// Per-kind expected `r_pcrel`. `None` means the flag is unconstrained
+/// (currently: `Unsigned` and `Subtractor`).
+fn kind_expects_pcrel(k: RelocKind) -> Option<bool> {
+    match k {
+        RelocKind::Branch26
+        | RelocKind::Page21
+        | RelocKind::GotLoadPage21
+        | RelocKind::TlvpLoadPage21
+        | RelocKind::PointerToGot => Some(true),
+        RelocKind::PageOff12 | RelocKind::GotLoadPageOff12 | RelocKind::TlvpLoadPageOff12 => {
+            Some(false)
+        }
+        RelocKind::Unsigned | RelocKind::Subtractor => None,
+    }
+}
+
+/// Validate one fused relocation against the sizes of its containing section,
+/// the symbol table, and the section table. Sprint 11 will additionally check
+/// semantic constraints (range of BRANCH26 targets, etc.) when it has final
+/// addresses.
+pub fn validate_reloc(
+    r: &Reloc,
+    section_size: u64,
+    nsyms: u32,
+    nsects: u8,
+) -> Result<(), ReadError> {
+    // Offset + width must fit inside the section.
+    let width = r.length.byte_width() as u64;
+    let end = (r.offset as u64)
+        .checked_add(width)
+        .ok_or(ReadError::BadRelocation {
+            at_offset: r.offset,
+            reason: "reloc offset + width overflows u64",
+        })?;
+    if end > section_size {
+        return Err(ReadError::BadRelocation {
+            at_offset: r.offset,
+            reason: "reloc offset + width exceeds section size",
+        });
+    }
+
+    // Referent must be in range.
+    validate_referent(r.offset, r.referent, nsyms, nsects)?;
+    if let Some(sub) = r.subtrahend {
+        validate_referent(r.offset, sub, nsyms, nsects)?;
+    }
+
+    // Kind-specific length constraint.
+    if kind_expects_word_only(r.kind) && r.length != RelocLength::Word {
+        return Err(ReadError::BadRelocation {
+            at_offset: r.offset,
+            reason: "reloc kind must use Word length (4 bytes)",
+        });
+    }
+
+    // Kind-specific pcrel constraint.
+    if let Some(expected) = kind_expects_pcrel(r.kind) {
+        if r.pcrel != expected {
+            return Err(ReadError::BadRelocation {
+                at_offset: r.offset,
+                reason: "reloc kind has fixed r_pcrel value that this entry violates",
+            });
+        }
+    }
+
+    // Subtractor invariants: must have a subtrahend.
+    if r.kind == RelocKind::Subtractor && r.subtrahend.is_none() {
+        return Err(ReadError::BadRelocation {
+            at_offset: r.offset,
+            reason: "Subtractor kind requires a subtrahend",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_referent(
+    offset: u32,
+    referent: Referent,
+    nsyms: u32,
+    nsects: u8,
+) -> Result<(), ReadError> {
+    match referent {
+        Referent::Symbol(idx) => {
+            if idx >= nsyms {
+                return Err(ReadError::BadRelocation {
+                    at_offset: offset,
+                    reason: "r_symbolnum past end of symbol table",
+                });
+            }
+        }
+        Referent::Section(idx) => {
+            if idx == 0 || idx > nsects {
+                return Err(ReadError::BadRelocation {
+                    at_offset: offset,
+                    reason: "section-relative reloc with out-of-range section index",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate every entry in a section's reloc list. Short-circuits on the first
+/// error so the diagnostic stream stays stable across re-runs.
+pub fn validate_relocs(
+    relocs: &[Reloc],
+    section_size: u64,
+    nsyms: u32,
+    nsects: u8,
+) -> Result<(), ReadError> {
+    for r in relocs {
+        validate_reloc(r, section_size, nsyms, nsects)?;
+    }
+    Ok(())
+}
+
 /// Lower the fused `Reloc` stream back to raw wire entries.
 /// `parse_relocs(write_relocs(r))` must produce `r` for any `r` that came out
 /// of `parse_relocs`; `write_raw_relocs(write_relocs(r))` produces bytes that
@@ -833,6 +957,115 @@ mod tests {
         assert!(matches!(
             err,
             ReadError::BadRelocation { reason, .. } if reason.contains("24-bit")
+        ));
+    }
+
+    // ---------- validate_reloc tests ----------
+
+    fn good() -> Reloc {
+        Reloc {
+            offset: 0x10,
+            kind: RelocKind::Branch26,
+            length: RelocLength::Word,
+            pcrel: true,
+            referent: Referent::Symbol(0),
+            addend: 0,
+            subtrahend: None,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_good_reloc() {
+        assert!(validate_reloc(&good(), 0x100, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_bounds_offset() {
+        let mut r = good();
+        r.offset = 0xFC; // offset+4 = 0x100, at boundary → ok
+        assert!(validate_reloc(&r, 0x100, 1, 1).is_ok());
+        r.offset = 0xFD; // offset+4 = 0x101, past end
+        assert!(matches!(
+            validate_reloc(&r, 0x100, 1, 1).unwrap_err(),
+            ReadError::BadRelocation { reason, .. } if reason.contains("exceeds section")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_symbol_oob() {
+        let mut r = good();
+        r.referent = Referent::Symbol(5);
+        assert!(matches!(
+            validate_reloc(&r, 0x100, 3, 1).unwrap_err(),
+            ReadError::BadRelocation { reason, .. } if reason.contains("past end of symbol")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_section_oob() {
+        let mut r = good();
+        r.referent = Referent::Section(4);
+        assert!(matches!(
+            validate_reloc(&r, 0x100, 0, 2).unwrap_err(),
+            ReadError::BadRelocation { reason, .. } if reason.contains("out-of-range section")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_branch26_with_wrong_length() {
+        let mut r = good();
+        r.length = RelocLength::Quad; // BRANCH26 must be Word
+        assert!(matches!(
+            validate_reloc(&r, 0x100, 1, 1).unwrap_err(),
+            ReadError::BadRelocation { reason, .. } if reason.contains("Word length")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_page21_without_pcrel() {
+        let r = Reloc {
+            offset: 0x10,
+            kind: RelocKind::Page21,
+            length: RelocLength::Word,
+            pcrel: false, // Page21 requires pcrel=true
+            referent: Referent::Symbol(0),
+            addend: 0,
+            subtrahend: None,
+        };
+        assert!(matches!(
+            validate_reloc(&r, 0x100, 1, 1).unwrap_err(),
+            ReadError::BadRelocation { reason, .. } if reason.contains("pcrel")
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_unsigned_quad() {
+        let r = Reloc {
+            offset: 0,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(0),
+            addend: 0,
+            subtrahend: None,
+        };
+        assert!(validate_reloc(&r, 0x100, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_subtractor_missing_subtrahend() {
+        let r = Reloc {
+            offset: 0,
+            kind: RelocKind::Subtractor,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(0),
+            addend: 0,
+            subtrahend: None,
+        };
+        assert!(matches!(
+            validate_reloc(&r, 0x100, 1, 1).unwrap_err(),
+            ReadError::BadRelocation { reason, .. } if reason.contains("subtrahend")
         ));
     }
 

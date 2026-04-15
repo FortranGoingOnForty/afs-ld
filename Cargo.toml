@@ -1,0 +1,18 @@
+[package]
+name = "afs-ld"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone ARM64 Mach-O linker for macOS"
+license = "GPL-3.0-only"
+repository = "https://github.com/FortranGoingOnForty/afs-ld"
+readme = "README.md"
+keywords = ["arm64", "aarch64", "linker", "macho", "macos"]
+categories = ["development-tools"]
+
+[[bin]]
+name = "afs-ld"
+path = "src/main.rs"
+
+[lib]
+name = "afs_ld"
+path = "src/lib.rs"

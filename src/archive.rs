@@ -18,8 +18,11 @@
 //! the archive buffer (or a secondary mmap for GNU-thin).
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str;
+
+use crate::input::ObjectFile;
+use crate::macho::reader::ReadError;
 
 /// 8-byte magic bytes common to both regular `ar` variants.
 pub const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
@@ -228,7 +231,86 @@ impl<'a> Archive<'a> {
     pub fn object_members(&self) -> impl Iterator<Item = &Member<'a>> {
         self.members.iter().filter(|m| m.special == SpecialMember::None)
     }
+
+    /// Find the first member whose `ar_hdr` begins at `header_offset`. The
+    /// symbol-index's `member_header_offset` fields feed into this lookup.
+    pub fn member_at_offset(&self, header_offset: u32) -> Option<&Member<'a>> {
+        self.members
+            .iter()
+            .find(|m| m.header_offset == header_offset as usize)
+    }
+
+    /// First member that defines `name` according to the archive's symbol
+    /// index. Returns `None` when either no index is present or `name` is
+    /// absent.
+    pub fn first_member_defining(&self, name: &str) -> Option<&Member<'a>> {
+        let off = self.symbol_index.as_ref()?.first_defining_offset(name)?;
+        self.member_at_offset(off)
+    }
+
+    /// Parse a member's body as a Mach-O `ObjectFile`. Non-thin members use
+    /// the in-buffer slice; GNU-thin members read their external file on
+    /// demand.
+    pub fn parse_member_object(&self, member: &Member<'a>) -> Result<ObjectFile, FetchError> {
+        let logical_path = self.member_logical_path(member);
+        match self.flavor {
+            Flavor::GnuThin => {
+                let file_path = self.member_external_path(member);
+                let bytes = std::fs::read(&file_path).map_err(FetchError::Io)?;
+                ObjectFile::parse(logical_path, &bytes).map_err(FetchError::Read)
+            }
+            _ => ObjectFile::parse(logical_path, member.body).map_err(FetchError::Read),
+        }
+    }
+
+    /// Resolve `name` to its defining member, then parse that member as an
+    /// `ObjectFile`. Returns `None` when the symbol is absent; `Some(Err(_))`
+    /// when the member exists but fails to parse.
+    pub fn fetch_object_defining(
+        &self,
+        name: &str,
+    ) -> Option<Result<ObjectFile, FetchError>> {
+        let member = self.first_member_defining(name)?;
+        Some(self.parse_member_object(member))
+    }
+
+    /// Produce the display path a member should surface as when parsed:
+    /// `/abs/path/libfoo.a(foo.o)`. For thin archives the path is the
+    /// external source file — that path is useful on its own.
+    fn member_logical_path(&self, member: &Member<'a>) -> PathBuf {
+        if self.flavor == Flavor::GnuThin {
+            return self.member_external_path(member);
+        }
+        let mut s = self.path.as_os_str().to_owned();
+        s.push("(");
+        s.push(member.name.as_str());
+        s.push(")");
+        PathBuf::from(s)
+    }
+
+    fn member_external_path(&self, member: &Member<'a>) -> PathBuf {
+        let base = self.path.parent().unwrap_or_else(|| Path::new("."));
+        base.join(&member.name)
+    }
 }
+
+/// Unified error for member fetching — I/O (GNU-thin only) or Mach-O parse.
+#[derive(Debug)]
+pub enum FetchError {
+    Io(std::io::Error),
+    Read(ReadError),
+}
+
+impl fmt::Display for FetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FetchError::Io(e) => write!(f, "thin-member I/O: {e}"),
+            FetchError::Read(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
 
 // ---------------------------------------------------------------------------
 // Member walking & name decoding.
@@ -1019,6 +1101,66 @@ mod tests {
             Archive::open("/tmp/bad_idx.a", &buf).unwrap_err(),
             ArchiveError::BadSymbolIndex { .. }
         ));
+    }
+
+    // ----- fetch API tests -----
+
+    fn encode_member_at(raw_name: &str, body: &[u8], out: &mut Vec<u8>) -> usize {
+        let off = out.len();
+        out.extend_from_slice(&encode_member(raw_name, body));
+        off
+    }
+
+    #[test]
+    fn first_member_defining_uses_symbol_index_offset() {
+        // Layout: magic, __.SYMDEF placeholder, real.o body. Patch the index
+        // after we know real.o's header offset.
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(AR_MAGIC);
+        let idx_placeholder = encode_bsd_symbol_index(&[("_foo", 0)]);
+        let idx_member_bytes = encode_bsd_extended("__.SYMDEF", &idx_placeholder);
+        let idx_member_off = buf.len();
+        buf.extend_from_slice(&idx_member_bytes);
+
+        let real_off = encode_member_at("real.o", b"CONTENT", &mut buf) as u32;
+        let updated_idx = encode_bsd_symbol_index(&[("_foo", real_off)]);
+        let updated_member = encode_bsd_extended("__.SYMDEF", &updated_idx);
+        buf.splice(
+            idx_member_off..idx_member_off + idx_member_bytes.len(),
+            updated_member,
+        );
+
+        let ar = Archive::open("/tmp/sym_fetch.a", &buf).unwrap();
+        let m = ar.first_member_defining("_foo").expect("symbol found");
+        assert_eq!(m.name, "real.o");
+        assert_eq!(m.body, b"CONTENT");
+    }
+
+    #[test]
+    fn fetch_object_defining_reports_parse_error_for_non_macho_body() {
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(AR_MAGIC);
+        let idx_placeholder = encode_bsd_symbol_index(&[("_bogus", 0)]);
+        let idx_bytes = encode_bsd_extended("__.SYMDEF", &idx_placeholder);
+        let idx_off = buf.len();
+        buf.extend_from_slice(&idx_bytes);
+        let real_off = encode_member_at("bogus.o", b"notmacho", &mut buf) as u32;
+        let updated_idx = encode_bsd_symbol_index(&[("_bogus", real_off)]);
+        let updated_member = encode_bsd_extended("__.SYMDEF", &updated_idx);
+        buf.splice(idx_off..idx_off + idx_bytes.len(), updated_member);
+
+        let ar = Archive::open("/tmp/bad_body.a", &buf).unwrap();
+        let result = ar.fetch_object_defining("_bogus").expect("found");
+        assert!(matches!(result, Err(FetchError::Read(_))));
+    }
+
+    #[test]
+    fn fetch_object_defining_returns_none_for_unknown_symbol() {
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(AR_MAGIC);
+        buf.extend_from_slice(&encode_member("foo.o", b"BODY"));
+        let ar = Archive::open("/tmp/no_idx.a", &buf).unwrap();
+        assert!(ar.fetch_object_defining("_missing").is_none());
     }
 
     #[test]

@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 use crate::input::ObjectFile;
 use crate::macho::constants::MH_SUBSECTIONS_VIA_SYMBOLS;
+use crate::reloc::{parse_raw_relocs, parse_relocs, Referent};
 use crate::resolve::{AtomId, InputId, SymbolId};
 use crate::section::{InputSection, SectionKind};
 use crate::symbol::{InputSymbol, SymKind};
@@ -258,7 +259,6 @@ pub fn atomize_object(
 
     for (sect_idx_zero, sect) in obj.sections.iter().enumerate() {
         let sect_idx_one = (sect_idx_zero + 1) as u8;
-        // Gather symbols that target this section.
         let mut syms: Vec<(usize, &InputSymbol)> = obj
             .symbols
             .iter()
@@ -282,7 +282,82 @@ pub fn atomize_object(
         );
     }
 
+    // Post-pass: wire `parent_of` for every `__compact_unwind` atom to the
+    // function atom that its `function_start` reloc references.
+    link_unwind_parents(input_id, obj, table, &out);
+
     out
+}
+
+/// Walk `__compact_unwind` atoms; for each, find its `function_start`
+/// reloc (at record offset 0), resolve the referent to a function atom
+/// within this same input, and set `parent_of`. External-symbol relocs
+/// (e.g. `__compact_unwind` referencing a function in another object)
+/// are left with `parent_of = None` and wired by Sprint 17's unwind
+/// synthesis pass, which has the full atom table.
+fn link_unwind_parents(
+    input_id: InputId,
+    obj: &ObjectFile,
+    table: &mut AtomTable,
+    out: &ObjectAtomization,
+) {
+    let Some((cu_idx_zero, cu_sect)) = obj
+        .sections
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.kind == SectionKind::CompactUnwind)
+    else {
+        return;
+    };
+    let cu_idx_one = (cu_idx_zero + 1) as u8;
+
+    let raws = match parse_raw_relocs(&cu_sect.raw_relocs, 0, cu_sect.nreloc) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let fused = match parse_relocs(&raws) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    // Index atoms produced by this object for (section, offset) lookup.
+    let mut atom_index: HashMap<(u8, u32), AtomId> = HashMap::new();
+    for id in &out.atoms {
+        let a = table.get(*id);
+        atom_index.insert((a.input_section, a.input_offset), *id);
+    }
+
+    // For each compact_unwind atom, find its first reloc.
+    for id in &out.atoms {
+        let atom = table.get(*id);
+        if atom.input_section != cu_idx_one {
+            continue;
+        }
+        let record_start = atom.input_offset;
+        let Some(r) = fused.iter().find(|r| r.offset == record_start) else {
+            continue;
+        };
+        let parent = match r.referent {
+            Referent::Section(sect_idx) => {
+                // The 8-byte `function_start` field holds the target's
+                // in-section offset. For ARM64_RELOC_UNSIGNED, that byte
+                // window carries the addend directly.
+                if atom.data.len() >= 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&atom.data[0..8]);
+                    let target_offset = u64::from_le_bytes(buf) as u32;
+                    atom_index.get(&(sect_idx, target_offset)).copied()
+                } else {
+                    None
+                }
+            }
+            Referent::Symbol(_) => None,
+        };
+        if let Some(parent_id) = parent {
+            table.get_mut(*id).parent_of = Some(parent_id);
+        }
+    }
+    let _ = input_id; // reserved for cross-object lookup in Sprint 17
 }
 
 /// Split one section into atoms according to the `MH_SUBSECTIONS_VIA_SYMBOLS`
@@ -326,6 +401,14 @@ fn atomize_regular_section(
     // labels. Sprint 24's ICF uses the per-atom content for dedup.
     if atom_section.is_literal() {
         atomize_literal_section(input_id, section_idx, sect, syms, atom_section, table, out);
+        return;
+    }
+
+    // `__compact_unwind` is a fixed-layout array of 32-byte records; each
+    // record becomes its own atom with `parent_of` wired to the function
+    // atom it describes (linked post-hoc in `link_unwind_parents`).
+    if atom_section == AtomSection::CompactUnwind {
+        atomize_compact_unwind(input_id, section_idx, sect, syms, atom_section, table, out);
         return;
     }
 
@@ -538,6 +621,54 @@ fn atomize_fixed_literal(
             data,
             flags,
             parent_of: None,
+        };
+        let id = table.push(atom);
+        out.atoms.push(id);
+        if let Some(idx) = owner_idx {
+            out.owner_by_sym.push((idx, id));
+        }
+        offset = end;
+    }
+}
+
+/// Split `__compact_unwind` into 32-byte atoms (one per record).
+/// `parent_of` is filled in post-hoc by `link_unwind_parents` once all
+/// sections of this object have been atomized.
+fn atomize_compact_unwind(
+    input_id: InputId,
+    section_idx: u8,
+    sect: &InputSection,
+    syms: &[(usize, &InputSymbol)],
+    atom_section: AtomSection,
+    table: &mut AtomTable,
+    out: &mut ObjectAtomization,
+) {
+    const RECORD: usize = 32;
+    let section_size = sect.size as usize;
+    let mut offset = 0usize;
+    while offset < section_size {
+        let end = (offset + RECORD).min(section_size);
+        let data = sect.data[offset..end.min(sect.data.len())].to_vec();
+        let size = (end - offset) as u32;
+
+        let owner_idx = syms
+            .iter()
+            .find(|(_, s)| s.value() as usize == offset)
+            .map(|(i, _)| *i);
+
+        let atom = Atom {
+            id: AtomId(0),
+            origin: input_id,
+            input_section: section_idx,
+            section: atom_section,
+            input_offset: offset as u32,
+            size,
+            align_pow2: sect.align_pow2 as u8,
+            owner: owner_idx.map(|i| SymbolId(i as u32)),
+            alt_entries: Vec::new(),
+            data,
+            flags: AtomFlags::default(),
+            parent_of: None, // filled by link_unwind_parents
         };
         let id = table.push(atom);
         out.atoms.push(id);

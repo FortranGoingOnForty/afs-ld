@@ -22,6 +22,7 @@ pub mod symbol;
 use std::path::{Path, PathBuf};
 
 use macho::dylib::DylibFile;
+use macho::reader::DylibCmd;
 use macho::tbd::{parse_tbd, Arch, Platform, Target};
 use resolve::{
     format_duplicate_diagnostic, format_undefined_diagnostic, InputId, Inputs, SymbolTable,
@@ -168,8 +169,9 @@ impl Linker {
         }
 
         let layout = section::build_layout(opts.kind, &atoms, &table);
+        let plan = build_write_plan(&inputs);
         let mut bytes = Vec::new();
-        macho::writer::write_with_atoms(&layout, &atoms, opts.kind, opts, &mut bytes)
+        macho::writer::write_with_atoms_and_plan(&layout, &atoms, opts.kind, opts, &plan, &mut bytes)
             .map_err(LinkError::Write)?;
 
         let out_path = output_path(opts);
@@ -185,6 +187,23 @@ fn output_path(opts: &LinkOptions) -> PathBuf {
     opts.output
         .clone()
         .unwrap_or_else(|| PathBuf::from("a.out"))
+}
+
+fn build_write_plan(inputs: &Inputs) -> macho::writer::WritePlan {
+    macho::writer::WritePlan {
+        dylibs: inputs
+            .dylibs
+            .iter()
+            .map(|dylib| DylibCmd {
+                cmd: macho::constants::LC_LOAD_DYLIB,
+                name: dylib.file.install_name.clone(),
+                timestamp: 2,
+                current_version: dylib.file.current_version,
+                compatibility_version: dylib.file.compatibility_version,
+            })
+            .collect(),
+        rpaths: Vec::new(),
+    }
 }
 
 fn load_input(inputs: &mut Inputs, path: &PathBuf, opts: &LinkOptions) -> Result<(), LinkError> {

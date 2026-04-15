@@ -8,7 +8,7 @@ use crate::atom::AtomTable;
 use crate::macho::constants::*;
 use crate::macho::reader::{
     write_commands, write_header, BuildVersionCmd, DyldInfoCmd, DylibCmd, DysymtabCmd,
-    LinkEditDataCmd, LoadCommand, MachHeader64, Section64Header, Segment64, SymtabCmd,
+    LinkEditDataCmd, LoadCommand, MachHeader64, RpathCmd, Section64Header, Segment64, SymtabCmd,
 };
 use crate::section::{assign_layout, is_zerofill, Layout};
 use crate::{LinkOptions, OutputKind};
@@ -28,13 +28,19 @@ impl std::fmt::Display for WriteError {
 
 impl std::error::Error for WriteError {}
 
+#[derive(Debug, Clone, Default)]
+pub struct WritePlan {
+    pub dylibs: Vec<DylibCmd>,
+    pub rpaths: Vec<String>,
+}
+
 pub fn write(
     layout: &Layout,
     kind: OutputKind,
     opts: &LinkOptions,
     out: &mut Vec<u8>,
 ) -> Result<(), WriteError> {
-    write_with_atoms(layout, &AtomTable::new(), kind, opts, out)
+    write_with_atoms_and_plan(layout, &AtomTable::new(), kind, opts, &WritePlan::default(), out)
 }
 
 pub fn write_with_atoms(
@@ -44,15 +50,26 @@ pub fn write_with_atoms(
     opts: &LinkOptions,
     out: &mut Vec<u8>,
 ) -> Result<(), WriteError> {
+    write_with_atoms_and_plan(layout, atoms, kind, opts, &WritePlan::default(), out)
+}
+
+pub fn write_with_atoms_and_plan(
+    layout: &Layout,
+    atoms: &AtomTable,
+    kind: OutputKind,
+    opts: &LinkOptions,
+    plan: &WritePlan,
+    out: &mut Vec<u8>,
+) -> Result<(), WriteError> {
     let mut layout = layout.clone();
-    let sizeofcmds = provisional_sizeofcmds(&layout, kind, opts)?;
+    let sizeofcmds = provisional_sizeofcmds(&layout, kind, opts, plan)?;
     assign_layout(
         &mut layout,
         std::mem::size_of::<MachHeader64>() as u64 + sizeofcmds as u64,
         0,
     );
 
-    let cmds = build_commands(&layout, kind, opts)?;
+    let cmds = build_commands(&layout, kind, opts, plan)?;
     let sizeofcmds = cmds.iter().map(LoadCommand::cmdsize).sum::<u32>();
     let header = MachHeader64 {
         magic: MH_MAGIC_64,
@@ -102,6 +119,7 @@ fn build_commands(
     layout: &Layout,
     kind: OutputKind,
     opts: &LinkOptions,
+    plan: &WritePlan,
 ) -> Result<Vec<LoadCommand>, WriteError> {
     let mut out = Vec::new();
     for segment in &layout.segments {
@@ -124,6 +142,14 @@ fn build_commands(
     out.push(LoadCommand::DyldInfoOnly(DyldInfoCmd::default()));
     out.push(linkedit_raw(LC_FUNCTION_STARTS));
     out.push(linkedit_raw(LC_DATA_IN_CODE));
+    for dylib in &plan.dylibs {
+        out.push(LoadCommand::Dylib(dylib.clone()));
+    }
+    for rpath in &plan.rpaths {
+        out.push(LoadCommand::Rpath(RpathCmd {
+            path: rpath.clone(),
+        }));
+    }
     out.push(linkedit_raw(LC_CODE_SIGNATURE));
 
     match kind {
@@ -144,8 +170,9 @@ fn provisional_sizeofcmds(
     layout: &Layout,
     kind: OutputKind,
     opts: &LinkOptions,
+    plan: &WritePlan,
 ) -> Result<u32, WriteError> {
-    Ok(build_commands(layout, kind, opts)?
+    Ok(build_commands(layout, kind, opts, plan)?
         .iter()
         .map(LoadCommand::cmdsize)
         .sum())

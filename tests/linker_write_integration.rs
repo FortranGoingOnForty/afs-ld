@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use afs_ld::macho::constants::{MH_DYLIB, MH_EXECUTE};
+use afs_ld::macho::constants::{LC_LOAD_DYLIB, MH_DYLIB, MH_EXECUTE};
 use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand, Section64Header};
 
 fn have_xcrun() -> bool {
@@ -19,6 +19,15 @@ fn have_tool(name: &str) -> bool {
         .arg("-h")
         .output()
         .map(|_| true)
+        .unwrap_or(false)
+}
+
+fn have_clang() -> bool {
+    Command::new("xcrun")
+        .arg("-f")
+        .arg("clang")
+        .output()
+        .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
@@ -41,6 +50,37 @@ fn assemble(src_text: &str, out: &Path) -> Result<(), String> {
         return Err(format!(
             "xcrun as failed: {}",
             String::from_utf8_lossy(&status.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn build_test_dylib(src: &str, out: &Path, install_name: &str) -> Result<(), String> {
+    let mut child = Command::new("xcrun")
+        .args([
+            "--sdk", "macosx", "clang", "-x", "c", "-arch", "arm64", "-shared", "-o",
+        ])
+        .arg(out)
+        .arg("-install_name")
+        .arg(install_name)
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn clang: {e}"))?;
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(src.as_bytes())
+        .map_err(|e| format!("write clang stdin: {e}"))?;
+    let out = child.wait_with_output().map_err(|e| format!("wait: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "clang failed: {}",
+            String::from_utf8_lossy(&out.stderr)
         ));
     }
     Ok(())
@@ -200,5 +240,60 @@ fn linker_writes_dylib_with_real_text_section() {
     );
 
     let _ = fs::remove_file(&obj);
+    let _ = fs::remove_file(&out);
+}
+
+#[test]
+fn linker_emits_load_dylib_for_direct_dependency_input() {
+    if !have_xcrun() || !have_clang() {
+        eprintln!("skipping: xcrun as / clang unavailable");
+        return;
+    }
+
+    let obj = scratch("dep-main.o");
+    let dep = scratch("libdep.dylib");
+    let out = scratch("dep-linked");
+    if let Err(e) = assemble(
+        r#"
+            .section __TEXT,__text,regular,pure_instructions
+            .globl _main
+            _main:
+                ret
+        "#,
+        &obj,
+    ) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+    if let Err(e) = build_test_dylib(
+        "int afsld_dep(void) { return 7; }\n",
+        &dep,
+        "@rpath/libafslddep.dylib",
+    ) {
+        eprintln!("skipping: clang failed: {e}");
+        return;
+    }
+
+    link_with_afs_ld(&[
+        obj.to_str().unwrap(),
+        dep.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ])
+    .expect("link executable with dylib");
+
+    let bytes = fs::read(&out).expect("read executable");
+    let hdr = parse_header(&bytes).expect("parse header");
+    let cmds = parse_commands(&hdr, &bytes).expect("parse commands");
+    assert!(cmds.iter().any(|cmd| {
+        matches!(
+            cmd,
+            LoadCommand::Dylib(d)
+                if d.cmd == LC_LOAD_DYLIB && d.name == "@rpath/libafslddep.dylib"
+        )
+    }));
+
+    let _ = fs::remove_file(&obj);
+    let _ = fs::remove_file(&dep);
     let _ = fs::remove_file(&out);
 }

@@ -126,41 +126,68 @@ fn build_commands(
         out.push(LoadCommand::Segment64(build_segment_command(layout, segment)?));
     }
 
-    out.push(LoadCommand::BuildVersion(BuildVersionCmd {
-        platform: PLATFORM_MACOS,
-        minos: packed_version(14, 0, 0),
-        sdk: packed_version(14, 0, 0),
-        tools: Vec::new(),
-    }));
-    out.push(LoadCommand::Symtab(SymtabCmd {
+    let symtab = LoadCommand::Symtab(SymtabCmd {
         symoff: 0,
         nsyms: 0,
         stroff: 0,
         strsize: 0,
-    }));
-    out.push(LoadCommand::Dysymtab(DysymtabCmd::default()));
-    out.push(LoadCommand::DyldInfoOnly(DyldInfoCmd::default()));
-    out.push(linkedit_raw(LC_FUNCTION_STARTS));
-    out.push(linkedit_raw(LC_DATA_IN_CODE));
-    for dylib in &plan.dylibs {
-        out.push(LoadCommand::Dylib(dylib.clone()));
-    }
-    for rpath in &plan.rpaths {
-        out.push(LoadCommand::Rpath(RpathCmd {
-            path: rpath.clone(),
-        }));
-    }
-    out.push(linkedit_raw(LC_CODE_SIGNATURE));
+    });
+    let dysymtab = LoadCommand::Dysymtab(DysymtabCmd::default());
+    let build_version = LoadCommand::BuildVersion(BuildVersionCmd {
+        platform: PLATFORM_MACOS,
+        minos: packed_version(14, 0, 0),
+        sdk: packed_version(14, 0, 0),
+        tools: Vec::new(),
+    });
+    let dyld_metadata = LoadCommand::DyldInfoOnly(DyldInfoCmd::default());
+    let function_starts = linkedit_raw(LC_FUNCTION_STARTS);
+    let data_in_code = linkedit_raw(LC_DATA_IN_CODE);
+    let code_signature = linkedit_raw(LC_CODE_SIGNATURE);
 
     match kind {
-        OutputKind::Executable => out.push(lc_main_raw(0)),
-        OutputKind::Dylib => out.push(LoadCommand::Dylib(DylibCmd {
-            cmd: LC_ID_DYLIB,
-            name: install_name(opts),
-            timestamp: 2,
-            current_version: packed_version(1, 0, 0),
-            compatibility_version: packed_version(1, 0, 0),
-        })),
+        OutputKind::Executable => {
+            out.push(dyld_metadata);
+            out.push(symtab);
+            out.push(dysymtab);
+            out.push(raw_string_command(LC_LOAD_DYLINKER, "/usr/lib/dyld"));
+            out.push(build_version);
+            out.push(lc_main_raw(0));
+            for dylib in &plan.dylibs {
+                out.push(LoadCommand::Dylib(dylib.clone()));
+            }
+            for rpath in &plan.rpaths {
+                out.push(LoadCommand::Rpath(RpathCmd {
+                    path: rpath.clone(),
+                }));
+            }
+            out.push(function_starts);
+            out.push(data_in_code);
+            out.push(code_signature);
+        }
+        OutputKind::Dylib => {
+            out.push(LoadCommand::Dylib(DylibCmd {
+                cmd: LC_ID_DYLIB,
+                name: install_name(opts),
+                timestamp: 2,
+                current_version: packed_version(1, 0, 0),
+                compatibility_version: packed_version(1, 0, 0),
+            }));
+            out.push(dyld_metadata);
+            out.push(symtab);
+            out.push(dysymtab);
+            out.push(build_version);
+            for dylib in &plan.dylibs {
+                out.push(LoadCommand::Dylib(dylib.clone()));
+            }
+            for rpath in &plan.rpaths {
+                out.push(LoadCommand::Rpath(RpathCmd {
+                    path: rpath.clone(),
+                }));
+            }
+            out.push(function_starts);
+            out.push(data_in_code);
+            out.push(code_signature);
+        }
     }
 
     Ok(out)
@@ -235,6 +262,21 @@ fn lc_main_raw(entryoff: u64) -> LoadCommand {
     LoadCommand::Raw {
         cmd: LC_MAIN,
         cmdsize: 24,
+        data,
+    }
+}
+
+fn raw_string_command(cmd: u32, value: &str) -> LoadCommand {
+    let mut data = Vec::new();
+    let offset = 12u32;
+    data.extend_from_slice(&offset.to_le_bytes());
+    data.extend_from_slice(value.as_bytes());
+    data.push(0);
+    let padded = align_to(data.len() as u64, 8) as usize;
+    data.resize(padded, 0);
+    LoadCommand::Raw {
+        cmd,
+        cmdsize: (8 + data.len()) as u32,
         data,
     }
 }

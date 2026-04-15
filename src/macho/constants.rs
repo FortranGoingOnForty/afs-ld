@@ -30,6 +30,7 @@ pub const LC_SYMTAB: u32 = 0x02;
 pub const LC_DYSYMTAB: u32 = 0x0B;
 pub const LC_LOAD_DYLIB: u32 = 0x0C;
 pub const LC_ID_DYLIB: u32 = 0x0D;
+pub const LC_LOAD_DYLINKER: u32 = 0x0E;
 pub const LC_LOAD_WEAK_DYLIB: u32 = 0x18 | LC_REQ_DYLD;
 pub const LC_REEXPORT_DYLIB: u32 = 0x1F | LC_REQ_DYLD;
 pub const LC_UUID: u32 = 0x1B;

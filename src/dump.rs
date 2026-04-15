@@ -7,16 +7,16 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::archive::{Archive, Flavor, SpecialMember};
+use crate::archive::Archive;
 use crate::input::ObjectFile;
+use crate::macho::constants::*;
 use crate::macho::dylib::{DylibFile, DylibLoadKind};
 use crate::macho::exports::ExportKind;
-use crate::macho::tbd::parse_tbd;
-use crate::macho::constants::*;
 use crate::macho::reader::{
     BuildVersionCmd, DyldInfoCmd, DylibCmd, DysymtabCmd, LinkEditDataCmd, LoadCommand,
     MachHeader64, RpathCmd, Section64Header, Segment64, SymtabCmd,
 };
+use crate::macho::tbd::parse_tbd;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind};
 use crate::section::InputSection;
 use crate::symbol::{InputSymbol, SymKind};
@@ -27,50 +27,16 @@ pub fn dump_archive_file(path: &Path) -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let out = io::stdout();
     let mut h = out.lock();
-    let flavor = match ar.flavor {
-        Flavor::Bsd => "BSD",
-        Flavor::Sysv => "SysV",
-        Flavor::GnuThin => "GNU-thin",
-    };
-    writeln!(h, "{}:", path.display())?;
-    writeln!(
-        h,
-        "archive: flavor={flavor} members={} symbols={}",
-        ar.members().len(),
-        ar.symbol_index().map(|i| i.len()).unwrap_or(0),
-    )?;
-    writeln!(h, "Members:")?;
-    for (i, m) in ar.members().iter().enumerate() {
-        let kind = match m.special {
-            SpecialMember::None => "obj",
-            SpecialMember::BsdSymIndex => "bsd-symindex",
-            SpecialMember::SysvSymIndex => "sysv-symindex",
-            SpecialMember::SysvLongNames => "sysv-longnames",
-        };
-        writeln!(
-            h,
-            "  [{i}] @0x{:x} {kind:<16} {} ({} bytes)",
-            m.header_offset,
-            m.name,
-            m.body.len()
-        )?;
-    }
-    if let Some(idx) = ar.symbol_index() {
-        writeln!(h, "Symbols ({}):", idx.len())?;
-        for (i, e) in idx.entries.iter().enumerate().take(16) {
-            writeln!(h, "  [{i}] {} -> member@0x{:x}", e.name, e.member_header_offset)?;
-        }
-        if idx.len() > 16 {
-            writeln!(h, "  ... ({} more)", idx.len() - 16)?;
-        }
+    for member in ar.members() {
+        writeln!(h, "{}", member.name)?;
     }
     Ok(())
 }
 
 pub fn dump_tbd_file(path: &Path) -> io::Result<()> {
     let src = std::fs::read_to_string(path)?;
-    let docs = parse_tbd(&src)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let docs =
+        parse_tbd(&src).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let out = io::stdout();
     let mut h = out.lock();
     writeln!(h, "{}:", path.display())?;
@@ -86,18 +52,10 @@ pub fn dump_tbd_file(path: &Path) -> io::Result<()> {
             tbd.compatibility_version.as_deref().unwrap_or("-")
         )?;
         if !tbd.reexported_libraries.is_empty() {
-            let total: usize = tbd
-                .reexported_libraries
-                .iter()
-                .map(|s| s.value.len())
-                .sum();
+            let total: usize = tbd.reexported_libraries.iter().map(|s| s.value.len()).sum();
             writeln!(h, "      reexported-libraries: {total}")?;
         }
-        let export_syms: usize = tbd
-            .exports
-            .iter()
-            .map(|s| s.value.total())
-            .sum();
+        let export_syms: usize = tbd.exports.iter().map(|s| s.value.total()).sum();
         if export_syms > 0 {
             writeln!(h, "      exports: {export_syms} symbols total")?;
         }
@@ -203,13 +161,9 @@ fn write_header(w: &mut impl Write, hdr: &MachHeader64) -> io::Result<()> {
 }
 
 fn write_command(w: &mut impl Write, idx: usize, cmd: &LoadCommand) -> io::Result<()> {
-    writeln!(
-        w,
-        "Load command {}: {} cmdsize={}",
-        idx,
-        cmd_name(cmd.cmd()),
-        cmd.cmdsize()
-    )?;
+    writeln!(w, "Load command {idx}")?;
+    writeln!(w, "      cmd {}", cmd_name(cmd.cmd()))?;
+    writeln!(w, "  cmdsize {}", cmd.cmdsize())?;
     match cmd {
         LoadCommand::Segment64(s) => write_segment64(w, s),
         LoadCommand::Symtab(s) => write_symtab(w, s),
@@ -222,12 +176,8 @@ fn write_command(w: &mut impl Write, idx: usize, cmd: &LoadCommand) -> io::Resul
         LoadCommand::DyldExportsTrie(l) => write_linkedit_data(w, l, "EXPORTS_TRIE"),
         LoadCommand::DyldChainedFixups(l) => write_linkedit_data(w, l, "CHAINED_FIXUPS"),
         LoadCommand::Raw { cmd, data, .. } => {
-            writeln!(
-                w,
-                "  (raw — cmd=0x{:x}, payload {} bytes)",
-                cmd,
-                data.len()
-            )
+            writeln!(w, "  rawcmd 0x{cmd:x}")?;
+            writeln!(w, " payload {} bytes", data.len())
         }
     }
 }
@@ -250,7 +200,7 @@ fn write_rpath(w: &mut impl Write, r: &RpathCmd) -> io::Result<()> {
 fn write_dyld_info(w: &mut impl Write, d: &DyldInfoCmd) -> io::Result<()> {
     writeln!(
         w,
-        "  rebase=@{}..+{} bind=@{}..+{} weak_bind=@{}..+{} lazy_bind=@{}..+{} export=@{}..+{}",
+        " rebase_off {} rebase_size {} bind_off {} bind_size {} weak_bind_off {} weak_bind_size {} lazy_bind_off {} lazy_bind_size {} export_off {} export_size {}",
         d.rebase_off,
         d.rebase_size,
         d.bind_off,
@@ -265,86 +215,85 @@ fn write_dyld_info(w: &mut impl Write, d: &DyldInfoCmd) -> io::Result<()> {
 }
 
 fn write_segment64(w: &mut impl Write, s: &Segment64) -> io::Result<()> {
-    writeln!(
-        w,
-        "  segname={:<16} vmaddr=0x{:x} vmsize=0x{:x} fileoff={} filesize={} maxprot={} initprot={} nsects={} flags=0x{:x}",
-        format!("\"{}\"", s.segname_str()),
-        s.vmaddr,
-        s.vmsize,
-        s.fileoff,
-        s.filesize,
-        prot_str(s.maxprot),
-        prot_str(s.initprot),
-        s.sections.len(),
-        s.flags
-    )?;
-    for (i, sec) in s.sections.iter().enumerate() {
-        write_section(w, i, sec)?;
+    writeln!(w, "  segname {}", s.segname_str())?;
+    writeln!(w, "   vmaddr 0x{:016x}", s.vmaddr)?;
+    writeln!(w, "   vmsize 0x{:016x}", s.vmsize)?;
+    writeln!(w, "  fileoff {}", s.fileoff)?;
+    writeln!(w, " filesize {}", s.filesize)?;
+    writeln!(w, "  maxprot {}", prot_str(s.maxprot))?;
+    writeln!(w, " initprot {}", prot_str(s.initprot))?;
+    writeln!(w, "   nsects {}", s.sections.len())?;
+    writeln!(w, "    flags {}", segment_flags_str(s.flags))?;
+    for sec in &s.sections {
+        write_section(w, sec)?;
     }
     Ok(())
 }
 
-fn write_section(w: &mut impl Write, idx: usize, s: &Section64Header) -> io::Result<()> {
-    writeln!(
-        w,
-        "  Section {}: {},{} addr=0x{:x} size=0x{:x} offset={} align=2^{} reloff={} nreloc={} flags=0x{:08x}",
-        idx,
-        s.segname_str(),
-        s.sectname_str(),
-        s.addr,
-        s.size,
-        s.offset,
-        s.align,
-        s.reloff,
-        s.nreloc,
-        s.flags
-    )
+fn write_section(w: &mut impl Write, s: &Section64Header) -> io::Result<()> {
+    writeln!(w, "Section")?;
+    writeln!(w, "  sectname {}", s.sectname_str())?;
+    writeln!(w, "   segname {}", s.segname_str())?;
+    writeln!(w, "      addr 0x{:016x}", s.addr)?;
+    writeln!(w, "      size 0x{:016x}", s.size)?;
+    writeln!(w, "    offset {}", s.offset)?;
+    writeln!(w, "     align 2^{} ({})", s.align, 1u64 << s.align)?;
+    writeln!(w, "    reloff {}", s.reloff)?;
+    writeln!(w, "    nreloc {}", s.nreloc)?;
+    writeln!(w, "      type {}", section_type_name(s.flags))?;
+    writeln!(w, "attributes {}", section_attributes(s.flags))?;
+    writeln!(w, " reserved1 {}", s.reserved1)?;
+    writeln!(w, " reserved2 {}", s.reserved2)
 }
 
 fn write_symtab(w: &mut impl Write, s: &SymtabCmd) -> io::Result<()> {
-    writeln!(
-        w,
-        "  symoff={} nsyms={} stroff={} strsize={}",
-        s.symoff, s.nsyms, s.stroff, s.strsize
-    )
+    writeln!(w, "  symoff {}", s.symoff)?;
+    writeln!(w, "   nsyms {}", s.nsyms)?;
+    writeln!(w, "  stroff {}", s.stroff)?;
+    writeln!(w, " strsize {}", s.strsize)
 }
 
 fn write_dysymtab(w: &mut impl Write, d: &DysymtabCmd) -> io::Result<()> {
-    writeln!(
-        w,
-        "  ilocalsym={} nlocalsym={} iextdefsym={} nextdefsym={} iundefsym={} nundefsym={} indirectsymoff={} nindirectsyms={}",
-        d.ilocalsym,
-        d.nlocalsym,
-        d.iextdefsym,
-        d.nextdefsym,
-        d.iundefsym,
-        d.nundefsym,
-        d.indirectsymoff,
-        d.nindirectsyms
-    )
+    writeln!(w, "      ilocalsym {}", d.ilocalsym)?;
+    writeln!(w, "      nlocalsym {}", d.nlocalsym)?;
+    writeln!(w, "     iextdefsym {}", d.iextdefsym)?;
+    writeln!(w, "     nextdefsym {}", d.nextdefsym)?;
+    writeln!(w, "      iundefsym {}", d.iundefsym)?;
+    writeln!(w, "      nundefsym {}", d.nundefsym)?;
+    writeln!(w, "         tocoff {}", d.tocoff)?;
+    writeln!(w, "           ntoc {}", d.ntoc)?;
+    writeln!(w, "      modtaboff {}", d.modtaboff)?;
+    writeln!(w, "        nmodtab {}", d.nmodtab)?;
+    writeln!(w, "   extrefsymoff {}", d.extrefsymoff)?;
+    writeln!(w, "    nextrefsyms {}", d.nextrefsyms)?;
+    writeln!(w, " indirectsymoff {}", d.indirectsymoff)?;
+    writeln!(w, "  nindirectsyms {}", d.nindirectsyms)?;
+    writeln!(w, "      extreloff {}", d.extreloff)?;
+    writeln!(w, "        nextrel {}", d.nextrel)?;
+    writeln!(w, "      locreloff {}", d.locreloff)?;
+    writeln!(w, "        nlocrel {}", d.nlocrel)
 }
 
 fn write_build_version(w: &mut impl Write, b: &BuildVersionCmd) -> io::Result<()> {
-    writeln!(
-        w,
-        "  platform={} minos={} sdk={} ntools={}",
-        platform_name(b.platform),
-        version_str(b.minos),
-        version_str(b.sdk),
-        b.tools.len()
-    )?;
+    writeln!(w, " platform {}", platform_name(b.platform))?;
+    writeln!(w, "    minos {}", otool_version_str(b.minos))?;
+    writeln!(w, "      sdk {}", otool_sdk_str(b.sdk))?;
+    writeln!(w, "   ntools {}", b.tools.len())?;
     for t in &b.tools {
-        writeln!(w, "    tool={} version={}", t.tool, version_str(t.version))?;
+        writeln!(
+            w,
+            "    tool {} version {}",
+            t.tool,
+            otool_version_str(t.version)
+        )?;
     }
     Ok(())
 }
 
 fn write_linkedit_data(w: &mut impl Write, l: &LinkEditDataCmd, kind: &str) -> io::Result<()> {
-    writeln!(
-        w,
-        "  {kind} dataoff={} datasize={}",
-        l.dataoff, l.datasize
-    )
+    let _ = kind;
+    writeln!(w, " dataoff {}", l.dataoff)?;
+    writeln!(w, "datasize {}", l.datasize)
 }
 
 fn write_sections(w: &mut impl Write, secs: &[InputSection]) -> io::Result<()> {
@@ -356,22 +305,14 @@ fn write_sections(w: &mut impl Write, secs: &[InputSection]) -> io::Result<()> {
         writeln!(
             w,
             "  [{i}] {},{:<16} {:?} addr=0x{:x} size=0x{:x} align=2^{} offset={} flags=0x{:08x}",
-            s.segname,
-            s.sectname,
-            s.kind,
-            s.addr,
-            s.size,
-            s.align_pow2,
-            s.offset,
-            s.flags
+            s.segname, s.sectname, s.kind, s.addr, s.size, s.align_pow2, s.offset, s.flags
         )?;
         if !s.data.is_empty() {
             writeln!(w, "      data: {}", hex_preview(&s.data, 16))?;
         }
         if s.nreloc > 0 {
             writeln!(w, "      relocs ({}):", s.nreloc)?;
-            match parse_raw_relocs(&s.raw_relocs, 0, s.nreloc)
-                .and_then(|raws| parse_relocs(&raws))
+            match parse_raw_relocs(&s.raw_relocs, 0, s.nreloc).and_then(|raws| parse_relocs(&raws))
             {
                 Ok(fused) => {
                     for (ri, r) in fused.iter().enumerate() {
@@ -399,7 +340,11 @@ fn write_symbols(w: &mut impl Write, obj: &ObjectFile) -> io::Result<()> {
 
 fn describe_symbol(sym: &InputSymbol) -> String {
     if let Some(stab) = sym.stab_kind() {
-        return format!("STAB kind=0x{stab:02x} sect={} value=0x{:x}", sym.sect_idx(), sym.value());
+        return format!(
+            "STAB kind=0x{stab:02x} sect={} value=0x{:x}",
+            sym.sect_idx(),
+            sym.value()
+        );
     }
     let mut parts: Vec<String> = Vec::new();
     parts.push(
@@ -520,6 +465,7 @@ fn cmd_name(cmd: u32) -> String {
         LC_UUID => "LC_UUID".into(),
         LC_MAIN => "LC_MAIN".into(),
         LC_LOAD_DYLIB => "LC_LOAD_DYLIB".into(),
+        LC_LOAD_DYLINKER => "LC_LOAD_DYLINKER".into(),
         LC_LOAD_WEAK_DYLIB => "LC_LOAD_WEAK_DYLIB".into(),
         LC_ID_DYLIB => "LC_ID_DYLIB".into(),
         LC_REEXPORT_DYLIB => "LC_REEXPORT_DYLIB".into(),
@@ -556,6 +502,82 @@ fn prot_str(p: u32) -> String {
     let w = if p & 2 != 0 { 'w' } else { '-' };
     let x = if p & 4 != 0 { 'x' } else { '-' };
     format!("{r}{w}{x}")
+}
+
+fn segment_flags_str(flags: u32) -> String {
+    if flags == 0 {
+        "(none)".into()
+    } else {
+        format!("0x{flags:x}")
+    }
+}
+
+fn section_type_name(flags: u32) -> &'static str {
+    match flags & SECTION_TYPE_MASK {
+        S_REGULAR => "S_REGULAR",
+        S_ZEROFILL => "S_ZEROFILL",
+        S_CSTRING_LITERALS => "S_CSTRING_LITERALS",
+        S_4BYTE_LITERALS => "S_4BYTE_LITERALS",
+        S_8BYTE_LITERALS => "S_8BYTE_LITERALS",
+        S_LITERAL_POINTERS => "S_LITERAL_POINTERS",
+        S_NON_LAZY_SYMBOL_POINTERS => "S_NON_LAZY_SYMBOL_POINTERS",
+        S_LAZY_SYMBOL_POINTERS => "S_LAZY_SYMBOL_POINTERS",
+        S_SYMBOL_STUBS => "S_SYMBOL_STUBS",
+        S_MOD_INIT_FUNC_POINTERS => "S_MOD_INIT_FUNC_POINTERS",
+        S_MOD_TERM_FUNC_POINTERS => "S_MOD_TERM_FUNC_POINTERS",
+        S_COALESCED => "S_COALESCED",
+        S_GB_ZEROFILL => "S_GB_ZEROFILL",
+        S_INTERPOSING => "S_INTERPOSING",
+        S_16BYTE_LITERALS => "S_16BYTE_LITERALS",
+        S_THREAD_LOCAL_REGULAR => "S_THREAD_LOCAL_REGULAR",
+        S_THREAD_LOCAL_ZEROFILL => "S_THREAD_LOCAL_ZEROFILL",
+        S_THREAD_LOCAL_VARIABLES => "S_THREAD_LOCAL_VARIABLES",
+        S_THREAD_LOCAL_VARIABLE_POINTERS => "S_THREAD_LOCAL_VARIABLE_POINTERS",
+        S_THREAD_LOCAL_INIT_FUNCTION_POINTERS => "S_THREAD_LOCAL_INIT_FUNCTION_POINTERS",
+        _ => "UNKNOWN",
+    }
+}
+
+fn section_attributes(flags: u32) -> String {
+    let attrs = [
+        (S_ATTR_PURE_INSTRUCTIONS, "PURE_INSTRUCTIONS"),
+        (S_ATTR_NO_TOC, "NO_TOC"),
+        (S_ATTR_STRIP_STATIC_SYMS, "STRIP_STATIC_SYMS"),
+        (S_ATTR_NO_DEAD_STRIP, "NO_DEAD_STRIP"),
+        (S_ATTR_LIVE_SUPPORT, "LIVE_SUPPORT"),
+        (S_ATTR_SELF_MODIFYING_CODE, "SELF_MODIFYING_CODE"),
+        (S_ATTR_DEBUG, "DEBUG"),
+        (S_ATTR_SOME_INSTRUCTIONS, "SOME_INSTRUCTIONS"),
+        (S_ATTR_EXT_RELOC, "EXT_RELOC"),
+        (S_ATTR_LOC_RELOC, "LOC_RELOC"),
+    ]
+    .into_iter()
+    .filter_map(|(bit, name)| (flags & bit != 0).then_some(name))
+    .collect::<Vec<_>>();
+    if attrs.is_empty() {
+        "(none)".into()
+    } else {
+        attrs.join(" ")
+    }
+}
+
+fn otool_version_str(v: u32) -> String {
+    let x = (v >> 16) & 0xffff;
+    let y = (v >> 8) & 0xff;
+    let z = v & 0xff;
+    if z == 0 {
+        format!("{x}.{y}")
+    } else {
+        format!("{x}.{y}.{z}")
+    }
+}
+
+fn otool_sdk_str(v: u32) -> String {
+    if v == 0 {
+        "n/a".into()
+    } else {
+        otool_version_str(v)
+    }
 }
 
 #[cfg(test)]

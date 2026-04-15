@@ -192,18 +192,31 @@ fn output_path(opts: &LinkOptions) -> PathBuf {
 }
 
 fn build_write_plan(inputs: &Inputs, opts: &LinkOptions) -> macho::writer::WritePlan {
-    macho::writer::WritePlan {
-        dylibs: inputs
-            .dylibs
-            .iter()
-            .map(|dylib| DylibCmd {
+    let mut dylibs: Vec<DylibCmd> = inputs
+        .dylibs
+        .iter()
+        .map(|dylib| DylibCmd {
                 cmd: macho::constants::LC_LOAD_DYLIB,
                 name: dylib.file.install_name.clone(),
                 timestamp: 2,
                 current_version: dylib.file.current_version,
                 compatibility_version: dylib.file.compatibility_version,
             })
-            .collect(),
+        .collect();
+    if !dylibs
+        .iter()
+        .any(|dylib| dylib.name == "/usr/lib/libSystem.B.dylib")
+    {
+        dylibs.push(DylibCmd {
+            cmd: macho::constants::LC_LOAD_DYLIB,
+            name: "/usr/lib/libSystem.B.dylib".into(),
+            timestamp: 2,
+            current_version: 0,
+            compatibility_version: 0,
+        });
+    }
+    macho::writer::WritePlan {
+        dylibs,
         rpaths: opts.rpaths.clone(),
     }
 }

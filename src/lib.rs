@@ -9,6 +9,7 @@ pub mod diag;
 pub mod dump;
 pub mod input;
 pub mod macho;
+pub mod reloc;
 pub mod section;
 pub mod string_table;
 pub mod symbol;

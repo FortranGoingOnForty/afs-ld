@@ -46,6 +46,7 @@ pub const LC_DYLD_EXPORTS_TRIE: u32 = 0x33 | LC_REQ_DYLD;
 pub const LC_MAIN: u32 = 0x28 | LC_REQ_DYLD;
 
 // Section type nibble (flags & 0xff)
+pub const SECTION_TYPE_MASK: u32 = 0x0000_00ff;
 pub const S_REGULAR: u32 = 0x0;
 pub const S_ZEROFILL: u32 = 0x1;
 pub const S_CSTRING_LITERALS: u32 = 0x2;

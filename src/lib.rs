@@ -8,6 +8,7 @@ pub mod args;
 pub mod diag;
 pub mod dump;
 pub mod macho;
+pub mod section;
 
 use std::path::PathBuf;
 

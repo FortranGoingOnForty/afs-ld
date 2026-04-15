@@ -10,8 +10,9 @@
 use std::path::PathBuf;
 
 use super::constants::*;
-use super::exports::Exports;
+use super::exports::{ExportEntry, ExportKind, Exports};
 use super::reader::{parse_commands, parse_header, LoadCommand, MachHeader64, ReadError, SymtabCmd};
+use super::tbd::{parse_version, SymbolLists, Target, Tbd};
 
 /// How a consumer loaded this dylib. The filetype of the dylib itself is
 /// always `MH_DYLIB`; this kind captures the *relationship*.
@@ -168,6 +169,140 @@ fn trie_slice(file_bytes: &[u8], off: u32, size: u32) -> Result<Exports, ReadErr
     Ok(Exports::from_trie_bytes(&file_bytes[start..end]))
 }
 
+impl DylibFile {
+    /// Materialize a TBD document as a `DylibFile` specialized for a single
+    /// target. Scoped lists (`exports`, `reexported-libraries`, `rpaths`
+    /// via parent-umbrella) narrow to entries whose target set includes
+    /// `target`. Symbol kinds map to ObjC-class / ObjC-eh-type / ObjC-ivar /
+    /// thread-local / weak / regular in `ExportKind::Regular` form —
+    /// addresses are zero because TBD stubs don't commit to them.
+    pub fn from_tbd(path: impl Into<PathBuf>, tbd: &Tbd, target: &Target) -> Self {
+        let mut entries: Vec<ExportEntry> = Vec::new();
+        for scoped in &tbd.exports {
+            if !scope_matches(&scoped.targets, target) {
+                continue;
+            }
+            append_entries(&scoped.value, &mut entries);
+        }
+        // re-exported symbols from peer dylibs surface the same way —
+        // dyld treats them as part of this dylib's export surface.
+        for scoped in &tbd.reexports {
+            if !scope_matches(&scoped.targets, target) {
+                continue;
+            }
+            append_entries(&scoped.value, &mut entries);
+        }
+
+        let mut dependencies = Vec::new();
+        let mut ordinal: u16 = 1;
+        for scoped in &tbd.reexported_libraries {
+            if !scope_matches(&scoped.targets, target) {
+                continue;
+            }
+            for install_name in &scoped.value {
+                dependencies.push(DylibDependency {
+                    kind: DylibLoadKind::Reexport,
+                    install_name: install_name.clone(),
+                    current_version: 0,
+                    compatibility_version: 0,
+                    ordinal,
+                });
+                ordinal += 1;
+            }
+        }
+
+        DylibFile {
+            path: path.into(),
+            // TBDs have no binary header; synth a minimal one so downstream
+            // consumers that only read `install_name` / versions don't care
+            // whether they got a binary or a stub.
+            header: synthetic_header(),
+            commands: Vec::new(),
+            install_name: tbd.install_name.clone(),
+            current_version: tbd
+                .current_version
+                .as_deref()
+                .map(parse_version)
+                .unwrap_or(0),
+            compatibility_version: tbd
+                .compatibility_version
+                .as_deref()
+                .map(parse_version)
+                .unwrap_or(0),
+            dependencies,
+            rpaths: Vec::new(),
+            symtab: None,
+            exports: Exports::from_entries(entries),
+        }
+    }
+}
+
+fn scope_matches(targets: &[Target], wanted: &Target) -> bool {
+    targets.iter().any(|t| t == wanted)
+}
+
+fn append_entries(lists: &SymbolLists, out: &mut Vec<ExportEntry>) {
+    for n in &lists.symbols {
+        out.push(regular_entry(n, 0));
+    }
+    for n in &lists.weak_symbols {
+        out.push(weak_entry(n));
+    }
+    for n in &lists.thread_local_symbols {
+        out.push(tls_entry(n));
+    }
+    // ObjC classes ship as `_OBJC_CLASS_$_<name>` externs in a real dylib.
+    for n in &lists.objc_classes {
+        let full = format!("_OBJC_CLASS_$_{n}");
+        out.push(regular_entry(&full, 0));
+    }
+    for n in &lists.objc_eh_types {
+        let full = format!("_OBJC_EHTYPE_$_{n}");
+        out.push(regular_entry(&full, 0));
+    }
+    for n in &lists.objc_ivars {
+        let full = format!("_OBJC_IVAR_$_{n}");
+        out.push(regular_entry(&full, 0));
+    }
+}
+
+fn regular_entry(name: &str, flags: u64) -> ExportEntry {
+    ExportEntry {
+        name: name.to_string(),
+        flags,
+        kind: ExportKind::Regular { address: 0 },
+    }
+}
+
+fn weak_entry(name: &str) -> ExportEntry {
+    ExportEntry {
+        name: name.to_string(),
+        flags: EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION,
+        kind: ExportKind::Regular { address: 0 },
+    }
+}
+
+fn tls_entry(name: &str) -> ExportEntry {
+    ExportEntry {
+        name: name.to_string(),
+        flags: EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL,
+        kind: ExportKind::ThreadLocal { address: 0 },
+    }
+}
+
+fn synthetic_header() -> MachHeader64 {
+    MachHeader64 {
+        magic: MH_MAGIC_64,
+        cputype: CPU_TYPE_ARM64,
+        cpusubtype: 0,
+        filetype: MH_DYLIB,
+        ncmds: 0,
+        sizeofcmds: 0,
+        flags: MH_DYLDLINK | MH_TWOLEVEL,
+        reserved: 0,
+    }
+}
+
 /// Look up the 1-based ordinal of a dependency by its install name. Used by
 /// Sprint 14's symbol-table writer when encoding each undefined symbol's
 /// two-level-namespace library ordinal into its `n_desc` high byte.
@@ -273,6 +408,102 @@ mod tests {
             dy.rpaths,
             vec!["@executable_path/../lib", "/opt/local/lib"]
         );
+    }
+
+    // ----- DylibFile::from_tbd tests -----
+
+    use crate::macho::tbd::{parse_tbd, Arch, Platform};
+
+    fn arm64_macos() -> Target {
+        Target {
+            arch: Arch::Arm64,
+            platform: Platform::MacOs,
+        }
+    }
+
+    #[test]
+    fn from_tbd_filters_exports_by_target() {
+        let src = "--- !tapi-tbd\n\
+                   tbd-version: 4\n\
+                   targets: [ arm64-macos, x86_64-macos ]\n\
+                   install-name: '/usr/lib/libdemo.dylib'\n\
+                   current-version: 1.2.3\n\
+                   exports:\n\
+                   \x20 - targets: [ arm64-macos ]\n\
+                   \x20   symbols: [ _arm_only ]\n\
+                   \x20 - targets: [ x86_64-macos ]\n\
+                   \x20   symbols: [ _x86_only ]\n\
+                   \x20 - targets: [ arm64-macos, x86_64-macos ]\n\
+                   \x20   symbols: [ _shared_sym ]\n";
+        let tbd = &parse_tbd(src).unwrap()[0];
+        let dy = DylibFile::from_tbd("/stub/libdemo.tbd", tbd, &arm64_macos());
+        let names: Vec<String> = dy
+            .exports
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"_arm_only".to_string()));
+        assert!(names.contains(&"_shared_sym".to_string()));
+        assert!(!names.contains(&"_x86_only".to_string()));
+    }
+
+    #[test]
+    fn from_tbd_includes_reexported_libraries_as_dependencies() {
+        let src = "--- !tapi-tbd\n\
+                   tbd-version: 4\n\
+                   targets: [ arm64-macos ]\n\
+                   install-name: '/usr/lib/libSystem.B.dylib'\n\
+                   reexported-libraries:\n\
+                   \x20 - targets: [ arm64-macos ]\n\
+                   \x20   libraries: [ '/usr/lib/system/libcache.dylib', '/usr/lib/system/libxpc.dylib' ]\n";
+        let tbd = &parse_tbd(src).unwrap()[0];
+        let dy = DylibFile::from_tbd("/stub/libSystem.tbd", tbd, &arm64_macos());
+        assert_eq!(dy.dependencies.len(), 2);
+        assert_eq!(dy.dependencies[0].kind, DylibLoadKind::Reexport);
+        assert_eq!(dy.dependencies[0].ordinal, 1);
+        assert_eq!(
+            dy.dependencies[0].install_name,
+            "/usr/lib/system/libcache.dylib"
+        );
+        assert_eq!(dy.dependencies[1].ordinal, 2);
+    }
+
+    #[test]
+    fn from_tbd_decodes_objc_symbols_with_prefix() {
+        let src = "--- !tapi-tbd\n\
+                   tbd-version: 4\n\
+                   targets: [ arm64-macos ]\n\
+                   install-name: '/usr/lib/libobjc.A.dylib'\n\
+                   exports:\n\
+                   \x20 - targets: [ arm64-macos ]\n\
+                   \x20   objc-classes: [ NSObject, NSArray ]\n\
+                   \x20   objc-eh-types: [ NSException ]\n";
+        let tbd = &parse_tbd(src).unwrap()[0];
+        let dy = DylibFile::from_tbd("/stub/libobjc.tbd", tbd, &arm64_macos());
+        let names: Vec<String> = dy
+            .exports
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"_OBJC_CLASS_$_NSObject".to_string()));
+        assert!(names.contains(&"_OBJC_CLASS_$_NSArray".to_string()));
+        assert!(names.contains(&"_OBJC_EHTYPE_$_NSException".to_string()));
+    }
+
+    #[test]
+    fn from_tbd_parses_current_version_into_packed_u32() {
+        let src = "--- !tapi-tbd\n\
+                   tbd-version: 4\n\
+                   targets: [ arm64-macos ]\n\
+                   install-name: '/usr/lib/libfoo.dylib'\n\
+                   current-version: 14.2.3\n";
+        let tbd = &parse_tbd(src).unwrap()[0];
+        let dy = DylibFile::from_tbd("/stub", tbd, &arm64_macos());
+        assert_eq!(dy.current_version, (14 << 16) | (2 << 8) | 3);
     }
 
     #[test]

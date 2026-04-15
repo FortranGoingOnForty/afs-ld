@@ -1145,6 +1145,113 @@ pub fn find_archive_by_path(inputs: &Inputs, path: &std::path::Path) -> Option<A
         .map(|i| ArchiveId(i as u32))
 }
 
+// ---------------------------------------------------------------------------
+// Unresolved classification.
+// ---------------------------------------------------------------------------
+
+/// Policy for handling Undefined symbols that remain after the fixed
+/// point. Maps to the CLI `-undefined <treatment>` flag (Sprint 19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UndefinedTreatment {
+    /// Undefineds are errors. The default, matching Apple `ld`.
+    #[default]
+    Error,
+    /// Undefineds produce warnings; left in the table as Undefined.
+    Warning,
+    /// Undefineds are silently accepted; left in the table as Undefined.
+    Suppress,
+    /// Undefineds are promoted to flat-lookup DylibImport entries — dyld
+    /// searches every loaded dylib at runtime.
+    DynamicLookup,
+}
+
+/// `n_desc`-style special ordinal: `-2` (two's-complement u16 = 0xFFFE)
+/// tells dyld to use flat-namespace lookup. Sprint 15 emits this into
+/// `LC_DYLD_INFO` bind opcodes.
+pub const FLAT_LOOKUP_ORDINAL: u16 = 0xFFFE;
+
+/// Sentinel DylibId used for dynamic-lookup promotions before a real
+/// dylib registry is bound. Sprint 15 interprets `DylibId::INVALID`
+/// when emitting bind opcodes.
+impl DylibId {
+    pub const INVALID: DylibId = DylibId(u32::MAX);
+}
+
+#[derive(Debug, Default)]
+pub struct ClassificationReport {
+    /// Strong undefineds that triggered errors under `Error` treatment.
+    pub errors: Vec<Unresolved>,
+    /// Strong undefineds that produced warnings under `Warning` treatment.
+    pub warnings: Vec<Unresolved>,
+    /// Strong undefineds that were silently accepted under `Suppress`.
+    pub suppressed: Vec<Unresolved>,
+    /// Undefineds promoted to flat-lookup DylibImport entries.
+    pub promoted_to_dynamic: Vec<SymbolId>,
+    /// Weak references that remain unresolved — always accepted.
+    pub weak: Vec<Unresolved>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unresolved {
+    pub name: Istr,
+    pub id: SymbolId,
+}
+
+/// After the fixed-point loop, walk the table and classify every remaining
+/// `Undefined`. Weak references always pass through cleanly.
+pub fn classify_unresolved(
+    table: &mut SymbolTable,
+    treatment: UndefinedTreatment,
+) -> ClassificationReport {
+    let mut report = ClassificationReport::default();
+
+    // Collect undefineds before mutating — avoids double-borrow grief.
+    let undefs: Vec<(SymbolId, Istr, bool)> = table
+        .iter()
+        .filter_map(|(id, s)| match s {
+            Symbol::Undefined {
+                name, weak_ref, ..
+            } => Some((id, *name, *weak_ref)),
+            _ => None,
+        })
+        .collect();
+
+    for (id, name, weak_ref) in undefs {
+        if weak_ref {
+            report.weak.push(Unresolved { name, id });
+            continue;
+        }
+        match treatment {
+            UndefinedTreatment::Error => {
+                report.errors.push(Unresolved { name, id });
+            }
+            UndefinedTreatment::Warning => {
+                report.warnings.push(Unresolved { name, id });
+            }
+            UndefinedTreatment::Suppress => {
+                report.suppressed.push(Unresolved { name, id });
+            }
+            UndefinedTreatment::DynamicLookup => {
+                table.symbols[id.0 as usize] = Symbol::DylibImport {
+                    name,
+                    dylib: DylibId::INVALID,
+                    ordinal: FLAT_LOOKUP_ORDINAL,
+                    weak_import: true,
+                };
+                table.transitions.push(Transition {
+                    id,
+                    from: SymbolKindTag::Undefined,
+                    to: SymbolKindTag::DylibImport,
+                    cause: TransitionCause::Replaced,
+                });
+                report.promoted_to_dynamic.push(id);
+            }
+        }
+    }
+
+    report
+}
+
 /// Drive the fetch queue to a fixed point. Each fetched member's own
 /// undefined references may trigger additional pending fetches — drain
 /// those too until the queue is empty.

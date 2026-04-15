@@ -513,6 +513,22 @@ impl SymbolTable {
         &self.transitions
     }
 
+    /// Back-patch a `Symbol::Defined`'s `atom` and `value` fields. The
+    /// atomization pass (Sprint 9) uses this to replace the `AtomId(0)`
+    /// placeholder seeded at resolution time with the real atom handle
+    /// and the symbol's atom-relative offset. No-op for non-Defined
+    /// entries; silently ignored so an Alias or DylibImport that shadows
+    /// a previously-Defined slot doesn't panic.
+    pub fn bind_atom(&mut self, id: SymbolId, atom: AtomId, value: u64) {
+        if let Symbol::Defined {
+            atom: a, value: v, ..
+        } = &mut self.symbols[id.0 as usize]
+        {
+            *a = atom;
+            *v = value;
+        }
+    }
+
     /// Insert a symbol, running the resolution matrix. See Sprint 7's
     /// `.docs/sprints/sprint07.md` for the full matrix.
     pub fn insert(&mut self, sym: Symbol) -> Result<InsertOutcome, InsertError> {

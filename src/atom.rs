@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use crate::input::ObjectFile;
 use crate::macho::constants::MH_SUBSECTIONS_VIA_SYMBOLS;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent};
-use crate::resolve::{AtomId, InputId, SymbolId};
+use crate::resolve::{AtomId, InputId, SymbolTable, SymbolId};
 use crate::section::{InputSection, SectionKind};
 use crate::symbol::{InputSymbol, SymKind};
 
@@ -259,7 +259,17 @@ pub fn atomize_object(
 
     for (sect_idx_zero, sect) in obj.sections.iter().enumerate() {
         let sect_idx_one = (sect_idx_zero + 1) as u8;
-        let mut syms: Vec<(usize, &InputSymbol)> = obj
+        // Gather symbols targeting this section and translate their
+        // `n_value` (absolute address in the object's layout) into
+        // in-section offsets by subtracting the section's `addr`.
+        //
+        // Only external / private-extern / alt-entry symbols count as
+        // subsection boundaries. Locals like `ltmp0` often sit at the
+        // same offset as an adjacent external (they're compiler-generated
+        // anchors for PC-relative addressing); splitting at them would
+        // produce zero-size atoms. This matches ld64's pragmatic reading
+        // of MH_SUBSECTIONS_VIA_SYMBOLS.
+        let mut syms: Vec<(usize, &InputSymbol, u32)> = obj
             .symbols
             .iter()
             .enumerate()
@@ -267,9 +277,14 @@ pub fn atomize_object(
                 s.stab_kind().is_none()
                     && s.kind() == SymKind::Sect
                     && s.sect_idx() == sect_idx_one
+                    && (s.is_ext() || s.is_private_ext() || s.alt_entry())
+            })
+            .map(|(i, s)| {
+                let offset = s.value().saturating_sub(sect.addr) as u32;
+                (i, s, offset)
             })
             .collect();
-        syms.sort_by_key(|(_, s)| s.value());
+        syms.sort_by_key(|(_, _, off)| *off);
 
         atomize_regular_section(
             input_id,
@@ -360,6 +375,65 @@ fn link_unwind_parents(
     let _ = input_id; // reserved for cross-object lookup in Sprint 17
 }
 
+/// Replace every `Symbol::Defined { atom: AtomId(0), ... }` seeded before
+/// atomization with the real atom handle and atom-relative offset.
+/// Silently skips symbols that have no matching entry (e.g. those that
+/// were replaced by a strong definition elsewhere before atomization ran).
+pub fn backpatch_symbol_atoms(
+    atomization: &ObjectAtomization,
+    input_id: InputId,
+    obj: &ObjectFile,
+    sym_table: &mut SymbolTable,
+    atom_table: &mut AtomTable,
+) {
+    use crate::resolve::Symbol;
+
+    for (sym_idx, atom_id) in &atomization.owner_by_sym {
+        let input_sym = &obj.symbols[*sym_idx];
+        let Ok(name_str) = obj.symbol_name(input_sym) else {
+            continue;
+        };
+        let istr = sym_table.intern(name_str);
+        let Some(sid) = sym_table.lookup(istr) else {
+            continue;
+        };
+        // Primary owner symbols sit at atom boundary → atom-relative 0.
+        if let Symbol::Defined { origin, .. } = sym_table.get(sid) {
+            if *origin == input_id {
+                sym_table.bind_atom(sid, *atom_id, 0);
+                atom_table.get_mut(*atom_id).owner = Some(sid);
+            }
+        }
+    }
+
+    for (sym_idx, atom_id, local_off) in &atomization.alt_entries_by_sym {
+        let input_sym = &obj.symbols[*sym_idx];
+        let Ok(name_str) = obj.symbol_name(input_sym) else {
+            continue;
+        };
+        let istr = sym_table.intern(name_str);
+        let Some(sid) = sym_table.lookup(istr) else {
+            continue;
+        };
+        if let Symbol::Defined { origin, .. } = sym_table.get(sid) {
+            if *origin == input_id {
+                sym_table.bind_atom(sid, *atom_id, *local_off as u64);
+                // Update the atom's alt_entries with the resolver-side
+                // SymbolId (we stored the InputSymbol index during
+                // atomization; now we know the real handle).
+                let atom = atom_table.get_mut(*atom_id);
+                for alt in &mut atom.alt_entries {
+                    if alt.symbol == SymbolId(*sym_idx as u32)
+                        && alt.offset_within_atom == *local_off
+                    {
+                        alt.symbol = sid;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Split one section into atoms according to the `MH_SUBSECTIONS_VIA_SYMBOLS`
 /// invariant plus `.alt_entry` folding. Literal and unwind specialization
 /// lands in follow-up commits; this function's fallback is "one atom per
@@ -369,7 +443,7 @@ fn atomize_regular_section(
     input_id: InputId,
     section_idx: u8,
     sect: &InputSection,
-    syms: &[(usize, &InputSymbol)],
+    syms: &[(usize, &InputSymbol, u32)],
     subsections_via_symbols: bool,
     table: &mut AtomTable,
     out: &mut ObjectAtomization,
@@ -383,8 +457,8 @@ fn atomize_regular_section(
         let atom = build_section_atom(input_id, section_idx, sect, atom_section);
         let id = table.push(atom);
         out.atoms.push(id);
-        for (sym_idx, sym) in syms {
-            out.alt_entries_by_sym.push((*sym_idx, id, sym.value() as u32));
+        for (sym_idx, _sym, off) in syms {
+            out.alt_entries_by_sym.push((*sym_idx, id, *off));
         }
         return;
     }
@@ -424,7 +498,7 @@ fn atomize_regular_section(
     // If there's content before the first symbol, carve a head atom
     // (unowned). afs-as emits a leading symbol in practice so this is
     // typically zero bytes, but the fallback keeps the byte-flow intact.
-    let first_offset = syms[0].1.value() as u32;
+    let first_offset = syms[0].2;
     if first_offset > 0 {
         let head = build_slice_atom(
             input_id,
@@ -444,25 +518,23 @@ fn atomize_regular_section(
     let section_size = sect.size as u32;
     let mut i = 0;
     while i < syms.len() {
-        let (primary_idx, primary) = syms[i];
-        let atom_offset = primary.value() as u32;
+        let (primary_idx, primary, atom_offset) = syms[i];
         let next_real_boundary = find_next_non_alt_entry(syms, i + 1)
-            .map(|j| syms[j].1.value() as u32)
+            .map(|j| syms[j].2)
             .unwrap_or(section_size);
         let size = next_real_boundary.saturating_sub(atom_offset);
 
         // Collect alt_entries that fall into [atom_offset, atom_offset+size).
         let mut alts: Vec<AltEntry> = Vec::new();
         let mut alt_folded: Vec<(usize, u32)> = Vec::new();
-        for (alt_idx, alt_sym) in syms.iter().skip(i + 1) {
-            let alt_off = alt_sym.value() as u32;
-            if alt_off >= atom_offset + size {
+        for (alt_idx, alt_sym, alt_off) in syms.iter().skip(i + 1) {
+            if *alt_off >= atom_offset + size {
                 break;
             }
             if !alt_sym.alt_entry() {
                 break;
             }
-            let local = alt_off - atom_offset;
+            let local = *alt_off - atom_offset;
             alts.push(AltEntry {
                 symbol: SymbolId(*alt_idx as u32),
                 offset_within_atom: local,
@@ -500,7 +572,7 @@ fn atomize_literal_section(
     input_id: InputId,
     section_idx: u8,
     sect: &InputSection,
-    syms: &[(usize, &InputSymbol)],
+    syms: &[(usize, &InputSymbol, u32)],
     atom_section: AtomSection,
     table: &mut AtomTable,
     out: &mut ObjectAtomization,
@@ -526,7 +598,7 @@ fn atomize_cstring(
     input_id: InputId,
     section_idx: u8,
     sect: &InputSection,
-    syms: &[(usize, &InputSymbol)],
+    syms: &[(usize, &InputSymbol, u32)],
     atom_section: AtomSection,
     table: &mut AtomTable,
     out: &mut ObjectAtomization,
@@ -542,14 +614,14 @@ fn atomize_cstring(
         let data = sect.data[offset..end].to_vec();
         let size = (end - offset) as u32;
 
-        let owner_idx = syms
+        let owner_entry = syms
             .iter()
-            .find(|(_, s)| s.value() as usize == offset)
-            .map(|(i, _)| *i);
+            .find(|(_, _, off)| *off as usize == offset);
+        let owner_idx = owner_entry.map(|(i, _, _)| *i);
 
         let mut flags = AtomFlags::default().with(AtomFlags::LITERAL);
-        if let Some(idx) = owner_idx {
-            flags.set(symbol_flags(syms[idx].1).bits());
+        if let Some((_, sym, _)) = owner_entry {
+            flags.set(symbol_flags(sym).bits());
         }
 
         let atom = Atom {
@@ -560,7 +632,7 @@ fn atomize_cstring(
             input_offset: offset as u32,
             size,
             align_pow2: sect.align_pow2 as u8,
-            owner: owner_idx.map(|i| SymbolId(i as u32)),
+            owner: None,
             alt_entries: Vec::new(),
             data,
             flags,
@@ -580,7 +652,7 @@ fn atomize_fixed_literal(
     input_id: InputId,
     section_idx: u8,
     sect: &InputSection,
-    syms: &[(usize, &InputSymbol)],
+    syms: &[(usize, &InputSymbol, u32)],
     chunk_size: usize,
     atom_section: AtomSection,
     table: &mut AtomTable,
@@ -598,14 +670,14 @@ fn atomize_fixed_literal(
         };
         let size = (end - offset) as u32;
 
-        let owner_idx = syms
+        let owner_entry = syms
             .iter()
-            .find(|(_, s)| s.value() as usize == offset)
-            .map(|(i, _)| *i);
+            .find(|(_, _, off)| *off as usize == offset);
+        let owner_idx = owner_entry.map(|(i, _, _)| *i);
 
         let mut flags = AtomFlags::default().with(AtomFlags::LITERAL);
-        if let Some(idx) = owner_idx {
-            flags.set(symbol_flags(syms[idx].1).bits());
+        if let Some((_, sym, _)) = owner_entry {
+            flags.set(symbol_flags(sym).bits());
         }
 
         let atom = Atom {
@@ -616,7 +688,7 @@ fn atomize_fixed_literal(
             input_offset: offset as u32,
             size,
             align_pow2: sect.align_pow2 as u8,
-            owner: owner_idx.map(|i| SymbolId(i as u32)),
+            owner: None,
             alt_entries: Vec::new(),
             data,
             flags,
@@ -638,7 +710,7 @@ fn atomize_compact_unwind(
     input_id: InputId,
     section_idx: u8,
     sect: &InputSection,
-    syms: &[(usize, &InputSymbol)],
+    syms: &[(usize, &InputSymbol, u32)],
     atom_section: AtomSection,
     table: &mut AtomTable,
     out: &mut ObjectAtomization,
@@ -653,8 +725,8 @@ fn atomize_compact_unwind(
 
         let owner_idx = syms
             .iter()
-            .find(|(_, s)| s.value() as usize == offset)
-            .map(|(i, _)| *i);
+            .find(|(_, _, off)| *off as usize == offset)
+            .map(|(i, _, _)| *i);
 
         let atom = Atom {
             id: AtomId(0),
@@ -664,7 +736,7 @@ fn atomize_compact_unwind(
             input_offset: offset as u32,
             size,
             align_pow2: sect.align_pow2 as u8,
-            owner: owner_idx.map(|i| SymbolId(i as u32)),
+            owner: None,
             alt_entries: Vec::new(),
             data,
             flags: AtomFlags::default(),
@@ -683,7 +755,7 @@ fn atomize_zerofill(
     input_id: InputId,
     section_idx: u8,
     sect: &InputSection,
-    syms: &[(usize, &InputSymbol)],
+    syms: &[(usize, &InputSymbol, u32)],
     atom_section: AtomSection,
     table: &mut AtomTable,
     out: &mut ObjectAtomization,
@@ -695,11 +767,11 @@ fn atomize_zerofill(
         return;
     }
     let section_size = sect.size as u32;
-    for (i, (sym_idx, sym)) in syms.iter().enumerate() {
-        let start = sym.value() as u32;
+    for (i, (sym_idx, sym, start)) in syms.iter().enumerate() {
+        let start = *start;
         let end = syms
             .get(i + 1)
-            .map(|(_, s)| s.value() as u32)
+            .map(|(_, _, off)| *off)
             .unwrap_or(section_size);
         let size = end.saturating_sub(start);
         let atom = Atom {
@@ -786,12 +858,9 @@ fn build_slice_atom(
         input_offset: offset,
         size,
         align_pow2: sect.align_pow2 as u8,
-        owner: owner.map(|_| {
-            // caller provides the symbol index via `owner_by_sym`; we
-            // store a placeholder here and let the caller set it
-            // post-hoc. Leaving it None is acceptable too.
-            SymbolId(u32::MAX)
-        }),
+        // owner is wired at back-patch time via `backpatch_symbol_atoms`;
+        // atomization doesn't know the resolver-side SymbolId yet.
+        owner: None,
         alt_entries: alt_entries.to_vec(),
         data,
         flags,
@@ -813,11 +882,11 @@ fn symbol_flags(sym: &InputSymbol) -> AtomFlags {
 /// Find the next non-alt_entry symbol starting from index `i`. Returns the
 /// index (into `syms`), or `None` if every remaining symbol is an alt
 /// entry.
-fn find_next_non_alt_entry(syms: &[(usize, &InputSymbol)], from: usize) -> Option<usize> {
+fn find_next_non_alt_entry(syms: &[(usize, &InputSymbol, u32)], from: usize) -> Option<usize> {
     syms.iter()
         .enumerate()
         .skip(from)
-        .find(|(_, (_, s))| !s.alt_entry())
+        .find(|(_, (_, s, _))| !s.alt_entry())
         .map(|(i, _)| i)
 }
 

@@ -118,6 +118,7 @@ pub fn write_header(hdr: &MachHeader64, out: &mut Vec<u8>) {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadCommand {
+    Segment64(Segment64),
     /// A load command whose payload we haven't decoded yet. Preserves bytes
     /// verbatim for byte-level round-trip.
     Raw { cmd: u32, cmdsize: u32, data: Vec<u8> },
@@ -126,14 +127,189 @@ pub enum LoadCommand {
 impl LoadCommand {
     pub fn cmd(&self) -> u32 {
         match self {
+            LoadCommand::Segment64(_) => LC_SEGMENT_64,
             LoadCommand::Raw { cmd, .. } => *cmd,
         }
     }
 
     pub fn cmdsize(&self) -> u32 {
         match self {
+            LoadCommand::Segment64(s) => s.wire_size(),
             LoadCommand::Raw { cmdsize, .. } => *cmdsize,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LC_SEGMENT_64 + section_64
+// ---------------------------------------------------------------------------
+
+/// Raw 16-byte name field. Null-padded; may be non-UTF-8 in pathological cases
+/// (the spec doesn't guarantee anything beyond "null-padded bytes"). Kept raw
+/// so byte-level round-trip is preserved; helpers below produce a lossy &str
+/// for display.
+pub type Name16 = [u8; 16];
+
+pub fn name16_str(name: &Name16) -> String {
+    let n = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    String::from_utf8_lossy(&name[..n]).into_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment64 {
+    pub segname: Name16,
+    pub vmaddr: u64,
+    pub vmsize: u64,
+    pub fileoff: u64,
+    pub filesize: u64,
+    pub maxprot: u32,
+    pub initprot: u32,
+    pub flags: u32,
+    pub sections: Vec<Section64Header>,
+}
+
+impl Segment64 {
+    /// Fixed portion (before sections array): 16 + 4×u64 + 4×u32 = 64 bytes.
+    const BASE: usize = 64;
+    /// Per-section size: 2×name16 + 2×u64 + 8×u32 = 80 bytes.
+    const SECT: usize = 80;
+
+    pub fn wire_size(&self) -> u32 {
+        (8 + Self::BASE + Self::SECT * self.sections.len()) as u32
+    }
+
+    pub fn segname_str(&self) -> String {
+        name16_str(&self.segname)
+    }
+
+    pub fn parse(cmdsize: u32, payload: &[u8]) -> Result<Self, ReadError> {
+        if payload.len() < Self::BASE {
+            return Err(ReadError::Truncated {
+                need: Self::BASE,
+                have: payload.len(),
+                context: "segment_command_64 base",
+            });
+        }
+        let segname: Name16 = payload[0..16].try_into().unwrap();
+        let vmaddr = u64_le(&payload[16..24]);
+        let vmsize = u64_le(&payload[24..32]);
+        let fileoff = u64_le(&payload[32..40]);
+        let filesize = u64_le(&payload[40..48]);
+        let maxprot = u32_le(&payload[48..52]);
+        let initprot = u32_le(&payload[52..56]);
+        let nsects = u32_le(&payload[56..60]);
+        let flags = u32_le(&payload[60..64]);
+
+        let body_needed = Self::BASE + Self::SECT * nsects as usize;
+        if payload.len() < body_needed {
+            return Err(ReadError::BadCmdsize {
+                cmd: LC_SEGMENT_64,
+                cmdsize,
+                at_offset: 0,
+                reason: "nsects implies more bytes than cmdsize accommodates",
+            });
+        }
+        let mut sections = Vec::with_capacity(nsects as usize);
+        for i in 0..nsects as usize {
+            let off = Self::BASE + i * Self::SECT;
+            sections.push(Section64Header::parse(&payload[off..off + Self::SECT])?);
+        }
+
+        Ok(Segment64 {
+            segname,
+            vmaddr,
+            vmsize,
+            fileoff,
+            filesize,
+            maxprot,
+            initprot,
+            flags,
+            sections,
+        })
+    }
+
+    pub fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        out.extend_from_slice(&self.wire_size().to_le_bytes());
+        out.extend_from_slice(&self.segname);
+        out.extend_from_slice(&self.vmaddr.to_le_bytes());
+        out.extend_from_slice(&self.vmsize.to_le_bytes());
+        out.extend_from_slice(&self.fileoff.to_le_bytes());
+        out.extend_from_slice(&self.filesize.to_le_bytes());
+        out.extend_from_slice(&self.maxprot.to_le_bytes());
+        out.extend_from_slice(&self.initprot.to_le_bytes());
+        out.extend_from_slice(&(self.sections.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        for s in &self.sections {
+            s.write(out);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Section64Header {
+    pub sectname: Name16,
+    pub segname: Name16,
+    pub addr: u64,
+    pub size: u64,
+    pub offset: u32,
+    pub align: u32, // log2
+    pub reloff: u32,
+    pub nreloc: u32,
+    pub flags: u32,
+    pub reserved1: u32,
+    pub reserved2: u32,
+    pub reserved3: u32,
+}
+
+impl Section64Header {
+    fn parse(bytes: &[u8]) -> Result<Self, ReadError> {
+        if bytes.len() < Segment64::SECT {
+            return Err(ReadError::Truncated {
+                need: Segment64::SECT,
+                have: bytes.len(),
+                context: "section_64",
+            });
+        }
+        let sectname: Name16 = bytes[0..16].try_into().unwrap();
+        let segname: Name16 = bytes[16..32].try_into().unwrap();
+        Ok(Section64Header {
+            sectname,
+            segname,
+            addr: u64_le(&bytes[32..40]),
+            size: u64_le(&bytes[40..48]),
+            offset: u32_le(&bytes[48..52]),
+            align: u32_le(&bytes[52..56]),
+            reloff: u32_le(&bytes[56..60]),
+            nreloc: u32_le(&bytes[60..64]),
+            flags: u32_le(&bytes[64..68]),
+            reserved1: u32_le(&bytes[68..72]),
+            reserved2: u32_le(&bytes[72..76]),
+            reserved3: u32_le(&bytes[76..80]),
+        })
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.sectname);
+        out.extend_from_slice(&self.segname);
+        out.extend_from_slice(&self.addr.to_le_bytes());
+        out.extend_from_slice(&self.size.to_le_bytes());
+        out.extend_from_slice(&self.offset.to_le_bytes());
+        out.extend_from_slice(&self.align.to_le_bytes());
+        out.extend_from_slice(&self.reloff.to_le_bytes());
+        out.extend_from_slice(&self.nreloc.to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        out.extend_from_slice(&self.reserved1.to_le_bytes());
+        out.extend_from_slice(&self.reserved2.to_le_bytes());
+        out.extend_from_slice(&self.reserved3.to_le_bytes());
+    }
+
+    pub fn sectname_str(&self) -> String {
+        name16_str(&self.sectname)
+    }
+
+    pub fn segname_str(&self) -> String {
+        name16_str(&self.segname)
     }
 }
 
@@ -203,12 +379,23 @@ pub fn parse_commands(
                 reason: "overruns sizeofcmds",
             });
         }
-        let data = bytes[cursor + 8..end].to_vec();
-        out.push(LoadCommand::Raw { cmd, cmdsize, data });
+        let payload = &bytes[cursor + 8..end];
+        out.push(decode_command(cmd, cmdsize, payload)?);
         cursor = end;
     }
 
     Ok(out)
+}
+
+fn decode_command(cmd: u32, cmdsize: u32, payload: &[u8]) -> Result<LoadCommand, ReadError> {
+    match cmd {
+        LC_SEGMENT_64 => Ok(LoadCommand::Segment64(Segment64::parse(cmdsize, payload)?)),
+        _ => Ok(LoadCommand::Raw {
+            cmd,
+            cmdsize,
+            data: payload.to_vec(),
+        }),
+    }
 }
 
 /// Write a sequence of load commands back to wire form. Paired with
@@ -217,6 +404,7 @@ pub fn parse_commands(
 pub fn write_commands(cmds: &[LoadCommand], out: &mut Vec<u8>) {
     for c in cmds {
         match c {
+            LoadCommand::Segment64(s) => s.write(out),
             LoadCommand::Raw { cmd, cmdsize, data } => {
                 out.extend_from_slice(&cmd.to_le_bytes());
                 out.extend_from_slice(&cmdsize.to_le_bytes());
@@ -382,6 +570,128 @@ mod tests {
             err,
             ReadError::BadCmdsize { cmd: 0x1234, cmdsize: 10, reason, .. } if reason.contains("aligned")
         ));
+    }
+
+    fn name16(s: &str) -> Name16 {
+        let mut out = [0u8; 16];
+        let bytes = s.as_bytes();
+        let n = bytes.len().min(16);
+        out[..n].copy_from_slice(&bytes[..n]);
+        out
+    }
+
+    fn sample_segment64() -> Segment64 {
+        Segment64 {
+            segname: name16("__TEXT"),
+            vmaddr: 0,
+            vmsize: 0x1000,
+            fileoff: 0x200,
+            filesize: 0x40,
+            maxprot: 7,
+            initprot: 5,
+            flags: 0,
+            sections: vec![Section64Header {
+                sectname: name16("__text"),
+                segname: name16("__TEXT"),
+                addr: 0,
+                size: 0x10,
+                offset: 0x200,
+                align: 2,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn segment64_round_trip_byte_equal() {
+        let seg = sample_segment64();
+        let mut wire = Vec::new();
+        seg.write(&mut wire);
+        // Strip LC header so Segment64::parse gets just the payload.
+        let payload = &wire[8..];
+        let decoded = Segment64::parse(seg.wire_size(), payload).unwrap();
+        assert_eq!(decoded, seg);
+
+        // And byte-equal on re-emit.
+        let mut reemit = Vec::new();
+        decoded.write(&mut reemit);
+        assert_eq!(reemit, wire);
+    }
+
+    #[test]
+    fn segment64_helpers_decode_names() {
+        let seg = sample_segment64();
+        assert_eq!(seg.segname_str(), "__TEXT");
+        assert_eq!(seg.sections[0].sectname_str(), "__text");
+        assert_eq!(seg.sections[0].segname_str(), "__TEXT");
+    }
+
+    #[test]
+    fn segment64_with_zero_sections_round_trips() {
+        let seg = Segment64 {
+            segname: name16("__DATA"),
+            vmaddr: 0,
+            vmsize: 0,
+            fileoff: 0,
+            filesize: 0,
+            maxprot: 3,
+            initprot: 3,
+            flags: 0,
+            sections: vec![],
+        };
+        let mut wire = Vec::new();
+        seg.write(&mut wire);
+        let decoded = Segment64::parse(seg.wire_size(), &wire[8..]).unwrap();
+        assert_eq!(decoded, seg);
+        assert_eq!(seg.wire_size(), 8 + 64);
+    }
+
+    #[test]
+    fn segment64_through_dispatcher_preserves_bytes() {
+        // Build a synthetic image with a single LC_SEGMENT_64 + a following
+        // opaque LC_BUILD_VERSION-shaped Raw command. Both must survive the
+        // parse/write round-trip.
+        let seg = sample_segment64();
+        let mut seg_wire = Vec::new();
+        seg.write(&mut seg_wire);
+
+        let raw_cmd = 0xCAFE_F00Du32; // any unknown cmd
+        let raw_cmdsize: u32 = 16;
+        let mut raw_wire = Vec::new();
+        raw_wire.extend_from_slice(&raw_cmd.to_le_bytes());
+        raw_wire.extend_from_slice(&raw_cmdsize.to_le_bytes());
+        raw_wire.extend_from_slice(&[0x55u8; 8]);
+
+        let sizeofcmds = (seg_wire.len() + raw_wire.len()) as u32;
+        let hdr = MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: 0,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        };
+        let mut image = Vec::new();
+        write_header(&hdr, &mut image);
+        image.extend_from_slice(&seg_wire);
+        image.extend_from_slice(&raw_wire);
+
+        let parsed_hdr = parse_header(&image).unwrap();
+        let cmds = parse_commands(&parsed_hdr, &image).unwrap();
+        assert!(matches!(cmds[0], LoadCommand::Segment64(_)));
+        assert!(matches!(cmds[1], LoadCommand::Raw { cmd: 0xCAFE_F00D, .. }));
+
+        let mut out = Vec::new();
+        write_header(&parsed_hdr, &mut out);
+        write_commands(&cmds, &mut out);
+        assert_eq!(out, image);
     }
 
     #[test]

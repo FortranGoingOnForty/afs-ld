@@ -9,6 +9,7 @@ pub mod args;
 pub mod diag;
 pub mod dump;
 pub mod input;
+pub mod leb;
 pub mod macho;
 pub mod reloc;
 pub mod section;

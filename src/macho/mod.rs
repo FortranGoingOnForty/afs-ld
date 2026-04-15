@@ -5,4 +5,6 @@
 //! (both MH_EXECUTE and MH_DYLIB paths).
 
 pub mod constants;
+pub mod dylib;
+pub mod exports;
 pub mod reader;

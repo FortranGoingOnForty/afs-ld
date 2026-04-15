@@ -15,6 +15,7 @@
 //! fused `Reloc` form. Later passes (Sprint 11, Sprint 23's dead-strip) reason
 //! about `Reloc` and never touch `RawRelocation` again.
 
+use crate::macho::constants::*;
 use crate::macho::reader::{u32_le, ReadError};
 
 /// Size of one `relocation_info` on the wire.
@@ -103,10 +104,223 @@ pub fn write_raw_relocs(relocs: &[RawRelocation], out: &mut Vec<u8>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fused Reloc form. Sprint 11's reloc-application pass consumes this.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelocKind {
+    Unsigned,
+    Branch26,
+    Page21,
+    PageOff12,
+    GotLoadPage21,
+    GotLoadPageOff12,
+    PointerToGot,
+    TlvpLoadPage21,
+    TlvpLoadPageOff12,
+    /// Fused `ARM64_RELOC_SUBTRACTOR` + `ARM64_RELOC_UNSIGNED` pair — the
+    /// value stored is `minuend - subtrahend + addend`. `referent` carries
+    /// the minuend; `subtrahend` (set on the fused form only) carries the
+    /// other half.
+    Subtractor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RelocLength {
+    Byte = 0,
+    Half = 1,
+    Word = 2,
+    Quad = 3,
+}
+
+impl RelocLength {
+    pub fn from_bits(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(RelocLength::Byte),
+            1 => Some(RelocLength::Half),
+            2 => Some(RelocLength::Word),
+            3 => Some(RelocLength::Quad),
+            _ => None,
+        }
+    }
+
+    pub fn as_bits(self) -> u8 {
+        self as u8
+    }
+
+    pub fn byte_width(self) -> usize {
+        1 << (self as u8)
+    }
+}
+
+/// What a relocation references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Referent {
+    /// Set when the raw `r_extern` flag is `1`. Index into the nlist table.
+    Symbol(u32),
+    /// Set when `r_extern = 0`. 1-based section index.
+    Section(u8),
+}
+
+/// Fused linker-facing relocation. One `Reloc` may correspond to 1-3 raw
+/// `relocation_info` entries on the wire (ADDEND prefix, SUBTRACTOR + UNSIGNED
+/// pair, or the combination of both).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reloc {
+    pub offset: u32,
+    pub kind: RelocKind,
+    pub length: RelocLength,
+    pub pcrel: bool,
+    pub referent: Referent,
+    pub addend: i64,
+    /// Only set when `kind == Subtractor`.
+    pub subtrahend: Option<Referent>,
+}
+
+fn referent_from(raw: &RawRelocation) -> Result<Referent, ReadError> {
+    if raw.r_extern {
+        Ok(Referent::Symbol(raw.r_symbolnum))
+    } else {
+        if raw.r_symbolnum == 0 || raw.r_symbolnum > u8::MAX as u32 {
+            return Err(ReadError::BadRelocation {
+                at_offset: raw.r_address as u32,
+                reason: "non-extern reloc with out-of-range section index",
+            });
+        }
+        Ok(Referent::Section(raw.r_symbolnum as u8))
+    }
+}
+
+/// Sign-extend a 24-bit value (the ADDEND reloc's `r_symbolnum` field) into
+/// a full `i32`.
+fn sign_extend_24(v: u32) -> i32 {
+    if v & 0x0080_0000 != 0 {
+        (v | 0xFF00_0000) as i32
+    } else {
+        v as i32
+    }
+}
+
+fn primary_kind_from_type(t: u8) -> Option<RelocKind> {
+    match t {
+        ARM64_RELOC_UNSIGNED => Some(RelocKind::Unsigned),
+        ARM64_RELOC_BRANCH26 => Some(RelocKind::Branch26),
+        ARM64_RELOC_PAGE21 => Some(RelocKind::Page21),
+        ARM64_RELOC_PAGEOFF12 => Some(RelocKind::PageOff12),
+        ARM64_RELOC_GOT_LOAD_PAGE21 => Some(RelocKind::GotLoadPage21),
+        ARM64_RELOC_GOT_LOAD_PAGEOFF12 => Some(RelocKind::GotLoadPageOff12),
+        ARM64_RELOC_POINTER_TO_GOT => Some(RelocKind::PointerToGot),
+        ARM64_RELOC_TLVP_LOAD_PAGE21 => Some(RelocKind::TlvpLoadPage21),
+        ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => Some(RelocKind::TlvpLoadPageOff12),
+        _ => None,
+    }
+}
+
+/// Lift a vector of raw relocation entries into the fused `Reloc` form.
+/// ADDEND prefixes fold into their following primary; SUBTRACTOR + UNSIGNED
+/// pairs fold into a single `RelocKind::Subtractor`.
+pub fn parse_relocs(raws: &[RawRelocation]) -> Result<Vec<Reloc>, ReadError> {
+    let mut out: Vec<Reloc> = Vec::with_capacity(raws.len());
+    let mut pending_addend: Option<i32> = None;
+    let mut pending_subtractor: Option<RawRelocation> = None;
+
+    for raw in raws {
+        match raw.r_type {
+            ARM64_RELOC_ADDEND => {
+                if pending_addend.is_some() {
+                    return Err(ReadError::BadRelocation {
+                        at_offset: raw.r_address as u32,
+                        reason: "two ARM64_RELOC_ADDEND in a row",
+                    });
+                }
+                if raw.r_extern {
+                    return Err(ReadError::BadRelocation {
+                        at_offset: raw.r_address as u32,
+                        reason: "ARM64_RELOC_ADDEND must not have r_extern set",
+                    });
+                }
+                pending_addend = Some(sign_extend_24(raw.r_symbolnum));
+            }
+            ARM64_RELOC_SUBTRACTOR => {
+                if pending_subtractor.is_some() {
+                    return Err(ReadError::BadRelocation {
+                        at_offset: raw.r_address as u32,
+                        reason: "two ARM64_RELOC_SUBTRACTOR in a row",
+                    });
+                }
+                pending_subtractor = Some(*raw);
+            }
+            t => {
+                let kind = primary_kind_from_type(t).ok_or(ReadError::BadRelocation {
+                    at_offset: raw.r_address as u32,
+                    reason: "unknown ARM64_RELOC_* type",
+                })?;
+                let length = RelocLength::from_bits(raw.r_length).ok_or(ReadError::BadRelocation {
+                    at_offset: raw.r_address as u32,
+                    reason: "invalid r_length (must be 0..=3)",
+                })?;
+                let addend = pending_addend.take().map(|v| v as i64).unwrap_or(0);
+                let referent = referent_from(raw)?;
+
+                let (kind, subtrahend) = match pending_subtractor.take() {
+                    Some(sub) => {
+                        if t != ARM64_RELOC_UNSIGNED {
+                            return Err(ReadError::BadRelocation {
+                                at_offset: raw.r_address as u32,
+                                reason: "SUBTRACTOR must be followed by UNSIGNED",
+                            });
+                        }
+                        if sub.r_address != raw.r_address {
+                            return Err(ReadError::BadRelocation {
+                                at_offset: raw.r_address as u32,
+                                reason: "SUBTRACTOR/UNSIGNED pair must share r_address",
+                            });
+                        }
+                        if sub.r_length != raw.r_length {
+                            return Err(ReadError::BadRelocation {
+                                at_offset: raw.r_address as u32,
+                                reason: "SUBTRACTOR/UNSIGNED pair must share r_length",
+                            });
+                        }
+                        (RelocKind::Subtractor, Some(referent_from(&sub)?))
+                    }
+                    None => (kind, None),
+                };
+
+                out.push(Reloc {
+                    offset: raw.r_address as u32,
+                    kind,
+                    length,
+                    pcrel: raw.r_pcrel,
+                    referent,
+                    addend,
+                    subtrahend,
+                });
+            }
+        }
+    }
+
+    if pending_addend.is_some() {
+        return Err(ReadError::BadRelocation {
+            at_offset: 0,
+            reason: "trailing ARM64_RELOC_ADDEND with no following primary",
+        });
+    }
+    if pending_subtractor.is_some() {
+        return Err(ReadError::BadRelocation {
+            at_offset: 0,
+            reason: "trailing ARM64_RELOC_SUBTRACTOR with no following UNSIGNED",
+        });
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macho::constants::*;
 
     #[test]
     fn raw_reloc_round_trip_byte_equal() {
@@ -205,5 +419,181 @@ mod tests {
         // Ask for 2 × 8 = 16 bytes starting at 0; we only have 8.
         let err = parse_raw_relocs(&file, 0, 2).unwrap_err();
         assert!(matches!(err, ReadError::Truncated { .. }));
+    }
+
+    // ---------- fused Reloc tests ----------
+
+    fn rel(ty: u8, addr: i32, symnum: u32, ext: bool, pcrel: bool, len: u8) -> RawRelocation {
+        RawRelocation {
+            r_address: addr,
+            r_symbolnum: symnum,
+            r_pcrel: pcrel,
+            r_length: len,
+            r_extern: ext,
+            r_type: ty,
+        }
+    }
+
+    #[test]
+    fn parse_branch26_simple() {
+        let raws = vec![rel(ARM64_RELOC_BRANCH26, 0x10, 3, true, true, 2)];
+        let parsed = parse_relocs(&raws).unwrap();
+        assert_eq!(parsed.len(), 1);
+        let r = parsed[0];
+        assert_eq!(r.kind, RelocKind::Branch26);
+        assert_eq!(r.length, RelocLength::Word);
+        assert!(r.pcrel);
+        assert_eq!(r.referent, Referent::Symbol(3));
+        assert_eq!(r.addend, 0);
+        assert_eq!(r.subtrahend, None);
+    }
+
+    #[test]
+    fn parse_page_pageoff_pair() {
+        let raws = vec![
+            rel(ARM64_RELOC_PAGE21, 0x10, 5, true, true, 2),
+            rel(ARM64_RELOC_PAGEOFF12, 0x14, 5, true, false, 2),
+        ];
+        let parsed = parse_relocs(&raws).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].kind, RelocKind::Page21);
+        assert_eq!(parsed[1].kind, RelocKind::PageOff12);
+        assert!(parsed[0].pcrel);
+        assert!(!parsed[1].pcrel);
+    }
+
+    #[test]
+    fn parse_addend_prefix_folds_positive() {
+        let raws = vec![
+            rel(ARM64_RELOC_ADDEND, 0x10, 0x1000, false, false, 2),
+            rel(ARM64_RELOC_PAGEOFF12, 0x10, 7, true, false, 2),
+        ];
+        let parsed = parse_relocs(&raws).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, RelocKind::PageOff12);
+        assert_eq!(parsed[0].addend, 0x1000);
+        assert_eq!(parsed[0].referent, Referent::Symbol(7));
+    }
+
+    #[test]
+    fn parse_addend_prefix_folds_negative() {
+        // r_symbolnum = 0xFFFFFF → 24-bit signed = -1.
+        let raws = vec![
+            rel(ARM64_RELOC_ADDEND, 0x20, 0x00FF_FFFF, false, false, 2),
+            rel(ARM64_RELOC_UNSIGNED, 0x20, 9, true, false, 3),
+        ];
+        let parsed = parse_relocs(&raws).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].addend, -1);
+        assert_eq!(parsed[0].kind, RelocKind::Unsigned);
+        assert_eq!(parsed[0].length, RelocLength::Quad);
+    }
+
+    #[test]
+    fn parse_subtractor_unsigned_pair() {
+        let raws = vec![
+            rel(ARM64_RELOC_SUBTRACTOR, 0x30, 11, true, false, 3),
+            rel(ARM64_RELOC_UNSIGNED, 0x30, 12, true, false, 3),
+        ];
+        let parsed = parse_relocs(&raws).unwrap();
+        assert_eq!(parsed.len(), 1);
+        let r = parsed[0];
+        assert_eq!(r.kind, RelocKind::Subtractor);
+        assert_eq!(r.referent, Referent::Symbol(12)); // minuend
+        assert_eq!(r.subtrahend, Some(Referent::Symbol(11))); // subtrahend
+        assert_eq!(r.length, RelocLength::Quad);
+    }
+
+    #[test]
+    fn parse_subtractor_with_addend() {
+        // SUBTRACTOR, ADDEND, UNSIGNED — addend applies to the final value.
+        let raws = vec![
+            rel(ARM64_RELOC_SUBTRACTOR, 0x40, 20, true, false, 3),
+            rel(ARM64_RELOC_ADDEND, 0x40, 0x100, false, false, 3),
+            rel(ARM64_RELOC_UNSIGNED, 0x40, 21, true, false, 3),
+        ];
+        let parsed = parse_relocs(&raws).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, RelocKind::Subtractor);
+        assert_eq!(parsed[0].referent, Referent::Symbol(21));
+        assert_eq!(parsed[0].subtrahend, Some(Referent::Symbol(20)));
+        assert_eq!(parsed[0].addend, 0x100);
+    }
+
+    #[test]
+    fn parse_section_relative_referent() {
+        // r_extern = false → section referent (1-based).
+        let raws = vec![rel(ARM64_RELOC_UNSIGNED, 0x0, 2, false, false, 3)];
+        let parsed = parse_relocs(&raws).unwrap();
+        assert_eq!(parsed[0].referent, Referent::Section(2));
+    }
+
+    #[test]
+    fn parse_trailing_addend_errors() {
+        let raws = vec![rel(ARM64_RELOC_ADDEND, 0x0, 1, false, false, 2)];
+        let err = parse_relocs(&raws).unwrap_err();
+        assert!(matches!(
+            err,
+            ReadError::BadRelocation { reason, .. } if reason.contains("trailing")
+        ));
+    }
+
+    #[test]
+    fn parse_trailing_subtractor_errors() {
+        let raws = vec![rel(ARM64_RELOC_SUBTRACTOR, 0x0, 1, true, false, 3)];
+        let err = parse_relocs(&raws).unwrap_err();
+        assert!(matches!(
+            err,
+            ReadError::BadRelocation { reason, .. } if reason.contains("trailing")
+        ));
+    }
+
+    #[test]
+    fn parse_subtractor_not_followed_by_unsigned_errors() {
+        let raws = vec![
+            rel(ARM64_RELOC_SUBTRACTOR, 0x0, 1, true, false, 3),
+            rel(ARM64_RELOC_BRANCH26, 0x0, 2, true, true, 2),
+        ];
+        let err = parse_relocs(&raws).unwrap_err();
+        assert!(matches!(
+            err,
+            ReadError::BadRelocation { reason, .. } if reason.contains("followed by UNSIGNED")
+        ));
+    }
+
+    #[test]
+    fn parse_subtractor_address_mismatch_errors() {
+        let raws = vec![
+            rel(ARM64_RELOC_SUBTRACTOR, 0x0, 1, true, false, 3),
+            rel(ARM64_RELOC_UNSIGNED, 0x8, 2, true, false, 3),
+        ];
+        let err = parse_relocs(&raws).unwrap_err();
+        assert!(matches!(
+            err,
+            ReadError::BadRelocation { reason, .. } if reason.contains("share r_address")
+        ));
+    }
+
+    #[test]
+    fn parse_subtractor_length_mismatch_errors() {
+        let raws = vec![
+            rel(ARM64_RELOC_SUBTRACTOR, 0x0, 1, true, false, 2),
+            rel(ARM64_RELOC_UNSIGNED, 0x0, 2, true, false, 3),
+        ];
+        let err = parse_relocs(&raws).unwrap_err();
+        assert!(matches!(
+            err,
+            ReadError::BadRelocation { reason, .. } if reason.contains("share r_length")
+        ));
+    }
+
+    #[test]
+    fn parse_unknown_reloc_type_errors() {
+        let raws = vec![rel(0x0F, 0x0, 1, true, false, 2)];
+        let err = parse_relocs(&raws).unwrap_err();
+        assert!(matches!(
+            err,
+            ReadError::BadRelocation { reason, .. } if reason.contains("unknown")
+        ));
     }
 }

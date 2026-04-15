@@ -24,6 +24,8 @@ pub enum ReadError {
     UnsupportedCpu { got: u32 },
     /// A load command's `cmdsize` field is malformed.
     BadCmdsize { cmd: u32, cmdsize: u32, at_offset: usize, reason: &'static str },
+    /// A relocation entry or pairing is structurally invalid.
+    BadRelocation { at_offset: u32, reason: &'static str },
 }
 
 impl fmt::Display for ReadError {
@@ -44,6 +46,10 @@ impl fmt::Display for ReadError {
             ReadError::BadCmdsize { cmd, cmdsize, at_offset, reason } => write!(
                 f,
                 "load command 0x{cmd:x} at offset 0x{at_offset:x}: cmdsize {cmdsize} invalid ({reason})"
+            ),
+            ReadError::BadRelocation { at_offset, reason } => write!(
+                f,
+                "malformed relocation at offset 0x{at_offset:x}: {reason}"
             ),
         }
     }

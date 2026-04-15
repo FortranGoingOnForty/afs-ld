@@ -318,6 +318,114 @@ pub fn parse_relocs(raws: &[RawRelocation]) -> Result<Vec<Reloc>, ReadError> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Round-trip encoder: fused Reloc -> raw wire entries.
+// ---------------------------------------------------------------------------
+
+fn ref_to_raw_parts(r: Referent) -> (u32, bool) {
+    match r {
+        Referent::Symbol(idx) => (idx & 0x00FF_FFFF, true),
+        Referent::Section(idx) => (idx as u32, false),
+    }
+}
+
+fn reloc_type_byte(k: RelocKind) -> u8 {
+    match k {
+        RelocKind::Unsigned => ARM64_RELOC_UNSIGNED,
+        RelocKind::Branch26 => ARM64_RELOC_BRANCH26,
+        RelocKind::Page21 => ARM64_RELOC_PAGE21,
+        RelocKind::PageOff12 => ARM64_RELOC_PAGEOFF12,
+        RelocKind::GotLoadPage21 => ARM64_RELOC_GOT_LOAD_PAGE21,
+        RelocKind::GotLoadPageOff12 => ARM64_RELOC_GOT_LOAD_PAGEOFF12,
+        RelocKind::PointerToGot => ARM64_RELOC_POINTER_TO_GOT,
+        RelocKind::TlvpLoadPage21 => ARM64_RELOC_TLVP_LOAD_PAGE21,
+        RelocKind::TlvpLoadPageOff12 => ARM64_RELOC_TLVP_LOAD_PAGEOFF12,
+        RelocKind::Subtractor => ARM64_RELOC_UNSIGNED, // the minuend half of the pair
+    }
+}
+
+fn encode_addend_prefix(offset: i32, addend: i64, length: u8) -> Result<RawRelocation, ReadError> {
+    const ADDEND_MIN: i64 = -0x0080_0000;
+    const ADDEND_MAX: i64 = 0x007F_FFFF;
+    if !(ADDEND_MIN..=ADDEND_MAX).contains(&addend) {
+        return Err(ReadError::BadRelocation {
+            at_offset: offset as u32,
+            reason: "addend outside 24-bit signed range (use ARM64_RELOC_ADDEND)",
+        });
+    }
+    let sym = (addend as i32) as u32 & 0x00FF_FFFF;
+    Ok(RawRelocation {
+        r_address: offset,
+        r_symbolnum: sym,
+        r_pcrel: false,
+        r_length: length,
+        r_extern: false,
+        r_type: ARM64_RELOC_ADDEND,
+    })
+}
+
+/// Lower the fused `Reloc` stream back to raw wire entries.
+/// `parse_relocs(write_relocs(r))` must produce `r` for any `r` that came out
+/// of `parse_relocs`; `write_raw_relocs(write_relocs(r))` produces bytes that
+/// re-read through `parse_raw_relocs` into the same raw stream.
+pub fn write_relocs(relocs: &[Reloc]) -> Result<Vec<RawRelocation>, ReadError> {
+    let mut out = Vec::with_capacity(relocs.len() * 2);
+    for r in relocs {
+        match r.kind {
+            RelocKind::Subtractor => {
+                let sub = r.subtrahend.ok_or(ReadError::BadRelocation {
+                    at_offset: r.offset,
+                    reason: "Subtractor kind requires a subtrahend",
+                })?;
+                let (sub_sym, sub_ext) = ref_to_raw_parts(sub);
+                out.push(RawRelocation {
+                    r_address: r.offset as i32,
+                    r_symbolnum: sub_sym,
+                    r_pcrel: false,
+                    r_length: r.length.as_bits(),
+                    r_extern: sub_ext,
+                    r_type: ARM64_RELOC_SUBTRACTOR,
+                });
+                if r.addend != 0 {
+                    out.push(encode_addend_prefix(
+                        r.offset as i32,
+                        r.addend,
+                        r.length.as_bits(),
+                    )?);
+                }
+                let (min_sym, min_ext) = ref_to_raw_parts(r.referent);
+                out.push(RawRelocation {
+                    r_address: r.offset as i32,
+                    r_symbolnum: min_sym,
+                    r_pcrel: false,
+                    r_length: r.length.as_bits(),
+                    r_extern: min_ext,
+                    r_type: ARM64_RELOC_UNSIGNED,
+                });
+            }
+            kind => {
+                if r.addend != 0 {
+                    out.push(encode_addend_prefix(
+                        r.offset as i32,
+                        r.addend,
+                        r.length.as_bits(),
+                    )?);
+                }
+                let (sym, ext) = ref_to_raw_parts(r.referent);
+                out.push(RawRelocation {
+                    r_address: r.offset as i32,
+                    r_symbolnum: sym,
+                    r_pcrel: r.pcrel,
+                    r_length: r.length.as_bits(),
+                    r_extern: ext,
+                    r_type: reloc_type_byte(kind),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +703,154 @@ mod tests {
             err,
             ReadError::BadRelocation { reason, .. } if reason.contains("unknown")
         ));
+    }
+
+    // ---------- round-trip write_relocs tests ----------
+
+    #[test]
+    fn write_then_parse_round_trip_simple() {
+        let input = vec![Reloc {
+            offset: 0x10,
+            kind: RelocKind::Branch26,
+            length: RelocLength::Word,
+            pcrel: true,
+            referent: Referent::Symbol(5),
+            addend: 0,
+            subtrahend: None,
+        }];
+        let raws = write_relocs(&input).unwrap();
+        assert_eq!(raws.len(), 1); // no ADDEND prefix when addend=0
+        let back = parse_relocs(&raws).unwrap();
+        assert_eq!(back, input);
+    }
+
+    #[test]
+    fn write_then_parse_round_trip_with_addend() {
+        let input = vec![Reloc {
+            offset: 0x20,
+            kind: RelocKind::PageOff12,
+            length: RelocLength::Word,
+            pcrel: false,
+            referent: Referent::Symbol(7),
+            addend: 0x1000,
+            subtrahend: None,
+        }];
+        let raws = write_relocs(&input).unwrap();
+        assert_eq!(raws.len(), 2);
+        assert_eq!(raws[0].r_type, ARM64_RELOC_ADDEND);
+        assert_eq!(raws[1].r_type, ARM64_RELOC_PAGEOFF12);
+        let back = parse_relocs(&raws).unwrap();
+        assert_eq!(back, input);
+    }
+
+    #[test]
+    fn write_then_parse_round_trip_subtractor_pair() {
+        let input = vec![Reloc {
+            offset: 0x30,
+            kind: RelocKind::Subtractor,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(12),
+            addend: 0,
+            subtrahend: Some(Referent::Symbol(11)),
+        }];
+        let raws = write_relocs(&input).unwrap();
+        assert_eq!(raws.len(), 2);
+        assert_eq!(raws[0].r_type, ARM64_RELOC_SUBTRACTOR);
+        assert_eq!(raws[0].r_symbolnum, 11);
+        assert_eq!(raws[1].r_type, ARM64_RELOC_UNSIGNED);
+        assert_eq!(raws[1].r_symbolnum, 12);
+        let back = parse_relocs(&raws).unwrap();
+        assert_eq!(back, input);
+    }
+
+    #[test]
+    fn write_then_parse_round_trip_subtractor_with_addend() {
+        let input = vec![Reloc {
+            offset: 0x40,
+            kind: RelocKind::Subtractor,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(21),
+            addend: 0x100,
+            subtrahend: Some(Referent::Symbol(20)),
+        }];
+        let raws = write_relocs(&input).unwrap();
+        assert_eq!(raws.len(), 3);
+        assert_eq!(raws[0].r_type, ARM64_RELOC_SUBTRACTOR);
+        assert_eq!(raws[1].r_type, ARM64_RELOC_ADDEND);
+        assert_eq!(raws[2].r_type, ARM64_RELOC_UNSIGNED);
+        let back = parse_relocs(&raws).unwrap();
+        assert_eq!(back, input);
+    }
+
+    #[test]
+    fn write_then_parse_round_trip_negative_addend() {
+        let input = vec![Reloc {
+            offset: 0x50,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(3),
+            addend: -1,
+            subtrahend: None,
+        }];
+        let raws = write_relocs(&input).unwrap();
+        let back = parse_relocs(&raws).unwrap();
+        assert_eq!(back, input);
+    }
+
+    #[test]
+    fn write_subtractor_without_subtrahend_errors() {
+        let bad = vec![Reloc {
+            offset: 0,
+            kind: RelocKind::Subtractor,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(1),
+            addend: 0,
+            subtrahend: None,
+        }];
+        let err = write_relocs(&bad).unwrap_err();
+        assert!(matches!(
+            err,
+            ReadError::BadRelocation { reason, .. } if reason.contains("subtrahend")
+        ));
+    }
+
+    #[test]
+    fn write_addend_overflow_errors() {
+        let bad = vec![Reloc {
+            offset: 0,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(1),
+            addend: 0x0100_0000, // outside 24-bit signed range
+            subtrahend: None,
+        }];
+        let err = write_relocs(&bad).unwrap_err();
+        assert!(matches!(
+            err,
+            ReadError::BadRelocation { reason, .. } if reason.contains("24-bit")
+        ));
+    }
+
+    #[test]
+    fn write_then_parse_round_trip_section_referent() {
+        let input = vec![Reloc {
+            offset: 0x60,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Section(2),
+            addend: 0,
+            subtrahend: None,
+        }];
+        let raws = write_relocs(&input).unwrap();
+        assert!(!raws[0].r_extern);
+        assert_eq!(raws[0].r_symbolnum, 2);
+        let back = parse_relocs(&raws).unwrap();
+        assert_eq!(back, input);
     }
 }

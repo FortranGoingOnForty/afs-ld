@@ -263,9 +263,21 @@ pub enum InsertError {
         first: SymbolId,
         second: Box<Symbol>,
     },
-    /// Alias chain would cycle back to itself.
+    /// Alias chain would cycle back to itself or exceed the depth cap.
     AliasCycle { name: Istr },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    /// `lookup` returned `None` for this name.
+    Unknown(Istr),
+    /// Alias chain cycled or exceeded `MAX_ALIAS_DEPTH`.
+    AliasCycle { start: Istr },
+}
+
+/// Maximum hops through alias chains before we call it a cycle. Real
+/// `N_INDR` chains are almost always a single hop; 32 is generous.
+pub const MAX_ALIAS_DEPTH: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transition {
@@ -518,9 +530,12 @@ impl SymbolTable {
         existing_id: SymbolId,
         sym: Symbol,
     ) -> Result<InsertOutcome, InsertError> {
-        // Cycle detection happens in the dedicated path added by the next
-        // commit (alias flattening). For now we accept the alias; Sprint 8
-        // will walk chains at lookup time.
+        let Symbol::Alias { name, aliased } = &sym else {
+            unreachable!("insert_alias_over called with non-Alias symbol");
+        };
+        if self.alias_would_cycle(*name, *aliased) {
+            return Err(InsertError::AliasCycle { name: *name });
+        }
         let from = self.symbols[existing_id.0 as usize].kind();
         self.symbols[existing_id.0 as usize] = sym;
         self.transitions.push(Transition {
@@ -534,6 +549,50 @@ impl SymbolTable {
             from,
             to: SymbolKindTag::Alias,
         })
+    }
+
+    /// Walk alias chains to a concrete (non-Alias) symbol. Used by Sprint 8
+    /// during name resolution and by `-why_live` to trace where a symbol
+    /// ultimately points. Returns `AliasCycle` if the chain loops or
+    /// exceeds `MAX_ALIAS_DEPTH`.
+    pub fn resolve_chain(&self, name: Istr) -> Result<(SymbolId, &Symbol), ResolveError> {
+        let mut current = name;
+        for _ in 0..MAX_ALIAS_DEPTH {
+            let Some(id) = self.by_name.get(&current).copied() else {
+                return Err(ResolveError::Unknown(name));
+            };
+            let sym = &self.symbols[id.0 as usize];
+            match sym {
+                Symbol::Alias { aliased, .. } => current = *aliased,
+                _ => return Ok((id, sym)),
+            }
+        }
+        Err(ResolveError::AliasCycle { start: name })
+    }
+
+    /// Check whether adding an alias `new_name → target` would create a
+    /// cycle. Returns true if walking the existing chain from `target`
+    /// reaches `new_name` within `MAX_ALIAS_DEPTH` steps.
+    fn alias_would_cycle(&self, new_name: Istr, target: Istr) -> bool {
+        // A self-loop (`_foo → _foo`) is the shortest cycle.
+        if new_name == target {
+            return true;
+        }
+        let mut current = target;
+        for _ in 0..MAX_ALIAS_DEPTH {
+            if current == new_name {
+                return true;
+            }
+            let Some(id) = self.by_name.get(&current).copied() else {
+                return false;
+            };
+            match &self.symbols[id.0 as usize] {
+                Symbol::Alias { aliased, .. } => current = *aliased,
+                _ => return false,
+            }
+        }
+        // Exceeded the depth cap — treat as a cycle.
+        true
     }
 }
 

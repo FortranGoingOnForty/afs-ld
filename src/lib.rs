@@ -6,6 +6,7 @@
 
 pub mod args;
 pub mod diag;
+pub mod dump;
 pub mod macho;
 
 use std::path::PathBuf;
@@ -25,6 +26,9 @@ pub struct LinkOptions {
     pub entry: Option<String>,
     pub arch: Option<String>,
     pub kind: OutputKind,
+    /// When set, afs-ld operates in dump mode and prints the given file's
+    /// header + load commands instead of linking.
+    pub dump: Option<PathBuf>,
 }
 
 impl Default for LinkOptions {
@@ -35,6 +39,7 @@ impl Default for LinkOptions {
             entry: None,
             arch: None,
             kind: OutputKind::Executable,
+            dump: None,
         }
     }
 }

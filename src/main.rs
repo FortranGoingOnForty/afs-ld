@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use afs_ld::{args, diag, LinkError, Linker};
+use afs_ld::{args, diag, dump, LinkError, Linker};
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
@@ -12,6 +12,16 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    if let Some(path) = &opts.dump {
+        return match dump::dump_file(path) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                diag::error(&format!("{}: {}", path.display(), e));
+                ExitCode::from(1)
+            }
+        };
+    }
 
     match Linker::run(&opts) {
         Ok(()) => ExitCode::SUCCESS,

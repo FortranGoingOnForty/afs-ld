@@ -56,6 +56,12 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
             "-dylib" => {
                 opts.kind = OutputKind::Dylib;
             }
+            "--dump" => {
+                opts.dump = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("--dump".into()))?,
+                ));
+            }
             s if s.starts_with('-') => {
                 return Err(ArgsError::UnknownFlag(s.to_string()));
             }
@@ -105,5 +111,17 @@ mod tests {
     fn empty_argv_is_ok_with_no_inputs() {
         let opts = parse(&[]).unwrap();
         assert!(opts.inputs.is_empty());
+    }
+
+    #[test]
+    fn dump_flag_captures_path() {
+        let opts = parse(&argv(&["--dump", "some.o"])).unwrap();
+        assert_eq!(opts.dump.as_deref(), Some(std::path::Path::new("some.o")));
+    }
+
+    #[test]
+    fn dump_flag_without_value_errors() {
+        let err = parse(&argv(&["--dump"])).unwrap_err();
+        assert!(matches!(err, ArgsError::MissingValue(ref f) if f == "--dump"));
     }
 }

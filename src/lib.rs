@@ -6,6 +6,7 @@
 
 pub mod archive;
 pub mod args;
+pub mod atom;
 pub mod diag;
 pub mod dump;
 pub mod input;

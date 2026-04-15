@@ -7,33 +7,28 @@
 use std::io::{self, Write};
 use std::path::Path;
 
+use crate::input::ObjectFile;
 use crate::macho::constants::*;
 use crate::macho::reader::{
-    parse_commands, parse_header, BuildVersionCmd, DysymtabCmd, LinkEditDataCmd, LoadCommand,
-    MachHeader64, Section64Header, Segment64, SymtabCmd,
+    BuildVersionCmd, DysymtabCmd, LinkEditDataCmd, LoadCommand, MachHeader64, Section64Header,
+    Segment64, SymtabCmd,
 };
+use crate::section::InputSection;
+use crate::symbol::{InputSymbol, SymKind};
 
 pub fn dump_file(path: &Path) -> io::Result<()> {
     let bytes = std::fs::read(path)?;
+    let obj = ObjectFile::parse(path, &bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let out = io::stdout();
     let mut h = out.lock();
     writeln!(h, "{}:", path.display())?;
-    let hdr = match parse_header(&bytes) {
-        Ok(h) => h,
-        Err(e) => {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
-        }
-    };
-    write_header(&mut h, &hdr)?;
-    let cmds = match parse_commands(&hdr, &bytes) {
-        Ok(c) => c,
-        Err(e) => {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
-        }
-    };
-    for (i, cmd) in cmds.iter().enumerate() {
+    write_header(&mut h, &obj.header)?;
+    for (i, cmd) in obj.commands.iter().enumerate() {
         write_command(&mut h, i, cmd)?;
     }
+    write_sections(&mut h, &obj.sections)?;
+    write_symbols(&mut h, &obj)?;
     Ok(())
 }
 
@@ -155,6 +150,107 @@ fn write_linkedit_data(w: &mut impl Write, l: &LinkEditDataCmd, kind: &str) -> i
         "  {kind} dataoff={} datasize={}",
         l.dataoff, l.datasize
     )
+}
+
+fn write_sections(w: &mut impl Write, secs: &[InputSection]) -> io::Result<()> {
+    if secs.is_empty() {
+        return Ok(());
+    }
+    writeln!(w, "Sections ({}):", secs.len())?;
+    for (i, s) in secs.iter().enumerate() {
+        writeln!(
+            w,
+            "  [{i}] {},{:<16} {:?} addr=0x{:x} size=0x{:x} align=2^{} offset={} flags=0x{:08x}",
+            s.segname,
+            s.sectname,
+            s.kind,
+            s.addr,
+            s.size,
+            s.align_pow2,
+            s.offset,
+            s.flags
+        )?;
+        if !s.data.is_empty() {
+            writeln!(w, "      data: {}", hex_preview(&s.data, 16))?;
+        }
+        if s.nreloc > 0 {
+            writeln!(
+                w,
+                "      relocs: {} entry/ies at offset {} (decoded in Sprint 3)",
+                s.nreloc, s.reloff
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn write_symbols(w: &mut impl Write, obj: &ObjectFile) -> io::Result<()> {
+    if obj.symbols.is_empty() {
+        return Ok(());
+    }
+    writeln!(w, "Symbols ({}):", obj.symbols.len())?;
+    for (i, sym) in obj.symbols.iter().enumerate() {
+        let name = obj.symbol_name(sym).unwrap_or("<unresolved>");
+        writeln!(w, "  [{i}] {:<32} {}", name, describe_symbol(sym))?;
+    }
+    Ok(())
+}
+
+fn describe_symbol(sym: &InputSymbol) -> String {
+    if let Some(stab) = sym.stab_kind() {
+        return format!("STAB kind=0x{stab:02x} sect={} value=0x{:x}", sym.sect_idx(), sym.value());
+    }
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(
+        match sym.kind() {
+            SymKind::Undef => "UNDF",
+            SymKind::Abs => "ABS",
+            SymKind::Sect => "SECT",
+            SymKind::Indirect => "INDR",
+        }
+        .to_string(),
+    );
+    if sym.is_ext() {
+        parts.push("ext".into());
+    }
+    if sym.is_private_ext() {
+        parts.push("pext".into());
+    }
+    if sym.weak_def() {
+        parts.push("weak_def".into());
+    }
+    if sym.weak_ref() {
+        parts.push("weak_ref".into());
+    }
+    if sym.no_dead_strip() {
+        parts.push("no_dead_strip".into());
+    }
+    match sym.kind() {
+        SymKind::Sect => parts.push(format!("sect={} value=0x{:x}", sym.sect_idx(), sym.value())),
+        SymKind::Abs => parts.push(format!("value=0x{:x}", sym.value())),
+        SymKind::Undef => {
+            if let Some(sz) = sym.common_size() {
+                let a = sym.common_align_pow2().unwrap_or(0);
+                parts.push(format!("common size={sz} align=2^{a}"));
+            } else if let Some(ord) = sym.library_ordinal() {
+                parts.push(format!("ord={ord}"));
+            }
+        }
+        SymKind::Indirect => {
+            parts.push(format!("-> strx={}", sym.value() as u32));
+        }
+    }
+    parts.join(" ")
+}
+
+fn hex_preview(bytes: &[u8], max: usize) -> String {
+    let shown = bytes.iter().take(max);
+    let hex: Vec<String> = shown.map(|b| format!("{b:02x}")).collect();
+    if bytes.len() > max {
+        format!("{} ... ({} more)", hex.join(" "), bytes.len() - max)
+    } else {
+        hex.join(" ")
+    }
 }
 
 // ---- pretty-printers ------------------------------------------------------

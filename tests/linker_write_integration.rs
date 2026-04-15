@@ -297,3 +297,48 @@ fn linker_emits_load_dylib_for_direct_dependency_input() {
     let _ = fs::remove_file(&dep);
     let _ = fs::remove_file(&out);
 }
+
+#[test]
+fn linker_emits_rpath_load_command() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("rpath-main.o");
+    let out = scratch("rpath-linked");
+    if let Err(e) = assemble(
+        r#"
+            .section __TEXT,__text,regular,pure_instructions
+            .globl _main
+            _main:
+                ret
+        "#,
+        &obj,
+    ) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    link_with_afs_ld(&[
+        obj.to_str().unwrap(),
+        "-rpath",
+        "@executable_path/../lib",
+        "-o",
+        out.to_str().unwrap(),
+    ])
+    .expect("link executable with rpath");
+
+    let bytes = fs::read(&out).expect("read executable");
+    let hdr = parse_header(&bytes).expect("parse header");
+    let cmds = parse_commands(&hdr, &bytes).expect("parse commands");
+    assert!(cmds.iter().any(|cmd| {
+        matches!(
+            cmd,
+            LoadCommand::Rpath(r) if r.path == "@executable_path/../lib"
+        )
+    }));
+
+    let _ = fs::remove_file(&obj);
+    let _ = fs::remove_file(&out);
+}

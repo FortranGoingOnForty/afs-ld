@@ -49,6 +49,7 @@ pub struct LinkOptions {
     pub syslibroots: Vec<PathBuf>,
     pub library_search_paths: Vec<PathBuf>,
     pub framework_search_paths: Vec<PathBuf>,
+    pub rpaths: Vec<String>,
     /// When set, afs-ld operates in dump mode and prints the given file's
     /// header + load commands instead of linking.
     pub dump: Option<PathBuf>,
@@ -74,6 +75,7 @@ impl Default for LinkOptions {
             syslibroots: Vec::new(),
             library_search_paths: Vec::new(),
             framework_search_paths: Vec::new(),
+            rpaths: Vec::new(),
             dump: None,
             dump_archive: None,
             dump_dylib: None,
@@ -169,7 +171,7 @@ impl Linker {
         }
 
         let layout = section::build_layout(opts.kind, &atoms, &table);
-        let plan = build_write_plan(&inputs);
+        let plan = build_write_plan(&inputs, opts);
         let mut bytes = Vec::new();
         macho::writer::write_with_atoms_and_plan(&layout, &atoms, opts.kind, opts, &plan, &mut bytes)
             .map_err(LinkError::Write)?;
@@ -189,7 +191,7 @@ fn output_path(opts: &LinkOptions) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("a.out"))
 }
 
-fn build_write_plan(inputs: &Inputs) -> macho::writer::WritePlan {
+fn build_write_plan(inputs: &Inputs, opts: &LinkOptions) -> macho::writer::WritePlan {
     macho::writer::WritePlan {
         dylibs: inputs
             .dylibs
@@ -202,7 +204,7 @@ fn build_write_plan(inputs: &Inputs) -> macho::writer::WritePlan {
                 compatibility_version: dylib.file.compatibility_version,
             })
             .collect(),
-        rpaths: Vec::new(),
+        rpaths: opts.rpaths.clone(),
     }
 }
 

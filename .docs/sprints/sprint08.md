@@ -6,6 +6,11 @@ Sprint 7 — `SymbolTable` with insertion semantics.
 ## Goals
 Drive the symbol table to a fixed point: every undefined reference either resolves to a Defined (from an object), Common (promoted in BSS), DylibImport (from a dylib/TBD), or raises a clear, actionable diagnostic. `-force_load` / `-all_load` / `-undefined <treatment>` all handled.
 
+Closeout note: the implemented entrypoint is
+`resolve(inputs, table, opts) -> ResolutionReport`. The current library
+surface applies archive force-loading as archives are encountered in
+command-line order so left-to-right archive behavior stays explicit.
+
 ## Deliverables
 
 ### 1. Resolution algorithm
@@ -13,13 +18,10 @@ Drive the symbol table to a fixed point: every undefined reference either resolv
 
 ```rust
 pub fn resolve(inputs: &mut Inputs, table: &mut SymbolTable, opts: &LinkOptions)
-    -> Result<(), Vec<ResolveError>>
+    -> Result<ResolutionReport, ResolutionError>
 {
-    seed_table_with_objects_and_dylib_imports(inputs, table, opts);
-    if opts.all_load    { force_load_everything(inputs, table); }
-    for forced in &opts.force_load { force_load_one(inputs, table, forced); }
-    fixed_point_pull_from_archives(inputs, table);
-    classify_unresolved(table, opts);
+    seed_and_resolve_in_link_order(inputs, table, opts);
+    classify_unresolved(table, opts.undefined_treatment);
 }
 ```
 
@@ -43,7 +45,7 @@ Order matters: armfortas's driver currently passes `<objs> <runtime.a> -lSystem`
 ### 4. `-force_load` and `-all_load`
 - `-force_load <archive>`: pull every member of that archive before fixed-point.
 - `-all_load`: pull every member of every archive.
-- Both happen before the fixed-point loop so their transitively-pulled symbols feed into the same fixed point.
+- In the implemented surface these happen when the named archive is encountered in link order, which preserves left-to-right linker semantics while still feeding the same resolution/classification pipeline.
 
 ### 5. `-undefined <treatment>`
 After the fixed point, any still-Undefined entry is classified by the `-undefined` setting:
@@ -60,8 +62,8 @@ Undefined errors must cite every referrer input, not just one. Output format:
 
 ```
 afs-ld: error: undefined symbol: _afs_print
-      referenced by program.o(text section + 0x34)
-      referenced by runtime.o(text section + 0x120)
+      referenced by program.o(__TEXT,__text + 0x34)
+      referenced by runtime.o(__TEXT,__text + 0x120)
       (also via 2 relocations in libarmfortas_rt.a(io.o))
 Hint: did you mean _afs_print_real? (Levenshtein distance 5)
 ```
@@ -71,8 +73,8 @@ Did-you-mean uses a basic Levenshtein-3 search over defined symbols.
 ### 8. Diagnostics for duplicate strong
 ```
 afs-ld: error: duplicate symbol _foo
-  defined in: a.o (text + 0x0)
-  also in:    b.o (text + 0x0)
+  defined in: a.o (__TEXT,__text + 0x0)
+  also in:    b.o (__TEXT,__text + 0x0)
 ```
 
 No suggestion — two strong defs is a real ambiguity.

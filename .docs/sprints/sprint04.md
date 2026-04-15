@@ -6,6 +6,13 @@ Sprints 1–3 — Mach-O reading complete.
 ## Goals
 Read static archives (`.a`) including the BSD, System V, and GNU-thin variants. Support lazy member fetching: a member is only parsed when an undefined symbol names it. This is the mechanism by which `libarmfortas_rt.a` gets pulled in.
 
+Closeout note: the force-load surface landed in the resolver as
+`resolve::force_load_archive` / `resolve::force_load_all`, and one-level
+nested archives are expanded through the fetched-member path with provenance
+chains such as `outer.a(inner.a)(foo.o)`. `--dump-archive` now intentionally
+prints the same member listing shape as `ar -t`, and parity is checked
+against both generated archives and `libarmfortas_rt.a` when available.
+
 ## Deliverables
 
 ### 1. Archive format recognizer
@@ -69,7 +76,10 @@ impl<'a> Archive<'a> {
 Returns `None` if the archive does not define `name`. Fetching an archive member memoizes: a second lookup for the same member returns a cached handle. The resolution pass (Sprint 8) is the only caller.
 
 ### 6. `-force_load` / `-all_load` support (semantics, not CLI yet)
-Archive has a `force_all(&mut self)` method that pre-fetches every member. Sprint 19 wires the CLI.
+Implemented via the resolver-level helpers
+`resolve::force_load_archive` / `resolve::force_load_all`, which pre-fetch
+archive members against the live linker input registry. Sprint 19 wires the
+CLI surface.
 
 ### 7. Archive-of-archives
 Rare but legal: member can be another `.a`. Recurse one level. If a sub-archive defines `name`, the outer `fetch` returns the sub-member's object file and records a provenance chain for diagnostics.

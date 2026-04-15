@@ -88,14 +88,16 @@ pub fn link_both(case: &LinkCase) -> LinkOutputs;
 pub fn diff_macho(ours: &[u8], theirs: &[u8]) -> DiffReport;
 ```
 
-`DiffReport` categorizes byte differences as `Tolerated` (UUID, timestamp, temp-path hashes) or `Critical` (anything else). Critical diffs fail the test. `link_both` shells out to `ld` via `xcrun -f ld` so it picks up the active toolchain.
+`DiffReport` categorizes byte differences as `Tolerated` (UUID, timestamp, temp-path hashes) or `Critical` (anything else). Critical diffs fail the test.
+
+Closeout note: the current Sprint 0 surface is intentionally synthetic. `diff_macho` exists and is tested, but `link_both` remains a placeholder until afs-ld can emit real linked output. That means the current harness validates diff categorization logic, not end-to-end linker parity yet.
 
 ### 6. Skeleton CLI and first failing test
 
 - `afs-ld/src/args.rs`: hand-rolled argv parser stub that recognizes `-o`, `-e`, `-arch`, and positional inputs. Unknown flags error loudly with a hint.
 - `afs-ld/tests/reader_empty.rs`: attempts to link `0 inputs → empty output`, expects the diagnostic `"afs-ld: error: no input files"`. Passes today by producing that exact string.
-- `afs-ld/tests/diff_harness_sanity.rs`: runs the harness against a known-identical pair (two copies of the same pre-linked binary produced by `xcrun ld`) and expects zero diffs. Passes.
-- `afs-ld/tests/diff_harness_finds_critical.rs`: feeds the harness two binaries that differ in a non-tolerated byte range (e.g. different text bytes) and asserts the harness reports `Critical`. Passes.
+- `afs-ld/tests/diff_harness_sanity.rs`: exercises the diff surface against two identical synthetic byte slices and expects zero diffs. Passes.
+- `afs-ld/tests/diff_harness_finds_critical.rs`: feeds the harness two synthetic binaries that differ in a non-tolerated byte range and asserts the harness reports `Critical`. Passes.
 
 ## Testing Strategy
 
@@ -115,5 +117,5 @@ pub fn diff_macho(ours: &[u8], theirs: &[u8]) -> DiffReport;
 - `armfortas/Cargo.toml` lists `afs-ld` in `[workspace] members`.
 - `afs-ld/CLAUDE.md`, `README.md`, `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `src/args.rs` all committed in the new repo.
 - `.refs/ld64/` and `.refs/mold/` cloned.
-- Differential harness runs, correctly reports zero diffs on identical binaries, correctly reports critical diffs on intentionally-different binaries.
+- Differential harness substrate runs, correctly reports zero diffs on identical byte slices, correctly reports critical diffs on intentionally-different byte slices.
 - `cargo test --workspace` green.

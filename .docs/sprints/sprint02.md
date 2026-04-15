@@ -6,6 +6,13 @@ Sprint 1 — header + load commands parsed.
 ## Goals
 Decode section payloads, the symbol table (nlist_64), and the string table. Expose the full section/symbol/string model that later sprints build on.
 
+Closeout note: `tests/reader_malformed_stress.rs` now also covers malformed
+symbol/string-table variants derived from real corpus objects so the reader's
+symbol and string surfaces are exercised under targeted bad-input cases, not
+just hand-written unit fixtures. `tests/reader_tool_parity.rs` now also checks
+symbol classification against `nm -a` and raw relocation tables against
+`otool -r` across the afs-as corpus.
+
 ## Deliverables
 
 ### 1. Section attributes and kinds

@@ -6,6 +6,12 @@ Sprint 0 — crate, harness, references in place.
 ## Goals
 Read a Mach-O relocatable object file: parse the header and every load command afs-as emits. End state: given any `.o` in `afs-as/tests/corpus/`, afs-ld can pretty-print its structure and round-trip-compare it to a golden.
 
+Closeout note: alongside the original unit coverage, `tests/reader_malformed_stress.rs`
+now runs deterministic truncated/header-corruption cases over real corpus-built
+objects to defend the "no panics on malformed input" bar, and
+`tests/reader_tool_parity.rs` checks the `--dump` load-command surface against
+`otool -lV` across the afs-as corpus.
+
 ## Deliverables
 
 ### 1. Mach-O constants

@@ -9,6 +9,7 @@
 //! `OutputSection` / `OutputSegment` (layout model) on top of this module.
 
 use crate::macho::constants::*;
+use crate::macho::reader::{name16_str, ReadError, Section64Header};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SectionKind {
@@ -109,6 +110,107 @@ pub fn is_executable(kind: SectionKind) -> bool {
         kind,
         SectionKind::Text | SectionKind::SymbolStubs | SectionKind::Coalesced
     )
+}
+
+// ---------------------------------------------------------------------------
+// InputSection — the linker-side model for one input .o's section.
+// ---------------------------------------------------------------------------
+
+/// A single input-file section with its decoded header, kind, content slice,
+/// and raw relocation bytes. Relocation decoding happens in Sprint 3; here we
+/// preserve the wire bytes unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputSection {
+    pub segname: String,
+    pub sectname: String,
+    pub kind: SectionKind,
+    pub addr: u64,
+    pub size: u64,
+    pub align_pow2: u32,
+    pub flags: u32,
+    pub offset: u32,
+    pub reloff: u32,
+    pub nreloc: u32,
+    pub reserved1: u32,
+    pub reserved2: u32,
+    pub reserved3: u32,
+    /// File-backed bytes of the section. Empty for zerofill/TLS-zerofill/GB.
+    pub data: Vec<u8>,
+    /// Raw 8-byte relocation_info entries (`nreloc × 8` bytes). Decoded in
+    /// Sprint 3; owned here so later passes can reinterpret without
+    /// re-reading the source file.
+    pub raw_relocs: Vec<u8>,
+}
+
+impl InputSection {
+    /// Lift an `InputSection` out of a file image using the decoded section
+    /// header to locate its content and relocation bytes.
+    pub fn from_header(hdr: &Section64Header, file_bytes: &[u8]) -> Result<Self, ReadError> {
+        let segname = name16_str(&hdr.segname);
+        let sectname = name16_str(&hdr.sectname);
+        let kind = classify_section(&segname, &sectname, hdr.flags);
+
+        let data = if is_zerofill(kind) {
+            Vec::new()
+        } else {
+            let start = hdr.offset as usize;
+            let end = start.checked_add(hdr.size as usize).ok_or(ReadError::Truncated {
+                need: usize::MAX,
+                have: file_bytes.len(),
+                context: "section content (offset + size overflows)",
+            })?;
+            if end > file_bytes.len() {
+                return Err(ReadError::Truncated {
+                    need: end,
+                    have: file_bytes.len(),
+                    context: "section content",
+                });
+            }
+            file_bytes[start..end].to_vec()
+        };
+
+        let raw_relocs = if hdr.nreloc == 0 {
+            Vec::new()
+        } else {
+            let start = hdr.reloff as usize;
+            let total = (hdr.nreloc as usize).checked_mul(8).ok_or(ReadError::Truncated {
+                need: usize::MAX,
+                have: file_bytes.len(),
+                context: "section relocs (nreloc × 8 overflows)",
+            })?;
+            let end = start.checked_add(total).ok_or(ReadError::Truncated {
+                need: usize::MAX,
+                have: file_bytes.len(),
+                context: "section relocs (reloff + size overflows)",
+            })?;
+            if end > file_bytes.len() {
+                return Err(ReadError::Truncated {
+                    need: end,
+                    have: file_bytes.len(),
+                    context: "section relocs",
+                });
+            }
+            file_bytes[start..end].to_vec()
+        };
+
+        Ok(InputSection {
+            segname,
+            sectname,
+            kind,
+            addr: hdr.addr,
+            size: hdr.size,
+            align_pow2: hdr.align,
+            flags: hdr.flags,
+            offset: hdr.offset,
+            reloff: hdr.reloff,
+            nreloc: hdr.nreloc,
+            reserved1: hdr.reserved1,
+            reserved2: hdr.reserved2,
+            reserved3: hdr.reserved3,
+            data,
+            raw_relocs,
+        })
+    }
 }
 
 #[cfg(test)]

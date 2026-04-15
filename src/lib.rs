@@ -7,6 +7,7 @@
 pub mod args;
 pub mod diag;
 pub mod dump;
+pub mod input;
 pub mod macho;
 pub mod section;
 pub mod string_table;

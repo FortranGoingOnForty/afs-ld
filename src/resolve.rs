@@ -794,6 +794,10 @@ pub struct SeedReport {
     /// Collected rather than short-circuited so the user sees all of them
     /// in one pass.
     pub duplicates: Vec<InsertError>,
+    /// `(name, origin)` for every reference to an external name seen in
+    /// an object file. Drives the "referenced by" lines in undefined-
+    /// symbol diagnostics. Multi-input references accumulate.
+    pub referrers: ReferrerLog,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -801,6 +805,34 @@ pub struct PendingFetch {
     pub id: SymbolId,
     pub archive: ArchiveId,
     pub member: MemberId,
+}
+
+/// Tracks which inputs reference each external name. A single name can
+/// appear as a Defined, Undefined, or Common in multiple inputs; we keep
+/// one entry per (name, origin) pair in insertion order.
+#[derive(Debug, Default)]
+pub struct ReferrerLog {
+    entries: HashMap<Istr, Vec<InputId>>,
+}
+
+impl ReferrerLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, name: Istr, origin: InputId) {
+        let list = self.entries.entry(name).or_default();
+        if !list.contains(&origin) {
+            list.push(origin);
+        }
+    }
+
+    pub fn get(&self, name: Istr) -> &[InputId] {
+        self.entries
+            .get(&name)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
 }
 
 impl SeedReport {
@@ -911,6 +943,7 @@ pub fn seed_object(
             continue;
         };
         let name = table.intern(name_str);
+        report.referrers.add(name, input_id);
         let Some(sym) = symbolize_input(name, input_sym, input_id) else {
             continue;
         };
@@ -1195,6 +1228,130 @@ pub struct ClassificationReport {
 pub struct Unresolved {
     pub name: Istr,
     pub id: SymbolId,
+}
+
+// ---------------------------------------------------------------------------
+// Levenshtein distance — used for did-you-mean hints.
+// ---------------------------------------------------------------------------
+
+/// Classic dynamic-programming edit distance. O(m·n) time, O(n) space.
+pub fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut row: Vec<usize> = (0..=n).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            let new_val = (row[j + 1] + 1)
+                .min(row[j] + 1)
+                .min(prev + cost);
+            prev = row[j + 1];
+            row[j + 1] = new_val;
+        }
+    }
+    row[n]
+}
+
+/// Return up to `max` candidate names from `table` within `budget` edits
+/// of `query`. Sorted by ascending distance, ties broken by name.
+pub fn did_you_mean(table: &SymbolTable, query: &str, budget: usize, max: usize) -> Vec<String> {
+    let mut hits: Vec<(usize, String)> = table
+        .iter()
+        .filter_map(|(_, s)| {
+            let candidate = table.interner.resolve(s.name());
+            if candidate == query {
+                return None;
+            }
+            let d = levenshtein(query, candidate);
+            if d <= budget {
+                Some((d, candidate.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    hits.dedup_by(|a, b| a.1 == b.1);
+    hits.into_iter().take(max).map(|(_, n)| n).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic formatters — produce afs-as-style text for the driver to
+// emit. Sprint 8 writes to String; Sprint 19's CLI layer owns stderr.
+// ---------------------------------------------------------------------------
+
+/// Format the full undefined-symbol diagnostic block, one entry per
+/// unresolved name: the error line, every referrer, and an optional
+/// did-you-mean hint.
+pub fn format_undefined_diagnostic(
+    table: &SymbolTable,
+    inputs: &Inputs,
+    referrers: &ReferrerLog,
+    unresolved: &[Unresolved],
+) -> String {
+    let mut out = String::new();
+    for u in unresolved {
+        let name = table.interner.resolve(u.name);
+        out.push_str(&format!("afs-ld: error: undefined symbol: {name}\n"));
+        for origin in referrers.get(u.name) {
+            if let Some(oi) = inputs.objects.get(origin.0 as usize) {
+                out.push_str(&format!("      referenced by {}\n", oi.path.display()));
+            }
+        }
+        let suggestions = did_you_mean(table, name, 3, 3);
+        if !suggestions.is_empty() {
+            out.push_str(&format!(
+                "  Hint: did you mean {}?\n",
+                suggestions
+                    .iter()
+                    .map(|s| format!("{s:?}"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ));
+        }
+    }
+    out
+}
+
+/// Format a `DuplicateStrong` insertion error for user consumption. Needs
+/// the incumbent symbol (from the table) plus the losing second symbol
+/// carried in the error itself.
+pub fn format_duplicate_diagnostic(
+    table: &SymbolTable,
+    inputs: &Inputs,
+    err: &InsertError,
+) -> String {
+    let InsertError::DuplicateStrong {
+        name,
+        first,
+        second,
+    } = err
+    else {
+        return String::new();
+    };
+    let name_str = table.interner.resolve(*name);
+    let mut out = String::new();
+    out.push_str(&format!("afs-ld: error: duplicate symbol {name_str}\n"));
+    if let Symbol::Defined { origin, .. } = table.get(*first) {
+        if let Some(oi) = inputs.objects.get(origin.0 as usize) {
+            out.push_str(&format!("  defined in {}\n", oi.path.display()));
+        }
+    }
+    if let Symbol::Defined { origin, .. } = second.as_ref() {
+        if let Some(oi) = inputs.objects.get(origin.0 as usize) {
+            out.push_str(&format!("  also in {}\n", oi.path.display()));
+        }
+    }
+    out
 }
 
 /// After the fixed-point loop, walk the table and classify every remaining

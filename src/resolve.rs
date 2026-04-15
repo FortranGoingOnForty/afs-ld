@@ -781,6 +781,240 @@ enum Action {
     PendingObjectLoad,
 }
 
+// ---------------------------------------------------------------------------
+// Seeding: turn `Inputs` into `SymbolTable` entries.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+pub struct SeedReport {
+    /// Fetches queued by (LazyArchive, Undefined) insertions. Sprint 8's
+    /// fixed-point loop drains this.
+    pub pending_fetches: Vec<PendingFetch>,
+    /// Duplicate-strong-defined errors encountered during seeding.
+    /// Collected rather than short-circuited so the user sees all of them
+    /// in one pass.
+    pub duplicates: Vec<InsertError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingFetch {
+    pub id: SymbolId,
+    pub archive: ArchiveId,
+    pub member: MemberId,
+}
+
+impl SeedReport {
+    fn record_outcome(&mut self, outcome: InsertOutcome) {
+        if let InsertOutcome::PendingArchiveFetch {
+            id,
+            archive,
+            member,
+        } = outcome
+        {
+            self.pending_fetches.push(PendingFetch {
+                id,
+                archive,
+                member,
+            });
+        }
+    }
+
+    fn record_error(&mut self, err: InsertError) {
+        self.duplicates.push(err);
+    }
+
+    pub fn has_errors(&self) -> bool {
+        !self.duplicates.is_empty()
+    }
+}
+
+#[derive(Debug)]
+pub enum SeedError {
+    Read(ReadError),
+    Archive(ArchiveError),
+}
+
+impl std::fmt::Display for SeedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SeedError::Read(e) => write!(f, "{e}"),
+            SeedError::Archive(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for SeedError {}
+
+impl From<ReadError> for SeedError {
+    fn from(e: ReadError) -> Self {
+        SeedError::Read(e)
+    }
+}
+
+impl From<ArchiveError> for SeedError {
+    fn from(e: ArchiveError) -> Self {
+        SeedError::Archive(e)
+    }
+}
+
+/// Seed LazyArchive entries for every symbol defined in every archive's
+/// symbol index. Do this before object seeding so undefined references
+/// in objects correctly trigger `PendingArchiveFetch`.
+pub fn seed_archives(
+    inputs: &Inputs,
+    table: &mut SymbolTable,
+    report: &mut SeedReport,
+) -> Result<(), SeedError> {
+    for (ai_idx, ai) in inputs.archives.iter().enumerate() {
+        let archive = Archive::open(&ai.path, &ai.bytes)?;
+        let archive_id = ArchiveId(ai_idx as u32);
+        let Some(idx) = archive.symbol_index() else {
+            // Archives without a symbol index are legal (clang produces
+            // them occasionally). They require -all_load to pull anything.
+            continue;
+        };
+        for entry in &idx.entries {
+            let name = table.intern(&entry.name);
+            let sym = Symbol::LazyArchive {
+                name,
+                archive: archive_id,
+                member: MemberId(entry.member_header_offset),
+            };
+            match table.insert(sym) {
+                Ok(outcome) => report.record_outcome(outcome),
+                Err(e) => report.record_error(e),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Seed one object's externals into the table. Private-extern symbols
+/// (`N_PEXT`) participate in resolution but stay hidden from dylib
+/// exports. Local symbols, stabs, and debug entries are skipped.
+pub fn seed_object(
+    inputs: &Inputs,
+    input_id: InputId,
+    table: &mut SymbolTable,
+    report: &mut SeedReport,
+) -> Result<(), SeedError> {
+    let obj = inputs.object_file(input_id)?;
+    for input_sym in &obj.symbols {
+        if input_sym.stab_kind().is_some() {
+            continue;
+        }
+        // Only externals and private-externals participate.
+        if !input_sym.is_ext() && !input_sym.is_private_ext() {
+            continue;
+        }
+        let Ok(name_str) = obj.symbol_name(input_sym) else {
+            continue;
+        };
+        let name = table.intern(name_str);
+        let Some(sym) = symbolize_input(name, input_sym, input_id) else {
+            continue;
+        };
+        match table.insert(sym) {
+            Ok(outcome) => report.record_outcome(outcome),
+            Err(e) => report.record_error(e),
+        }
+    }
+    Ok(())
+}
+
+/// Seed every regular export from a dylib as a `DylibImport`. Re-exports
+/// and stub+resolver terminals map to `DylibImport` too — they behave
+/// like imports from the consumer's perspective.
+pub fn seed_dylib(
+    inputs: &Inputs,
+    dylib_id: DylibId,
+    table: &mut SymbolTable,
+    report: &mut SeedReport,
+) -> Result<(), SeedError> {
+    let di = inputs.dylib(dylib_id);
+    let entries = di
+        .file
+        .exports
+        .entries()
+        .map_err(SeedError::Read)?;
+    for entry in entries {
+        let name = table.intern(&entry.name);
+        let sym = Symbol::DylibImport {
+            name,
+            dylib: dylib_id,
+            ordinal: di.ordinal,
+            weak_import: entry.weak_def(),
+        };
+        match table.insert(sym) {
+            Ok(outcome) => report.record_outcome(outcome),
+            Err(e) => report.record_error(e),
+        }
+    }
+    Ok(())
+}
+
+/// Seed every input in a single pass. Order is archives → objects → dylibs
+/// so lazy-archive promotion works correctly (undefineds in objects hit
+/// pre-seeded LazyArchive slots and trigger `PendingArchiveFetch`).
+pub fn seed_all(inputs: &Inputs, table: &mut SymbolTable) -> Result<SeedReport, SeedError> {
+    let mut report = SeedReport::default();
+    seed_archives(inputs, table, &mut report)?;
+    for i in 0..inputs.objects.len() {
+        seed_object(inputs, InputId(i as u32), table, &mut report)?;
+    }
+    for i in 0..inputs.dylibs.len() {
+        seed_dylib(inputs, DylibId(i as u32), table, &mut report)?;
+    }
+    Ok(report)
+}
+
+/// Turn a wire-form `InputSymbol` into a resolver-side `Symbol`. Returns
+/// `None` for kinds the resolver does not track (currently: aliases with
+/// unresolved target strx — Sprint 8's resolver defers those for now).
+fn symbolize_input(
+    name: Istr,
+    input_sym: &crate::symbol::InputSymbol,
+    origin: InputId,
+) -> Option<Symbol> {
+    use crate::symbol::SymKind;
+    match input_sym.kind() {
+        SymKind::Undef => {
+            if let Some(size) = input_sym.common_size() {
+                let align_pow2 = input_sym.common_align_pow2().unwrap_or(0);
+                Some(Symbol::Common {
+                    name,
+                    origin,
+                    size,
+                    align_pow2,
+                })
+            } else {
+                Some(Symbol::Undefined {
+                    name,
+                    origin,
+                    weak_ref: input_sym.weak_ref(),
+                })
+            }
+        }
+        SymKind::Abs | SymKind::Sect => Some(Symbol::Defined {
+            name,
+            origin,
+            // AtomId(0) is a placeholder; Sprint 9's atomization pass
+            // replaces these with real atom handles in-place.
+            atom: AtomId(0),
+            value: input_sym.value(),
+            weak: input_sym.weak_def(),
+            private_extern: input_sym.is_private_ext(),
+            no_dead_strip: input_sym.no_dead_strip(),
+        }),
+        SymKind::Indirect => {
+            // Sprint 8 does not wire indirect-strx lookups yet — Sprint 9's
+            // atomization pass (which has the string table at hand) will
+            // rewrite these. For now, skip.
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

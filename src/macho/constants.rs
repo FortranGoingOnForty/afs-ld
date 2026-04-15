@@ -96,6 +96,10 @@ pub const N_INDR: u8 = 0xa;
 pub const N_NO_DEAD_STRIP: u16 = 0x0020;
 pub const N_WEAK_REF: u16 = 0x0040;
 pub const N_WEAK_DEF: u16 = 0x0080;
+/// Symbol is an alternate entry point into the atom defined by the
+/// preceding symbol in the same section. Folded into that atom's
+/// `alt_entries` during atomization.
+pub const N_ALT_ENTRY: u16 = 0x0200;
 
 // ARM64 relocation kinds
 pub const ARM64_RELOC_UNSIGNED: u8 = 0;

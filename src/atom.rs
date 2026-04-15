@@ -19,8 +19,11 @@
 
 use std::collections::HashMap;
 
+use crate::input::ObjectFile;
+use crate::macho::constants::MH_SUBSECTIONS_VIA_SYMBOLS;
 use crate::resolve::{AtomId, InputId, SymbolId};
-use crate::section::SectionKind;
+use crate::section::{InputSection, SectionKind};
+use crate::symbol::{InputSymbol, SymKind};
 
 /// Which conceptual output section family this atom belongs to. Sprint 10
 /// turns these into real `__TEXT,__text` / `__DATA,__data` etc. placements.
@@ -223,6 +226,321 @@ impl AtomTable {
         }
         out
     }
+}
+
+// ---------------------------------------------------------------------------
+// Atomization pass.
+// ---------------------------------------------------------------------------
+
+/// Per-object atomization output. Back-patching `Symbol::Defined.atom`
+/// walks `owner_by_sym`; Sprint 23's dead-strip reads `alt_entries_by_sym`
+/// when computing the live graph.
+#[derive(Debug, Default)]
+pub struct ObjectAtomization {
+    pub atoms: Vec<AtomId>,
+    /// `(symbol_index_in_object → atom that owns it)`. Populated for every
+    /// external/private-extern SECT symbol that started a new atom.
+    pub owner_by_sym: Vec<(usize, AtomId)>,
+    /// `(symbol_index_in_object → (containing_atom, offset_within_atom))`.
+    /// Populated for `.alt_entry` symbols that folded into an existing atom.
+    pub alt_entries_by_sym: Vec<(usize, AtomId, u32)>,
+}
+
+/// Atomize every section in `obj`, pushing into `table`. The caller
+/// typically walks every input in sequence and merges results.
+pub fn atomize_object(
+    input_id: InputId,
+    obj: &ObjectFile,
+    table: &mut AtomTable,
+) -> ObjectAtomization {
+    let subsections_via_symbols = obj.header.flags & MH_SUBSECTIONS_VIA_SYMBOLS != 0;
+    let mut out = ObjectAtomization::default();
+
+    for (sect_idx_zero, sect) in obj.sections.iter().enumerate() {
+        let sect_idx_one = (sect_idx_zero + 1) as u8;
+        // Gather symbols that target this section.
+        let mut syms: Vec<(usize, &InputSymbol)> = obj
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.stab_kind().is_none()
+                    && s.kind() == SymKind::Sect
+                    && s.sect_idx() == sect_idx_one
+            })
+            .collect();
+        syms.sort_by_key(|(_, s)| s.value());
+
+        atomize_regular_section(
+            input_id,
+            sect_idx_one,
+            sect,
+            &syms,
+            subsections_via_symbols,
+            table,
+            &mut out,
+        );
+    }
+
+    out
+}
+
+/// Split one section into atoms according to the `MH_SUBSECTIONS_VIA_SYMBOLS`
+/// invariant plus `.alt_entry` folding. Literal and unwind specialization
+/// lands in follow-up commits; this function's fallback is "one atom per
+/// section" for sections the subsections flag doesn't split.
+#[allow(clippy::too_many_arguments)]
+fn atomize_regular_section(
+    input_id: InputId,
+    section_idx: u8,
+    sect: &InputSection,
+    syms: &[(usize, &InputSymbol)],
+    subsections_via_symbols: bool,
+    table: &mut AtomTable,
+    out: &mut ObjectAtomization,
+) {
+    let kind = sect.kind;
+    let atom_section = AtomSection::from_section_kind(kind);
+
+    // Without the subsections flag, every section becomes one atom — the
+    // linker-side equivalent of Apple-style monolithic sections.
+    if !subsections_via_symbols {
+        let atom = build_section_atom(input_id, section_idx, sect, atom_section);
+        let id = table.push(atom);
+        out.atoms.push(id);
+        for (sym_idx, sym) in syms {
+            out.alt_entries_by_sym.push((*sym_idx, id, sym.value() as u32));
+        }
+        return;
+    }
+
+    // Zerofill: splitting happens per symbol (each tentative common-style
+    // slot gets its own atom). If no symbols defined, emit a single atom.
+    if atom_section.is_zerofill() {
+        atomize_zerofill(input_id, section_idx, sect, syms, atom_section, table, out);
+        return;
+    }
+
+    // With subsections_via_symbols and at least one split point, walk the
+    // sorted symbols and emit one atom per non-alt_entry boundary.
+    if syms.is_empty() {
+        let atom = build_section_atom(input_id, section_idx, sect, atom_section);
+        let id = table.push(atom);
+        out.atoms.push(id);
+        return;
+    }
+
+    // If there's content before the first symbol, carve a head atom
+    // (unowned). afs-as emits a leading symbol in practice so this is
+    // typically zero bytes, but the fallback keeps the byte-flow intact.
+    let first_offset = syms[0].1.value() as u32;
+    if first_offset > 0 {
+        let head = build_slice_atom(
+            input_id,
+            section_idx,
+            sect,
+            atom_section,
+            0,
+            first_offset,
+            None,
+            &[],
+        );
+        let head_id = table.push(head);
+        out.atoms.push(head_id);
+    }
+
+    // Walk symbol boundaries.
+    let section_size = sect.size as u32;
+    let mut i = 0;
+    while i < syms.len() {
+        let (primary_idx, primary) = syms[i];
+        let atom_offset = primary.value() as u32;
+        let next_real_boundary = find_next_non_alt_entry(syms, i + 1)
+            .map(|j| syms[j].1.value() as u32)
+            .unwrap_or(section_size);
+        let size = next_real_boundary.saturating_sub(atom_offset);
+
+        // Collect alt_entries that fall into [atom_offset, atom_offset+size).
+        let mut alts: Vec<AltEntry> = Vec::new();
+        let mut alt_folded: Vec<(usize, u32)> = Vec::new();
+        for (alt_idx, alt_sym) in syms.iter().skip(i + 1) {
+            let alt_off = alt_sym.value() as u32;
+            if alt_off >= atom_offset + size {
+                break;
+            }
+            if !alt_sym.alt_entry() {
+                break;
+            }
+            let local = alt_off - atom_offset;
+            alts.push(AltEntry {
+                symbol: SymbolId(*alt_idx as u32),
+                offset_within_atom: local,
+            });
+            alt_folded.push((*alt_idx, local));
+        }
+
+        let atom = build_slice_atom(
+            input_id,
+            section_idx,
+            sect,
+            atom_section,
+            atom_offset,
+            size,
+            Some(primary),
+            &alts,
+        );
+        let id = table.push(atom);
+        out.atoms.push(id);
+        out.owner_by_sym.push((primary_idx, id));
+        for (alt_idx, local_off) in alt_folded {
+            out.alt_entries_by_sym.push((alt_idx, id, local_off));
+        }
+
+        // Advance past the primary and its folded alt_entries.
+        i = find_next_non_alt_entry(syms, i + 1).unwrap_or(syms.len());
+    }
+}
+
+fn atomize_zerofill(
+    input_id: InputId,
+    section_idx: u8,
+    sect: &InputSection,
+    syms: &[(usize, &InputSymbol)],
+    atom_section: AtomSection,
+    table: &mut AtomTable,
+    out: &mut ObjectAtomization,
+) {
+    if syms.is_empty() {
+        let atom = build_section_atom(input_id, section_idx, sect, atom_section);
+        let id = table.push(atom);
+        out.atoms.push(id);
+        return;
+    }
+    let section_size = sect.size as u32;
+    for (i, (sym_idx, sym)) in syms.iter().enumerate() {
+        let start = sym.value() as u32;
+        let end = syms
+            .get(i + 1)
+            .map(|(_, s)| s.value() as u32)
+            .unwrap_or(section_size);
+        let size = end.saturating_sub(start);
+        let atom = Atom {
+            id: AtomId(0),
+            origin: input_id,
+            input_section: section_idx,
+            section: atom_section,
+            input_offset: start,
+            size,
+            align_pow2: sect.align_pow2 as u8,
+            owner: Some(SymbolId(*sym_idx as u32)),
+            alt_entries: Vec::new(),
+            data: Vec::new(), // zerofill
+            flags: symbol_flags(sym),
+            parent_of: None,
+        };
+        let id = table.push(atom);
+        out.atoms.push(id);
+        out.owner_by_sym.push((*sym_idx, id));
+    }
+}
+
+fn build_section_atom(
+    input_id: InputId,
+    section_idx: u8,
+    sect: &InputSection,
+    atom_section: AtomSection,
+) -> Atom {
+    let data = if atom_section.is_zerofill() {
+        Vec::new()
+    } else {
+        sect.data.clone()
+    };
+    let mut flags = AtomFlags::default();
+    if sect.kind == SectionKind::Text {
+        flags.set(AtomFlags::PURE_INSTRUCTIONS);
+    }
+    Atom {
+        id: AtomId(0),
+        origin: input_id,
+        input_section: section_idx,
+        section: atom_section,
+        input_offset: 0,
+        size: sect.size as u32,
+        align_pow2: sect.align_pow2 as u8,
+        owner: None,
+        alt_entries: Vec::new(),
+        data,
+        flags,
+        parent_of: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_slice_atom(
+    input_id: InputId,
+    section_idx: u8,
+    sect: &InputSection,
+    atom_section: AtomSection,
+    offset: u32,
+    size: u32,
+    owner: Option<&InputSymbol>,
+    alt_entries: &[AltEntry],
+) -> Atom {
+    let data = if atom_section.is_zerofill() {
+        Vec::new()
+    } else {
+        let start = offset as usize;
+        let end = (offset + size) as usize;
+        sect.data[start..end.min(sect.data.len())].to_vec()
+    };
+    let mut flags = AtomFlags::default();
+    if sect.kind == SectionKind::Text {
+        flags.set(AtomFlags::PURE_INSTRUCTIONS);
+    }
+    if let Some(sym) = owner {
+        flags.set(symbol_flags(sym).bits());
+    }
+    Atom {
+        id: AtomId(0),
+        origin: input_id,
+        input_section: section_idx,
+        section: atom_section,
+        input_offset: offset,
+        size,
+        align_pow2: sect.align_pow2 as u8,
+        owner: owner.map(|_| {
+            // caller provides the symbol index via `owner_by_sym`; we
+            // store a placeholder here and let the caller set it
+            // post-hoc. Leaving it None is acceptable too.
+            SymbolId(u32::MAX)
+        }),
+        alt_entries: alt_entries.to_vec(),
+        data,
+        flags,
+        parent_of: None,
+    }
+}
+
+fn symbol_flags(sym: &InputSymbol) -> AtomFlags {
+    let mut f = AtomFlags::default();
+    if sym.no_dead_strip() {
+        f.set(AtomFlags::NO_DEAD_STRIP);
+    }
+    if sym.weak_def() {
+        f.set(AtomFlags::WEAK_DEF);
+    }
+    f
+}
+
+/// Find the next non-alt_entry symbol starting from index `i`. Returns the
+/// index (into `syms`), or `None` if every remaining symbol is an alt
+/// entry.
+fn find_next_non_alt_entry(syms: &[(usize, &InputSymbol)], from: usize) -> Option<usize> {
+    syms.iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, (_, s))| !s.alt_entry())
+        .map(|(i, _)| i)
 }
 
 #[cfg(test)]

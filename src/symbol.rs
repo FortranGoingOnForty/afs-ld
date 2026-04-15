@@ -128,6 +128,13 @@ impl InputSymbol {
         self.raw.n_desc & N_NO_DEAD_STRIP != 0
     }
 
+    /// True for symbols marked as an alternate entry point for their
+    /// section's preceding atom. Atomization folds these into the
+    /// owning atom's `alt_entries` list instead of splitting at them.
+    pub fn alt_entry(&self) -> bool {
+        self.raw.n_desc & N_ALT_ENTRY != 0
+    }
+
     /// True iff this is an external undefined symbol with a non-zero size —
     /// the Mach-O convention for "common" tentative definitions.
     pub fn is_common(&self) -> bool {

@@ -13,6 +13,7 @@ use crate::macho::reader::{
     BuildVersionCmd, DysymtabCmd, LinkEditDataCmd, LoadCommand, MachHeader64, Section64Header,
     Segment64, SymtabCmd,
 };
+use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind};
 use crate::section::InputSection;
 use crate::symbol::{InputSymbol, SymKind};
 
@@ -174,11 +175,17 @@ fn write_sections(w: &mut impl Write, secs: &[InputSection]) -> io::Result<()> {
             writeln!(w, "      data: {}", hex_preview(&s.data, 16))?;
         }
         if s.nreloc > 0 {
-            writeln!(
-                w,
-                "      relocs: {} entry/ies at offset {} (decoded in Sprint 3)",
-                s.nreloc, s.reloff
-            )?;
+            writeln!(w, "      relocs ({}):", s.nreloc)?;
+            match parse_raw_relocs(&s.raw_relocs, 0, s.nreloc)
+                .and_then(|raws| parse_relocs(&raws))
+            {
+                Ok(fused) => {
+                    for (ri, r) in fused.iter().enumerate() {
+                        writeln!(w, "        [{ri}] {}", describe_reloc(r))?;
+                    }
+                }
+                Err(e) => writeln!(w, "        <parse error: {e}>")?,
+            }
         }
     }
     Ok(())
@@ -239,6 +246,44 @@ fn describe_symbol(sym: &InputSymbol) -> String {
         SymKind::Indirect => {
             parts.push(format!("-> strx={}", sym.value() as u32));
         }
+    }
+    parts.join(" ")
+}
+
+fn describe_reloc(r: &Reloc) -> String {
+    let kind = match r.kind {
+        RelocKind::Unsigned => "Unsigned",
+        RelocKind::Branch26 => "Branch26",
+        RelocKind::Page21 => "Page21",
+        RelocKind::PageOff12 => "PageOff12",
+        RelocKind::GotLoadPage21 => "GotLoadPage21",
+        RelocKind::GotLoadPageOff12 => "GotLoadPageOff12",
+        RelocKind::PointerToGot => "PointerToGot",
+        RelocKind::TlvpLoadPage21 => "TlvpLoadPage21",
+        RelocKind::TlvpLoadPageOff12 => "TlvpLoadPageOff12",
+        RelocKind::Subtractor => "Subtractor",
+    };
+    let width = r.length.byte_width();
+    let mut parts = vec![
+        format!("offset=0x{:x}", r.offset),
+        kind.to_string(),
+        format!("len={width}"),
+    ];
+    if r.pcrel {
+        parts.push("pcrel".into());
+    }
+    parts.push(match r.referent {
+        Referent::Symbol(i) => format!("sym={i}"),
+        Referent::Section(i) => format!("sect={i}"),
+    });
+    if let Some(sub) = r.subtrahend {
+        parts.push(match sub {
+            Referent::Symbol(i) => format!("- sym={i}"),
+            Referent::Section(i) => format!("- sect={i}"),
+        });
+    }
+    if r.addend != 0 {
+        parts.push(format!("+ 0x{:x}", r.addend));
     }
     parts.join(" ")
 }

@@ -14,6 +14,10 @@ use std::process::Command;
 
 use afs_ld::input::ObjectFile;
 use afs_ld::macho::reader::{parse_commands, parse_header, write_commands, write_header, HEADER_SIZE};
+use afs_ld::reloc::{
+    parse_raw_relocs, parse_relocs, validate_relocs, write_raw_relocs, write_relocs,
+    RAW_RELOC_SIZE,
+};
 use afs_ld::symbol::{write_nlist_table, NLIST_SIZE};
 
 fn corpus_dir() -> PathBuf {
@@ -257,12 +261,160 @@ fn every_afs_as_corpus_object_parses_fully() {
     );
 }
 
+/// Sprint 3 gate: every corpus fixture's per-section relocation region
+/// round-trips byte-exact through raw→fused→raw→bytes, every fused reloc
+/// passes `validate_relocs`, and no fixture triggers a diagnostic.
+#[test]
+fn every_afs_as_corpus_section_relocs_round_trip() {
+    let corpus = corpus_dir();
+    if !corpus.is_dir() {
+        eprintln!("skipping: corpus not found at {}", corpus.display());
+        return;
+    }
+    let which = Command::new("xcrun").arg("-f").arg("as").output();
+    if !matches!(which, Ok(o) if o.status.success()) {
+        eprintln!("skipping: xcrun as not available");
+        return;
+    }
+
+    let scratch = tempdir();
+    let mut fixture_count = 0usize;
+    let mut reloc_count_total = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    let mut entries: Vec<PathBuf> = fs::read_dir(&corpus)
+        .expect("read corpus dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map(|e| e == "s").unwrap_or(false))
+        .collect();
+    entries.sort();
+
+    for src in entries {
+        fixture_count += 1;
+        let obj_path = scratch.join(format!(
+            "{}.o",
+            src.file_stem().and_then(|s| s.to_str()).unwrap_or("fixture")
+        ));
+        if let Err(e) = assemble(&src, &obj_path) {
+            failures.push(format!("{}: assemble: {e}", src.display()));
+            continue;
+        }
+        let bytes = match fs::read(&obj_path) {
+            Ok(b) => b,
+            Err(e) => {
+                failures.push(format!("{}: read: {e}", src.display()));
+                continue;
+            }
+        };
+        let obj = match ObjectFile::parse(&obj_path, &bytes) {
+            Ok(o) => o,
+            Err(e) => {
+                failures.push(format!("{}: ObjectFile::parse: {e}", src.display()));
+                continue;
+            }
+        };
+
+        let nsyms = obj.symbols.len() as u32;
+        let nsects = obj.sections.len() as u8;
+
+        for (i, sec) in obj.sections.iter().enumerate() {
+            if sec.nreloc == 0 {
+                continue;
+            }
+            // Raw parse from the section's owned reloc bytes.
+            let raws = match parse_raw_relocs(&sec.raw_relocs, 0, sec.nreloc) {
+                Ok(r) => r,
+                Err(e) => {
+                    failures.push(format!(
+                        "{}: section[{i}] {} raw parse: {e}",
+                        src.display(),
+                        sec.sectname
+                    ));
+                    continue;
+                }
+            };
+
+            // Fuse ADDEND/SUBTRACTOR prefixes.
+            let fused = match parse_relocs(&raws) {
+                Ok(r) => r,
+                Err(e) => {
+                    failures.push(format!(
+                        "{}: section[{i}] {} fuse: {e}",
+                        src.display(),
+                        sec.sectname
+                    ));
+                    continue;
+                }
+            };
+            reloc_count_total += fused.len();
+
+            // Validate bounds + referents.
+            if let Err(e) = validate_relocs(&fused, sec.size, nsyms, nsects) {
+                failures.push(format!(
+                    "{}: section[{i}] {} validate: {e}",
+                    src.display(),
+                    sec.sectname
+                ));
+                continue;
+            }
+
+            // Re-emit raw via write_relocs and compare to the original bytes.
+            let reemitted_raws = match write_relocs(&fused) {
+                Ok(r) => r,
+                Err(e) => {
+                    failures.push(format!(
+                        "{}: section[{i}] {} write_relocs: {e}",
+                        src.display(),
+                        sec.sectname
+                    ));
+                    continue;
+                }
+            };
+            let mut reemitted_bytes = Vec::with_capacity(reemitted_raws.len() * RAW_RELOC_SIZE);
+            write_raw_relocs(&reemitted_raws, &mut reemitted_bytes);
+            if reemitted_bytes != sec.raw_relocs {
+                failures.push(format!(
+                    "{}: section[{i}] {} reloc re-emit mismatch (nreloc={}, raws={} fused={})",
+                    src.display(),
+                    sec.sectname,
+                    sec.nreloc,
+                    raws.len(),
+                    fused.len()
+                ));
+            }
+        }
+    }
+
+    assert!(fixture_count > 0, "no fixtures found");
+    assert!(
+        reloc_count_total > 0,
+        "corpus produced zero relocs — reading wrong?"
+    );
+    assert!(
+        failures.is_empty(),
+        "{} of {} fixtures failed Sprint 3 reloc invariants ({} fused relocs across corpus):\n{}",
+        failures.len(),
+        fixture_count,
+        reloc_count_total,
+        failures.join("\n")
+    );
+}
+
 fn first_diff(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()))
 }
 
 fn tempdir() -> PathBuf {
-    let base = std::env::temp_dir().join(format!("afs-ld-corpus-{}", std::process::id()));
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    // Each caller gets a unique dir so cargo's parallel tests don't step on
+    // one another's .o files.
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!(
+        "afs-ld-corpus-{}-{}",
+        std::process::id(),
+        seq
+    ));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).expect("create scratch dir");
     base

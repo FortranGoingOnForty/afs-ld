@@ -364,26 +364,29 @@ fn encode_addend_prefix(offset: i32, addend: i64, length: u8) -> Result<RawReloc
     })
 }
 
-/// Per-kind expected `r_length` (in bit-width form). `Unsigned` / `Subtractor`
-/// are the only kinds that validly carry both `Word` and `Quad`; every other
-/// kind is always `Word` (one 4-byte instruction).
+/// Per-kind expected `r_length` (in bit-width form). Instruction-patching
+/// kinds are always `Word` (one 4-byte ARM64 instruction). Data kinds
+/// (`Unsigned`, `Subtractor`, `PointerToGot`) validly carry `Word` or `Quad`.
 fn kind_expects_word_only(k: RelocKind) -> bool {
-    !matches!(k, RelocKind::Unsigned | RelocKind::Subtractor)
+    !matches!(
+        k,
+        RelocKind::Unsigned | RelocKind::Subtractor | RelocKind::PointerToGot
+    )
 }
 
-/// Per-kind expected `r_pcrel`. `None` means the flag is unconstrained
-/// (currently: `Unsigned` and `Subtractor`).
+/// Per-kind expected `r_pcrel`. `None` means the flag is unconstrained.
+/// `PointerToGot` can be either PC-relative (32-bit delta inside code) or
+/// absolute (64-bit pointer inside data), so we leave it unconstrained.
 fn kind_expects_pcrel(k: RelocKind) -> Option<bool> {
     match k {
         RelocKind::Branch26
         | RelocKind::Page21
         | RelocKind::GotLoadPage21
-        | RelocKind::TlvpLoadPage21
-        | RelocKind::PointerToGot => Some(true),
+        | RelocKind::TlvpLoadPage21 => Some(true),
         RelocKind::PageOff12 | RelocKind::GotLoadPageOff12 | RelocKind::TlvpLoadPageOff12 => {
             Some(false)
         }
-        RelocKind::Unsigned | RelocKind::Subtractor => None,
+        RelocKind::Unsigned | RelocKind::Subtractor | RelocKind::PointerToGot => None,
     }
 }
 

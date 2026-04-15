@@ -4,6 +4,7 @@
 //! returns `LinkError::NotYetImplemented`. Subsequent sprints fill in the
 //! reader, resolver, layout, reloc, synth, writer, and signing paths.
 
+pub mod archive;
 pub mod args;
 pub mod diag;
 pub mod dump;

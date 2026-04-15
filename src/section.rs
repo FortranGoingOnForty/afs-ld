@@ -277,6 +277,9 @@ pub struct OutputSection {
     pub kind: SectionKind,
     pub align_pow2: u8,
     pub flags: u32,
+    pub reserved1: u32,
+    pub reserved2: u32,
+    pub reserved3: u32,
     pub atoms: Vec<AtomId>,
     pub addr: u64,
     pub size: u64,
@@ -311,7 +314,9 @@ pub fn build_layout(kind: OutputKind, atoms: &AtomTable, symbols: &SymbolTable) 
     }
 
     for group in &mut groups {
-        group.atoms.sort_by(|a, b| compare_atoms(*a, *b, atoms, symbols));
+        group
+            .atoms
+            .sort_by(|a, b| compare_atoms(*a, *b, atoms, symbols));
     }
 
     groups.sort_by(|a, b| {
@@ -338,6 +343,9 @@ pub fn build_layout(kind: OutputKind, atoms: &AtomTable, symbols: &SymbolTable) 
             kind: group.spec.kind,
             align_pow2,
             flags: group.spec.flags,
+            reserved1: group.spec.reserved1,
+            reserved2: group.spec.reserved2,
+            reserved3: group.spec.reserved3,
             atoms: group.atoms,
             addr: 0,
             size,
@@ -430,8 +438,41 @@ struct OutputSectionSpec {
     name: &'static str,
     kind: SectionKind,
     flags: u32,
+    reserved1: u32,
+    reserved2: u32,
+    reserved3: u32,
     segment_order: u8,
     section_order: u8,
+}
+
+impl OutputSectionSpec {
+    fn new(
+        segment: &'static str,
+        name: &'static str,
+        kind: SectionKind,
+        flags: u32,
+        segment_order: u8,
+        section_order: u8,
+    ) -> Self {
+        Self {
+            segment,
+            name,
+            kind,
+            flags,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            segment_order,
+            section_order,
+        }
+    }
+
+    fn with_reserved(mut self, reserved1: u32, reserved2: u32, reserved3: u32) -> Self {
+        self.reserved1 = reserved1;
+        self.reserved2 = reserved2;
+        self.reserved3 = reserved3;
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -470,12 +511,7 @@ fn build_output_segments(kind: OutputKind, sections: &[OutputSection]) -> Vec<Ou
             Prot::READ | Prot::EXECUTE,
             true,
         ),
-        (
-            "__DATA_CONST",
-            Prot::READ,
-            Prot::READ | Prot::WRITE,
-            false,
-        ),
+        ("__DATA_CONST", Prot::READ, Prot::READ | Prot::WRITE, false),
         (
             "__DATA",
             Prot::READ | Prot::WRITE,
@@ -537,154 +573,145 @@ fn measure_output_section(atom_ids: &[AtomId], atoms: &AtomTable) -> (u8, u64) {
 
 fn output_section_spec(section: AtomSection) -> OutputSectionSpec {
     match section {
-        AtomSection::Text | AtomSection::Coalesced => OutputSectionSpec {
-            segment: "__TEXT",
-            name: "__text",
-            kind: if matches!(section, AtomSection::Coalesced) {
+        AtomSection::Text | AtomSection::Coalesced => OutputSectionSpec::new(
+            "__TEXT",
+            "__text",
+            if matches!(section, AtomSection::Coalesced) {
                 SectionKind::Coalesced
             } else {
                 SectionKind::Text
             },
-            flags: if matches!(section, AtomSection::Coalesced) {
+            if matches!(section, AtomSection::Coalesced) {
                 S_COALESCED
             } else {
                 S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
             },
-            segment_order: 1,
-            section_order: 0,
-        },
-        AtomSection::SymbolStubs => OutputSectionSpec {
-            segment: "__TEXT",
-            name: "__stubs",
-            kind: SectionKind::SymbolStubs,
-            flags: S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
-            segment_order: 1,
-            section_order: 1,
-        },
-        AtomSection::CStringLiterals => OutputSectionSpec {
-            segment: "__TEXT",
-            name: "__cstring",
-            kind: SectionKind::CStringLiterals,
-            flags: S_CSTRING_LITERALS,
-            segment_order: 1,
-            section_order: 3,
-        },
-        AtomSection::ConstData => OutputSectionSpec {
-            segment: "__TEXT",
-            name: "__const",
-            kind: SectionKind::ConstData,
-            flags: S_REGULAR,
-            segment_order: 1,
-            section_order: 4,
-        },
-        AtomSection::Literal4 => OutputSectionSpec {
-            segment: "__TEXT",
-            name: "__literal4",
-            kind: SectionKind::Literal4,
-            flags: S_4BYTE_LITERALS,
-            segment_order: 1,
-            section_order: 5,
-        },
-        AtomSection::Literal8 => OutputSectionSpec {
-            segment: "__TEXT",
-            name: "__literal8",
-            kind: SectionKind::Literal8,
-            flags: S_8BYTE_LITERALS,
-            segment_order: 1,
-            section_order: 6,
-        },
-        AtomSection::Literal16 => OutputSectionSpec {
-            segment: "__TEXT",
-            name: "__literal16",
-            kind: SectionKind::Literal16,
-            flags: S_16BYTE_LITERALS,
-            segment_order: 1,
-            section_order: 7,
-        },
-        AtomSection::CompactUnwind => OutputSectionSpec {
-            segment: "__TEXT",
-            name: "__unwind_info",
-            kind: SectionKind::CompactUnwind,
-            flags: S_REGULAR | S_ATTR_DEBUG,
-            segment_order: 1,
-            section_order: 8,
-        },
-        AtomSection::EhFrame => OutputSectionSpec {
-            segment: "__TEXT",
-            name: "__eh_frame",
-            kind: SectionKind::EhFrame,
-            flags: S_COALESCED,
-            segment_order: 1,
-            section_order: 9,
-        },
-        AtomSection::NonLazySymbolPointers => OutputSectionSpec {
-            segment: "__DATA_CONST",
-            name: "__got",
-            kind: SectionKind::NonLazySymbolPointers,
-            flags: S_NON_LAZY_SYMBOL_POINTERS,
-            segment_order: 2,
-            section_order: 0,
-        },
-        AtomSection::Data | AtomSection::Other => OutputSectionSpec {
-            segment: "__DATA",
-            name: "__data",
-            kind: if matches!(section, AtomSection::Other) {
+            1,
+            0,
+        ),
+        AtomSection::SymbolStubs => OutputSectionSpec::new(
+            "__TEXT",
+            "__stubs",
+            SectionKind::SymbolStubs,
+            S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            1,
+            1,
+        )
+        .with_reserved(0, 12, 0),
+        AtomSection::CStringLiterals => OutputSectionSpec::new(
+            "__TEXT",
+            "__cstring",
+            SectionKind::CStringLiterals,
+            S_CSTRING_LITERALS,
+            1,
+            3,
+        ),
+        AtomSection::ConstData => {
+            OutputSectionSpec::new("__TEXT", "__const", SectionKind::ConstData, S_REGULAR, 1, 4)
+        }
+        AtomSection::Literal4 => OutputSectionSpec::new(
+            "__TEXT",
+            "__literal4",
+            SectionKind::Literal4,
+            S_4BYTE_LITERALS,
+            1,
+            5,
+        ),
+        AtomSection::Literal8 => OutputSectionSpec::new(
+            "__TEXT",
+            "__literal8",
+            SectionKind::Literal8,
+            S_8BYTE_LITERALS,
+            1,
+            6,
+        ),
+        AtomSection::Literal16 => OutputSectionSpec::new(
+            "__TEXT",
+            "__literal16",
+            SectionKind::Literal16,
+            S_16BYTE_LITERALS,
+            1,
+            7,
+        ),
+        AtomSection::CompactUnwind => OutputSectionSpec::new(
+            "__TEXT",
+            "__unwind_info",
+            SectionKind::CompactUnwind,
+            S_REGULAR | S_ATTR_DEBUG,
+            1,
+            8,
+        ),
+        AtomSection::EhFrame => OutputSectionSpec::new(
+            "__TEXT",
+            "__eh_frame",
+            SectionKind::EhFrame,
+            S_COALESCED,
+            1,
+            9,
+        ),
+        AtomSection::NonLazySymbolPointers => OutputSectionSpec::new(
+            "__DATA_CONST",
+            "__got",
+            SectionKind::NonLazySymbolPointers,
+            S_NON_LAZY_SYMBOL_POINTERS,
+            2,
+            0,
+        ),
+        AtomSection::Data | AtomSection::Other => OutputSectionSpec::new(
+            "__DATA",
+            "__data",
+            if matches!(section, AtomSection::Other) {
                 SectionKind::Regular
             } else {
                 SectionKind::Data
             },
-            flags: S_REGULAR,
-            segment_order: 3,
-            section_order: 1,
-        },
-        AtomSection::LazySymbolPointers => OutputSectionSpec {
-            segment: "__DATA",
-            name: "__la_symbol_ptr",
-            kind: SectionKind::LazySymbolPointers,
-            flags: S_LAZY_SYMBOL_POINTERS,
-            segment_order: 3,
-            section_order: 0,
-        },
-        AtomSection::ThreadLocalVariables => OutputSectionSpec {
-            segment: "__DATA",
-            name: "__thread_vars",
-            kind: SectionKind::ThreadLocalVariables,
-            flags: S_THREAD_LOCAL_VARIABLES,
-            segment_order: 3,
-            section_order: 2,
-        },
-        AtomSection::ThreadLocalInitPointers => OutputSectionSpec {
-            segment: "__DATA",
-            name: "__thread_ptrs",
-            kind: SectionKind::ThreadLocalInitPointers,
-            flags: S_THREAD_LOCAL_INIT_FUNCTION_POINTERS,
-            segment_order: 3,
-            section_order: 3,
-        },
-        AtomSection::ThreadLocalData => OutputSectionSpec {
-            segment: "__DATA",
-            name: "__thread_data",
-            kind: SectionKind::ThreadLocalRegular,
-            flags: S_THREAD_LOCAL_REGULAR,
-            segment_order: 3,
-            section_order: 4,
-        },
-        AtomSection::ThreadLocalBss => OutputSectionSpec {
-            segment: "__DATA",
-            name: "__thread_bss",
-            kind: SectionKind::ThreadLocalZeroFill,
-            flags: S_THREAD_LOCAL_ZEROFILL,
-            segment_order: 3,
-            section_order: 5,
-        },
-        AtomSection::ZeroFill => OutputSectionSpec {
-            segment: "__DATA",
-            name: "__bss",
-            kind: SectionKind::ZeroFill,
-            flags: S_ZEROFILL,
-            segment_order: 3,
-            section_order: 6,
-        },
+            S_REGULAR,
+            3,
+            1,
+        ),
+        AtomSection::LazySymbolPointers => OutputSectionSpec::new(
+            "__DATA",
+            "__la_symbol_ptr",
+            SectionKind::LazySymbolPointers,
+            S_LAZY_SYMBOL_POINTERS,
+            3,
+            0,
+        ),
+        AtomSection::ThreadLocalVariables => OutputSectionSpec::new(
+            "__DATA",
+            "__thread_vars",
+            SectionKind::ThreadLocalVariables,
+            S_THREAD_LOCAL_VARIABLES,
+            3,
+            2,
+        ),
+        AtomSection::ThreadLocalInitPointers => OutputSectionSpec::new(
+            "__DATA",
+            "__thread_ptrs",
+            SectionKind::ThreadLocalInitPointers,
+            S_THREAD_LOCAL_INIT_FUNCTION_POINTERS,
+            3,
+            3,
+        ),
+        AtomSection::ThreadLocalData => OutputSectionSpec::new(
+            "__DATA",
+            "__thread_data",
+            SectionKind::ThreadLocalRegular,
+            S_THREAD_LOCAL_REGULAR,
+            3,
+            4,
+        ),
+        AtomSection::ThreadLocalBss => OutputSectionSpec::new(
+            "__DATA",
+            "__thread_bss",
+            SectionKind::ThreadLocalZeroFill,
+            S_THREAD_LOCAL_ZEROFILL,
+            3,
+            5,
+        ),
+        AtomSection::ZeroFill => {
+            OutputSectionSpec::new("__DATA", "__bss", SectionKind::ZeroFill, S_ZEROFILL, 3, 6)
+        }
     }
 }
 
@@ -877,5 +904,68 @@ mod tests {
 
         assert_eq!(data.atoms, vec![a, c, b]);
         assert_eq!(data.size, 12);
+    }
+
+    #[test]
+    fn build_layout_carries_special_section_reserved_fields() {
+        let mut atoms = AtomTable::new();
+        atoms.push(synth_atom(InputId(0), 0, 12, AtomSection::SymbolStubs));
+        atoms.push(synth_atom(
+            InputId(0),
+            16,
+            8,
+            AtomSection::NonLazySymbolPointers,
+        ));
+        atoms.push(synth_atom(
+            InputId(0),
+            24,
+            8,
+            AtomSection::LazySymbolPointers,
+        ));
+        atoms.push(synth_atom(
+            InputId(0),
+            32,
+            8,
+            AtomSection::ThreadLocalInitPointers,
+        ));
+
+        let layout = build_layout(OutputKind::Executable, &atoms, &SymbolTable::new());
+        let stubs = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__TEXT" && section.name == "__stubs")
+            .expect("__TEXT,__stubs");
+        assert_eq!(
+            (stubs.reserved1, stubs.reserved2, stubs.reserved3),
+            (0, 12, 0)
+        );
+
+        let got = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
+            .expect("__DATA_CONST,__got");
+        assert_eq!((got.reserved1, got.reserved2, got.reserved3), (0, 0, 0));
+
+        let lazy = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
+            .expect("__DATA,__la_symbol_ptr");
+        assert_eq!((lazy.reserved1, lazy.reserved2, lazy.reserved3), (0, 0, 0));
+
+        let thread_ptrs = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__DATA" && section.name == "__thread_ptrs")
+            .expect("__DATA,__thread_ptrs");
+        assert_eq!(
+            (
+                thread_ptrs.reserved1,
+                thread_ptrs.reserved2,
+                thread_ptrs.reserved3
+            ),
+            (0, 0, 0)
+        );
     }
 }

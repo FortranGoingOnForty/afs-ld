@@ -40,7 +40,14 @@ pub fn write(
     opts: &LinkOptions,
     out: &mut Vec<u8>,
 ) -> Result<(), WriteError> {
-    write_with_atoms_and_plan(layout, &AtomTable::new(), kind, opts, &WritePlan::default(), out)
+    write_with_atoms_and_plan(
+        layout,
+        &AtomTable::new(),
+        kind,
+        opts,
+        &WritePlan::default(),
+        out,
+    )
 }
 
 pub fn write_with_atoms(
@@ -86,7 +93,8 @@ pub fn write_with_atoms_and_plan(
     };
 
     let file_len = total_file_size(&layout)
-        .max(std::mem::size_of::<MachHeader64>() as u64 + sizeofcmds as u64) as usize;
+        .max(std::mem::size_of::<MachHeader64>() as u64 + sizeofcmds as u64)
+        as usize;
     out.clear();
     out.resize(file_len, 0);
 
@@ -123,7 +131,9 @@ fn build_commands(
 ) -> Result<Vec<LoadCommand>, WriteError> {
     let mut out = Vec::new();
     for segment in &layout.segments {
-        out.push(LoadCommand::Segment64(build_segment_command(layout, segment)?));
+        out.push(LoadCommand::Segment64(build_segment_command(
+            layout, segment,
+        )?));
     }
 
     let symtab = LoadCommand::Symtab(SymtabCmd {
@@ -222,9 +232,9 @@ fn build_segment_command(
             reloff: 0,
             nreloc: 0,
             flags: sec.flags,
-            reserved1: 0,
-            reserved2: 0,
-            reserved3: 0,
+            reserved1: sec.reserved1,
+            reserved2: sec.reserved2,
+            reserved3: sec.reserved3,
         });
     }
 
@@ -328,5 +338,51 @@ fn align_to(value: u64, align: u64) -> u64 {
         value
     } else {
         (value + align - 1) & !(align - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::section::{
+        Layout, OutputSection, OutputSectionId, OutputSegment, Prot, SectionKind, PAGE_SIZE,
+    };
+
+    #[test]
+    fn segment_command_preserves_reserved_section_fields() {
+        let layout = Layout {
+            kind: OutputKind::Executable,
+            segments: Vec::new(),
+            sections: vec![OutputSection {
+                segment: "__TEXT".into(),
+                name: "__stubs".into(),
+                kind: SectionKind::SymbolStubs,
+                align_pow2: 2,
+                flags: S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                reserved1: 7,
+                reserved2: 12,
+                reserved3: 3,
+                atoms: Vec::new(),
+                addr: 0x1_0000_0400,
+                size: 12,
+                file_off: 0x400,
+            }],
+        };
+        let segment = OutputSegment {
+            name: "__TEXT".into(),
+            sections: vec![OutputSectionId(0)],
+            vm_addr: 0x1_0000_0000,
+            vm_size: PAGE_SIZE,
+            file_off: 0,
+            file_size: 0x1000,
+            init_prot: Prot::READ | Prot::EXECUTE,
+            max_prot: Prot::READ | Prot::EXECUTE,
+        };
+
+        let command = build_segment_command(&layout, &segment).expect("build segment");
+        let section = &command.sections[0];
+        assert_eq!(section.reserved1, 7);
+        assert_eq!(section.reserved2, 12);
+        assert_eq!(section.reserved3, 3);
     }
 }

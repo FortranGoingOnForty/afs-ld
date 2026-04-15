@@ -16,7 +16,13 @@
 //! drive the outer loop.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
+
+use crate::archive::{Archive, ArchiveError};
+use crate::input::ObjectFile;
+use crate::macho::dylib::DylibFile;
+use crate::macho::reader::ReadError;
 
 // ---------------------------------------------------------------------------
 // Interned strings.
@@ -115,6 +121,175 @@ opaque_id!(
     /// Index into `SymbolTable::symbols`. Stable across the whole link.
     SymbolId
 );
+
+// ---------------------------------------------------------------------------
+// Inputs registry.
+//
+// Sprint 8 drives resolution against a triple of per-kind Vecs. Handles
+// `InputId` / `ArchiveId` / `DylibId` are 1:1 with slot indices here, and
+// the opaque newtypes (above) keep them from being confused across
+// categories.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct ObjectInput {
+    pub path: PathBuf,
+    /// Raw bytes; `ObjectFile::parse` re-runs cheaply against this on
+    /// demand. We don't cache a parsed view because `ObjectFile` copies
+    /// the fields it needs on construction, so re-parse is idempotent.
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct ArchiveInput {
+    pub path: PathBuf,
+    pub bytes: Vec<u8>,
+    /// Members we've already fetched (keyed by `ar_hdr` offset). Prevents
+    /// the fixed-point loop from re-ingesting the same object twice —
+    /// important both for correctness (no duplicate-strong errors from
+    /// our own symbols) and for keeping transitions deterministic.
+    pub fetched: std::collections::HashSet<u32>,
+}
+
+#[derive(Debug)]
+pub struct DylibInput {
+    pub path: PathBuf,
+    /// Parsed `DylibFile`. `DylibFile` owns its data (no borrow into
+    /// `bytes`), so we keep it pre-parsed for O(1) export-trie walks.
+    pub file: DylibFile,
+    /// 1-based two-level-namespace ordinal. Matches command-line order
+    /// of `LC_LOAD_DYLIB`-style entries.
+    pub ordinal: u16,
+}
+
+#[derive(Debug, Default)]
+pub struct Inputs {
+    pub objects: Vec<ObjectInput>,
+    pub archives: Vec<ArchiveInput>,
+    pub dylibs: Vec<DylibInput>,
+}
+
+#[derive(Debug)]
+pub enum InputAddError {
+    Read(ReadError),
+    Archive(ArchiveError),
+}
+
+impl std::fmt::Display for InputAddError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InputAddError::Read(e) => write!(f, "{e}"),
+            InputAddError::Archive(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for InputAddError {}
+
+impl From<ReadError> for InputAddError {
+    fn from(e: ReadError) -> Self {
+        InputAddError::Read(e)
+    }
+}
+
+impl From<ArchiveError> for InputAddError {
+    fn from(e: ArchiveError) -> Self {
+        InputAddError::Archive(e)
+    }
+}
+
+impl Inputs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register an `.o` file. Validates the Mach-O header by parsing once,
+    /// then keeps only the raw bytes (re-parsing on demand is cheap and
+    /// sidesteps borrow-lifetime headaches).
+    pub fn add_object(&mut self, path: PathBuf, bytes: Vec<u8>) -> Result<InputId, InputAddError> {
+        // Validate now — we'd rather catch a bad object at the add site.
+        ObjectFile::parse(&path, &bytes)?;
+        let id = InputId(self.objects.len() as u32);
+        self.objects.push(ObjectInput { path, bytes });
+        Ok(id)
+    }
+
+    /// Register an `.a` file.
+    pub fn add_archive(
+        &mut self,
+        path: PathBuf,
+        bytes: Vec<u8>,
+    ) -> Result<ArchiveId, InputAddError> {
+        Archive::open(&path, &bytes)?; // validate
+        let id = ArchiveId(self.archives.len() as u32);
+        self.archives.push(ArchiveInput {
+            path,
+            bytes,
+            fetched: std::collections::HashSet::new(),
+        });
+        Ok(id)
+    }
+
+    /// Register a `.dylib`. TBD-backed dylibs go through
+    /// [`Inputs::add_dylib_from_tbd`].
+    pub fn add_dylib(&mut self, path: PathBuf, bytes: Vec<u8>) -> Result<DylibId, InputAddError> {
+        let file = DylibFile::parse(&path, &bytes)?;
+        let ordinal = (self.dylibs.len() + 1) as u16;
+        let id = DylibId(self.dylibs.len() as u32);
+        self.dylibs.push(DylibInput {
+            path,
+            file,
+            ordinal,
+        });
+        Ok(id)
+    }
+
+    /// Register a TBD-backed dylib. The caller materializes the `DylibFile`
+    /// via `DylibFile::from_tbd(path, tbd, target)` so the target filter
+    /// is explicit.
+    pub fn add_dylib_from_file(&mut self, path: PathBuf, file: DylibFile) -> DylibId {
+        let ordinal = (self.dylibs.len() + 1) as u16;
+        let id = DylibId(self.dylibs.len() as u32);
+        self.dylibs.push(DylibInput {
+            path,
+            file,
+            ordinal,
+        });
+        id
+    }
+
+    // ---- accessors ----
+
+    pub fn object(&self, id: InputId) -> &ObjectInput {
+        &self.objects[id.0 as usize]
+    }
+
+    pub fn archive(&self, id: ArchiveId) -> &ArchiveInput {
+        &self.archives[id.0 as usize]
+    }
+
+    pub fn archive_mut(&mut self, id: ArchiveId) -> &mut ArchiveInput {
+        &mut self.archives[id.0 as usize]
+    }
+
+    pub fn dylib(&self, id: DylibId) -> &DylibInput {
+        &self.dylibs[id.0 as usize]
+    }
+
+    /// Parse an `ObjectFile` view of a registered object. Fast — `ObjectFile`
+    /// owns its buffers, so this is just the Mach-O walk cost.
+    pub fn object_file(&self, id: InputId) -> Result<ObjectFile, ReadError> {
+        let o = &self.objects[id.0 as usize];
+        ObjectFile::parse(&o.path, &o.bytes)
+    }
+
+    /// Open an `Archive` view, borrowing from the registry's bytes for the
+    /// returned lifetime.
+    pub fn archive_view(&self, id: ArchiveId) -> Result<Archive<'_>, ArchiveError> {
+        let a = &self.archives[id.0 as usize];
+        Archive::open(&a.path, &a.bytes)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Symbol sum type.

@@ -186,6 +186,7 @@ pub struct Archive<'a> {
     pub flavor: Flavor,
     data: &'a [u8],
     members: Vec<Member<'a>>,
+    symbol_index: Option<SymbolIndex>,
 }
 
 impl<'a> Archive<'a> {
@@ -194,12 +195,18 @@ impl<'a> Archive<'a> {
     pub fn open(path: impl Into<PathBuf>, data: &'a [u8]) -> Result<Self, ArchiveError> {
         let flavor = detect_flavor(data)?;
         let (members, flavor) = parse_members(data, flavor)?;
+        let symbol_index = build_symbol_index(&members)?;
         Ok(Archive {
             path: path.into(),
             flavor,
             data,
             members,
+            symbol_index,
         })
+    }
+
+    pub fn symbol_index(&self) -> Option<&SymbolIndex> {
+        self.symbol_index.as_ref()
     }
 
     /// Raw bytes following the 8-byte magic — where member entries begin.
@@ -402,6 +409,199 @@ fn decode_member<'a>(
         &data[body_start..body_start + size],
         SpecialMember::None,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Symbol index parsing (BSD __.SYMDEF / SysV `/`).
+// ---------------------------------------------------------------------------
+
+/// One defined-symbol row in the archive symbol index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolIndexEntry {
+    pub name: String,
+    /// Byte offset of the defining member's `ar_hdr` within the archive.
+    pub member_header_offset: u32,
+}
+
+/// The table of `(symbol → defining member offset)` the archive writer
+/// embeds up front. A given name can appear multiple times — ld's policy is
+/// to take the first defining member. Iteration preserves the source order.
+#[derive(Debug, Clone, Default)]
+pub struct SymbolIndex {
+    pub entries: Vec<SymbolIndexEntry>,
+}
+
+impl SymbolIndex {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Return the `ar_hdr` offset of the first member that defines `name`,
+    /// or `None` if the index has no such entry. The "first" rule matches
+    /// ld's classic ordering — a later duplicate doesn't shadow an earlier.
+    pub fn first_defining_offset(&self, name: &str) -> Option<u32> {
+        self.entries
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.member_header_offset)
+    }
+
+    /// All `ar_hdr` offsets where `name` appears. Exists for `-all_load` /
+    /// `-force_load` semantics and for tests that want to verify duplicates.
+    pub fn offsets_for<'n>(&'n self, name: &'n str) -> impl Iterator<Item = u32> + 'n {
+        self.entries
+            .iter()
+            .filter(move |e| e.name == name)
+            .map(|e| e.member_header_offset)
+    }
+}
+
+fn build_symbol_index(members: &[Member<'_>]) -> Result<Option<SymbolIndex>, ArchiveError> {
+    for m in members {
+        match m.special {
+            SpecialMember::BsdSymIndex => {
+                return Ok(Some(parse_bsd_symbol_index(m.body)?));
+            }
+            SpecialMember::SysvSymIndex => {
+                return Ok(Some(parse_sysv_symbol_index(m.body)?));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+/// BSD `__.SYMDEF` / `__.SYMDEF SORTED`, little-endian:
+/// ```text
+///   u32 ranlib_byte_count
+///   ranlib[] { u32 strx; u32 member_header_offset; }
+///   u32 string_size
+///   char strings[string_size]
+/// ```
+fn parse_bsd_symbol_index(body: &[u8]) -> Result<SymbolIndex, ArchiveError> {
+    if body.len() < 8 {
+        return Err(ArchiveError::BadSymbolIndex {
+            reason: "__.SYMDEF shorter than 8-byte header",
+        });
+    }
+    let ranlib_bytes = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    if !ranlib_bytes.is_multiple_of(8) {
+        return Err(ArchiveError::BadSymbolIndex {
+            reason: "__.SYMDEF ranlib byte count not a multiple of 8",
+        });
+    }
+    let ranlib_end = 4usize.checked_add(ranlib_bytes).ok_or(ArchiveError::BadSymbolIndex {
+        reason: "__.SYMDEF ranlib region overflows",
+    })?;
+    if ranlib_end + 4 > body.len() {
+        return Err(ArchiveError::BadSymbolIndex {
+            reason: "__.SYMDEF ranlib + stringsize region overruns member",
+        });
+    }
+    let stringsize =
+        u32::from_le_bytes(body[ranlib_end..ranlib_end + 4].try_into().unwrap()) as usize;
+    let strings_start = ranlib_end + 4;
+    let strings_end = strings_start
+        .checked_add(stringsize)
+        .ok_or(ArchiveError::BadSymbolIndex {
+            reason: "__.SYMDEF strings region overflows",
+        })?;
+    if strings_end > body.len() {
+        return Err(ArchiveError::BadSymbolIndex {
+            reason: "__.SYMDEF strings region overruns member",
+        });
+    }
+    let strings = &body[strings_start..strings_end];
+
+    let mut entries = Vec::with_capacity(ranlib_bytes / 8);
+    let mut off = 4;
+    while off < ranlib_end {
+        let strx = u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) as usize;
+        let mh_off = u32::from_le_bytes(body[off + 4..off + 8].try_into().unwrap());
+        if strx >= strings.len() {
+            return Err(ArchiveError::BadSymbolIndex {
+                reason: "ranlib strx out of bounds",
+            });
+        }
+        let end = strings[strx..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|i| strx + i)
+            .ok_or(ArchiveError::BadSymbolIndex {
+                reason: "ranlib name not null-terminated",
+            })?;
+        let name = str::from_utf8(&strings[strx..end])
+            .map_err(|_| ArchiveError::BadSymbolIndex {
+                reason: "ranlib name not UTF-8",
+            })?
+            .to_string();
+        entries.push(SymbolIndexEntry {
+            name,
+            member_header_offset: mh_off,
+        });
+        off += 8;
+    }
+    Ok(SymbolIndex { entries })
+}
+
+/// SysV `/` symbol index, big-endian:
+/// ```text
+///   u32  nsyms
+///   u32  offsets[nsyms]   — each a member ar_hdr offset
+///   char strings[]        — nsyms null-terminated names, concatenated
+/// ```
+fn parse_sysv_symbol_index(body: &[u8]) -> Result<SymbolIndex, ArchiveError> {
+    if body.len() < 4 {
+        return Err(ArchiveError::BadSymbolIndex {
+            reason: "SysV symbol index shorter than 4-byte header",
+        });
+    }
+    let nsyms = u32::from_be_bytes(body[0..4].try_into().unwrap()) as usize;
+    let offsets_end = 4usize
+        .checked_add(nsyms * 4)
+        .ok_or(ArchiveError::BadSymbolIndex {
+            reason: "SysV symbol-index offsets region overflows",
+        })?;
+    if offsets_end > body.len() {
+        return Err(ArchiveError::BadSymbolIndex {
+            reason: "SysV symbol-index offsets region overruns member",
+        });
+    }
+    let strings = &body[offsets_end..];
+
+    let mut entries = Vec::with_capacity(nsyms);
+    let mut cursor = 0usize;
+    for i in 0..nsyms {
+        let off = 4 + i * 4;
+        let mh_off = u32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+        if cursor >= strings.len() {
+            return Err(ArchiveError::BadSymbolIndex {
+                reason: "SysV symbol-index names exhausted before nsyms satisfied",
+            });
+        }
+        let end = strings[cursor..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|i| cursor + i)
+            .ok_or(ArchiveError::BadSymbolIndex {
+                reason: "SysV symbol-index name not null-terminated",
+            })?;
+        let name = str::from_utf8(&strings[cursor..end])
+            .map_err(|_| ArchiveError::BadSymbolIndex {
+                reason: "SysV symbol-index name not UTF-8",
+            })?
+            .to_string();
+        entries.push(SymbolIndexEntry {
+            name,
+            member_header_offset: mh_off,
+        });
+        cursor = end + 1;
+    }
+    Ok(SymbolIndex { entries })
 }
 
 fn decode_long_name(
@@ -627,9 +827,10 @@ mod tests {
 
     #[test]
     fn bsd_extended_symdef_marked_special() {
+        let empty_idx = encode_bsd_symbol_index(&[]);
         let mut buf = Vec::new();
         buf.extend_from_slice(AR_MAGIC);
-        buf.extend_from_slice(&encode_bsd_extended("__.SYMDEF SORTED", &[0xAA; 4]));
+        buf.extend_from_slice(&encode_bsd_extended("__.SYMDEF SORTED", &empty_idx));
         let ar = Archive::open("/tmp/bsd_symdef.a", &buf).unwrap();
         assert_eq!(ar.members()[0].special, SpecialMember::BsdSymIndex);
     }
@@ -665,9 +866,10 @@ mod tests {
 
     #[test]
     fn sysv_symbol_index_member_is_special() {
+        let empty_idx = encode_sysv_symbol_index(&[]);
         let mut buf = Vec::new();
         buf.extend_from_slice(AR_MAGIC);
-        buf.extend_from_slice(&encode_member("/", &[0xFFu8; 8]));
+        buf.extend_from_slice(&encode_member("/", &empty_idx));
         let ar = Archive::open("/tmp/sysv_sym.a", &buf).unwrap();
         assert_eq!(ar.members()[0].special, SpecialMember::SysvSymIndex);
         assert_eq!(ar.flavor, Flavor::Sysv);
@@ -687,9 +889,10 @@ mod tests {
 
     #[test]
     fn object_members_skip_specials() {
+        let empty_idx = encode_bsd_symbol_index(&[]);
         let mut buf = Vec::new();
         buf.extend_from_slice(AR_MAGIC);
-        buf.extend_from_slice(&encode_bsd_extended("__.SYMDEF", &[0u8; 4]));
+        buf.extend_from_slice(&encode_bsd_extended("__.SYMDEF", &empty_idx));
         buf.extend_from_slice(&encode_member("real.o", b"CONTENT"));
         let ar = Archive::open("/tmp/mixed.a", &buf).unwrap();
         assert_eq!(ar.members().len(), 2);
@@ -709,6 +912,113 @@ mod tests {
         assert_eq!(ar.members().len(), 2);
         assert_eq!(ar.members()[0].name, "../foo.o");
         assert_eq!(ar.members()[1].name, "bar.o");
+    }
+
+    // ----- symbol-index tests -----
+
+    /// Build a BSD __.SYMDEF body: ranlib array + stringtab.
+    fn encode_bsd_symbol_index(entries: &[(&str, u32)]) -> Vec<u8> {
+        let mut strings = Vec::<u8>::new();
+        let mut strx_map = Vec::new();
+        for (name, _) in entries {
+            let strx = strings.len() as u32;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            strx_map.push(strx);
+        }
+        let ranlib_bytes = (entries.len() * 8) as u32;
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&ranlib_bytes.to_le_bytes());
+        for ((_, mh_off), strx) in entries.iter().zip(strx_map.iter()) {
+            body.extend_from_slice(&strx.to_le_bytes());
+            body.extend_from_slice(&mh_off.to_le_bytes());
+        }
+        let stringsize = strings.len() as u32;
+        body.extend_from_slice(&stringsize.to_le_bytes());
+        body.extend_from_slice(&strings);
+        body
+    }
+
+    fn encode_sysv_symbol_index(entries: &[(&str, u32)]) -> Vec<u8> {
+        let nsyms = entries.len() as u32;
+        let mut body = Vec::new();
+        body.extend_from_slice(&nsyms.to_be_bytes());
+        for (_, mh_off) in entries {
+            body.extend_from_slice(&mh_off.to_be_bytes());
+        }
+        for (name, _) in entries {
+            body.extend_from_slice(name.as_bytes());
+            body.push(0);
+        }
+        body
+    }
+
+    #[test]
+    fn bsd_symbol_index_parses_entries() {
+        let idx_body = encode_bsd_symbol_index(&[("_alpha", 0x100), ("_beta", 0x200)]);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(AR_MAGIC);
+        buf.extend_from_slice(&encode_bsd_extended("__.SYMDEF SORTED", &idx_body));
+        let ar = Archive::open("/tmp/bsd_idx.a", &buf).unwrap();
+        let idx = ar.symbol_index().expect("index present");
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx.first_defining_offset("_alpha"), Some(0x100));
+        assert_eq!(idx.first_defining_offset("_beta"), Some(0x200));
+        assert_eq!(idx.first_defining_offset("_missing"), None);
+    }
+
+    #[test]
+    fn sysv_symbol_index_parses_entries() {
+        let idx_body = encode_sysv_symbol_index(&[("_alpha", 0x60), ("_beta", 0xC0)]);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(AR_MAGIC);
+        buf.extend_from_slice(&encode_member("/", &idx_body));
+        let ar = Archive::open("/tmp/sysv_idx.a", &buf).unwrap();
+        let idx = ar.symbol_index().expect("index present");
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx.first_defining_offset("_alpha"), Some(0x60));
+        assert_eq!(idx.first_defining_offset("_beta"), Some(0xC0));
+    }
+
+    #[test]
+    fn symbol_index_absent_when_no_special_member() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(AR_MAGIC);
+        buf.extend_from_slice(&encode_member("foo.o/", b"CONTENT"));
+        let ar = Archive::open("/tmp/noidx.a", &buf).unwrap();
+        assert!(ar.symbol_index().is_none());
+    }
+
+    #[test]
+    fn symbol_index_duplicate_returns_first() {
+        let idx_body = encode_bsd_symbol_index(&[("_sym", 0x100), ("_sym", 0x200)]);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(AR_MAGIC);
+        buf.extend_from_slice(&encode_bsd_extended("__.SYMDEF", &idx_body));
+        let ar = Archive::open("/tmp/dup.a", &buf).unwrap();
+        let idx = ar.symbol_index().unwrap();
+        assert_eq!(idx.first_defining_offset("_sym"), Some(0x100));
+        let all: Vec<u32> = idx.offsets_for("_sym").collect();
+        assert_eq!(all, vec![0x100, 0x200]);
+    }
+
+    #[test]
+    fn bsd_symbol_index_rejects_oob_strx() {
+        // ranlib entry with strx = 999 but strings is tiny.
+        let mut body = Vec::new();
+        body.extend_from_slice(&8u32.to_le_bytes()); // 8 bytes → 1 ranlib
+        body.extend_from_slice(&999u32.to_le_bytes()); // strx
+        body.extend_from_slice(&0u32.to_le_bytes()); // mh_off
+        body.extend_from_slice(&4u32.to_le_bytes()); // stringsize
+        body.extend_from_slice(b"abc\0");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(AR_MAGIC);
+        buf.extend_from_slice(&encode_bsd_extended("__.SYMDEF", &body));
+        assert!(matches!(
+            Archive::open("/tmp/bad_idx.a", &buf).unwrap_err(),
+            ArchiveError::BadSymbolIndex { .. }
+        ));
     }
 
     #[test]

@@ -221,6 +221,332 @@ pub enum SymbolKindTag {
     Alias,
 }
 
+// ---------------------------------------------------------------------------
+// SymbolTable.
+// ---------------------------------------------------------------------------
+
+/// What `SymbolTable::insert` did with the incoming symbol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InsertOutcome {
+    /// First time this name appeared; the new symbol is now at `id`.
+    Inserted(SymbolId),
+    /// A stronger / more-concrete symbol replaced the existing entry.
+    Replaced {
+        id: SymbolId,
+        from: SymbolKindTag,
+        to: SymbolKindTag,
+    },
+    /// Existing entry wins; the new one was dropped on the floor.
+    Kept(SymbolId),
+    /// Two Common symbols with the same name were coalesced: size grew to
+    /// the max and alignment grew to the stricter of the two.
+    CommonCoalesced { id: SymbolId },
+    /// Inserting an Undefined whose slot currently holds a LazyArchive.
+    /// The caller (Sprint 8 resolver) must fetch the named archive member
+    /// and re-insert its symbols. The LazyArchive stays in place.
+    PendingArchiveFetch {
+        id: SymbolId,
+        archive: ArchiveId,
+        member: MemberId,
+    },
+    /// Inserting an Undefined whose slot currently holds a LazyObject
+    /// (from `--start-lib`). Caller loads the object and re-inserts.
+    PendingObjectLoad { id: SymbolId, origin: InputId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InsertError {
+    /// Two distinct strong `Defined` entries collided. Sprint 8 surfaces
+    /// this as a user-facing `duplicate symbol` diagnostic.
+    DuplicateStrong {
+        name: Istr,
+        first: SymbolId,
+        second: Box<Symbol>,
+    },
+    /// Alias chain would cycle back to itself.
+    AliasCycle { name: Istr },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transition {
+    pub id: SymbolId,
+    pub from: SymbolKindTag,
+    pub to: SymbolKindTag,
+    pub cause: TransitionCause,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionCause {
+    Inserted,
+    Replaced,
+    CommonCoalesced,
+}
+
+#[derive(Debug, Default)]
+pub struct SymbolTable {
+    pub interner: StringInterner,
+    symbols: Vec<Symbol>,
+    by_name: HashMap<Istr, SymbolId>,
+    transitions: Vec<Transition>,
+}
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn intern(&mut self, name: &str) -> Istr {
+        self.interner.intern(name)
+    }
+
+    pub fn lookup(&self, name: Istr) -> Option<SymbolId> {
+        self.by_name.get(&name).copied()
+    }
+
+    pub fn get(&self, id: SymbolId) -> &Symbol {
+        &self.symbols[id.0 as usize]
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (SymbolId, &Symbol)> {
+        self.symbols
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (SymbolId(i as u32), s))
+    }
+
+    pub fn len(&self) -> usize {
+        self.symbols.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.symbols.is_empty()
+    }
+
+    pub fn transitions(&self) -> &[Transition] {
+        &self.transitions
+    }
+
+    /// Insert a symbol, running the resolution matrix. See Sprint 7's
+    /// `.docs/sprints/sprint07.md` for the full matrix.
+    pub fn insert(&mut self, sym: Symbol) -> Result<InsertOutcome, InsertError> {
+        let name = sym.name();
+
+        // Vacant slot: just store it.
+        let Some(&existing_id) = self.by_name.get(&name) else {
+            let id = self.push_new(sym.clone());
+            self.transitions.push(Transition {
+                id,
+                from: sym.kind(),
+                to: sym.kind(),
+                cause: TransitionCause::Inserted,
+            });
+            return Ok(InsertOutcome::Inserted(id));
+        };
+
+        let existing_kind = self.symbols[existing_id.0 as usize].kind();
+        let new_kind = sym.kind();
+
+        // Alias insertions have their own rules (cycle detection).
+        if new_kind == SymbolKindTag::Alias {
+            return self.insert_alias_over(existing_id, sym);
+        }
+
+        // Resolve the existing × new pair via the matrix.
+        use SymbolKindTag::*;
+        let action = match (existing_kind, new_kind) {
+            // --- existing Undefined ---
+            (Undefined, Undefined) => Action::Keep,
+            (Undefined, Defined | Common | DylibImport | LazyArchive | LazyObject) => {
+                Action::Replace
+            }
+
+            // --- existing Defined (strong vs weak resolved inline) ---
+            (Defined, Undefined)
+            | (Defined, Common)
+            | (Defined, DylibImport)
+            | (Defined, LazyArchive)
+            | (Defined, LazyObject) => Action::Keep,
+            (Defined, Defined) => self.defined_vs_defined(existing_id, &sym)?,
+
+            // --- existing Common ---
+            (Common, Undefined) => Action::Keep,
+            (Common, Defined) => Action::Replace,
+            (Common, Common) => Action::CoalesceCommon,
+            (Common, DylibImport) | (Common, LazyArchive) | (Common, LazyObject) => Action::Keep,
+
+            // --- existing DylibImport ---
+            (DylibImport, Undefined) => Action::Keep,
+            (DylibImport, Defined) => Action::Replace,
+            (DylibImport, Common)
+            | (DylibImport, DylibImport)
+            | (DylibImport, LazyArchive)
+            | (DylibImport, LazyObject) => Action::Keep,
+
+            // --- existing LazyArchive ---
+            (LazyArchive, Undefined) => Action::PendingArchiveFetch,
+            (LazyArchive, Defined)
+            | (LazyArchive, Common)
+            | (LazyArchive, DylibImport)
+            | (LazyArchive, LazyObject) => Action::Replace,
+            (LazyArchive, LazyArchive) => Action::Keep,
+
+            // --- existing LazyObject ---
+            (LazyObject, Undefined) => Action::PendingObjectLoad,
+            (LazyObject, Defined)
+            | (LazyObject, Common)
+            | (LazyObject, DylibImport)
+            | (LazyObject, LazyArchive) => Action::Replace,
+            (LazyObject, LazyObject) => Action::Keep,
+
+            // --- existing Alias: a direct form replaces it ---
+            (Alias, _) => Action::Replace,
+
+            // Shouldn't hit — Alias insertions diverged above.
+            (_, Alias) => unreachable!(),
+        };
+
+        Ok(self.apply_action(existing_id, sym, existing_kind, new_kind, action))
+    }
+
+    fn defined_vs_defined(
+        &self,
+        existing_id: SymbolId,
+        new: &Symbol,
+    ) -> Result<Action, InsertError> {
+        let existing = &self.symbols[existing_id.0 as usize];
+        match (existing.is_strong_defined(), new.is_strong_defined()) {
+            (true, true) => Err(InsertError::DuplicateStrong {
+                name: new.name(),
+                first: existing_id,
+                second: Box::new(new.clone()),
+            }),
+            (false, true) => Ok(Action::Replace),     // strong over weak
+            (true, false) => Ok(Action::Keep),        // strong keeps its seat
+            (false, false) => Ok(Action::Keep),       // first weak wins
+        }
+    }
+
+    fn apply_action(
+        &mut self,
+        id: SymbolId,
+        sym: Symbol,
+        from: SymbolKindTag,
+        to: SymbolKindTag,
+        action: Action,
+    ) -> InsertOutcome {
+        match action {
+            Action::Keep => InsertOutcome::Kept(id),
+            Action::Replace => {
+                self.symbols[id.0 as usize] = sym;
+                self.transitions.push(Transition {
+                    id,
+                    from,
+                    to,
+                    cause: TransitionCause::Replaced,
+                });
+                InsertOutcome::Replaced { id, from, to }
+            }
+            Action::CoalesceCommon => {
+                self.coalesce_common(id, sym);
+                self.transitions.push(Transition {
+                    id,
+                    from,
+                    to,
+                    cause: TransitionCause::CommonCoalesced,
+                });
+                InsertOutcome::CommonCoalesced { id }
+            }
+            Action::PendingArchiveFetch => {
+                let Symbol::LazyArchive { archive, member, .. } = self.symbols[id.0 as usize]
+                else {
+                    unreachable!("PendingArchiveFetch requires LazyArchive in slot")
+                };
+                InsertOutcome::PendingArchiveFetch {
+                    id,
+                    archive,
+                    member,
+                }
+            }
+            Action::PendingObjectLoad => {
+                let Symbol::LazyObject { origin, .. } = self.symbols[id.0 as usize]
+                else {
+                    unreachable!("PendingObjectLoad requires LazyObject in slot")
+                };
+                InsertOutcome::PendingObjectLoad { id, origin }
+            }
+        }
+    }
+
+    fn coalesce_common(&mut self, id: SymbolId, incoming: Symbol) {
+        let slot = &mut self.symbols[id.0 as usize];
+        let (
+            Symbol::Common {
+                size: a_size,
+                align_pow2: a_align,
+                ..
+            },
+            Symbol::Common {
+                size: b_size,
+                align_pow2: b_align,
+                ..
+            },
+        ) = (slot.clone(), incoming)
+        else {
+            unreachable!("coalesce_common requires two Common entries");
+        };
+        if let Symbol::Common {
+            size,
+            align_pow2,
+            ..
+        } = slot
+        {
+            *size = a_size.max(b_size);
+            *align_pow2 = a_align.max(b_align);
+        }
+    }
+
+    fn push_new(&mut self, sym: Symbol) -> SymbolId {
+        let id = SymbolId(self.symbols.len() as u32);
+        let name = sym.name();
+        self.symbols.push(sym);
+        self.by_name.insert(name, id);
+        id
+    }
+
+    fn insert_alias_over(
+        &mut self,
+        existing_id: SymbolId,
+        sym: Symbol,
+    ) -> Result<InsertOutcome, InsertError> {
+        // Cycle detection happens in the dedicated path added by the next
+        // commit (alias flattening). For now we accept the alias; Sprint 8
+        // will walk chains at lookup time.
+        let from = self.symbols[existing_id.0 as usize].kind();
+        self.symbols[existing_id.0 as usize] = sym;
+        self.transitions.push(Transition {
+            id: existing_id,
+            from,
+            to: SymbolKindTag::Alias,
+            cause: TransitionCause::Replaced,
+        });
+        Ok(InsertOutcome::Replaced {
+            id: existing_id,
+            from,
+            to: SymbolKindTag::Alias,
+        })
+    }
+}
+
+/// Internal matrix verdict — what `insert()` decided to do before actually
+/// performing the operation.
+enum Action {
+    Keep,
+    Replace,
+    CoalesceCommon,
+    PendingArchiveFetch,
+    PendingObjectLoad,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

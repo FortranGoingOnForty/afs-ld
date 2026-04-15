@@ -7,6 +7,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 
+use crate::archive::{Archive, Flavor, SpecialMember};
 use crate::input::ObjectFile;
 use crate::macho::constants::*;
 use crate::macho::reader::{
@@ -16,6 +17,52 @@ use crate::macho::reader::{
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind};
 use crate::section::InputSection;
 use crate::symbol::{InputSymbol, SymKind};
+
+pub fn dump_archive_file(path: &Path) -> io::Result<()> {
+    let bytes = std::fs::read(path)?;
+    let ar = Archive::open(path, &bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let out = io::stdout();
+    let mut h = out.lock();
+    let flavor = match ar.flavor {
+        Flavor::Bsd => "BSD",
+        Flavor::Sysv => "SysV",
+        Flavor::GnuThin => "GNU-thin",
+    };
+    writeln!(h, "{}:", path.display())?;
+    writeln!(
+        h,
+        "archive: flavor={flavor} members={} symbols={}",
+        ar.members().len(),
+        ar.symbol_index().map(|i| i.len()).unwrap_or(0),
+    )?;
+    writeln!(h, "Members:")?;
+    for (i, m) in ar.members().iter().enumerate() {
+        let kind = match m.special {
+            SpecialMember::None => "obj",
+            SpecialMember::BsdSymIndex => "bsd-symindex",
+            SpecialMember::SysvSymIndex => "sysv-symindex",
+            SpecialMember::SysvLongNames => "sysv-longnames",
+        };
+        writeln!(
+            h,
+            "  [{i}] @0x{:x} {kind:<16} {} ({} bytes)",
+            m.header_offset,
+            m.name,
+            m.body.len()
+        )?;
+    }
+    if let Some(idx) = ar.symbol_index() {
+        writeln!(h, "Symbols ({}):", idx.len())?;
+        for (i, e) in idx.entries.iter().enumerate().take(16) {
+            writeln!(h, "  [{i}] {} -> member@0x{:x}", e.name, e.member_header_offset)?;
+        }
+        if idx.len() > 16 {
+            writeln!(h, "  ... ({} more)", idx.len() - 16)?;
+        }
+    }
+    Ok(())
+}
 
 pub fn dump_file(path: &Path) -> io::Result<()> {
     let bytes = std::fs::read(path)?;

@@ -23,6 +23,16 @@ fn main() -> ExitCode {
         };
     }
 
+    if let Some(path) = &opts.dump_archive {
+        return match dump::dump_archive_file(path) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                diag::error(&format!("{}: {}", path.display(), e));
+                ExitCode::from(1)
+            }
+        };
+    }
+
     match Linker::run(&opts) {
         Ok(()) => ExitCode::SUCCESS,
         Err(LinkError::NoInputs) => {

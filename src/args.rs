@@ -62,6 +62,12 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                         .ok_or_else(|| ArgsError::MissingValue("--dump".into()))?,
                 ));
             }
+            "--dump-archive" => {
+                opts.dump_archive = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("--dump-archive".into()))?,
+                ));
+            }
             s if s.starts_with('-') => {
                 return Err(ArgsError::UnknownFlag(s.to_string()));
             }
@@ -123,5 +129,14 @@ mod tests {
     fn dump_flag_without_value_errors() {
         let err = parse(&argv(&["--dump"])).unwrap_err();
         assert!(matches!(err, ArgsError::MissingValue(ref f) if f == "--dump"));
+    }
+
+    #[test]
+    fn dump_archive_flag_captures_path() {
+        let opts = parse(&argv(&["--dump-archive", "libfoo.a"])).unwrap();
+        assert_eq!(
+            opts.dump_archive.as_deref(),
+            Some(std::path::Path::new("libfoo.a"))
+        );
     }
 }

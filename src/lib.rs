@@ -35,6 +35,8 @@ pub struct LinkOptions {
     /// When set, afs-ld operates in dump mode and prints the given file's
     /// header + load commands instead of linking.
     pub dump: Option<PathBuf>,
+    /// When set, afs-ld dumps the named static archive's structure.
+    pub dump_archive: Option<PathBuf>,
 }
 
 impl Default for LinkOptions {
@@ -46,6 +48,7 @@ impl Default for LinkOptions {
             arch: None,
             kind: OutputKind::Executable,
             dump: None,
+            dump_archive: None,
         }
     }
 }

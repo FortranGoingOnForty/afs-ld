@@ -119,6 +119,8 @@ pub fn write_header(hdr: &MachHeader64, out: &mut Vec<u8>) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadCommand {
     Segment64(Segment64),
+    Symtab(SymtabCmd),
+    Dysymtab(DysymtabCmd),
     /// A load command whose payload we haven't decoded yet. Preserves bytes
     /// verbatim for byte-level round-trip.
     Raw { cmd: u32, cmdsize: u32, data: Vec<u8> },
@@ -128,6 +130,8 @@ impl LoadCommand {
     pub fn cmd(&self) -> u32 {
         match self {
             LoadCommand::Segment64(_) => LC_SEGMENT_64,
+            LoadCommand::Symtab(_) => LC_SYMTAB,
+            LoadCommand::Dysymtab(_) => LC_DYSYMTAB,
             LoadCommand::Raw { cmd, .. } => *cmd,
         }
     }
@@ -135,6 +139,8 @@ impl LoadCommand {
     pub fn cmdsize(&self) -> u32 {
         match self {
             LoadCommand::Segment64(s) => s.wire_size(),
+            LoadCommand::Symtab(_) => SymtabCmd::WIRE_SIZE,
+            LoadCommand::Dysymtab(_) => DysymtabCmd::WIRE_SIZE,
             LoadCommand::Raw { cmdsize, .. } => *cmdsize,
         }
     }
@@ -390,6 +396,8 @@ pub fn parse_commands(
 fn decode_command(cmd: u32, cmdsize: u32, payload: &[u8]) -> Result<LoadCommand, ReadError> {
     match cmd {
         LC_SEGMENT_64 => Ok(LoadCommand::Segment64(Segment64::parse(cmdsize, payload)?)),
+        LC_SYMTAB => Ok(LoadCommand::Symtab(SymtabCmd::parse(cmdsize, payload)?)),
+        LC_DYSYMTAB => Ok(LoadCommand::Dysymtab(DysymtabCmd::parse(cmdsize, payload)?)),
         _ => Ok(LoadCommand::Raw {
             cmd,
             cmdsize,
@@ -405,11 +413,165 @@ pub fn write_commands(cmds: &[LoadCommand], out: &mut Vec<u8>) {
     for c in cmds {
         match c {
             LoadCommand::Segment64(s) => s.write(out),
+            LoadCommand::Symtab(s) => s.write(out),
+            LoadCommand::Dysymtab(d) => d.write(out),
             LoadCommand::Raw { cmd, cmdsize, data } => {
                 out.extend_from_slice(&cmd.to_le_bytes());
                 out.extend_from_slice(&cmdsize.to_le_bytes());
                 out.extend_from_slice(data);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LC_SYMTAB
+// ---------------------------------------------------------------------------
+
+/// `symtab_command` — 16-byte payload locating the symbol table and string
+/// table in the file. Sprint 2 decodes the nlist_64 + string table contents
+/// themselves; this sprint only lifts the locator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymtabCmd {
+    pub symoff: u32,
+    pub nsyms: u32,
+    pub stroff: u32,
+    pub strsize: u32,
+}
+
+impl SymtabCmd {
+    pub const WIRE_SIZE: u32 = 8 + 16;
+
+    pub fn parse(cmdsize: u32, payload: &[u8]) -> Result<Self, ReadError> {
+        if cmdsize != Self::WIRE_SIZE {
+            return Err(ReadError::BadCmdsize {
+                cmd: LC_SYMTAB,
+                cmdsize,
+                at_offset: 0,
+                reason: "LC_SYMTAB cmdsize must be 24",
+            });
+        }
+        if payload.len() < 16 {
+            return Err(ReadError::Truncated {
+                need: 16,
+                have: payload.len(),
+                context: "symtab_command",
+            });
+        }
+        Ok(SymtabCmd {
+            symoff: u32_le(&payload[0..4]),
+            nsyms: u32_le(&payload[4..8]),
+            stroff: u32_le(&payload[8..12]),
+            strsize: u32_le(&payload[12..16]),
+        })
+    }
+
+    pub fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&LC_SYMTAB.to_le_bytes());
+        out.extend_from_slice(&Self::WIRE_SIZE.to_le_bytes());
+        out.extend_from_slice(&self.symoff.to_le_bytes());
+        out.extend_from_slice(&self.nsyms.to_le_bytes());
+        out.extend_from_slice(&self.stroff.to_le_bytes());
+        out.extend_from_slice(&self.strsize.to_le_bytes());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LC_DYSYMTAB
+// ---------------------------------------------------------------------------
+
+/// `dysymtab_command` — 72-byte payload with 18 u32 fields describing
+/// partitioning of the symbol table and auxiliary tables. Sprint 2 consumes
+/// the partition boundaries; the other fields are for dylibs / indirect
+/// symbol tables (Sprint 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DysymtabCmd {
+    pub ilocalsym: u32,
+    pub nlocalsym: u32,
+    pub iextdefsym: u32,
+    pub nextdefsym: u32,
+    pub iundefsym: u32,
+    pub nundefsym: u32,
+    pub tocoff: u32,
+    pub ntoc: u32,
+    pub modtaboff: u32,
+    pub nmodtab: u32,
+    pub extrefsymoff: u32,
+    pub nextrefsyms: u32,
+    pub indirectsymoff: u32,
+    pub nindirectsyms: u32,
+    pub extreloff: u32,
+    pub nextrel: u32,
+    pub locreloff: u32,
+    pub nlocrel: u32,
+}
+
+impl DysymtabCmd {
+    pub const WIRE_SIZE: u32 = 8 + 72;
+
+    pub fn parse(cmdsize: u32, payload: &[u8]) -> Result<Self, ReadError> {
+        if cmdsize != Self::WIRE_SIZE {
+            return Err(ReadError::BadCmdsize {
+                cmd: LC_DYSYMTAB,
+                cmdsize,
+                at_offset: 0,
+                reason: "LC_DYSYMTAB cmdsize must be 80",
+            });
+        }
+        if payload.len() < 72 {
+            return Err(ReadError::Truncated {
+                need: 72,
+                have: payload.len(),
+                context: "dysymtab_command",
+            });
+        }
+        let get = |i: usize| u32_le(&payload[i * 4..(i + 1) * 4]);
+        Ok(DysymtabCmd {
+            ilocalsym: get(0),
+            nlocalsym: get(1),
+            iextdefsym: get(2),
+            nextdefsym: get(3),
+            iundefsym: get(4),
+            nundefsym: get(5),
+            tocoff: get(6),
+            ntoc: get(7),
+            modtaboff: get(8),
+            nmodtab: get(9),
+            extrefsymoff: get(10),
+            nextrefsyms: get(11),
+            indirectsymoff: get(12),
+            nindirectsyms: get(13),
+            extreloff: get(14),
+            nextrel: get(15),
+            locreloff: get(16),
+            nlocrel: get(17),
+        })
+    }
+
+    pub fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&LC_DYSYMTAB.to_le_bytes());
+        out.extend_from_slice(&Self::WIRE_SIZE.to_le_bytes());
+        for v in [
+            self.ilocalsym,
+            self.nlocalsym,
+            self.iextdefsym,
+            self.nextdefsym,
+            self.iundefsym,
+            self.nundefsym,
+            self.tocoff,
+            self.ntoc,
+            self.modtaboff,
+            self.nmodtab,
+            self.extrefsymoff,
+            self.nextrefsyms,
+            self.indirectsymoff,
+            self.nindirectsyms,
+            self.extreloff,
+            self.nextrel,
+            self.locreloff,
+            self.nlocrel,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
         }
     }
 }
@@ -649,6 +811,84 @@ mod tests {
         let decoded = Segment64::parse(seg.wire_size(), &wire[8..]).unwrap();
         assert_eq!(decoded, seg);
         assert_eq!(seg.wire_size(), 8 + 64);
+    }
+
+    #[test]
+    fn symtab_round_trip_and_dispatcher() {
+        let cmd = SymtabCmd {
+            symoff: 0x1234,
+            nsyms: 7,
+            stroff: 0x2000,
+            strsize: 0x40,
+        };
+        let mut wire = Vec::new();
+        cmd.write(&mut wire);
+        assert_eq!(wire.len(), SymtabCmd::WIRE_SIZE as usize);
+
+        let decoded = SymtabCmd::parse(SymtabCmd::WIRE_SIZE, &wire[8..]).unwrap();
+        assert_eq!(decoded, cmd);
+
+        let hdr = MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: 0,
+            filetype: MH_OBJECT,
+            ncmds: 1,
+            sizeofcmds: SymtabCmd::WIRE_SIZE,
+            flags: 0,
+            reserved: 0,
+        };
+        let mut image = Vec::new();
+        write_header(&hdr, &mut image);
+        image.extend_from_slice(&wire);
+
+        let parsed = parse_commands(&hdr, &image).unwrap();
+        assert!(matches!(parsed[0], LoadCommand::Symtab(c) if c == cmd));
+    }
+
+    #[test]
+    fn symtab_wrong_cmdsize_errors() {
+        let payload = [0u8; 16];
+        let err = SymtabCmd::parse(20, &payload).unwrap_err();
+        assert!(matches!(err, ReadError::BadCmdsize { .. }));
+    }
+
+    #[test]
+    fn dysymtab_round_trip_and_dispatcher() {
+        let cmd = DysymtabCmd {
+            ilocalsym: 0,
+            nlocalsym: 3,
+            iextdefsym: 3,
+            nextdefsym: 2,
+            iundefsym: 5,
+            nundefsym: 4,
+            indirectsymoff: 0x3000,
+            nindirectsyms: 7,
+            ..Default::default()
+        };
+        let mut wire = Vec::new();
+        cmd.write(&mut wire);
+        assert_eq!(wire.len(), DysymtabCmd::WIRE_SIZE as usize);
+
+        let decoded = DysymtabCmd::parse(DysymtabCmd::WIRE_SIZE, &wire[8..]).unwrap();
+        assert_eq!(decoded, cmd);
+
+        let hdr = MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: 0,
+            filetype: MH_OBJECT,
+            ncmds: 1,
+            sizeofcmds: DysymtabCmd::WIRE_SIZE,
+            flags: 0,
+            reserved: 0,
+        };
+        let mut image = Vec::new();
+        write_header(&hdr, &mut image);
+        image.extend_from_slice(&wire);
+
+        let parsed = parse_commands(&hdr, &image).unwrap();
+        assert!(matches!(parsed[0], LoadCommand::Dysymtab(c) if c == cmd));
     }
 
     #[test]

@@ -68,6 +68,12 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                         .ok_or_else(|| ArgsError::MissingValue("--dump-archive".into()))?,
                 ));
             }
+            "--dump-dylib" => {
+                opts.dump_dylib = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("--dump-dylib".into()))?,
+                ));
+            }
             s if s.starts_with('-') => {
                 return Err(ArgsError::UnknownFlag(s.to_string()));
             }

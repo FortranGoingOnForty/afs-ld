@@ -134,6 +134,14 @@ pub enum LoadCommand {
     Dylib(DylibCmd),
     /// `LC_RPATH` — one runtime-search path per entry.
     Rpath(RpathCmd),
+    /// `LC_DYLD_INFO_ONLY` — classic locator for rebase/bind/lazy/weak/export
+    /// streams in `__LINKEDIT`.
+    DyldInfoOnly(DyldInfoCmd),
+    /// `LC_DYLD_EXPORTS_TRIE` — the modern chained-fixups alternative that
+    /// holds only the export trie (paired with `LC_DYLD_CHAINED_FIXUPS`).
+    DyldExportsTrie(LinkEditDataCmd),
+    /// `LC_DYLD_CHAINED_FIXUPS` — pointer to the chained-fixups blob.
+    DyldChainedFixups(LinkEditDataCmd),
     /// A load command whose payload we haven't decoded yet. Preserves bytes
     /// verbatim for byte-level round-trip.
     Raw { cmd: u32, cmdsize: u32, data: Vec<u8> },
@@ -149,6 +157,9 @@ impl LoadCommand {
             LoadCommand::LinkerOptimizationHint(_) => LC_LINKER_OPTIMIZATION_HINT,
             LoadCommand::Dylib(d) => d.cmd,
             LoadCommand::Rpath(_) => LC_RPATH,
+            LoadCommand::DyldInfoOnly(_) => LC_DYLD_INFO_ONLY,
+            LoadCommand::DyldExportsTrie(_) => LC_DYLD_EXPORTS_TRIE,
+            LoadCommand::DyldChainedFixups(_) => LC_DYLD_CHAINED_FIXUPS,
             LoadCommand::Raw { cmd, .. } => *cmd,
         }
     }
@@ -162,6 +173,9 @@ impl LoadCommand {
             LoadCommand::LinkerOptimizationHint(_) => LinkEditDataCmd::WIRE_SIZE,
             LoadCommand::Dylib(d) => d.wire_size(),
             LoadCommand::Rpath(r) => r.wire_size(),
+            LoadCommand::DyldInfoOnly(_) => DyldInfoCmd::WIRE_SIZE,
+            LoadCommand::DyldExportsTrie(_) => LinkEditDataCmd::WIRE_SIZE,
+            LoadCommand::DyldChainedFixups(_) => LinkEditDataCmd::WIRE_SIZE,
             LoadCommand::Raw { cmdsize, .. } => *cmdsize,
         }
     }
@@ -431,6 +445,17 @@ fn decode_command(cmd: u32, cmdsize: u32, payload: &[u8]) -> Result<LoadCommand,
         | LC_REEXPORT_DYLIB
         | LC_LOAD_UPWARD_DYLIB => Ok(LoadCommand::Dylib(DylibCmd::parse(cmd, cmdsize, payload)?)),
         LC_RPATH => Ok(LoadCommand::Rpath(RpathCmd::parse(cmdsize, payload)?)),
+        LC_DYLD_INFO_ONLY => Ok(LoadCommand::DyldInfoOnly(DyldInfoCmd::parse(cmdsize, payload)?)),
+        LC_DYLD_EXPORTS_TRIE => Ok(LoadCommand::DyldExportsTrie(LinkEditDataCmd::parse(
+            LC_DYLD_EXPORTS_TRIE,
+            cmdsize,
+            payload,
+        )?)),
+        LC_DYLD_CHAINED_FIXUPS => Ok(LoadCommand::DyldChainedFixups(LinkEditDataCmd::parse(
+            LC_DYLD_CHAINED_FIXUPS,
+            cmdsize,
+            payload,
+        )?)),
         _ => Ok(LoadCommand::Raw {
             cmd,
             cmdsize,
@@ -452,6 +477,9 @@ pub fn write_commands(cmds: &[LoadCommand], out: &mut Vec<u8>) {
             LoadCommand::LinkerOptimizationHint(l) => l.write(LC_LINKER_OPTIMIZATION_HINT, out),
             LoadCommand::Dylib(d) => d.write(out),
             LoadCommand::Rpath(r) => r.write(out),
+            LoadCommand::DyldInfoOnly(d) => d.write(out),
+            LoadCommand::DyldExportsTrie(l) => l.write(LC_DYLD_EXPORTS_TRIE, out),
+            LoadCommand::DyldChainedFixups(l) => l.write(LC_DYLD_CHAINED_FIXUPS, out),
             LoadCommand::Raw { cmd, cmdsize, data } => {
                 out.extend_from_slice(&cmd.to_le_bytes());
                 out.extend_from_slice(&cmdsize.to_le_bytes());
@@ -863,6 +891,78 @@ impl RpathCmd {
 #[inline]
 fn pad8(n: usize) -> usize {
     (n + 7) & !7
+}
+
+// ---------------------------------------------------------------------------
+// LC_DYLD_INFO_ONLY — classic locator for rebase/bind/lazy/weak/export.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DyldInfoCmd {
+    pub rebase_off: u32,
+    pub rebase_size: u32,
+    pub bind_off: u32,
+    pub bind_size: u32,
+    pub weak_bind_off: u32,
+    pub weak_bind_size: u32,
+    pub lazy_bind_off: u32,
+    pub lazy_bind_size: u32,
+    pub export_off: u32,
+    pub export_size: u32,
+}
+
+impl DyldInfoCmd {
+    pub const WIRE_SIZE: u32 = 8 + 40;
+
+    pub fn parse(cmdsize: u32, payload: &[u8]) -> Result<Self, ReadError> {
+        if cmdsize != Self::WIRE_SIZE {
+            return Err(ReadError::BadCmdsize {
+                cmd: LC_DYLD_INFO_ONLY,
+                cmdsize,
+                at_offset: 0,
+                reason: "LC_DYLD_INFO_ONLY cmdsize must be 48",
+            });
+        }
+        if payload.len() < 40 {
+            return Err(ReadError::Truncated {
+                need: 40,
+                have: payload.len(),
+                context: "dyld_info_command",
+            });
+        }
+        let g = |i: usize| u32_le(&payload[i * 4..(i + 1) * 4]);
+        Ok(DyldInfoCmd {
+            rebase_off: g(0),
+            rebase_size: g(1),
+            bind_off: g(2),
+            bind_size: g(3),
+            weak_bind_off: g(4),
+            weak_bind_size: g(5),
+            lazy_bind_off: g(6),
+            lazy_bind_size: g(7),
+            export_off: g(8),
+            export_size: g(9),
+        })
+    }
+
+    pub fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&LC_DYLD_INFO_ONLY.to_le_bytes());
+        out.extend_from_slice(&Self::WIRE_SIZE.to_le_bytes());
+        for v in [
+            self.rebase_off,
+            self.rebase_size,
+            self.bind_off,
+            self.bind_size,
+            self.weak_bind_off,
+            self.weak_bind_size,
+            self.lazy_bind_off,
+            self.lazy_bind_size,
+            self.export_off,
+            self.export_size,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

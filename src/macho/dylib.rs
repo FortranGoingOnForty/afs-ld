@@ -127,27 +127,44 @@ impl DylibFile {
     }
 }
 
-/// The export trie lives in `__LINKEDIT` pointed at either by
-/// `LC_DYLD_INFO_ONLY.export_off / export_size` (classic) or by
-/// `LC_DYLD_EXPORTS_TRIE` (chained-fixups era). We accept both; the latter
-/// shares the `linkedit_data_command` wire shape.
-///
-/// Dylibs built with older toolchains may have no export trie at all (the
-/// symbol table was the only source of exports). Return an empty trie so
-/// downstream code doesn't crash.
+/// Locate the export-trie bytes in either `LC_DYLD_INFO_ONLY.export_*` or
+/// `LC_DYLD_EXPORTS_TRIE` (chained-fixups era). Dylibs built by older
+/// toolchains may have no export trie; in that case return an empty trie.
 fn locate_exports_trie(
     commands: &[LoadCommand],
     file_bytes: &[u8],
 ) -> Result<ExportTrie, ReadError> {
-    // Sprint 5 intentionally surfaces only the raw trie bytes; the walker
-    // arrives in the next commit. Placeholder for now: return the empty trie.
     for cmd in commands {
-        if let LoadCommand::LinkerOptimizationHint(_) = cmd {
-            // LC_LOH is not the trie — just here to keep the walk explicit.
+        match cmd {
+            LoadCommand::DyldInfoOnly(d) if d.export_size != 0 => {
+                return trie_slice(file_bytes, d.export_off, d.export_size);
+            }
+            LoadCommand::DyldExportsTrie(l) if l.datasize != 0 => {
+                return trie_slice(file_bytes, l.dataoff, l.datasize);
+            }
+            _ => {}
         }
     }
-    let _ = file_bytes;
     Ok(ExportTrie::empty())
+}
+
+fn trie_slice(file_bytes: &[u8], off: u32, size: u32) -> Result<ExportTrie, ReadError> {
+    let start = off as usize;
+    let end = start
+        .checked_add(size as usize)
+        .ok_or(ReadError::Truncated {
+            need: usize::MAX,
+            have: file_bytes.len(),
+            context: "export trie (offset + size overflows)",
+        })?;
+    if end > file_bytes.len() {
+        return Err(ReadError::Truncated {
+            need: end,
+            have: file_bytes.len(),
+            context: "export trie",
+        });
+    }
+    Ok(ExportTrie::from_bytes(&file_bytes[start..end]))
 }
 
 /// Look up the 1-based ordinal of a dependency by its install name. Used by

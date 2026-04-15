@@ -38,6 +38,8 @@ pub struct LinkOptions {
     pub dump: Option<PathBuf>,
     /// When set, afs-ld dumps the named static archive's structure.
     pub dump_archive: Option<PathBuf>,
+    /// When set, afs-ld dumps the named MH_DYLIB's load commands + exports.
+    pub dump_dylib: Option<PathBuf>,
 }
 
 impl Default for LinkOptions {
@@ -50,6 +52,7 @@ impl Default for LinkOptions {
             kind: OutputKind::Executable,
             dump: None,
             dump_archive: None,
+            dump_dylib: None,
         }
     }
 }

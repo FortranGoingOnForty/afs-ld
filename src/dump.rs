@@ -9,10 +9,12 @@ use std::path::Path;
 
 use crate::archive::{Archive, Flavor, SpecialMember};
 use crate::input::ObjectFile;
+use crate::macho::dylib::{DylibFile, DylibLoadKind};
+use crate::macho::exports::ExportKind;
 use crate::macho::constants::*;
 use crate::macho::reader::{
-    BuildVersionCmd, DylibCmd, DysymtabCmd, LinkEditDataCmd, LoadCommand, MachHeader64,
-    RpathCmd, Section64Header, Segment64, SymtabCmd,
+    BuildVersionCmd, DyldInfoCmd, DylibCmd, DysymtabCmd, LinkEditDataCmd, LoadCommand,
+    MachHeader64, RpathCmd, Section64Header, Segment64, SymtabCmd,
 };
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind};
 use crate::section::InputSection;
@@ -64,6 +66,75 @@ pub fn dump_archive_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+pub fn dump_dylib_file(path: &Path) -> io::Result<()> {
+    let bytes = std::fs::read(path)?;
+    let dy = DylibFile::parse(path, &bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let out = io::stdout();
+    let mut h = out.lock();
+    writeln!(h, "{}:", path.display())?;
+    writeln!(
+        h,
+        "dylib: install_name={:?} current={} compat={}",
+        dy.install_name,
+        version_str(dy.current_version),
+        version_str(dy.compatibility_version)
+    )?;
+    writeln!(h, "Dependencies ({}):", dy.dependencies.len())?;
+    for d in &dy.dependencies {
+        let kind = match d.kind {
+            DylibLoadKind::Normal => "normal",
+            DylibLoadKind::Weak => "weak",
+            DylibLoadKind::Reexport => "reexport",
+            DylibLoadKind::Upward => "upward",
+        };
+        writeln!(
+            h,
+            "  [{}] {kind:<8} {} current={} compat={}",
+            d.ordinal,
+            d.install_name,
+            version_str(d.current_version),
+            version_str(d.compatibility_version)
+        )?;
+    }
+    if !dy.rpaths.is_empty() {
+        writeln!(h, "Rpaths ({}):", dy.rpaths.len())?;
+        for (i, p) in dy.rpaths.iter().enumerate() {
+            writeln!(h, "  [{i}] {p}")?;
+        }
+    }
+    let entries = dy
+        .exports
+        .entries()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    writeln!(h, "Exports ({}):", entries.len())?;
+    for (i, e) in entries.iter().enumerate().take(32) {
+        let rhs = match &e.kind {
+            ExportKind::Regular { address } => format!("addr=0x{address:x}"),
+            ExportKind::ThreadLocal { address } => format!("tlv addr=0x{address:x}"),
+            ExportKind::Absolute { address } => format!("abs=0x{address:x}"),
+            ExportKind::Reexport {
+                ordinal,
+                imported_name,
+            } => {
+                if imported_name.is_empty() {
+                    format!("reexport from dylib#{ordinal}")
+                } else {
+                    format!("reexport from dylib#{ordinal} as {imported_name}")
+                }
+            }
+            ExportKind::StubAndResolver { stub, resolver } => {
+                format!("stub=0x{stub:x} resolver=0x{resolver:x}")
+            }
+        };
+        writeln!(h, "  [{i}] {:<40} {rhs}", e.name)?;
+    }
+    if entries.len() > 32 {
+        writeln!(h, "  ... ({} more)", entries.len() - 32)?;
+    }
+    Ok(())
+}
+
 pub fn dump_file(path: &Path) -> io::Result<()> {
     let bytes = std::fs::read(path)?;
     let obj = ObjectFile::parse(path, &bytes)
@@ -108,6 +179,9 @@ fn write_command(w: &mut impl Write, idx: usize, cmd: &LoadCommand) -> io::Resul
         LoadCommand::LinkerOptimizationHint(l) => write_linkedit_data(w, l, "LOH"),
         LoadCommand::Dylib(d) => write_dylib(w, d),
         LoadCommand::Rpath(r) => write_rpath(w, r),
+        LoadCommand::DyldInfoOnly(d) => write_dyld_info(w, d),
+        LoadCommand::DyldExportsTrie(l) => write_linkedit_data(w, l, "EXPORTS_TRIE"),
+        LoadCommand::DyldChainedFixups(l) => write_linkedit_data(w, l, "CHAINED_FIXUPS"),
         LoadCommand::Raw { cmd, data, .. } => {
             writeln!(
                 w,
@@ -132,6 +206,23 @@ fn write_dylib(w: &mut impl Write, d: &DylibCmd) -> io::Result<()> {
 
 fn write_rpath(w: &mut impl Write, r: &RpathCmd) -> io::Result<()> {
     writeln!(w, "  path={:?}", r.path)
+}
+
+fn write_dyld_info(w: &mut impl Write, d: &DyldInfoCmd) -> io::Result<()> {
+    writeln!(
+        w,
+        "  rebase=@{}..+{} bind=@{}..+{} weak_bind=@{}..+{} lazy_bind=@{}..+{} export=@{}..+{}",
+        d.rebase_off,
+        d.rebase_size,
+        d.bind_off,
+        d.bind_size,
+        d.weak_bind_off,
+        d.weak_bind_size,
+        d.lazy_bind_off,
+        d.lazy_bind_size,
+        d.export_off,
+        d.export_size
+    )
 }
 
 fn write_segment64(w: &mut impl Write, s: &Segment64) -> io::Result<()> {

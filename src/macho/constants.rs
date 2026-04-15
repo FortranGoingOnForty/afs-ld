@@ -113,3 +113,12 @@ pub const ARM64_RELOC_ADDEND: u8 = 10;
 // Platforms for LC_BUILD_VERSION
 pub const PLATFORM_MACOS: u32 = 1;
 pub const PLATFORM_IOS: u32 = 2;
+
+// Export trie terminal-node flags (<mach-o/loader.h>)
+pub const EXPORT_SYMBOL_FLAGS_KIND_MASK: u64 = 0x03;
+pub const EXPORT_SYMBOL_FLAGS_KIND_REGULAR: u64 = 0x00;
+pub const EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL: u64 = 0x01;
+pub const EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE: u64 = 0x02;
+pub const EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION: u64 = 0x04;
+pub const EXPORT_SYMBOL_FLAGS_REEXPORT: u64 = 0x08;
+pub const EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER: u64 = 0x10;

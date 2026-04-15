@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use afs_ld::macho::constants::{LC_LOAD_DYLIB, MH_DYLIB, MH_EXECUTE};
+use afs_ld::macho::constants::{LC_LOAD_DYLIB, LC_SOURCE_VERSION, LC_UUID, MH_DYLIB, MH_EXECUTE};
 use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand, Section64Header};
 
 fn have_xcrun() -> bool {
@@ -166,12 +166,8 @@ fn linker_writes_executable_with_real_section_bytes() {
         eprintln!("skipping: assemble failed: {e}");
         return;
     }
-    link_with_afs_ld(&[
-        obj.to_str().unwrap(),
-        "-o",
-        out.to_str().unwrap(),
-    ])
-    .expect("link executable");
+    link_with_afs_ld(&[obj.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .expect("link executable");
 
     let bytes = fs::read(&out).expect("read executable");
     let hdr = parse_header(&bytes).expect("parse header");
@@ -220,13 +216,8 @@ fn linker_writes_dylib_with_real_text_section() {
         eprintln!("skipping: assemble failed: {e}");
         return;
     }
-    link_with_afs_ld(&[
-        "-dylib",
-        obj.to_str().unwrap(),
-        "-o",
-        out.to_str().unwrap(),
-    ])
-    .expect("link dylib");
+    link_with_afs_ld(&["-dylib", obj.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .expect("link dylib");
 
     let bytes = fs::read(&out).expect("read dylib");
     let hdr = parse_header(&bytes).expect("parse header");
@@ -338,6 +329,48 @@ fn linker_emits_rpath_load_command() {
             LoadCommand::Rpath(r) if r.path == "@executable_path/../lib"
         )
     }));
+
+    let _ = fs::remove_file(&obj);
+    let _ = fs::remove_file(&out);
+}
+
+#[test]
+fn linker_emits_uuid_and_source_version_commands() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("uuid-main.o");
+    let out = scratch("uuid-linked");
+    if let Err(e) = assemble(
+        r#"
+            .section __TEXT,__text,regular,pure_instructions
+            .globl _main
+            _main:
+                ret
+        "#,
+        &obj,
+    ) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    link_with_afs_ld(&[obj.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .expect("link executable with metadata");
+
+    let bytes = fs::read(&out).expect("read executable");
+    let hdr = parse_header(&bytes).expect("parse header");
+    let ids: Vec<u32> = parse_commands(&hdr, &bytes)
+        .expect("parse commands")
+        .into_iter()
+        .map(|cmd| match cmd {
+            LoadCommand::Raw { cmd, .. } => cmd,
+            other => other.cmd(),
+        })
+        .collect();
+    assert!(ids.contains(&LC_UUID));
+    assert!(ids.contains(&LC_SOURCE_VERSION));
 
     let _ = fs::remove_file(&obj);
     let _ = fs::remove_file(&out);

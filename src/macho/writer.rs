@@ -32,6 +32,8 @@ impl std::error::Error for WriteError {}
 pub struct WritePlan {
     pub dylibs: Vec<DylibCmd>,
     pub rpaths: Vec<String>,
+    pub uuid: Option<[u8; 16]>,
+    pub source_version: Option<u64>,
 }
 
 pub fn write(
@@ -160,7 +162,13 @@ fn build_commands(
             out.push(symtab);
             out.push(dysymtab);
             out.push(raw_string_command(LC_LOAD_DYLINKER, "/usr/lib/dyld"));
+            if let Some(uuid) = plan.uuid {
+                out.push(uuid_raw(uuid));
+            }
             out.push(build_version);
+            if let Some(source_version) = plan.source_version {
+                out.push(source_version_raw(source_version));
+            }
             out.push(lc_main_raw(0));
             for dylib in &plan.dylibs {
                 out.push(LoadCommand::Dylib(dylib.clone()));
@@ -185,7 +193,13 @@ fn build_commands(
             out.push(dyld_metadata);
             out.push(symtab);
             out.push(dysymtab);
+            if let Some(uuid) = plan.uuid {
+                out.push(uuid_raw(uuid));
+            }
             out.push(build_version);
+            if let Some(source_version) = plan.source_version {
+                out.push(source_version_raw(source_version));
+            }
             for dylib in &plan.dylibs {
                 out.push(LoadCommand::Dylib(dylib.clone()));
             }
@@ -291,6 +305,22 @@ fn raw_string_command(cmd: u32, value: &str) -> LoadCommand {
     }
 }
 
+fn uuid_raw(uuid: [u8; 16]) -> LoadCommand {
+    LoadCommand::Raw {
+        cmd: LC_UUID,
+        cmdsize: 24,
+        data: uuid.to_vec(),
+    }
+}
+
+fn source_version_raw(version: u64) -> LoadCommand {
+    LoadCommand::Raw {
+        cmd: LC_SOURCE_VERSION,
+        cmdsize: 16,
+        data: version.to_le_bytes().to_vec(),
+    }
+}
+
 fn mach_header_flags(kind: OutputKind) -> u32 {
     match kind {
         OutputKind::Executable => MH_DYLDLINK | MH_NOUNDEFS | MH_TWOLEVEL | MH_PIE,
@@ -384,5 +414,36 @@ mod tests {
         assert_eq!(section.reserved1, 7);
         assert_eq!(section.reserved2, 12);
         assert_eq!(section.reserved3, 3);
+    }
+
+    #[test]
+    fn build_commands_emits_optional_uuid_and_source_version() {
+        let layout = crate::section::build_empty_layout(OutputKind::Executable);
+        let opts = LinkOptions::default();
+        let plan = WritePlan {
+            uuid: Some([0x11; 16]),
+            source_version: Some(0x0102_0304_0506_0708),
+            ..WritePlan::default()
+        };
+
+        let commands =
+            build_commands(&layout, OutputKind::Executable, &opts, &plan).expect("build commands");
+        let ids: Vec<u32> = commands
+            .iter()
+            .map(|cmd| match cmd {
+                LoadCommand::Raw { cmd, .. } => *cmd,
+                other => other.cmd(),
+            })
+            .collect();
+        assert!(ids.contains(&LC_UUID));
+        assert!(ids.contains(&LC_SOURCE_VERSION));
+        assert!(
+            ids.iter().position(|cmd| *cmd == LC_UUID)
+                < ids.iter().position(|cmd| *cmd == LC_BUILD_VERSION)
+        );
+        assert!(
+            ids.iter().position(|cmd| *cmd == LC_BUILD_VERSION)
+                < ids.iter().position(|cmd| *cmd == LC_SOURCE_VERSION)
+        );
     }
 }

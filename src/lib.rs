@@ -159,12 +159,10 @@ impl Linker {
         let mut atoms = atom::AtomTable::new();
         for i in 0..inputs.objects.len() {
             let input_id = InputId(i as u32);
-            let obj = inputs
-                .object_file(input_id)
-                .map_err(|e| LinkError::Input {
-                    path: inputs.object(input_id).path.clone(),
-                    reason: e.to_string(),
-                })?;
+            let obj = inputs.object_file(input_id).map_err(|e| LinkError::Input {
+                path: inputs.object(input_id).path.clone(),
+                reason: e.to_string(),
+            })?;
             let atomization = atom::atomize_object(input_id, &obj, &mut atoms, &table)
                 .map_err(|e| LinkError::Atomize(e.to_string()))?;
             atom::backpatch_symbol_atoms(&atomization, input_id, &obj, &mut table, &mut atoms);
@@ -173,8 +171,10 @@ impl Linker {
         let layout = section::build_layout(opts.kind, &atoms, &table);
         let plan = build_write_plan(&inputs, opts);
         let mut bytes = Vec::new();
-        macho::writer::write_with_atoms_and_plan(&layout, &atoms, opts.kind, opts, &plan, &mut bytes)
-            .map_err(LinkError::Write)?;
+        macho::writer::write_with_atoms_and_plan(
+            &layout, &atoms, opts.kind, opts, &plan, &mut bytes,
+        )
+        .map_err(LinkError::Write)?;
 
         let out_path = output_path(opts);
         std::fs::write(&out_path, &bytes).map_err(|source| LinkError::Io {
@@ -196,12 +196,12 @@ fn build_write_plan(inputs: &Inputs, opts: &LinkOptions) -> macho::writer::Write
         .dylibs
         .iter()
         .map(|dylib| DylibCmd {
-                cmd: macho::constants::LC_LOAD_DYLIB,
-                name: dylib.file.install_name.clone(),
-                timestamp: 2,
-                current_version: dylib.file.current_version,
-                compatibility_version: dylib.file.compatibility_version,
-            })
+            cmd: macho::constants::LC_LOAD_DYLIB,
+            name: dylib.file.install_name.clone(),
+            timestamp: 2,
+            current_version: dylib.file.current_version,
+            compatibility_version: dylib.file.compatibility_version,
+        })
         .collect();
     if !dylibs
         .iter()
@@ -215,9 +215,64 @@ fn build_write_plan(inputs: &Inputs, opts: &LinkOptions) -> macho::writer::Write
             compatibility_version: 0,
         });
     }
+    let uuid = stable_output_uuid(opts, &dylibs);
     macho::writer::WritePlan {
         dylibs,
         rpaths: opts.rpaths.clone(),
+        uuid: Some(uuid),
+        source_version: Some(0),
+    }
+}
+
+fn stable_output_uuid(opts: &LinkOptions, dylibs: &[DylibCmd]) -> [u8; 16] {
+    let mut hi = 0x6d9b_c4f2_3a51_17cdu64;
+    let mut lo = 0xb5e8_92d4_6f13_08a1u64;
+
+    mix_u8(
+        &mut hi,
+        &mut lo,
+        match opts.kind {
+            OutputKind::Executable => 0,
+            OutputKind::Dylib => 1,
+        },
+    );
+    if let Some(output) = &opts.output {
+        mix_bytes(&mut hi, &mut lo, output.as_os_str().as_encoded_bytes());
+    }
+    for dylib in dylibs {
+        mix_bytes(&mut hi, &mut lo, dylib.name.as_bytes());
+        mix_u32(&mut hi, &mut lo, dylib.timestamp);
+        mix_u32(&mut hi, &mut lo, dylib.current_version);
+        mix_u32(&mut hi, &mut lo, dylib.compatibility_version);
+    }
+    for rpath in &opts.rpaths {
+        mix_bytes(&mut hi, &mut lo, rpath.as_bytes());
+    }
+
+    let mut uuid = [0u8; 16];
+    uuid[..8].copy_from_slice(&hi.to_be_bytes());
+    uuid[8..].copy_from_slice(&lo.to_be_bytes());
+    uuid[6] = (uuid[6] & 0x0f) | 0x50;
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;
+    uuid
+}
+
+fn mix_u8(hi: &mut u64, lo: &mut u64, value: u8) {
+    mix_bytes(hi, lo, &[value]);
+}
+
+fn mix_u32(hi: &mut u64, lo: &mut u64, value: u32) {
+    mix_bytes(hi, lo, &value.to_le_bytes());
+}
+
+fn mix_bytes(hi: &mut u64, lo: &mut u64, bytes: &[u8]) {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    for byte in bytes {
+        *hi ^= u64::from(*byte);
+        *hi = hi.wrapping_mul(FNV_PRIME);
+
+        *lo ^= u64::from(*byte).rotate_left(1);
+        *lo = lo.wrapping_mul(FNV_PRIME.rotate_left(7));
     }
 }
 

@@ -113,25 +113,24 @@ fn command_ids(path: &Path) -> Vec<u32> {
 
 fn normalize(ids: &[u32]) -> Vec<&'static str> {
     let mut out = Vec::new();
-    for token in ids
-        .iter()
-        .filter_map(|cmd| match *cmd {
-            LC_SEGMENT_64 => Some("SEGMENT"),
-            LC_DYLD_INFO_ONLY | LC_DYLD_CHAINED_FIXUPS | LC_DYLD_EXPORTS_TRIE => Some("FIXUPS"),
-            LC_SYMTAB => Some("SYMTAB"),
-            LC_DYSYMTAB => Some("DYSYMTAB"),
-            LC_LOAD_DYLINKER => Some("LOAD_DYLINKER"),
-            LC_BUILD_VERSION => Some("BUILD_VERSION"),
-            LC_MAIN => Some("MAIN"),
-            LC_ID_DYLIB => Some("ID_DYLIB"),
-            LC_LOAD_DYLIB => Some("LOAD_DYLIB"),
-            LC_RPATH => Some("RPATH"),
-            LC_FUNCTION_STARTS => Some("FUNCTION_STARTS"),
-            LC_DATA_IN_CODE => Some("DATA_IN_CODE"),
-            LC_CODE_SIGNATURE => Some("CODE_SIGNATURE"),
-            _ => None,
-        })
-    {
+    for token in ids.iter().filter_map(|cmd| match *cmd {
+        LC_SEGMENT_64 => Some("SEGMENT"),
+        LC_DYLD_INFO_ONLY | LC_DYLD_CHAINED_FIXUPS | LC_DYLD_EXPORTS_TRIE => Some("FIXUPS"),
+        LC_SYMTAB => Some("SYMTAB"),
+        LC_DYSYMTAB => Some("DYSYMTAB"),
+        LC_LOAD_DYLINKER => Some("LOAD_DYLINKER"),
+        LC_UUID => Some("UUID"),
+        LC_BUILD_VERSION => Some("BUILD_VERSION"),
+        LC_SOURCE_VERSION => Some("SOURCE_VERSION"),
+        LC_MAIN => Some("MAIN"),
+        LC_ID_DYLIB => Some("ID_DYLIB"),
+        LC_LOAD_DYLIB => Some("LOAD_DYLIB"),
+        LC_RPATH => Some("RPATH"),
+        LC_FUNCTION_STARTS => Some("FUNCTION_STARTS"),
+        LC_DATA_IN_CODE => Some("DATA_IN_CODE"),
+        LC_CODE_SIGNATURE => Some("CODE_SIGNATURE"),
+        _ => None,
+    }) {
         if out.last().copied() == Some(token) && token == "FIXUPS" {
             continue;
         }
@@ -170,7 +169,10 @@ fn executable_load_command_order_matches_apple_for_common_surface() {
         .expect("spawn clang");
     assert!(status.success(), "clang link failed");
 
-    assert_eq!(normalize(&command_ids(&ours)), normalize(&command_ids(&theirs)));
+    assert_eq!(
+        normalize(&command_ids(&ours)),
+        normalize(&command_ids(&theirs))
+    );
 
     let _ = fs::remove_file(&obj);
     let _ = fs::remove_file(&ours);
@@ -197,8 +199,13 @@ fn dylib_load_command_order_matches_apple_for_common_surface() {
         &obj,
     )
     .expect("assemble");
-    link_with_afs_ld(&["-dylib", obj.to_str().unwrap(), "-o", ours.to_str().unwrap()])
-        .expect("afs-ld dylib");
+    link_with_afs_ld(&[
+        "-dylib",
+        obj.to_str().unwrap(),
+        "-o",
+        ours.to_str().unwrap(),
+    ])
+    .expect("afs-ld dylib");
     let status = Command::new("xcrun")
         .args(["--sdk", "macosx", "clang", "-shared", "-arch", "arm64"])
         .arg(&obj)
@@ -210,7 +217,10 @@ fn dylib_load_command_order_matches_apple_for_common_surface() {
         .expect("spawn clang");
     assert!(status.success(), "clang dylib link failed");
 
-    assert_eq!(normalize(&command_ids(&ours)), normalize(&command_ids(&theirs)));
+    assert_eq!(
+        normalize(&command_ids(&ours)),
+        normalize(&command_ids(&theirs))
+    );
 
     let _ = fs::remove_file(&obj);
     let _ = fs::remove_file(&ours);
@@ -261,7 +271,10 @@ fn executable_load_command_order_with_dependency_and_rpath_matches_common_surfac
         .expect("spawn clang");
     assert!(status.success(), "clang dep link failed");
 
-    assert_eq!(normalize(&command_ids(&ours)), normalize(&command_ids(&theirs)));
+    assert_eq!(
+        normalize(&command_ids(&ours)),
+        normalize(&command_ids(&theirs))
+    );
 
     let _ = fs::remove_file(&obj);
     let _ = fs::remove_file(&dep);

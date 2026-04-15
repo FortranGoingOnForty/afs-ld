@@ -40,6 +40,8 @@ pub struct LinkOptions {
     pub dump_archive: Option<PathBuf>,
     /// When set, afs-ld dumps the named MH_DYLIB's load commands + exports.
     pub dump_dylib: Option<PathBuf>,
+    /// When set, afs-ld dumps the named TAPI TBD stub (all documents).
+    pub dump_tbd: Option<PathBuf>,
 }
 
 impl Default for LinkOptions {
@@ -53,6 +55,7 @@ impl Default for LinkOptions {
             dump: None,
             dump_archive: None,
             dump_dylib: None,
+            dump_tbd: None,
         }
     }
 }

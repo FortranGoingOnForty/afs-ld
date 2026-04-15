@@ -43,6 +43,16 @@ fn main() -> ExitCode {
         };
     }
 
+    if let Some(path) = &opts.dump_tbd {
+        return match dump::dump_tbd_file(path) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                diag::error(&format!("{}: {}", path.display(), e));
+                ExitCode::from(1)
+            }
+        };
+    }
+
     match Linker::run(&opts) {
         Ok(()) => ExitCode::SUCCESS,
         Err(LinkError::NoInputs) => {

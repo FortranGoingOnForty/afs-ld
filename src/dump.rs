@@ -11,6 +11,7 @@ use crate::archive::{Archive, Flavor, SpecialMember};
 use crate::input::ObjectFile;
 use crate::macho::dylib::{DylibFile, DylibLoadKind};
 use crate::macho::exports::ExportKind;
+use crate::macho::tbd::parse_tbd;
 use crate::macho::constants::*;
 use crate::macho::reader::{
     BuildVersionCmd, DyldInfoCmd, DylibCmd, DysymtabCmd, LinkEditDataCmd, LoadCommand,
@@ -61,6 +62,44 @@ pub fn dump_archive_file(path: &Path) -> io::Result<()> {
         }
         if idx.len() > 16 {
             writeln!(h, "  ... ({} more)", idx.len() - 16)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn dump_tbd_file(path: &Path) -> io::Result<()> {
+    let src = std::fs::read_to_string(path)?;
+    let docs = parse_tbd(&src)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let out = io::stdout();
+    let mut h = out.lock();
+    writeln!(h, "{}:", path.display())?;
+    writeln!(h, "tbd: documents={}", docs.len())?;
+    for (i, tbd) in docs.iter().enumerate() {
+        let targets: Vec<String> = tbd.targets.iter().map(|t| t.as_string()).collect();
+        writeln!(
+            h,
+            "  [{i}] install_name={:?} targets=[{}] current={} compat={}",
+            tbd.install_name,
+            targets.join(", "),
+            tbd.current_version.as_deref().unwrap_or("-"),
+            tbd.compatibility_version.as_deref().unwrap_or("-")
+        )?;
+        if !tbd.reexported_libraries.is_empty() {
+            let total: usize = tbd
+                .reexported_libraries
+                .iter()
+                .map(|s| s.value.len())
+                .sum();
+            writeln!(h, "      reexported-libraries: {total}")?;
+        }
+        let export_syms: usize = tbd
+            .exports
+            .iter()
+            .map(|s| s.value.total())
+            .sum();
+        if export_syms > 0 {
+            writeln!(h, "      exports: {export_syms} symbols total")?;
         }
     }
     Ok(())

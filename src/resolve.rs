@@ -1025,49 +1025,38 @@ pub struct DrainReport {
     pub duplicates: Vec<InsertError>,
 }
 
-/// Pull `pending`'s member, register it as a new `ObjectInput`, and seed
-/// its symbols. Returns any new `PendingFetch` entries triggered by the
-/// inserted object's own undefined references. Returns an empty Vec when
-/// the target member has already been fetched (de-dup against concurrent
-/// pending entries).
-fn fetch_and_ingest_one(
+/// Shared ingest: copy one archive member's body into a fresh
+/// `ObjectInput`, mark it fetched, and seed its symbols. Callers either
+/// respond to a demand-driven `PendingFetch` or force-pull the member.
+fn ingest_member_bytes(
     inputs: &mut Inputs,
     table: &mut SymbolTable,
-    pending: PendingFetch,
+    archive_id: ArchiveId,
+    member_id: MemberId,
     report: &mut DrainReport,
 ) -> Result<Vec<PendingFetch>, FetchError> {
-    // Phase 1: verify the slot still needs this member, and peel off the
-    // owned data we need from the archive before mutating the registry.
+    let ai = &inputs.archives[archive_id.0 as usize];
+    if ai.fetched.contains(&member_id.0) {
+        return Ok(Vec::new());
+    }
+
+    // Extract owned data before mutating the registry.
     let (logical_path, member_bytes) = {
-        let ai = &inputs.archives[pending.archive.0 as usize];
-        if ai.fetched.contains(&pending.member.0) {
-            return Ok(Vec::new());
-        }
-        let slot_is_still_lazy = matches!(
-            table.symbols[pending.id.0 as usize],
-            Symbol::LazyArchive { .. }
-        );
-        if !slot_is_still_lazy {
-            // A strong Defined beat us to the slot — no fetch required.
-            return Ok(Vec::new());
-        }
         let archive = Archive::open(&ai.path, &ai.bytes)?;
-        let member = archive
-            .member_at_offset(pending.member.0)
-            .ok_or(FetchError::MemberNotFound {
-                archive: pending.archive,
-                member: pending.member,
-            })?;
+        let member =
+            archive
+                .member_at_offset(member_id.0)
+                .ok_or(FetchError::MemberNotFound {
+                    archive: archive_id,
+                    member: member_id,
+                })?;
         let logical = format!("{}({})", ai.path.display(), member.name);
         (logical, member.body.to_vec())
     };
 
-    // Phase 2: register the fetched bytes as a fresh `ObjectInput` and
-    // mark the member as consumed. `seed_object` will fail fast if the
-    // member's Mach-O bytes are malformed.
-    inputs.archives[pending.archive.0 as usize]
+    inputs.archives[archive_id.0 as usize]
         .fetched
-        .insert(pending.member.0);
+        .insert(member_id.0);
     let input_id = InputId(inputs.objects.len() as u32);
     inputs.objects.push(ObjectInput {
         path: PathBuf::from(logical_path),
@@ -1075,12 +1064,85 @@ fn fetch_and_ingest_one(
     });
     report.fetched_members += 1;
 
-    // Phase 3: seed symbols from the fetched member. New
-    // `PendingArchiveFetch` outcomes bubble back up to the outer loop.
     let mut sub_report = SeedReport::default();
     seed_object(inputs, input_id, table, &mut sub_report)?;
     report.duplicates.extend(sub_report.duplicates);
     Ok(sub_report.pending_fetches)
+}
+
+/// Pull `pending`'s member only if the symbol slot is still a
+/// `LazyArchive` (i.e., a strong Defined hasn't superseded it). Returns
+/// any new `PendingFetch` entries triggered by the inserted member.
+fn fetch_and_ingest_one(
+    inputs: &mut Inputs,
+    table: &mut SymbolTable,
+    pending: PendingFetch,
+    report: &mut DrainReport,
+) -> Result<Vec<PendingFetch>, FetchError> {
+    let slot_is_still_lazy = matches!(table.get(pending.id), Symbol::LazyArchive { .. });
+    if !slot_is_still_lazy {
+        return Ok(Vec::new());
+    }
+    ingest_member_bytes(inputs, table, pending.archive, pending.member, report)
+}
+
+/// Pull every member of one archive (bypasses demand tracking). Respects
+/// `ArchiveInput::fetched` for deduplication so it's safe to combine with
+/// demand-driven fetching.
+pub fn force_load_archive(
+    inputs: &mut Inputs,
+    table: &mut SymbolTable,
+    archive_id: ArchiveId,
+    report: &mut DrainReport,
+) -> Result<(), FetchError> {
+    let member_offsets: Vec<u32> = {
+        let ai = &inputs.archives[archive_id.0 as usize];
+        let archive = Archive::open(&ai.path, &ai.bytes)?;
+        archive
+            .object_members()
+            .map(|m| m.header_offset as u32)
+            .collect()
+    };
+    let mut queue: Vec<PendingFetch> = Vec::new();
+    for offset in member_offsets {
+        let new = ingest_member_bytes(
+            inputs,
+            table,
+            archive_id,
+            MemberId(offset),
+            report,
+        )?;
+        queue.extend(new);
+    }
+    while let Some(p) = queue.pop() {
+        let new = fetch_and_ingest_one(inputs, table, p, report)?;
+        queue.extend(new);
+    }
+    Ok(())
+}
+
+/// Pull every member of every registered archive — the `-all_load`
+/// semantic.
+pub fn force_load_all(
+    inputs: &mut Inputs,
+    table: &mut SymbolTable,
+    report: &mut DrainReport,
+) -> Result<(), FetchError> {
+    for i in 0..inputs.archives.len() {
+        force_load_archive(inputs, table, ArchiveId(i as u32), report)?;
+    }
+    Ok(())
+}
+
+/// Look up an archive by path for `-force_load <path>`. Returns `None` if
+/// no registered archive matches; diagnostic surface lives in Sprint 19's
+/// CLI layer.
+pub fn find_archive_by_path(inputs: &Inputs, path: &std::path::Path) -> Option<ArchiveId> {
+    inputs
+        .archives
+        .iter()
+        .position(|a| a.path == path)
+        .map(|i| ArchiveId(i as u32))
 }
 
 /// Drive the fetch queue to a fixed point. Each fetched member's own

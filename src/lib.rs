@@ -9,6 +9,7 @@ pub mod diag;
 pub mod dump;
 pub mod macho;
 pub mod section;
+pub mod symbol;
 
 use std::path::PathBuf;
 

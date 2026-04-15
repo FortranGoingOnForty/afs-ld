@@ -728,13 +728,12 @@ impl LinkEditDataCmd {
 // ---------------------------------------------------------------------------
 
 #[inline]
-pub(crate) fn u32_le(b: &[u8]) -> u32 {
+pub fn u32_le(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
 #[inline]
-#[allow(dead_code)] // consumed by the LC_SEGMENT_64 decoder added in the next commit
-pub(crate) fn u64_le(b: &[u8]) -> u64 {
+pub fn u64_le(b: &[u8]) -> u64 {
     u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 

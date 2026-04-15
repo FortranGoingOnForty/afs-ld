@@ -759,4 +759,477 @@ mod tests {
         };
         assert_eq!(sym.name(), n(42));
     }
+
+    // ----------------- SymbolTable & insertion matrix tests -----------------
+
+    fn undef(t: &mut SymbolTable, name: &str) -> Symbol {
+        Symbol::Undefined {
+            name: t.intern(name),
+            origin: InputId(0),
+            weak_ref: false,
+        }
+    }
+
+    fn defined_strong(t: &mut SymbolTable, name: &str) -> Symbol {
+        Symbol::Defined {
+            name: t.intern(name),
+            origin: InputId(0),
+            atom: AtomId(0),
+            value: 0x100,
+            weak: false,
+            private_extern: false,
+            no_dead_strip: false,
+        }
+    }
+
+    fn defined_weak(t: &mut SymbolTable, name: &str) -> Symbol {
+        Symbol::Defined {
+            name: t.intern(name),
+            origin: InputId(0),
+            atom: AtomId(0),
+            value: 0x200,
+            weak: true,
+            private_extern: false,
+            no_dead_strip: false,
+        }
+    }
+
+    fn common(t: &mut SymbolTable, name: &str, size: u64, align: u8) -> Symbol {
+        Symbol::Common {
+            name: t.intern(name),
+            origin: InputId(0),
+            size,
+            align_pow2: align,
+        }
+    }
+
+    fn dylib_import(t: &mut SymbolTable, name: &str, ordinal: u16) -> Symbol {
+        Symbol::DylibImport {
+            name: t.intern(name),
+            dylib: DylibId(0),
+            ordinal,
+            weak_import: false,
+        }
+    }
+
+    fn lazy_archive(t: &mut SymbolTable, name: &str) -> Symbol {
+        Symbol::LazyArchive {
+            name: t.intern(name),
+            archive: ArchiveId(7),
+            member: MemberId(42),
+        }
+    }
+
+    fn lazy_object(t: &mut SymbolTable, name: &str) -> Symbol {
+        Symbol::LazyObject {
+            name: t.intern(name),
+            origin: InputId(5),
+        }
+    }
+
+    fn alias_sym(t: &mut SymbolTable, name: &str, target: &str) -> Symbol {
+        let name_i = t.intern(name);
+        let target_i = t.intern(target);
+        Symbol::Alias {
+            name: name_i,
+            aliased: target_i,
+        }
+    }
+
+    // ---- vacant-slot insertions ----
+
+    #[test]
+    fn vacant_insert_records_inserted_outcome() {
+        let mut t = SymbolTable::new();
+        let sym = defined_strong(&mut t, "_main");
+        match t.insert(sym).unwrap() {
+            InsertOutcome::Inserted(id) => {
+                assert_eq!(id, SymbolId(0));
+                assert!(matches!(t.get(id), Symbol::Defined { .. }));
+            }
+            other => panic!("expected Inserted, got {other:?}"),
+        }
+        assert_eq!(t.transitions().len(), 1);
+        assert_eq!(t.transitions()[0].cause, TransitionCause::Inserted);
+    }
+
+    // ---- existing Undefined ----
+
+    #[test]
+    fn undefined_kept_under_undefined() {
+        let mut t = SymbolTable::new();
+        let a = undef(&mut t, "_x");
+        let b = undef(&mut t, "_x");
+        t.insert(a).unwrap();
+        let out = t.insert(b).unwrap();
+        assert!(matches!(out, InsertOutcome::Kept(_)));
+    }
+
+    #[test]
+    fn undefined_replaced_by_definition() {
+        let mut t = SymbolTable::new();
+        let first = undef(&mut t, "_x");
+        t.insert(first).unwrap();
+        let incoming = defined_strong(&mut t, "_x");
+        let out = t.insert(incoming).unwrap();
+        assert!(matches!(out, InsertOutcome::Replaced { .. }));
+    }
+
+    #[test]
+    fn undefined_replaced_by_common() {
+        let mut t = SymbolTable::new();
+        let first = undef(&mut t, "_x");
+        t.insert(first).unwrap();
+        let c = common(&mut t, "_x", 8, 3);
+        let out = t.insert(c).unwrap();
+        assert!(matches!(out, InsertOutcome::Replaced { .. }));
+    }
+
+    #[test]
+    fn undefined_replaced_by_dylib_import() {
+        let mut t = SymbolTable::new();
+        let first = undef(&mut t, "_x");
+        t.insert(first).unwrap();
+        let di = dylib_import(&mut t, "_x", 1);
+        let out = t.insert(di).unwrap();
+        assert!(matches!(out, InsertOutcome::Replaced { .. }));
+    }
+
+    #[test]
+    fn undefined_replaced_by_lazy_archive() {
+        let mut t = SymbolTable::new();
+        let first = undef(&mut t, "_x");
+        t.insert(first).unwrap();
+        let la = lazy_archive(&mut t, "_x");
+        let out = t.insert(la).unwrap();
+        assert!(matches!(out, InsertOutcome::Replaced { .. }));
+    }
+
+    #[test]
+    fn undefined_replaced_by_lazy_object() {
+        let mut t = SymbolTable::new();
+        let first = undef(&mut t, "_x");
+        t.insert(first).unwrap();
+        let lo = lazy_object(&mut t, "_x");
+        let out = t.insert(lo).unwrap();
+        assert!(matches!(out, InsertOutcome::Replaced { .. }));
+    }
+
+    // ---- existing Defined ----
+
+    #[test]
+    fn strong_defined_keeps_under_undefined() {
+        let mut t = SymbolTable::new();
+        let existing = defined_strong(&mut t, "_x");
+        t.insert(existing).unwrap();
+        let newer = undef(&mut t, "_x");
+        let out = t.insert(newer).unwrap();
+        assert!(matches!(out, InsertOutcome::Kept(_)));
+    }
+
+    #[test]
+    fn two_strong_defined_is_duplicate_error() {
+        let mut t = SymbolTable::new();
+        let first = defined_strong(&mut t, "_x");
+        t.insert(first).unwrap();
+        let second = defined_strong(&mut t, "_x");
+        let err = t.insert(second).unwrap_err();
+        assert!(matches!(err, InsertError::DuplicateStrong { .. }));
+    }
+
+    #[test]
+    fn strong_keeps_under_weak() {
+        let mut t = SymbolTable::new();
+        let strong = defined_strong(&mut t, "_x");
+        t.insert(strong).unwrap();
+        let weaker = defined_weak(&mut t, "_x");
+        let out = t.insert(weaker).unwrap();
+        assert!(matches!(out, InsertOutcome::Kept(_)));
+    }
+
+    #[test]
+    fn weak_replaced_by_strong() {
+        let mut t = SymbolTable::new();
+        let weak = defined_weak(&mut t, "_x");
+        t.insert(weak).unwrap();
+        let strong = defined_strong(&mut t, "_x");
+        let out = t.insert(strong).unwrap();
+        assert!(matches!(out, InsertOutcome::Replaced { .. }));
+        assert!(t.get(SymbolId(0)).is_strong_defined());
+    }
+
+    #[test]
+    fn two_weak_defined_first_wins() {
+        let mut t = SymbolTable::new();
+        let first = defined_weak(&mut t, "_x");
+        let Symbol::Defined {
+            value: first_val, ..
+        } = first
+        else {
+            unreachable!()
+        };
+        t.insert(first).unwrap();
+        let second = defined_weak(&mut t, "_x");
+        let out = t.insert(second).unwrap();
+        assert!(matches!(out, InsertOutcome::Kept(_)));
+        if let Symbol::Defined { value, .. } = t.get(SymbolId(0)) {
+            assert_eq!(*value, first_val);
+        }
+    }
+
+    #[test]
+    fn defined_keeps_under_common() {
+        let mut t = SymbolTable::new();
+        let strong = defined_strong(&mut t, "_x");
+        t.insert(strong).unwrap();
+        let c = common(&mut t, "_x", 8, 3);
+        let out = t.insert(c).unwrap();
+        assert!(matches!(out, InsertOutcome::Kept(_)));
+    }
+
+    #[test]
+    fn defined_keeps_under_dylib_import() {
+        let mut t = SymbolTable::new();
+        let strong = defined_strong(&mut t, "_x");
+        t.insert(strong).unwrap();
+        let di = dylib_import(&mut t, "_x", 1);
+        let out = t.insert(di).unwrap();
+        assert!(matches!(out, InsertOutcome::Kept(_)));
+    }
+
+    #[test]
+    fn defined_keeps_under_lazy_archive() {
+        let mut t = SymbolTable::new();
+        let strong = defined_strong(&mut t, "_x");
+        t.insert(strong).unwrap();
+        let la = lazy_archive(&mut t, "_x");
+        let out = t.insert(la).unwrap();
+        assert!(matches!(out, InsertOutcome::Kept(_)));
+    }
+
+    // ---- existing Common ----
+
+    #[test]
+    fn common_replaced_by_definition() {
+        let mut t = SymbolTable::new();
+        let c = common(&mut t, "_x", 8, 3);
+        t.insert(c).unwrap();
+        let def = defined_strong(&mut t, "_x");
+        let out = t.insert(def).unwrap();
+        assert!(matches!(out, InsertOutcome::Replaced { .. }));
+    }
+
+    #[test]
+    fn common_coalesces_to_larger_size_and_stricter_alignment() {
+        let mut t = SymbolTable::new();
+        let a = common(&mut t, "_x", 8, 2);
+        t.insert(a).unwrap();
+        let b = common(&mut t, "_x", 16, 5);
+        let out = t.insert(b).unwrap();
+        assert!(matches!(out, InsertOutcome::CommonCoalesced { .. }));
+        if let Symbol::Common {
+            size, align_pow2, ..
+        } = t.get(SymbolId(0))
+        {
+            assert_eq!(*size, 16);
+            assert_eq!(*align_pow2, 5);
+        }
+    }
+
+    #[test]
+    fn common_kept_under_dylib_import() {
+        let mut t = SymbolTable::new();
+        let c = common(&mut t, "_x", 8, 3);
+        t.insert(c).unwrap();
+        let di = dylib_import(&mut t, "_x", 2);
+        let out = t.insert(di).unwrap();
+        assert!(matches!(out, InsertOutcome::Kept(_)));
+    }
+
+    // ---- existing DylibImport ----
+
+    #[test]
+    fn dylib_import_replaced_by_local_definition() {
+        let mut t = SymbolTable::new();
+        let di = dylib_import(&mut t, "_printf", 1);
+        t.insert(di).unwrap();
+        let def = defined_strong(&mut t, "_printf");
+        let out = t.insert(def).unwrap();
+        assert!(matches!(out, InsertOutcome::Replaced { .. }));
+    }
+
+    #[test]
+    fn dylib_import_keeps_under_another_import() {
+        let mut t = SymbolTable::new();
+        let first = dylib_import(&mut t, "_printf", 1);
+        t.insert(first).unwrap();
+        let second = dylib_import(&mut t, "_printf", 2);
+        let out = t.insert(second).unwrap();
+        assert!(matches!(out, InsertOutcome::Kept(_)));
+    }
+
+    // ---- existing LazyArchive ----
+
+    #[test]
+    fn lazy_archive_under_undefined_yields_pending_fetch() {
+        let mut t = SymbolTable::new();
+        let lazy = lazy_archive(&mut t, "_hidden");
+        t.insert(lazy).unwrap();
+        let want = undef(&mut t, "_hidden");
+        match t.insert(want).unwrap() {
+            InsertOutcome::PendingArchiveFetch { archive, member, .. } => {
+                assert_eq!(archive, ArchiveId(7));
+                assert_eq!(member, MemberId(42));
+            }
+            other => panic!("expected PendingArchiveFetch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lazy_archive_replaced_by_defined() {
+        let mut t = SymbolTable::new();
+        let lazy = lazy_archive(&mut t, "_f");
+        t.insert(lazy).unwrap();
+        let def = defined_strong(&mut t, "_f");
+        let out = t.insert(def).unwrap();
+        assert!(matches!(out, InsertOutcome::Replaced { .. }));
+    }
+
+    #[test]
+    fn two_lazy_archives_first_wins() {
+        let mut t = SymbolTable::new();
+        let first = lazy_archive(&mut t, "_f");
+        t.insert(first).unwrap();
+        let name = t.intern("_f");
+        let second = Symbol::LazyArchive {
+            name,
+            archive: ArchiveId(99),
+            member: MemberId(99),
+        };
+        let out = t.insert(second).unwrap();
+        assert!(matches!(out, InsertOutcome::Kept(_)));
+    }
+
+    // ---- existing LazyObject ----
+
+    #[test]
+    fn lazy_object_under_undefined_yields_pending_load() {
+        let mut t = SymbolTable::new();
+        let lazy = lazy_object(&mut t, "_f");
+        t.insert(lazy).unwrap();
+        let want = undef(&mut t, "_f");
+        match t.insert(want).unwrap() {
+            InsertOutcome::PendingObjectLoad { origin, .. } => {
+                assert_eq!(origin, InputId(5));
+            }
+            other => panic!("expected PendingObjectLoad, got {other:?}"),
+        }
+    }
+
+    // ---- Alias path ----
+
+    #[test]
+    fn alias_inserts_into_vacant_slot() {
+        let mut t = SymbolTable::new();
+        let al = alias_sym(&mut t, "_old_name", "_new_name");
+        let out = t.insert(al).unwrap();
+        assert!(matches!(out, InsertOutcome::Inserted(_)));
+    }
+
+    #[test]
+    fn direct_definition_replaces_alias() {
+        let mut t = SymbolTable::new();
+        let al = alias_sym(&mut t, "_alias", "_target");
+        t.insert(al).unwrap();
+        let def = defined_strong(&mut t, "_alias");
+        let out = t.insert(def).unwrap();
+        assert!(matches!(
+            out,
+            InsertOutcome::Replaced {
+                from: SymbolKindTag::Alias,
+                to: SymbolKindTag::Defined,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn self_loop_alias_rejected() {
+        let mut t = SymbolTable::new();
+        let u = undef(&mut t, "_foo");
+        t.insert(u).unwrap();
+        let looped = alias_sym(&mut t, "_foo", "_foo");
+        let err = t.insert(looped).unwrap_err();
+        assert!(matches!(err, InsertError::AliasCycle { .. }));
+    }
+
+    #[test]
+    fn two_step_alias_cycle_rejected() {
+        let mut t = SymbolTable::new();
+        let a_to_b = alias_sym(&mut t, "_a", "_b");
+        t.insert(a_to_b).unwrap();
+        let u = undef(&mut t, "_b");
+        t.insert(u).unwrap();
+        let loop_back = alias_sym(&mut t, "_b", "_a");
+        let err = t.insert(loop_back).unwrap_err();
+        assert!(matches!(err, InsertError::AliasCycle { .. }));
+    }
+
+    #[test]
+    fn resolve_chain_walks_to_concrete_target() {
+        let mut t = SymbolTable::new();
+        let defined = defined_strong(&mut t, "_target");
+        t.insert(defined).unwrap();
+        let al = alias_sym(&mut t, "_alias", "_target");
+        t.insert(al).unwrap();
+        let name = t.intern("_alias");
+        let (_, sym) = t.resolve_chain(name).unwrap();
+        assert!(matches!(sym, Symbol::Defined { .. }));
+    }
+
+    #[test]
+    fn resolve_chain_unknown_name_errors() {
+        let t = SymbolTable::new();
+        let err = t.resolve_chain(Istr(99)).unwrap_err();
+        assert!(matches!(err, ResolveError::Unknown(_)));
+    }
+
+    // ---- Transition log ----
+
+    #[test]
+    fn kept_entries_do_not_record_transitions() {
+        let mut t = SymbolTable::new();
+        let strong = defined_strong(&mut t, "_x");
+        t.insert(strong).unwrap();
+        let before = t.transitions().len();
+        let weaker = defined_weak(&mut t, "_x");
+        t.insert(weaker).unwrap();
+        assert_eq!(t.transitions().len(), before);
+    }
+
+    #[test]
+    fn replace_records_transition_with_from_and_to() {
+        let mut t = SymbolTable::new();
+        let u = undef(&mut t, "_x");
+        t.insert(u).unwrap();
+        let d = defined_strong(&mut t, "_x");
+        t.insert(d).unwrap();
+        let last = t.transitions().last().unwrap();
+        assert_eq!(last.from, SymbolKindTag::Undefined);
+        assert_eq!(last.to, SymbolKindTag::Defined);
+        assert_eq!(last.cause, TransitionCause::Replaced);
+    }
+
+    #[test]
+    fn common_coalesce_records_its_own_cause() {
+        let mut t = SymbolTable::new();
+        let a = common(&mut t, "_x", 8, 3);
+        t.insert(a).unwrap();
+        let b = common(&mut t, "_x", 16, 5);
+        t.insert(b).unwrap();
+        assert_eq!(
+            t.transitions().last().unwrap().cause,
+            TransitionCause::CommonCoalesced
+        );
+    }
 }

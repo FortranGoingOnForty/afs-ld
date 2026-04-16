@@ -29,7 +29,7 @@ use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
 use macho::tbd::{parse_tbd, Arch, Platform, Target};
 use resolve::{
     classify_unresolved, drain_fetches, format_duplicate_diagnostic, format_undefined_diagnostic,
-    seed_all, InputAddError, Inputs, SymbolTable, UndefinedTreatment,
+    seed_all, InputAddError, Inputs, Symbol, SymbolTable, UndefinedTreatment,
 };
 
 /// What kind of Mach-O file the linker is producing.
@@ -88,6 +88,7 @@ pub enum LinkError {
     UndefinedSymbols(String),
     UnsupportedArch(String),
     NoTbdDocument(PathBuf),
+    EntrySymbolNotFound(String),
 }
 
 impl std::fmt::Display for LinkError {
@@ -111,6 +112,9 @@ impl std::fmt::Display for LinkError {
                 "{}: no arm64-macos TBD document found",
                 path.display()
             ),
+            LinkError::EntrySymbolNotFound(name) => {
+                write!(f, "entry symbol `{name}` was not found in linked objects")
+            }
         }
     }
 }
@@ -239,7 +243,15 @@ impl Linker {
                 ordinal: dylib.ordinal,
             })
             .collect();
-        macho::writer::write_with_dylibs(&layout, opts.kind, opts, &dylib_loads, &mut image)?;
+        let entry_point = resolve_entry_point(opts, &sym_table)?;
+        macho::writer::write_with_dylibs(
+            &layout,
+            opts.kind,
+            opts,
+            entry_point,
+            &dylib_loads,
+            &mut image,
+        )?;
         let output = default_output_path(opts);
         fs::write(output, image)?;
         Ok(())
@@ -288,4 +300,26 @@ fn register_input(inputs: &mut Inputs, path: &std::path::Path) -> Result<(), Lin
         }
     }
     Ok(())
+}
+
+fn resolve_entry_point(
+    opts: &LinkOptions,
+    sym_table: &SymbolTable,
+) -> Result<Option<macho::writer::EntryPoint>, LinkError> {
+    let Some(name) = &opts.entry else {
+        return Ok(None);
+    };
+    let Some((symbol_id, _)) = sym_table
+        .iter()
+        .find(|(_, symbol)| sym_table.interner.resolve(symbol.name()) == name)
+    else {
+        return Err(LinkError::EntrySymbolNotFound(name.clone()));
+    };
+    let Symbol::Defined { atom, value, .. } = sym_table.get(symbol_id) else {
+        return Err(LinkError::EntrySymbolNotFound(name.clone()));
+    };
+    Ok(Some(macho::writer::EntryPoint {
+        atom: *atom,
+        atom_value: *value,
+    }))
 }

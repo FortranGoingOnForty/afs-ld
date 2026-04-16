@@ -10,6 +10,7 @@ pub mod atom;
 pub mod diag;
 pub mod dump;
 pub mod input;
+pub mod layout;
 pub mod leb;
 pub mod macho;
 pub mod reloc;
@@ -19,6 +20,17 @@ pub mod string_table;
 pub mod symbol;
 
 use std::path::PathBuf;
+use std::{fs, io};
+
+use atom::{atomize_object, backpatch_symbol_atoms, AtomTable};
+use layout::{Layout, LayoutInput};
+use macho::reader::ReadError;
+use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
+use macho::tbd::{parse_tbd, Arch, Platform, Target};
+use resolve::{
+    classify_unresolved, drain_fetches, format_duplicate_diagnostic, format_undefined_diagnostic,
+    seed_all, InputAddError, Inputs, SymbolTable, UndefinedTreatment,
+};
 
 /// What kind of Mach-O file the linker is producing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,16 +78,84 @@ impl Default for LinkOptions {
 pub enum LinkError {
     /// No input files were provided on the command line.
     NoInputs,
-    /// Path to this sprint's incomplete functionality.
-    NotYetImplemented(&'static str),
+    Io(io::Error),
+    Input(InputAddError),
+    Seed(resolve::SeedError),
+    Fetch(resolve::FetchError),
+    Write(macho::writer::WriteError),
+    Tbd(macho::tbd::TbdError),
+    DuplicateSymbols(String),
+    UndefinedSymbols(String),
+    UnsupportedArch(String),
+    NoTbdDocument(PathBuf),
 }
 
 impl std::fmt::Display for LinkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LinkError::NoInputs => write!(f, "no input files"),
-            LinkError::NotYetImplemented(what) => write!(f, "not yet implemented: {what}"),
+            LinkError::Io(e) => write!(f, "{e}"),
+            LinkError::Input(e) => write!(f, "{e}"),
+            LinkError::Seed(e) => write!(f, "{e}"),
+            LinkError::Fetch(e) => write!(f, "{e}"),
+            LinkError::Write(e) => write!(f, "{e}"),
+            LinkError::Tbd(e) => write!(f, "{e}"),
+            LinkError::DuplicateSymbols(msg) | LinkError::UndefinedSymbols(msg) => {
+                write!(f, "{msg}")
+            }
+            LinkError::UnsupportedArch(arch) => {
+                write!(f, "unsupported arch `{arch}` (afs-ld requires arm64)")
+            }
+            LinkError::NoTbdDocument(path) => write!(
+                f,
+                "{}: no arm64-macos TBD document found",
+                path.display()
+            ),
         }
+    }
+}
+
+impl std::error::Error for LinkError {}
+
+impl From<io::Error> for LinkError {
+    fn from(value: io::Error) -> Self {
+        LinkError::Io(value)
+    }
+}
+
+impl From<InputAddError> for LinkError {
+    fn from(value: InputAddError) -> Self {
+        LinkError::Input(value)
+    }
+}
+
+impl From<ReadError> for LinkError {
+    fn from(value: ReadError) -> Self {
+        LinkError::Input(InputAddError::from(value))
+    }
+}
+
+impl From<resolve::SeedError> for LinkError {
+    fn from(value: resolve::SeedError) -> Self {
+        LinkError::Seed(value)
+    }
+}
+
+impl From<resolve::FetchError> for LinkError {
+    fn from(value: resolve::FetchError) -> Self {
+        LinkError::Fetch(value)
+    }
+}
+
+impl From<macho::writer::WriteError> for LinkError {
+    fn from(value: macho::writer::WriteError) -> Self {
+        LinkError::Write(value)
+    }
+}
+
+impl From<macho::tbd::TbdError> for LinkError {
+    fn from(value: macho::tbd::TbdError) -> Self {
+        LinkError::Tbd(value)
     }
 }
 
@@ -88,8 +168,124 @@ impl Linker {
         if opts.inputs.is_empty() {
             return Err(LinkError::NoInputs);
         }
-        Err(LinkError::NotYetImplemented(
-            "input parsing (Sprint 1) lands next",
-        ))
+
+        if let Some(arch) = &opts.arch {
+            if arch != "arm64" {
+                return Err(LinkError::UnsupportedArch(arch.clone()));
+            }
+        }
+
+        let mut inputs = Inputs::new();
+        for path in &opts.inputs {
+            register_input(&mut inputs, path)?;
+        }
+
+        let mut sym_table = SymbolTable::new();
+        let seed_report = seed_all(&inputs, &mut sym_table)?;
+        if seed_report.has_errors() {
+            let mut msg = String::new();
+            for err in &seed_report.duplicates {
+                msg.push_str(&format_duplicate_diagnostic(&sym_table, &inputs, err));
+            }
+            return Err(LinkError::DuplicateSymbols(msg));
+        }
+
+        let drain_report = drain_fetches(&mut inputs, &mut sym_table, seed_report.pending_fetches)?;
+        if !drain_report.duplicates.is_empty() {
+            let mut msg = String::new();
+            for err in &drain_report.duplicates {
+                msg.push_str(&format_duplicate_diagnostic(&sym_table, &inputs, err));
+            }
+            return Err(LinkError::DuplicateSymbols(msg));
+        }
+        let unresolved = classify_unresolved(&mut sym_table, UndefinedTreatment::Error);
+        if !unresolved.errors.is_empty() {
+            return Err(LinkError::UndefinedSymbols(format_undefined_diagnostic(
+                &sym_table,
+                &inputs,
+                &seed_report.referrers,
+                &unresolved.errors,
+            )));
+        }
+
+        let mut atom_table = AtomTable::new();
+        let mut objects = Vec::new();
+        for idx in 0..inputs.objects.len() {
+            let input_id = resolve::InputId(idx as u32);
+            let obj = inputs.object_file(input_id)?;
+            let atomization = atomize_object(input_id, &obj, &mut atom_table);
+            backpatch_symbol_atoms(&atomization, input_id, &obj, &mut sym_table, &mut atom_table);
+            objects.push((input_id, obj));
+        }
+
+        let layout_inputs: Vec<LayoutInput<'_>> = objects
+            .iter()
+            .map(|(id, object)| LayoutInput {
+                id: *id,
+                object,
+            })
+            .collect();
+        let layout = Layout::build(opts.kind, &layout_inputs, &atom_table, 0);
+
+        let mut image = Vec::new();
+        let dylib_loads: Vec<DylibDependency> = inputs
+            .dylibs
+            .iter()
+            .map(|dylib| DylibDependency {
+                kind: DylibLoadKind::Normal,
+                install_name: dylib.file.install_name.clone(),
+                current_version: dylib.file.current_version,
+                compatibility_version: dylib.file.compatibility_version,
+                ordinal: dylib.ordinal,
+            })
+            .collect();
+        macho::writer::write_with_dylibs(&layout, opts.kind, opts, &dylib_loads, &mut image)?;
+        let output = default_output_path(opts);
+        fs::write(output, image)?;
+        Ok(())
     }
+}
+
+fn default_output_path(opts: &LinkOptions) -> PathBuf {
+    opts.output.clone().unwrap_or_else(|| PathBuf::from("a.out"))
+}
+
+fn register_input(inputs: &mut Inputs, path: &std::path::Path) -> Result<(), LinkError> {
+    let bytes = fs::read(path)?;
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("a") => {
+            let _ = inputs.add_archive(path.to_path_buf(), bytes)?;
+        }
+        Some("dylib") => {
+            let _ = inputs.add_dylib(path.to_path_buf(), bytes)?;
+        }
+        Some("tbd") => {
+            let text = std::str::from_utf8(&bytes).map_err(|e| {
+                LinkError::Tbd(macho::tbd::TbdError::Schema {
+                    msg: format!("TBD input is not UTF-8: {e}"),
+                })
+            })?;
+            let docs = parse_tbd(text)?;
+            let target = Target {
+                arch: Arch::Arm64,
+                platform: Platform::MacOs,
+            };
+            let mut loaded = false;
+            for doc in docs
+                .iter()
+                .filter(|doc| doc.targets.iter().any(|t| t == &target))
+            {
+                let file = DylibFile::from_tbd(path, doc, &target);
+                let _ = inputs.add_dylib_from_file(path.to_path_buf(), file);
+                loaded = true;
+            }
+            if !loaded {
+                return Err(LinkError::NoTbdDocument(path.to_path_buf()));
+            }
+        }
+        _ => {
+            let _ = inputs.add_object(path.to_path_buf(), bytes)?;
+        }
+    }
+    Ok(())
 }

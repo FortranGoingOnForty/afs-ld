@@ -256,6 +256,75 @@ fn linker_run_reports_duplicate_from_fetched_archive_member() {
 }
 
 #[test]
+fn fetched_archive_member_undefined_reports_member_referrer() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let main_obj = scratch("member-main.o");
+    let member_obj = scratch("member-undef.o");
+    let archive = scratch("member.a");
+
+    let main_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            bl _archive_sym
+            ret
+        .subsections_via_symbols
+    "#;
+    let member_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _archive_sym
+        _archive_sym:
+            bl _missing_from_member
+            ret
+        .subsections_via_symbols
+    "#;
+
+    for (src, out) in [(&main_src, &main_obj), (&member_src, &member_obj)] {
+        if let Err(e) = assemble(src, out) {
+            eprintln!("skipping: assemble failed: {e}");
+            return;
+        }
+    }
+
+    let ar = Command::new("ar")
+        .arg("rcs")
+        .arg(&archive)
+        .arg(&member_obj)
+        .output()
+        .unwrap();
+    if !ar.status.success() {
+        eprintln!("skipping: ar failed: {}", String::from_utf8_lossy(&ar.stderr));
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![main_obj.clone(), archive.clone()],
+        output: Some(scratch("member.out")),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    let err = Linker::run(&opts).unwrap_err();
+    match err {
+        LinkError::UndefinedSymbols(msg) => {
+            assert!(msg.contains("undefined symbol: _missing_from_member"), "{msg}");
+            assert!(
+                msg.contains(&format!("referenced by {}(", archive.display())),
+                "expected archive-member referrer in:\n{msg}"
+            );
+        }
+        other => panic!("expected UndefinedSymbols, got {other:?}"),
+    }
+
+    let _ = fs::remove_file(main_obj);
+    let _ = fs::remove_file(member_obj);
+    let _ = fs::remove_file(archive);
+}
+
+#[test]
 fn linker_run_carries_tbd_inputs_into_load_commands() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");

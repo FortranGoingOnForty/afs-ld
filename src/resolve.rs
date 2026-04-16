@@ -826,7 +826,7 @@ pub struct PendingFetch {
 /// Tracks which inputs reference each external name. A single name can
 /// appear as a Defined, Undefined, or Common in multiple inputs; we keep
 /// one entry per (name, origin) pair in insertion order.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ReferrerLog {
     entries: HashMap<Istr, Vec<InputId>>,
 }
@@ -848,6 +848,14 @@ impl ReferrerLog {
             .get(&name)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    pub fn extend_from(&mut self, other: &ReferrerLog) {
+        for (&name, origins) in &other.entries {
+            for &origin in origins {
+                self.add(name, origin);
+            }
+        }
     }
 }
 
@@ -1072,6 +1080,7 @@ impl From<SeedError> for FetchError {
 pub struct DrainReport {
     pub fetched_members: usize,
     pub duplicates: Vec<InsertError>,
+    pub referrers: ReferrerLog,
 }
 
 /// Shared ingest: copy one archive member's body into a fresh
@@ -1116,6 +1125,7 @@ fn ingest_member_bytes(
     let mut sub_report = SeedReport::default();
     seed_object(inputs, input_id, table, &mut sub_report)?;
     report.duplicates.extend(sub_report.duplicates);
+    report.referrers.extend_from(&sub_report.referrers);
     Ok(sub_report.pending_fetches)
 }
 

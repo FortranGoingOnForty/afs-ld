@@ -202,12 +202,14 @@ impl Linker {
             }
             return Err(LinkError::DuplicateSymbols(msg));
         }
+        let mut referrers = seed_report.referrers.clone();
+        referrers.extend_from(&drain_report.referrers);
         let unresolved = classify_unresolved(&mut sym_table, UndefinedTreatment::Error);
         if !unresolved.errors.is_empty() {
             return Err(LinkError::UndefinedSymbols(format_undefined_diagnostic(
                 &sym_table,
                 &inputs,
-                &seed_report.referrers,
+                &referrers,
                 &unresolved.errors,
             )));
         }

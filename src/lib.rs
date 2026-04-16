@@ -268,7 +268,14 @@ impl Linker {
             0,
             Some(&synthetic_plan),
         );
-        let mut layout = macho::writer::finalize_layout(&base_layout, opts.kind, opts, &dylib_loads)?;
+        let (mut layout, linkedit) = macho::writer::finalize_layout_with_linkedit(
+            &base_layout,
+            opts.kind,
+            opts,
+            &dylib_loads,
+            &sym_table,
+            &synthetic_plan,
+        )?;
         reloc::arm64::apply_layout(
             &mut layout,
             &layout_inputs,
@@ -279,12 +286,13 @@ impl Linker {
 
         let mut image = Vec::new();
         let entry_point = resolve_entry_point(opts, &sym_table)?;
-        macho::writer::write_finalized_with_dylibs(
+        macho::writer::write_finalized_with_linkedit(
             &layout,
             opts.kind,
             opts,
             entry_point,
             &dylib_loads,
+            &linkedit,
             &mut image,
         )?;
         let output = default_output_path(opts);

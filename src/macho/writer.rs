@@ -2,15 +2,19 @@
 //!
 //! Emits a parseable `MH_EXECUTE` or `MH_DYLIB` image from the output layout.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::layout::Layout;
 use crate::macho::constants::*;
 use crate::macho::dylib::DylibDependency;
 use crate::macho::reader::{
-    write_commands, write_header, BuildVersionCmd, BuildTool, DysymtabCmd, DylibCmd, LoadCommand,
-    MachHeader64, Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
+    write_commands, write_header, BuildVersionCmd, BuildTool, DyldInfoCmd, DysymtabCmd,
+    DylibCmd, LoadCommand, MachHeader64, Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
 };
+use crate::resolve::{Symbol, SymbolId, SymbolTable};
+use crate::symbol::{write_nlist_table, InputSymbol, RawNlist};
+use crate::synth::SyntheticPlan;
 use crate::{LinkOptions, OutputKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +28,8 @@ pub enum WriteError {
     MissingSegment(&'static str),
     OffsetTooLarge(&'static str),
     EntryAtomMissing(crate::resolve::AtomId),
+    ImportSymbolMissing(SymbolId),
+    ImportSymbolWrongKind(SymbolId),
 }
 
 impl fmt::Display for WriteError {
@@ -32,6 +38,12 @@ impl fmt::Display for WriteError {
             WriteError::MissingSegment(name) => write!(f, "missing output segment `{name}`"),
             WriteError::OffsetTooLarge(what) => write!(f, "{what} exceeds 32-bit Mach-O field width"),
             WriteError::EntryAtomMissing(atom) => write!(f, "entry atom {:?} missing from layout", atom),
+            WriteError::ImportSymbolMissing(symbol) => {
+                write!(f, "synthetic import symbol {:?} missing from symbol table", symbol)
+            }
+            WriteError::ImportSymbolWrongKind(symbol) => {
+                write!(f, "synthetic import symbol {:?} is not a dylib import", symbol)
+            }
         }
     }
 }
@@ -65,35 +77,50 @@ pub fn finalize_layout(
     opts: &LinkOptions,
     dylibs: &[DylibDependency],
 ) -> Result<Layout, WriteError> {
+    Ok(finalize_with_linkedit(layout, kind, opts, dylibs, None)?.0)
+}
+
+pub fn finalize_layout_with_linkedit(
+    layout: &Layout,
+    kind: OutputKind,
+    opts: &LinkOptions,
+    dylibs: &[DylibDependency],
+    sym_table: &SymbolTable,
+    synthetic_plan: &SyntheticPlan,
+) -> Result<(Layout, LinkEditPlan), WriteError> {
+    finalize_with_linkedit(layout, kind, opts, dylibs, Some((sym_table, synthetic_plan)))
+}
+
+fn finalize_with_linkedit(
+    layout: &Layout,
+    kind: OutputKind,
+    opts: &LinkOptions,
+    dylibs: &[DylibDependency],
+    imports: Option<(&SymbolTable, &SyntheticPlan)>,
+) -> Result<(Layout, LinkEditPlan), WriteError> {
     let mut layout = layout.clone();
-    let header_size = estimate_header_size(&layout, kind, opts, dylibs);
+    let mut linkedit = build_linkedit_plan(&layout, imports)?;
+    apply_indirect_starts(&mut layout, &linkedit);
+    let header_size = estimate_header_size(&layout, kind, opts, dylibs, &linkedit);
     layout.relayout(header_size);
 
-    let linkedit = layout
-        .segment("__LINKEDIT")
-        .cloned()
-        .ok_or(WriteError::MissingSegment("__LINKEDIT"))?;
-    let strtab_off = u32_fit(linkedit.file_off, "string table offset")?;
-    let symtab = SymtabCmd {
-        symoff: strtab_off,
-        nsyms: 0,
-        stroff: strtab_off,
-        strsize: 1,
-    };
-    let dysymtab = DysymtabCmd::default();
-    let sizeofcmds: u32 = build_commands(&layout, kind, opts, None, dylibs, symtab, dysymtab)?
+    linkedit = build_linkedit_plan(&layout, imports)?;
+    apply_indirect_starts(&mut layout, &linkedit);
+    let sizeofcmds: u32 = build_commands(&layout, kind, opts, None, dylibs, &linkedit)?
         .iter()
         .map(LoadCommand::cmdsize)
         .sum();
     let header_size = HEADER_SIZE as u64 + sizeofcmds as u64;
     layout.relayout(header_size);
+    linkedit = build_linkedit_plan(&layout, imports)?;
+    apply_indirect_starts(&mut layout, &linkedit);
 
-    let linkedit = layout
+    let linkedit_seg = layout
         .segment_mut("__LINKEDIT")
         .ok_or(WriteError::MissingSegment("__LINKEDIT"))?;
-    linkedit.file_size = 1;
-    linkedit.vm_size = 1;
-    Ok(layout)
+    linkedit_seg.file_size = linkedit.total_size().max(1);
+    linkedit_seg.vm_size = linkedit.total_size().max(1);
+    Ok((layout, linkedit))
 }
 
 pub fn write_finalized_with_dylibs(
@@ -104,26 +131,30 @@ pub fn write_finalized_with_dylibs(
     dylibs: &[DylibDependency],
     out: &mut Vec<u8>,
 ) -> Result<(), WriteError> {
-    let linkedit = layout
+    let linkedit = LinkEditPlan::minimal(layout)?;
+    write_finalized_with_linkedit(layout, kind, opts, entry_point, dylibs, &linkedit, out)
+}
+
+pub fn write_finalized_with_linkedit(
+    layout: &Layout,
+    kind: OutputKind,
+    opts: &LinkOptions,
+    entry_point: Option<EntryPoint>,
+    dylibs: &[DylibDependency],
+    linkedit_plan: &LinkEditPlan,
+    out: &mut Vec<u8>,
+) -> Result<(), WriteError> {
+    let _linkedit_segment = layout
         .segment("__LINKEDIT")
         .cloned()
         .ok_or(WriteError::MissingSegment("__LINKEDIT"))?;
-    let strtab_off = u32_fit(linkedit.file_off, "string table offset")?;
-    let symtab = SymtabCmd {
-        symoff: strtab_off,
-        nsyms: 0,
-        stroff: strtab_off,
-        strsize: 1,
-    };
-    let dysymtab = DysymtabCmd::default();
     let commands = build_commands(
         layout,
         kind,
         opts,
         entry_point,
         dylibs,
-        symtab,
-        dysymtab,
+        linkedit_plan,
     )?;
 
     let sizeofcmds: u32 = commands.iter().map(LoadCommand::cmdsize).sum();
@@ -164,7 +195,20 @@ pub fn write_finalized_with_dylibs(
         }
     }
 
-    out[strtab_off as usize] = 0;
+    let symoff = linkedit_plan.symtab.symoff as usize;
+    let indirectoff = linkedit_plan.dysymtab.indirectsymoff as usize;
+    let stroff = linkedit_plan.symtab.stroff as usize;
+    if !linkedit_plan.symtab_bytes.is_empty() {
+        let end = symoff + linkedit_plan.symtab_bytes.len();
+        out[symoff..end].copy_from_slice(&linkedit_plan.symtab_bytes);
+    }
+    if !linkedit_plan.indirect_bytes.is_empty() {
+        let end = indirectoff + linkedit_plan.indirect_bytes.len();
+        out[indirectoff..end].copy_from_slice(&linkedit_plan.indirect_bytes);
+    }
+    let end = stroff + linkedit_plan.strtab_bytes.len();
+    out[stroff..end].copy_from_slice(&linkedit_plan.strtab_bytes);
+
     Ok(())
 }
 
@@ -174,8 +218,7 @@ fn build_commands(
     opts: &LinkOptions,
     entry_point: Option<EntryPoint>,
     dylibs: &[DylibDependency],
-    symtab: SymtabCmd,
-    dysymtab: DysymtabCmd,
+    linkedit: &LinkEditPlan,
 ) -> Result<Vec<LoadCommand>, WriteError> {
     let mut commands = Vec::new();
     for segment in &layout.segments {
@@ -216,12 +259,12 @@ fn build_commands(
         }));
     }
 
-    commands.push(LoadCommand::Symtab(symtab));
-    commands.push(LoadCommand::Dysymtab(dysymtab));
+    commands.push(LoadCommand::Symtab(linkedit.symtab));
+    commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
     commands.push(raw_linkedit_command(LC_FUNCTION_STARTS, 0, 0));
     commands.push(raw_linkedit_command(LC_DATA_IN_CODE, 0, 0));
     commands.push(raw_linkedit_command(LC_CODE_SIGNATURE, 0, 0));
-    commands.push(raw_dyld_info_only());
+    commands.push(LoadCommand::DyldInfoOnly(linkedit.dyld_info));
 
     Ok(commands)
 }
@@ -231,6 +274,7 @@ fn estimate_header_size(
     kind: OutputKind,
     opts: &LinkOptions,
     dylibs: &[DylibDependency],
+    _linkedit: &LinkEditPlan,
 ) -> u64 {
     let mut size = HEADER_SIZE as u64;
     for segment in &layout.segments {
@@ -270,7 +314,7 @@ fn estimate_header_size(
     size += SymtabCmd::WIRE_SIZE as u64;
     size += DysymtabCmd::WIRE_SIZE as u64;
     size += 16 * 3;
-    size += 48;
+    size += DyldInfoCmd::WIRE_SIZE as u64;
     size
 }
 
@@ -343,14 +387,6 @@ fn raw_linkedit_command(cmd: u32, dataoff: u32, datasize: u32) -> LoadCommand {
     }
 }
 
-fn raw_dyld_info_only() -> LoadCommand {
-    LoadCommand::Raw {
-        cmd: LC_DYLD_INFO_ONLY,
-        cmdsize: 48,
-        data: vec![0; 40],
-    }
-}
-
 fn header_flags(kind: OutputKind) -> u32 {
     match kind {
         OutputKind::Executable => MH_DYLDLINK | MH_NOUNDEFS | MH_TWOLEVEL | MH_PIE,
@@ -366,6 +402,228 @@ fn dylib_install_name(opts: &LinkOptions) -> String {
         return path.display().to_string();
     }
     "@rpath/a.out.dylib".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkEditPlan {
+    pub symtab: SymtabCmd,
+    pub dysymtab: DysymtabCmd,
+    pub dyld_info: DyldInfoCmd,
+    pub symtab_bytes: Vec<u8>,
+    pub indirect_bytes: Vec<u8>,
+    pub strtab_bytes: Vec<u8>,
+    indirect_starts: HashMap<(String, String), u32>,
+}
+
+impl LinkEditPlan {
+    fn minimal(layout: &Layout) -> Result<Self, WriteError> {
+        build_linkedit_plan(layout, None)
+    }
+
+    fn total_size(&self) -> u64 {
+        (self.symtab_bytes.len() + self.indirect_bytes.len() + self.strtab_bytes.len()) as u64
+    }
+}
+
+fn build_linkedit_plan(
+    layout: &Layout,
+    imports: Option<(&SymbolTable, &SyntheticPlan)>,
+) -> Result<LinkEditPlan, WriteError> {
+    let linkedit = layout
+        .segment("__LINKEDIT")
+        .cloned()
+        .ok_or(WriteError::MissingSegment("__LINKEDIT"))?;
+    let base_off = u32_fit(linkedit.file_off, "linkedit file offset")?;
+
+    let Some((sym_table, synthetic_plan)) = imports else {
+        return Ok(LinkEditPlan {
+            symtab: SymtabCmd {
+                symoff: base_off,
+                nsyms: 0,
+                stroff: base_off,
+                strsize: 1,
+            },
+            dysymtab: DysymtabCmd::default(),
+            dyld_info: DyldInfoCmd::default(),
+            symtab_bytes: Vec::new(),
+            indirect_bytes: Vec::new(),
+            strtab_bytes: vec![0],
+            indirect_starts: HashMap::new(),
+        });
+    };
+
+    let imports = collect_imports(sym_table, synthetic_plan)?;
+    let mut strtab_bytes = vec![0];
+    let mut symbols = Vec::with_capacity(imports.len());
+    let mut symbol_indices = HashMap::new();
+    for (idx, import) in imports.iter().enumerate() {
+        let strx = strtab_bytes.len() as u32;
+        strtab_bytes.extend_from_slice(import.name.as_bytes());
+        strtab_bytes.push(0);
+        let mut n_desc = import.ordinal << 8;
+        if import.weak_import {
+            n_desc |= N_WEAK_REF;
+        }
+        symbols.push(InputSymbol::from_raw(RawNlist {
+            strx,
+            n_type: N_UNDF | N_EXT,
+            n_sect: 0,
+            n_desc,
+            n_value: 0,
+        }));
+        symbol_indices.insert(import.symbol, idx as u32);
+    }
+
+    let mut symtab_bytes = Vec::new();
+    write_nlist_table(&symbols, &mut symtab_bytes);
+
+    let mut indirect_symbols = Vec::new();
+    let mut indirect_starts = HashMap::new();
+    push_indirect_section(
+        &mut indirect_symbols,
+        &mut indirect_starts,
+        ("__TEXT", "__stubs"),
+        synthetic_plan
+            .stubs
+            .entries
+            .iter()
+            .map(|entry| entry.symbol),
+        &symbol_indices,
+    );
+    push_indirect_section(
+        &mut indirect_symbols,
+        &mut indirect_starts,
+        ("__DATA_CONST", "__got"),
+        synthetic_plan.got.entries.iter().map(|entry| entry.symbol),
+        &symbol_indices,
+    );
+    push_indirect_section(
+        &mut indirect_symbols,
+        &mut indirect_starts,
+        ("__DATA", "__la_symbol_ptr"),
+        synthetic_plan
+            .lazy_pointers
+            .entries
+            .iter()
+            .map(|entry| entry.symbol),
+        &symbol_indices,
+    );
+
+    let mut indirect_bytes = Vec::with_capacity(indirect_symbols.len() * 4);
+    for index in &indirect_symbols {
+        indirect_bytes.extend_from_slice(&index.to_le_bytes());
+    }
+
+    let symoff = base_off;
+    let indirectsymoff = u32_fit(
+        symoff as u64 + symtab_bytes.len() as u64,
+        "indirect symbol table offset",
+    )?;
+    let stroff = u32_fit(
+        indirectsymoff as u64 + indirect_bytes.len() as u64,
+        "string table offset",
+    )?;
+    Ok(LinkEditPlan {
+        symtab: SymtabCmd {
+            symoff,
+            nsyms: symbols.len() as u32,
+            stroff,
+            strsize: strtab_bytes.len() as u32,
+        },
+        dysymtab: DysymtabCmd {
+            iundefsym: 0,
+            nundefsym: symbols.len() as u32,
+            indirectsymoff,
+            nindirectsyms: indirect_symbols.len() as u32,
+            ..DysymtabCmd::default()
+        },
+        dyld_info: DyldInfoCmd::default(),
+        symtab_bytes,
+        indirect_bytes,
+        strtab_bytes,
+        indirect_starts,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ImportSymbolRecord {
+    symbol: SymbolId,
+    name: String,
+    ordinal: u16,
+    weak_import: bool,
+}
+
+fn collect_imports(
+    sym_table: &SymbolTable,
+    synthetic_plan: &SyntheticPlan,
+) -> Result<Vec<ImportSymbolRecord>, WriteError> {
+    let mut ids: Vec<SymbolId> = synthetic_plan
+        .stubs
+        .entries
+        .iter()
+        .map(|entry| entry.symbol)
+        .chain(synthetic_plan.got.entries.iter().map(|entry| entry.symbol))
+        .chain(
+            synthetic_plan
+                .lazy_pointers
+                .entries
+                .iter()
+                .map(|entry| entry.symbol),
+        )
+        .collect();
+    ids.sort();
+    ids.dedup();
+
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let symbol = sym_table.get(id);
+        let Symbol::DylibImport {
+            name,
+            ordinal,
+            weak_import,
+            ..
+        } = symbol
+        else {
+            return Err(WriteError::ImportSymbolWrongKind(id));
+        };
+        out.push(ImportSymbolRecord {
+            symbol: id,
+            name: sym_table.interner.resolve(*name).to_string(),
+            ordinal: *ordinal,
+            weak_import: *weak_import,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+fn push_indirect_section(
+    indirect_symbols: &mut Vec<u32>,
+    indirect_starts: &mut HashMap<(String, String), u32>,
+    key: (&str, &str),
+    symbols: impl Iterator<Item = SymbolId>,
+    symbol_indices: &HashMap<SymbolId, u32>,
+) {
+    let start = indirect_symbols.len() as u32;
+    let mut saw_any = false;
+    for symbol in symbols {
+        saw_any = true;
+        indirect_symbols.push(*symbol_indices.get(&symbol).expect("symbol index missing"));
+    }
+    if saw_any {
+        indirect_starts.insert((key.0.to_string(), key.1.to_string()), start);
+    }
+}
+
+fn apply_indirect_starts(layout: &mut Layout, linkedit: &LinkEditPlan) {
+    for section in &mut layout.sections {
+        if let Some(&start) = linkedit
+            .indirect_starts
+            .get(&(section.segment.clone(), section.name.clone()))
+        {
+            section.reserved1 = start;
+        }
+    }
 }
 
 fn entryoff(layout: &Layout) -> Result<u64, WriteError> {

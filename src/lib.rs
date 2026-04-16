@@ -17,17 +17,17 @@ pub mod reloc;
 pub mod resolve;
 pub mod section;
 pub mod string_table;
-pub mod synth;
 pub mod symbol;
+pub mod synth;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::{fs, io};
-use std::os::unix::fs::PermissionsExt;
 
 use atom::{atomize_object, backpatch_symbol_atoms, AtomTable};
 use layout::{Layout, LayoutInput};
-use macho::reader::ReadError;
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
+use macho::reader::ReadError;
 use macho::tbd::{parse_tbd, parse_version, Arch, Platform, Target};
 use reloc::arm64::RelocError;
 use resolve::{
@@ -91,6 +91,7 @@ pub enum LinkError {
     Tbd(macho::tbd::TbdError),
     Reloc(RelocError),
     Synth(synth::SynthError),
+    Unwind(synth::unwind::UnwindError),
     DuplicateSymbols(String),
     UndefinedSymbols(String),
     UnsupportedArch(String),
@@ -110,17 +111,16 @@ impl std::fmt::Display for LinkError {
             LinkError::Tbd(e) => write!(f, "{e}"),
             LinkError::Reloc(e) => write!(f, "{e}"),
             LinkError::Synth(e) => write!(f, "{e}"),
+            LinkError::Unwind(e) => write!(f, "{e}"),
             LinkError::DuplicateSymbols(msg) | LinkError::UndefinedSymbols(msg) => {
                 write!(f, "{msg}")
             }
             LinkError::UnsupportedArch(arch) => {
                 write!(f, "unsupported arch `{arch}` (afs-ld requires arm64)")
             }
-            LinkError::NoTbdDocument(path) => write!(
-                f,
-                "{}: no arm64-macos TBD document found",
-                path.display()
-            ),
+            LinkError::NoTbdDocument(path) => {
+                write!(f, "{}: no arm64-macos TBD document found", path.display())
+            }
             LinkError::EntrySymbolNotFound(name) => {
                 write!(f, "entry symbol `{name}` was not found in linked objects")
             }
@@ -184,6 +184,12 @@ impl From<synth::SynthError> for LinkError {
     }
 }
 
+impl From<synth::unwind::UnwindError> for LinkError {
+    fn from(value: synth::unwind::UnwindError) -> Self {
+        LinkError::Unwind(value)
+    }
+}
+
 /// The linker itself. Sprint 0 only validates that inputs exist; later sprints
 /// grow this into the full pipeline described in `.docs/overview.md`.
 pub struct Linker;
@@ -241,16 +247,19 @@ impl Linker {
             let input_id = resolve::InputId(idx as u32);
             let obj = inputs.object_file(input_id)?;
             let atomization = atomize_object(input_id, &obj, &mut atom_table);
-            backpatch_symbol_atoms(&atomization, input_id, &obj, &mut sym_table, &mut atom_table);
+            backpatch_symbol_atoms(
+                &atomization,
+                input_id,
+                &obj,
+                &mut sym_table,
+                &mut atom_table,
+            );
             objects.push((input_id, obj));
         }
 
         let layout_inputs: Vec<LayoutInput<'_>> = objects
             .iter()
-            .map(|(id, object)| LayoutInput {
-                id: *id,
-                object,
-            })
+            .map(|(id, object)| LayoutInput { id: *id, object })
             .collect();
         let mut dylib_loads = Vec::new();
         let mut seen_ordinals = std::collections::BTreeSet::new();
@@ -272,25 +281,37 @@ impl Linker {
             &mut sym_table,
             &inputs.dylibs,
         )?;
-        let base_layout = Layout::build_with_synthetics(
+        let mut layout = Layout::build_with_synthetics(
             opts.kind,
             &layout_inputs,
             &atom_table,
             0,
             Some(&synthetic_plan),
         );
-        let (mut layout, linkedit) = macho::writer::finalize_layout_with_linkedit(
-            &base_layout,
-            opts.kind,
-            opts,
-            &dylib_loads,
-            macho::writer::LinkEditContext {
-                layout_inputs: &layout_inputs,
-                atom_table: &atom_table,
-                sym_table: &sym_table,
-                synthetic_plan: &synthetic_plan,
-            },
-        )?;
+        let linkedit_context = macho::writer::LinkEditContext {
+            layout_inputs: &layout_inputs,
+            atom_table: &atom_table,
+            sym_table: &sym_table,
+            synthetic_plan: &synthetic_plan,
+        };
+        let mut linkedit = None;
+        for _ in 0..4 {
+            let (next_layout, next_linkedit) = macho::writer::finalize_layout_with_linkedit(
+                &layout,
+                opts.kind,
+                opts,
+                &dylib_loads,
+                linkedit_context,
+            )?;
+            layout = next_layout;
+            linkedit = Some(next_linkedit);
+            let changed =
+                synth::unwind::synthesize(&mut layout, &layout_inputs, &atom_table, &sym_table)?;
+            if !changed {
+                break;
+            }
+        }
+        let linkedit = linkedit.expect("finalize loop always runs at least once");
         reloc::arm64::apply_layout(
             &mut layout,
             &layout_inputs,
@@ -324,7 +345,9 @@ impl Linker {
 }
 
 fn default_output_path(opts: &LinkOptions) -> PathBuf {
-    opts.output.clone().unwrap_or_else(|| PathBuf::from("a.out"))
+    opts.output
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("a.out"))
 }
 
 fn register_input(inputs: &mut Inputs, path: &std::path::Path) -> Result<(), LinkError> {

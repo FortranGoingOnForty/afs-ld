@@ -464,6 +464,27 @@ struct DataInCodeRecord {
     kind: u16,
 }
 
+fn normalized_unwind_words(bytes: &[u8]) -> Vec<u32> {
+    let (_, unwind) = output_section(bytes, "__TEXT", "__unwind_info").unwrap();
+    let mut words: Vec<u32> = unwind
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    if words.len() < 7 {
+        return words;
+    }
+    let indices_count = words[6] as usize;
+    if indices_count == 0 || words.len() < 7 + indices_count * 3 {
+        return words;
+    }
+    let base = words[7];
+    for idx in 0..indices_count {
+        let word = 7 + idx * 3;
+        words[word] = words[word].saturating_sub(base);
+    }
+    words
+}
+
 fn decode_data_in_code(bytes: &[u8]) -> Vec<DataInCodeRecord> {
     let payload = linkedit_payload(bytes, LC_DATA_IN_CODE);
     payload
@@ -3449,6 +3470,104 @@ fn linker_run_strips_locals_with_x_like_ld() {
     assert_eq!(undefs, vec!["_ext_data".to_string()]);
 
     let _ = fs::remove_file(dylib);
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_emits_leaf_unwind_info_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+
+    let obj = scratch("unwind-leaf.o");
+    let our_out = scratch("unwind-leaf-ours.out");
+    let apple_out = scratch("unwind-leaf-apple.out");
+    let src = r#"
+        int main(void) {
+            return 0;
+        }
+    "#;
+    if let Err(e) = compile_c(src, &obj) {
+        eprintln!("skipping: clang compile failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert_eq!(normalized_unwind_words(&our_bytes), normalized_unwind_words(&apple_bytes));
+    assert!(output_section(&our_bytes, "__LD", "__compact_unwind").is_none());
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_emits_multi_function_unwind_info_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+
+    let obj = scratch("unwind-mixed.o");
+    let our_out = scratch("unwind-mixed-ours.out");
+    let apple_out = scratch("unwind-mixed-apple.out");
+    let src = r#"
+        int helper(void) {
+            return 1;
+        }
+
+        int main(void) {
+            return helper();
+        }
+    "#;
+    if let Err(e) = compile_c(src, &obj) {
+        eprintln!("skipping: clang compile failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert_eq!(normalized_unwind_words(&our_bytes), normalized_unwind_words(&apple_bytes));
+    assert!(output_section(&our_bytes, "__LD", "__compact_unwind").is_none());
+
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(apple_out);

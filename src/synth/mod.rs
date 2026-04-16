@@ -3,6 +3,7 @@ pub mod dyld_info;
 pub mod got;
 pub mod stubs;
 pub mod tlv;
+pub mod unwind;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -13,11 +14,12 @@ use crate::input::ObjectFile;
 use crate::layout::LayoutInput;
 use crate::macho::constants::{
     S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_LAZY_SYMBOL_POINTERS,
-    S_NON_LAZY_SYMBOL_POINTERS, S_REGULAR, S_SYMBOL_STUBS,
-    S_THREAD_LOCAL_VARIABLE_POINTERS,
+    S_NON_LAZY_SYMBOL_POINTERS, S_REGULAR, S_SYMBOL_STUBS, S_THREAD_LOCAL_VARIABLE_POINTERS,
 };
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
-use crate::resolve::{AtomId, DylibId, DylibInput, InputId, InsertOutcome, Symbol, SymbolId, SymbolTable};
+use crate::resolve::{
+    AtomId, DylibId, DylibInput, InputId, InsertOutcome, Symbol, SymbolId, SymbolTable,
+};
 use crate::section::{OutputSection, SectionKind};
 
 use self::got::GotSection;
@@ -79,24 +81,25 @@ impl SyntheticPlan {
         sym_table: &mut SymbolTable,
         dylibs: &[DylibInput],
     ) -> Result<Self, SynthError> {
-        let input_map: HashMap<InputId, &ObjectFile> =
-            inputs.iter().map(|input| (input.id, input.object)).collect();
+        let input_map: HashMap<InputId, &ObjectFile> = inputs
+            .iter()
+            .map(|input| (input.id, input.object))
+            .collect();
         let mut reloc_cache: HashMap<(InputId, u8), Vec<Reloc>> = HashMap::new();
         for input in inputs {
             for (sect_idx, section) in input.object.sections.iter().enumerate() {
                 let relocs = if section.nreloc == 0 {
                     Vec::new()
                 } else {
-                    let raws =
-                        parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(|err| {
-                            SynthError {
-                                input: input.object.path.clone(),
-                                atom: crate::resolve::AtomId(0),
-                                reloc_offset: 0,
-                                kind: RelocKind::Unsigned,
-                                detail: err.to_string(),
-                            }
-                        })?;
+                    let raws = parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(
+                        |err| SynthError {
+                            input: input.object.path.clone(),
+                            atom: crate::resolve::AtomId(0),
+                            reloc_offset: 0,
+                            kind: RelocKind::Unsigned,
+                            detail: err.to_string(),
+                        },
+                    )?;
                     parse_relocs(&raws).map_err(|err| SynthError {
                         input: input.object.path.clone(),
                         atom: crate::resolve::AtomId(0),
@@ -168,8 +171,11 @@ impl SyntheticPlan {
                             _ => continue,
                         };
                         stubs.intern(symbol_id, dylib, dylib_import_is_weak(sym_table, symbol_id));
-                        lazy_pointers
-                            .intern(symbol_id, dylib, dylib_import_is_weak(sym_table, symbol_id));
+                        lazy_pointers.intern(
+                            symbol_id,
+                            dylib,
+                            dylib_import_is_weak(sym_table, symbol_id),
+                        );
                     }
                     RelocKind::TlvpLoadPage21 | RelocKind::TlvpLoadPageOff12 => {
                         if let Some(symbol_id) = symbol_referent_id(obj, reloc.referent, sym_table)
@@ -270,7 +276,8 @@ impl SyntheticPlan {
                 synthetic_data: vec![
                     0;
                     STUB_HELPER_HEADER_SIZE as usize
-                        + self.lazy_pointers.entries.len() * STUB_HELPER_ENTRY_SIZE as usize
+                        + self.lazy_pointers.entries.len()
+                            * STUB_HELPER_ENTRY_SIZE as usize
                 ],
                 addr: 0,
                 size: STUB_HELPER_HEADER_SIZE as u64
@@ -344,7 +351,11 @@ impl SyntheticPlan {
                 reserved3: 0,
                 atoms: Vec::new(),
                 synthetic_offset: 0,
-                synthetic_data: vec![0; self.thread_pointers.entries.len() * THREAD_POINTER_SIZE as usize],
+                synthetic_data: vec![
+                    0;
+                    self.thread_pointers.entries.len()
+                        * THREAD_POINTER_SIZE as usize
+                ],
                 addr: 0,
                 size: (self.thread_pointers.entries.len() as u64) * THREAD_POINTER_SIZE as u64,
                 file_off: 0,
@@ -363,8 +374,12 @@ fn sort_symbol_indexed_entries<T, F>(
     F: Fn(&T) -> SymbolId,
 {
     entries.sort_by(|lhs, rhs| {
-        let lhs_name = sym_table.interner.resolve(sym_table.get(symbol_of(lhs)).name());
-        let rhs_name = sym_table.interner.resolve(sym_table.get(symbol_of(rhs)).name());
+        let lhs_name = sym_table
+            .interner
+            .resolve(sym_table.get(symbol_of(lhs)).name());
+        let rhs_name = sym_table
+            .interner
+            .resolve(sym_table.get(symbol_of(rhs)).name());
         lhs_name.cmp(rhs_name)
     });
     index.clear();
@@ -436,7 +451,10 @@ fn dylib_import_is_weak(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
 }
 
 fn tlv_symbol_needs_thread_pointer(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
-    matches!(sym_table.get(symbol_id), Symbol::LazyArchive { .. } | Symbol::LazyObject { .. })
+    matches!(
+        sym_table.get(symbol_id),
+        Symbol::LazyArchive { .. } | Symbol::LazyObject { .. }
+    )
 }
 
 fn tlv_symbol_needs_got(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
@@ -462,15 +480,14 @@ fn ensure_stub_helper_support(
     dylibs: &[DylibInput],
     got: &mut GotSection,
 ) -> Result<SymbolId, SynthError> {
-    let (libsystem_id, libsystem) = find_libsystem_input(dylibs)
-        .ok_or_else(|| SynthError {
-            input: PathBuf::from("<synthetic stubs>"),
-            atom: crate::resolve::AtomId(0),
-            reloc_offset: 0,
-            kind: RelocKind::Branch26,
-            detail: "stub helper requires a libSystem dylib/TBD input for `dyld_stub_binder`"
-                .to_string(),
-        })?;
+    let (libsystem_id, libsystem) = find_libsystem_input(dylibs).ok_or_else(|| SynthError {
+        input: PathBuf::from("<synthetic stubs>"),
+        atom: crate::resolve::AtomId(0),
+        reloc_offset: 0,
+        kind: RelocKind::Branch26,
+        detail: "stub helper requires a libSystem dylib/TBD input for `dyld_stub_binder`"
+            .to_string(),
+    })?;
 
     let name = sym_table.intern("dyld_stub_binder");
     let symbol_id = if let Some(id) = sym_table.lookup(name) {
@@ -693,7 +710,10 @@ mod tests {
         assert!(plan.tlv_bootstrap_symbol.is_none());
         assert!(plan.needs_dyld_private);
         assert_eq!(plan.stubs.entries[0].dylib, DylibId(2));
-        assert_eq!(plan.lazy_pointers.entries[0].symbol, plan.stubs.entries[0].symbol);
+        assert_eq!(
+            plan.lazy_pointers.entries[0].symbol,
+            plan.stubs.entries[0].symbol
+        );
     }
 
     #[test]

@@ -49,6 +49,7 @@ pub struct LinkOptions {
     pub output: Option<PathBuf>,
     pub entry: Option<String>,
     pub arch: Option<String>,
+    pub strip_locals: bool,
     pub kind: OutputKind,
     /// When set, afs-ld operates in dump mode and prints the given file's
     /// header + load commands instead of linking.
@@ -68,6 +69,7 @@ impl Default for LinkOptions {
             output: None,
             entry: None,
             arch: None,
+            strip_locals: false,
             kind: OutputKind::Executable,
             dump: None,
             dump_archive: None,

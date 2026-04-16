@@ -13,6 +13,7 @@ use afs_ld::macho::constants::{
     BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND,
     BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED, BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB,
     BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_DONE, BIND_OPCODE_MASK,
+    LC_DATA_IN_CODE, LC_FUNCTION_STARTS,
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
@@ -23,7 +24,7 @@ use afs_ld::macho::constants::{
     REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM, REBASE_TYPE_POINTER,
     SG_READ_ONLY,
 };
-use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand, Section64Header};
+use afs_ld::macho::reader::{parse_commands, parse_header, u32_le, LoadCommand, Section64Header};
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, SymKind};
 use afs_ld::{LinkError, LinkOptions, Linker, OutputKind};
@@ -205,6 +206,19 @@ fn segment_flags(bytes: &[u8], segname: &str) -> Option<u32> {
     None
 }
 
+fn segment_vmaddr(bytes: &[u8], segname: &str) -> Option<u64> {
+    let header = parse_header(bytes).ok()?;
+    let commands = parse_commands(&header, bytes).ok()?;
+    for cmd in commands {
+        if let LoadCommand::Segment64(seg) = cmd {
+            if seg.segname_str() == segname {
+                return Some(seg.vmaddr);
+            }
+        }
+    }
+    None
+}
+
 fn symtab_and_dysymtab(bytes: &[u8]) -> (afs_ld::macho::reader::SymtabCmd, afs_ld::macho::reader::DysymtabCmd) {
     let header = parse_header(bytes).unwrap();
     let commands = parse_commands(&header, bytes).unwrap();
@@ -317,6 +331,44 @@ fn indirect_symbol_table(bytes: &[u8]) -> Vec<u32> {
         .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
         .collect()
+}
+
+fn raw_linkedit_data_cmd(bytes: &[u8], expected_cmd: u32) -> (u32, u32) {
+    let header = parse_header(bytes).unwrap();
+    let commands = parse_commands(&header, bytes).unwrap();
+    for cmd in commands {
+        if let LoadCommand::Raw { cmd, data, .. } = cmd {
+            if cmd == expected_cmd {
+                return (u32_le(&data[0..4]), u32_le(&data[4..8]));
+            }
+        }
+    }
+    panic!("missing raw linkedit command 0x{expected_cmd:x}");
+}
+
+fn linkedit_payload(bytes: &[u8], cmd: u32) -> Vec<u8> {
+    let (dataoff, datasize) = raw_linkedit_data_cmd(bytes, cmd);
+    if datasize == 0 {
+        return Vec::new();
+    }
+    bytes[dataoff as usize..(dataoff + datasize) as usize].to_vec()
+}
+
+fn decode_function_starts(bytes: &[u8]) -> Vec<u64> {
+    let payload = linkedit_payload(bytes, LC_FUNCTION_STARTS);
+    let mut offsets = Vec::new();
+    let mut cursor = 0usize;
+    let mut current = 0u64;
+    while cursor < payload.len() {
+        let (delta, used) = read_uleb(&payload[cursor..]).unwrap();
+        cursor += used;
+        if delta == 0 {
+            break;
+        }
+        current += delta;
+        offsets.push(current);
+    }
+    offsets
 }
 
 fn assert_strtab_within_five_percent(ours: &[u8], apple: &[u8]) {
@@ -2303,6 +2355,180 @@ fn linker_run_partitions_symtab_like_ld() {
     );
 
     let _ = fs::remove_file(dylib);
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_strips_locals_with_x_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+
+    let dylib = scratch("symtab-strip.dylib");
+    let obj = scratch("symtab-strip.o");
+    let our_out = scratch("symtab-strip-ours.out");
+    let apple_out = scratch("symtab-strip-apple.out");
+
+    let dylib_src = r#"
+        int ext_data = 5;
+    "#;
+    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
+        eprintln!("skipping: dylib compile failed: {e}");
+        return;
+    }
+
+    let asm = r#"
+        .text
+        .private_extern _hidden
+        .globl _visible
+        .globl _main
+        .p2align 2
+    _local:
+        ret
+    _hidden:
+        ret
+    _visible:
+        ret
+    _main:
+        ret
+
+        .data
+        .quad _ext_data
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(asm, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), dylib.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        strip_locals: true,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let apple = Command::new("xcrun")
+        .args(["ld", "-arch", "arm64", "-x", "-e", "_main", "-o"])
+        .arg(&apple_out)
+        .arg(&obj)
+        .arg(&dylib)
+        .output()
+        .unwrap();
+    assert!(
+        apple.status.success(),
+        "xcrun ld failed: {}",
+        String::from_utf8_lossy(&apple.stderr)
+    );
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let (our_symtab, our_dysymtab) = symtab_and_dysymtab(&our_bytes);
+    let (apple_symtab, apple_dysymtab) = symtab_and_dysymtab(&apple_bytes);
+
+    assert_eq!(our_symtab.nsyms, apple_symtab.nsyms);
+    assert_eq!(our_dysymtab.ilocalsym, apple_dysymtab.ilocalsym);
+    assert_eq!(our_dysymtab.nlocalsym, apple_dysymtab.nlocalsym);
+    assert_eq!(our_dysymtab.iextdefsym, apple_dysymtab.iextdefsym);
+    assert_eq!(our_dysymtab.nextdefsym, apple_dysymtab.nextdefsym);
+    assert_eq!(our_dysymtab.iundefsym, apple_dysymtab.iundefsym);
+    assert_eq!(our_dysymtab.nundefsym, apple_dysymtab.nundefsym);
+    assert_eq!(canonical_symbol_records(&our_bytes), canonical_symbol_records(&apple_bytes));
+
+    let (locals, extdefs, undefs) = symbol_partition_names(&our_bytes);
+    assert!(locals.is_empty());
+    assert_eq!(
+        extdefs,
+        vec![
+            "__mh_execute_header".to_string(),
+            "_main".to_string(),
+            "_visible".to_string()
+        ]
+    );
+    assert_eq!(undefs, vec!["_ext_data".to_string()]);
+
+    let _ = fs::remove_file(dylib);
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_emits_function_starts_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("function-starts.o");
+    let our_out = scratch("function-starts-ours.out");
+    let apple_out = scratch("function-starts-apple.out");
+    let asm = r#"
+        .text
+        .globl _main
+        .p2align 2
+    _main:
+        ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(asm, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let our_fstarts = raw_linkedit_data_cmd(&our_bytes, LC_FUNCTION_STARTS);
+    let apple_fstarts = raw_linkedit_data_cmd(&apple_bytes, LC_FUNCTION_STARTS);
+    assert_ne!(our_fstarts.0, 0);
+    assert_eq!(our_fstarts.1, apple_fstarts.1);
+    assert_eq!(our_fstarts.1, 8);
+    assert_eq!(decode_function_starts(&our_bytes).len(), 1);
+    assert_eq!(decode_function_starts(&apple_bytes).len(), 1);
+    let our_text_addr = output_section(&our_bytes, "__TEXT", "__text").unwrap().0;
+    let apple_text_addr = output_section(&apple_bytes, "__TEXT", "__text").unwrap().0;
+    let our_text_base = segment_vmaddr(&our_bytes, "__TEXT").unwrap();
+    let apple_text_base = segment_vmaddr(&apple_bytes, "__TEXT").unwrap();
+    assert_eq!(decode_function_starts(&our_bytes), vec![our_text_addr - our_text_base]);
+    assert_eq!(
+        decode_function_starts(&apple_bytes),
+        vec![apple_text_addr - apple_text_base]
+    );
+
+    let our_dic = raw_linkedit_data_cmd(&our_bytes, LC_DATA_IN_CODE);
+    let apple_dic = raw_linkedit_data_cmd(&apple_bytes, LC_DATA_IN_CODE);
+    assert_ne!(our_dic.0, 0);
+    assert_eq!(our_dic.1, apple_dic.1);
+    assert_eq!(our_dic.0, our_fstarts.0 + our_fstarts.1);
+    assert_eq!(apple_dic.0, apple_fstarts.0 + apple_fstarts.1);
+
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(apple_out);

@@ -53,6 +53,9 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                         .clone(),
                 );
             }
+            "-x" => {
+                opts.strip_locals = true;
+            }
             "-dylib" => {
                 opts.kind = OutputKind::Dylib;
             }
@@ -111,6 +114,12 @@ mod tests {
     fn dylib_flag_switches_output_kind() {
         let opts = parse(&argv(&["-dylib", "foo.o"])).unwrap();
         assert_eq!(opts.kind, OutputKind::Dylib);
+    }
+
+    #[test]
+    fn strip_locals_flag_is_recorded() {
+        let opts = parse(&argv(&["-x", "foo.o"])).unwrap();
+        assert!(opts.strip_locals);
     }
 
     #[test]

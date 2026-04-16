@@ -13,12 +13,15 @@ use crate::macho::constants::*;
 use crate::macho::dylib::DylibDependency;
 use crate::macho::reader::{
     write_commands, write_header, BuildVersionCmd, BuildTool, DyldInfoCmd, DysymtabCmd,
-    DylibCmd, LoadCommand, MachHeader64, Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
+    DylibCmd, LinkEditDataCmd, LoadCommand, MachHeader64, Section64Header, Segment64, SymtabCmd,
+    HEADER_SIZE,
 };
 use crate::resolve::InputId;
 use crate::resolve::{Symbol, SymbolId, SymbolTable};
+use crate::section::is_executable;
 use crate::string_table::StringTableBuilder;
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind};
+use crate::synth::stubs::{STUB_HELPER_ENTRY_SIZE, STUB_HELPER_HEADER_SIZE, STUB_SIZE};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::{code_sig::CodeSignaturePlan, SyntheticPlan};
 use crate::{LinkOptions, OutputKind};
@@ -239,6 +242,8 @@ pub fn write_finalized_with_linkedit(
     let rebaseoff = linkedit_plan.dyld_info.rebase_off as usize;
     let bindoff = linkedit_plan.dyld_info.bind_off as usize;
     let lazy_bind_off = linkedit_plan.dyld_info.lazy_bind_off as usize;
+    let function_starts_off = linkedit_plan.function_starts.dataoff as usize;
+    let data_in_code_off = linkedit_plan.data_in_code.dataoff as usize;
     let stroff = linkedit_plan.symtab.stroff as usize;
     if !linkedit_plan.symtab_bytes.is_empty() {
         let end = symoff + linkedit_plan.symtab_bytes.len();
@@ -259,6 +264,14 @@ pub fn write_finalized_with_linkedit(
     if !linkedit_plan.lazy_bind_bytes.is_empty() {
         let end = lazy_bind_off + linkedit_plan.lazy_bind_bytes.len();
         out[lazy_bind_off..end].copy_from_slice(&linkedit_plan.lazy_bind_bytes);
+    }
+    if !linkedit_plan.function_starts_bytes.is_empty() {
+        let end = function_starts_off + linkedit_plan.function_starts_bytes.len();
+        out[function_starts_off..end].copy_from_slice(&linkedit_plan.function_starts_bytes);
+    }
+    if !linkedit_plan.data_in_code_bytes.is_empty() {
+        let end = data_in_code_off + linkedit_plan.data_in_code_bytes.len();
+        out[data_in_code_off..end].copy_from_slice(&linkedit_plan.data_in_code_bytes);
     }
     let end = stroff + linkedit_plan.strtab_bytes.len();
     out[stroff..end].copy_from_slice(&linkedit_plan.strtab_bytes);
@@ -321,8 +334,16 @@ fn build_commands(
 
     commands.push(LoadCommand::Symtab(linkedit.symtab));
     commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
-    commands.push(raw_linkedit_command(LC_FUNCTION_STARTS, 0, 0));
-    commands.push(raw_linkedit_command(LC_DATA_IN_CODE, 0, 0));
+    commands.push(raw_linkedit_command(
+        LC_FUNCTION_STARTS,
+        linkedit.function_starts.dataoff,
+        linkedit.function_starts.datasize,
+    ));
+    commands.push(raw_linkedit_command(
+        LC_DATA_IN_CODE,
+        linkedit.data_in_code.dataoff,
+        linkedit.data_in_code.datasize,
+    ));
     if let Some(code_signature) = &linkedit.code_signature {
         commands.push(raw_linkedit_command(
             LC_CODE_SIGNATURE,
@@ -502,11 +523,15 @@ pub struct LinkEditPlan {
     pub symtab: SymtabCmd,
     pub dysymtab: DysymtabCmd,
     pub dyld_info: DyldInfoCmd,
+    pub function_starts: LinkEditDataCmd,
+    pub data_in_code: LinkEditDataCmd,
     pub symtab_bytes: Vec<u8>,
     pub indirect_bytes: Vec<u8>,
     rebase_bytes: Vec<u8>,
     bind_bytes: Vec<u8>,
     lazy_bind_bytes: Vec<u8>,
+    function_starts_bytes: Vec<u8>,
+    data_in_code_bytes: Vec<u8>,
     pub strtab_bytes: Vec<u8>,
     code_signature: Option<CodeSignaturePlan>,
     indirect_starts: HashMap<(String, String), u32>,
@@ -557,11 +582,21 @@ fn build_linkedit_plan(
             },
             dysymtab: DysymtabCmd::default(),
             dyld_info: DyldInfoCmd::default(),
+            function_starts: LinkEditDataCmd {
+                dataoff: base_off,
+                datasize: 0,
+            },
+            data_in_code: LinkEditDataCmd {
+                dataoff: base_off,
+                datasize: 0,
+            },
             symtab_bytes: Vec::new(),
             indirect_bytes: Vec::new(),
             rebase_bytes: Vec::new(),
             bind_bytes: Vec::new(),
             lazy_bind_bytes: Vec::new(),
+            function_starts_bytes: Vec::new(),
+            data_in_code_bytes: Vec::new(),
             strtab_bytes: vec![0; 8],
             code_signature: Some(build_code_signature(layout, kind, opts, base_off as u64 + 8)?),
             indirect_starts: HashMap::new(),
@@ -574,7 +609,7 @@ fn build_linkedit_plan(
     let imports = collect_imports(sym_table, synthetic_plan)?;
     let import_lookup: HashMap<SymbolId, &ImportSymbolRecord> =
         imports.iter().map(|record| (record.symbol, record)).collect();
-    let symbol_plan = build_output_symbols(layout, kind, inputs, &imports)?;
+    let symbol_plan = build_output_symbols(layout, kind, opts.strip_locals, inputs, &imports)?;
 
     let mut symtab_bytes = Vec::new();
     write_nlist_table(&symbol_plan.symbols, &mut symtab_bytes);
@@ -618,6 +653,8 @@ fn build_linkedit_plan(
 
     let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
     let rebase_bytes = build_rebase_stream(layout, synthetic_plan)?;
+    let function_starts_bytes = build_function_starts(layout)?;
+    let data_in_code_bytes = Vec::new();
 
     let mut cursor = base_off as u64;
     let rebase_off = place_optional_block(&mut cursor, rebase_bytes.len(), "rebase stream offset")?;
@@ -628,6 +665,13 @@ fn build_linkedit_plan(
         bind_streams.lazy_bind.len(),
         "lazy bind stream offset",
     )?;
+    let function_starts = place_linkedit_data_block(
+        &mut cursor,
+        function_starts_bytes.len(),
+        "function starts offset",
+    )?;
+    let data_in_code =
+        place_linkedit_data_block(&mut cursor, data_in_code_bytes.len(), "data-in-code offset")?;
     let symoff = place_required_block(&mut cursor, symtab_bytes.len(), "symbol table offset")?;
     let indirectsymoff = place_optional_block(
         &mut cursor,
@@ -662,11 +706,15 @@ fn build_linkedit_plan(
             lazy_bind_size: bind_streams.lazy_bind.len() as u32,
             ..DyldInfoCmd::default()
         },
+        function_starts,
+        data_in_code,
         symtab_bytes,
         indirect_bytes,
         rebase_bytes,
         bind_bytes: bind_streams.bind,
         lazy_bind_bytes: bind_streams.lazy_bind,
+        function_starts_bytes,
+        data_in_code_bytes,
         strtab_bytes: symbol_plan.strtab_bytes,
         code_signature: Some(build_code_signature(layout, kind, opts, regular_end)?),
         indirect_starts,
@@ -774,6 +822,67 @@ fn emit_rebase_run(out: &mut Vec<u8>, count: usize) {
     }
 }
 
+fn build_function_starts(layout: &Layout) -> Result<Vec<u8>, WriteError> {
+    let image_base = layout
+        .segment("__TEXT")
+        .ok_or(WriteError::MissingSegment("__TEXT"))?
+        .vm_addr;
+    let mut starts = Vec::new();
+
+    for section in &layout.sections {
+        if section.segment != "__TEXT" || !is_executable(section.kind) {
+            continue;
+        }
+        for placed in &section.atoms {
+            starts.push(section.addr + placed.offset - image_base);
+        }
+        match section.name.as_str() {
+            "__stubs" => {
+                for idx in 0..(section.synthetic_data.len() / STUB_SIZE as usize) {
+                    starts.push(section.addr + idx as u64 * STUB_SIZE as u64 - image_base);
+                }
+            }
+            "__stub_helper" => {
+                if !section.synthetic_data.is_empty() {
+                    starts.push(section.addr - image_base);
+                    let entry_count = section
+                        .synthetic_data
+                        .len()
+                        .saturating_sub(STUB_HELPER_HEADER_SIZE as usize)
+                        / STUB_HELPER_ENTRY_SIZE as usize;
+                    for idx in 0..entry_count {
+                        starts.push(
+                            section.addr
+                                + STUB_HELPER_HEADER_SIZE as u64
+                                + idx as u64 * STUB_HELPER_ENTRY_SIZE as u64
+                                - image_base,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    starts.sort_unstable();
+    starts.dedup();
+    if starts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    let mut previous = 0u64;
+    for start in starts {
+        write_uleb(start - previous, &mut out);
+        previous = start;
+    }
+    out.push(0);
+    while !out.len().is_multiple_of(8) {
+        out.push(0);
+    }
+    Ok(out)
+}
+
 fn collect_imports(
     sym_table: &SymbolTable,
     synthetic_plan: &SyntheticPlan,
@@ -832,6 +941,7 @@ fn collect_imports(
 fn build_output_symbols(
     layout: &Layout,
     kind: OutputKind,
+    strip_locals: bool,
     inputs: LinkEditInputs<'_>,
     imports: &[ImportSymbolRecord],
 ) -> Result<SymbolTablePlan, WriteError> {
@@ -933,8 +1043,11 @@ fn build_output_symbols(
     }
     undefineds.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
 
-    let mut specs = Vec::with_capacity(locals.len() + external_defineds.len() + undefineds.len());
-    specs.extend(locals);
+    let local_count = if strip_locals { 0 } else { locals.len() };
+    let mut specs = Vec::with_capacity(local_count + external_defineds.len() + undefineds.len());
+    if !strip_locals {
+        specs.extend(locals);
+    }
     specs.extend(external_defineds);
     specs.extend(undefineds);
 
@@ -1163,6 +1276,20 @@ fn place_required_block(
     let offset = u32_fit(*cursor, context)?;
     *cursor += size as u64;
     Ok(offset)
+}
+
+fn place_linkedit_data_block(
+    cursor: &mut u64,
+    size: usize,
+    context: &'static str,
+) -> Result<LinkEditDataCmd, WriteError> {
+    *cursor = align_up(*cursor, 8);
+    let dataoff = u32_fit(*cursor, context)?;
+    *cursor += size as u64;
+    Ok(LinkEditDataCmd {
+        dataoff,
+        datasize: size as u32,
+    })
 }
 
 fn push_indirect_section(

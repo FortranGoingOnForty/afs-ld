@@ -3626,6 +3626,176 @@ fn linker_run_remaps_data_in_code_like_ld() {
 }
 
 #[test]
+fn linker_run_remaps_data_in_code_in_later_text_section_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("data-in-code-late.o");
+    let our_out = scratch("data-in-code-late-ours.out");
+    let apple_out = scratch("data-in-code-late-apple.out");
+    let asm = r#"
+        .text
+        .globl _main
+        .p2align 2
+    _main:
+        ret
+
+        .section __TEXT,__text2,regular,pure_instructions
+        .globl _helper
+        .p2align 2
+    _helper:
+        b Ldispatch
+        .p2align 2
+    Ltable:
+        .data_region jt32
+        .long Lcase0-Ltable
+        .long Lcase1-Ltable
+        .end_data_region
+    Ldispatch:
+        ret
+    Lcase0:
+        ret
+    Lcase1:
+        ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(asm, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert_eq!(
+        canonical_data_in_code(&our_bytes),
+        canonical_data_in_code(&apple_bytes)
+    );
+    assert_eq!(
+        canonical_data_in_code(&our_bytes),
+        vec![DataInCodeRecord {
+            offset: 8,
+            length: 8,
+            kind: DICE_KIND_JUMP_TABLE32,
+        }]
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_remaps_data_in_code_after_large_first_text_section_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("data-in-code-large-first.o");
+    let our_out = scratch("data-in-code-large-first-ours.out");
+    let apple_out = scratch("data-in-code-large-first-apple.out");
+    let asm = r#"
+        .text
+        .globl _main
+        .p2align 2
+    _main:
+        nop
+        nop
+        nop
+        nop
+        nop
+        ret
+
+        .section __TEXT,__text2,regular,pure_instructions
+        .globl _helper
+    _helper:
+        b Ldispatch
+        .p2align 2
+    Ltable:
+        .data_region jt32
+        .long Lcase0-Ltable
+        .long Lcase1-Ltable
+        .end_data_region
+    Ldispatch:
+        ret
+    Lcase0:
+        ret
+    Lcase1:
+        ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(asm, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert_eq!(
+        canonical_data_in_code(&our_bytes),
+        canonical_data_in_code(&apple_bytes)
+    );
+    assert_eq!(
+        canonical_data_in_code(&our_bytes),
+        vec![DataInCodeRecord {
+            offset: 28,
+            length: 8,
+            kind: DICE_KIND_JUMP_TABLE32,
+        }]
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
 fn linker_run_dedups_output_strtab_like_ld() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");

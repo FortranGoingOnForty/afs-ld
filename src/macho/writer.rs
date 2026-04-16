@@ -1167,14 +1167,14 @@ fn remap_data_in_code_to_section(
     object: &ObjectFile,
     entry: DataInCodeEntry,
 ) -> Result<(u8, u32), WriteError> {
-    let entry_end = entry
-        .offset
-        .checked_add(entry.length as u32)
+    let entry_start = entry.offset as u64;
+    let entry_end = entry_start
+        .checked_add(entry.length as u64)
         .ok_or_else(|| {
             WriteError::MalformedDataInCode(
                 object.path.clone(),
                 format!(
-                    "entry at file offset {} with len {} overflows u32",
+                    "entry at input offset {} with len {} overflows u64",
                     entry.offset, entry.length
                 ),
             )
@@ -1184,16 +1184,20 @@ fn remap_data_in_code_to_section(
         .iter()
         .enumerate()
         .filter(|(_, section)| !section.data.is_empty() && is_executable(section.kind))
-        .filter(|(_, section)| entry_end <= section.size as u32)
-        .map(|(idx, _)| (idx + 1) as u8);
-    if let Some(section_index) = matches.next() {
+        .filter_map(|(idx, section)| {
+            let section_start = section.addr;
+            let section_end = section.addr.checked_add(section.size)?;
+            (section_start <= entry_start && entry_end <= section_end)
+                .then_some(((idx + 1) as u8, (entry_start - section_start) as u32))
+        });
+    if let Some(mapped) = matches.next() {
         if matches.next().is_none() {
-            return Ok((section_index, entry.offset));
+            return Ok(mapped);
         }
         return Err(WriteError::MalformedDataInCode(
             object.path.clone(),
             format!(
-                "entry at section-relative offset {} (len {}) ambiguously matches multiple executable input sections",
+                "entry at input offset {} (len {}) ambiguously matches multiple executable input sections",
                 entry.offset, entry.length
             ),
         ));
@@ -1201,7 +1205,7 @@ fn remap_data_in_code_to_section(
     Err(WriteError::MalformedDataInCode(
         object.path.clone(),
         format!(
-            "entry at section-relative offset {} (len {}) does not map to any executable input section",
+            "entry at input offset {} (len {}) does not map to any executable input section range",
             entry.offset, entry.length
         ),
     ))

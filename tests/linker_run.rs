@@ -99,6 +99,30 @@ fn assemble(src: &str, out: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+fn compile_c(src: &str, out: &PathBuf) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "afs-ld-linker-run-{}-{}.c",
+        std::process::id(),
+        out.file_stem().and_then(|s| s.to_str()).unwrap_or("t")
+    ));
+    fs::write(&tmp, src).map_err(|e| format!("write: {e}"))?;
+    let output = Command::new("xcrun")
+        .args(["--sdk", "macosx", "clang", "-arch", "arm64", "-c"])
+        .arg(&tmp)
+        .arg("-o")
+        .arg(out)
+        .output()
+        .map_err(|e| format!("spawn xcrun clang: {e}"))?;
+    let _ = fs::remove_file(&tmp);
+    if !output.status.success() {
+        return Err(format!(
+            "xcrun clang failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
 fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-linker-run-{}-{name}", std::process::id()))
 }
@@ -1868,51 +1892,93 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
 }
 
 #[test]
-fn linker_run_rejects_tlvp_relocations_until_sprint_13() {
-    if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+fn linker_run_handles_local_tlv_descriptors() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun clang or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
         return;
     }
 
-    let obj = scratch("tlvp-reloc.o");
-    let out = scratch("tlvp-reloc.out");
+    let obj = scratch("tlvp-local.o");
+    let out = scratch("tlvp-local.out");
     let src = r#"
-        .section __TEXT,__text,regular,pure_instructions
-        .globl _main
-        _main:
-            adrp x0, _tlsvar@TLVPPAGE
-            ldr x0, [x0, _tlsvar@TLVPPAGEOFF]
-            ret
+        __thread long tls_a = 7;
+        __thread long tls_b;
 
-        .section __DATA,__thread_data,thread_local_regular
-        .globl _tlsvar
-        .p2align 3
-        _tlsvar:
-            .quad 0
-        .subsections_via_symbols
+        static long tls_sum(void) {
+            return tls_a + tls_b;
+        }
+
+        int main(void) {
+            return tls_sum() == 7 ? 0 : 1;
+        }
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
+    if let Err(e) = compile_c(src, &obj) {
+        eprintln!("skipping: compile failed: {e}");
         return;
     }
 
     let opts = LinkOptions {
-        inputs: vec![obj.clone()],
-        output: Some(out),
+        inputs: vec![obj.clone(), tbd],
+        output: Some(out.clone()),
         kind: OutputKind::Executable,
         ..LinkOptions::default()
     };
-    let err = Linker::run(&opts).unwrap_err();
-    match err {
-        LinkError::Reloc(err) => {
-            let msg = err.to_string();
-            assert!(msg.contains("TlvpLoadPage21") || msg.contains("TlvpLoadPageOff12"), "{msg}");
-            assert!(msg.contains("not yet implemented"), "{msg}");
-            assert!(msg.contains("Sprint 12/13"), "{msg}");
-            assert!(msg.contains("_tlsvar"), "{msg}");
-        }
-        other => panic!("expected Reloc error, got {other:?}"),
-    }
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (_, thread_vars) = output_section(&bytes, "__DATA", "__thread_vars").unwrap();
+    let (_, thread_data) = output_section(&bytes, "__DATA", "__thread_data").unwrap();
+    assert!(output_section(&bytes, "__DATA", "__thread_ptrs").is_none());
+    assert_eq!(thread_vars.len(), 48);
+    assert_eq!(thread_data.len(), 8);
+    assert_eq!(u64::from_le_bytes(thread_vars[16..24].try_into().unwrap()), 0);
+    assert_eq!(u64::from_le_bytes(thread_vars[40..48].try_into().unwrap()), 8);
+
+    let binds = decode_bind_records(&bytes, false).unwrap();
+    let mut tlv_binds: Vec<_> = binds
+        .into_iter()
+        .filter(|record| record.section == "__thread_vars" && record.symbol == "__tlv_bootstrap")
+        .collect();
+    tlv_binds.sort_by_key(|record| record.section_offset);
+    assert_eq!(tlv_binds.len(), 2);
+    assert_eq!(tlv_binds[0].section_offset, 0);
+    assert_eq!(tlv_binds[1].section_offset, 24);
+
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
+    let symtab = commands
+        .iter()
+        .find_map(|cmd| match cmd {
+            LoadCommand::Symtab(cmd) => Some(*cmd),
+            _ => None,
+        })
+        .unwrap();
+    let symbols = parse_nlist_table(&bytes, symtab.symoff, symtab.nsyms).unwrap();
+    let strings = StringTable::from_file(&bytes, symtab.stroff, symtab.strsize).unwrap();
+    let symbol_names: Vec<&str> = symbols
+        .iter()
+        .map(|symbol| strings.get(symbol.strx()).unwrap())
+        .collect();
+    assert!(symbol_names.contains(&"__tlv_bootstrap"));
+
+    let verify = Command::new("codesign").arg("-v").arg(&out).output().unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let status = Command::new(&out).status().unwrap();
+    assert_eq!(status.code(), Some(0), "expected TLV executable to exit 0");
 
     let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
 }

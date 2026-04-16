@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::atom::{Atom, AtomTable};
+use crate::atom::{Atom, AtomSection, AtomTable};
 use crate::input::ObjectFile;
 use crate::layout::LayoutInput;
 use crate::macho::constants::{
@@ -15,8 +15,8 @@ use crate::macho::constants::{
     S_NON_LAZY_SYMBOL_POINTERS, S_REGULAR, S_SYMBOL_STUBS,
     S_THREAD_LOCAL_VARIABLE_POINTERS,
 };
-use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind};
-use crate::resolve::{DylibId, DylibInput, InputId, InsertOutcome, Symbol, SymbolId, SymbolTable};
+use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
+use crate::resolve::{AtomId, DylibId, DylibInput, InputId, InsertOutcome, Symbol, SymbolId, SymbolTable};
 use crate::section::{OutputSection, SectionKind};
 
 use self::got::GotSection;
@@ -32,9 +32,18 @@ pub struct SyntheticPlan {
     pub stubs: StubsSection,
     pub lazy_pointers: LazyPointerSection,
     pub thread_pointers: ThreadPointerSection,
+    pub direct_binds: Vec<DirectBind>,
     pub binder_symbol: Option<SymbolId>,
     pub tlv_bootstrap_symbol: Option<SymbolId>,
     pub needs_dyld_private: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectBind {
+    pub atom: AtomId,
+    pub atom_offset: u32,
+    pub symbol: SymbolId,
+    pub addend: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +112,7 @@ impl SyntheticPlan {
         let mut stubs = StubsSection::default();
         let mut lazy_pointers = LazyPointerSection::default();
         let mut thread_pointers = ThreadPointerSection::default();
+        let mut direct_binds = Vec::new();
 
         for (atom_id, atom) in atoms.iter() {
             let obj = input_map.get(&atom.origin).ok_or_else(|| SynthError {
@@ -118,6 +128,26 @@ impl SyntheticPlan {
                 .unwrap_or(&[]);
             for reloc in relocs_for_atom(relocs, atom) {
                 match reloc.kind {
+                    RelocKind::Unsigned => {
+                        // `__thread_vars` descriptors carry their own dedicated
+                        // bind encoding later in the writer; don't double-count
+                        // those dylib imports as generic bound pointer slots.
+                        if matches!(atom.section, AtomSection::ThreadLocalVariables) {
+                            continue;
+                        }
+                        let Some(symbol_id) = dylib_import_referent(obj, reloc.referent, sym_table)
+                        else {
+                            continue;
+                        };
+                        if direct_import_bind_supported(reloc) {
+                            direct_binds.push(DirectBind {
+                                atom: atom_id,
+                                atom_offset: reloc.offset.saturating_sub(atom.input_offset),
+                                symbol: symbol_id,
+                                addend: reloc.addend,
+                            });
+                        }
+                    }
                     RelocKind::GotLoadPage21
                     | RelocKind::GotLoadPageOff12
                     | RelocKind::PointerToGot => {
@@ -172,6 +202,7 @@ impl SyntheticPlan {
             stubs,
             lazy_pointers,
             thread_pointers,
+            direct_binds,
             binder_symbol,
             tlv_bootstrap_symbol,
             needs_dyld_private,
@@ -365,6 +396,10 @@ fn tlv_symbol_needs_thread_pointer(sym_table: &SymbolTable, symbol_id: SymbolId)
 
 fn tlv_symbol_needs_got(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
     matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. })
+}
+
+fn direct_import_bind_supported(reloc: Reloc) -> bool {
+    matches!(reloc.length, RelocLength::Quad) && !reloc.pcrel && reloc.subtrahend.is_none()
 }
 
 fn inputs_have_tlv_descriptors(inputs: &[LayoutInput<'_>]) -> bool {
@@ -608,6 +643,7 @@ mod tests {
         assert_eq!(plan.stubs.entries.len(), 1);
         assert_eq!(plan.lazy_pointers.entries.len(), 1);
         assert!(plan.thread_pointers.entries.is_empty());
+        assert!(plan.direct_binds.is_empty());
         assert!(plan.binder_symbol.is_some());
         assert!(plan.tlv_bootstrap_symbol.is_none());
         assert!(plan.needs_dyld_private);
@@ -759,14 +795,18 @@ mod tests {
         let mut sym_table = SymbolTable::new();
         let name = sym_table.intern("_ext_tls");
         let input_id = InputId(0);
-        sym_table
+        let import = match sym_table
             .insert(Symbol::DylibImport {
                 name,
                 dylib: DylibId(0),
                 ordinal: 2,
                 weak_import: false,
             })
-            .unwrap();
+            .unwrap()
+        {
+            crate::resolve::InsertOutcome::Inserted(id) => id,
+            other => panic!("unexpected insert outcome: {other:?}"),
+        };
 
         let relocs = vec![
             Reloc {
@@ -818,9 +858,73 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.got.entries.len(), 1);
-        assert_eq!(plan.got.entries[0].symbol, SymbolId(0));
+        assert_eq!(plan.got.entries[0].symbol, import);
         assert!(plan.thread_pointers.entries.is_empty());
+        assert!(plan.direct_binds.is_empty());
         assert!(plan.tlv_bootstrap_symbol.is_none());
+    }
+
+    #[test]
+    fn synthetic_plan_collects_direct_import_bind_sites() {
+        let mut sym_table = SymbolTable::new();
+        let name = sym_table.intern("_ext_data");
+        let input_id = InputId(0);
+        let import = match sym_table
+            .insert(Symbol::DylibImport {
+                name,
+                dylib: DylibId(0),
+                ordinal: 2,
+                weak_import: false,
+            })
+            .unwrap()
+        {
+            crate::resolve::InsertOutcome::Inserted(id) => id,
+            other => panic!("unexpected insert outcome: {other:?}"),
+        };
+
+        let relocs = vec![Reloc {
+            offset: 0,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(0),
+            addend: 0,
+            subtrahend: None,
+        }];
+        let object = synth_object("_ext_data", encode_raw_relocs(&relocs));
+
+        let mut atoms = AtomTable::new();
+        let atom_id = atoms.push(Atom {
+            id: crate::resolve::AtomId(0),
+            origin: input_id,
+            input_section: 1,
+            section: AtomSection::Data,
+            input_offset: 0,
+            size: 8,
+            align_pow2: 3,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 8],
+            flags: AtomFlags::default(),
+            parent_of: None,
+        });
+
+        let plan = SyntheticPlan::build(
+            &[LayoutInput {
+                id: input_id,
+                object: &object,
+            }],
+            &atoms,
+            &mut sym_table,
+            &[libsystem_input()],
+        )
+        .unwrap();
+
+        assert!(plan.got.entries.is_empty());
+        assert_eq!(plan.direct_binds.len(), 1);
+        assert_eq!(plan.direct_binds[0].atom, atom_id);
+        assert_eq!(plan.direct_binds[0].atom_offset, 0);
+        assert_eq!(plan.direct_binds[0].symbol, import);
     }
 
     fn libsystem_input() -> DylibInput {

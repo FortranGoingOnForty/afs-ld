@@ -289,21 +289,39 @@ fn apply_one(
         .ok_or_else(|| reloc_error(atom, &obj.path, local_offset, reloc.kind, &describe_referent(obj, reloc.referent), "atom missing final address".to_string()))?
         + local_offset as u64;
     match reloc.kind {
-        RelocKind::Unsigned => patch_unsigned(
-            bytes,
-            atom,
-            obj,
-            local_offset,
-            reloc,
-            resolve_referent(obj, atom, reloc.referent, resolve)?,
-        ),
+        RelocKind::Unsigned => {
+            if dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table).is_some() {
+                if direct_import_bind_supported(reloc) {
+                    clear_direct_import_slot(bytes, atom, obj, local_offset, reloc)
+                } else {
+                    Err(reloc_error(
+                        atom,
+                        &obj.path,
+                        local_offset,
+                        reloc.kind,
+                        &describe_referent(obj, reloc.referent),
+                        "direct dylib imports currently require a 64-bit UNSIGNED pointer slot"
+                            .to_string(),
+                    ))
+                }
+            } else {
+                patch_unsigned(
+                    bytes,
+                    atom,
+                    obj,
+                    local_offset,
+                    reloc,
+                    resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)?,
+                )
+            }
+        }
         RelocKind::Subtractor => patch_subtractor(
             bytes,
             atom,
             obj,
             local_offset,
             reloc,
-            resolve_referent(obj, atom, reloc.referent, resolve)?,
+            resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)?,
             resolve,
         ),
         RelocKind::Branch26 => patch_branch26(
@@ -322,7 +340,7 @@ fn apply_one(
             local_offset,
             reloc,
             place,
-            resolve_referent(obj, atom, reloc.referent, resolve)?,
+            resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)?,
         ),
         RelocKind::PageOff12 => patch_pageoff12(
             bytes,
@@ -330,7 +348,7 @@ fn apply_one(
             obj,
             local_offset,
             reloc,
-            resolve_referent(obj, atom, reloc.referent, resolve)?,
+            resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)?,
         ),
         RelocKind::GotLoadPage21 => patch_page21(
             bytes,
@@ -395,7 +413,7 @@ fn resolve_branch_target(
             )
         });
     }
-    resolve_referent(obj, atom, reloc.referent, resolve)
+    resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)
 }
 
 fn resolve_got_target(
@@ -435,7 +453,7 @@ fn resolve_tlvp_target(
     if dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table).is_some() {
         return resolve_got_target(obj, atom, reloc, resolve);
     }
-    resolve_referent(obj, atom, reloc.referent, resolve)
+    resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)
 }
 
 fn resolve_tlvp_pageoff_target(
@@ -447,12 +465,13 @@ fn resolve_tlvp_pageoff_target(
     if dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table).is_some() {
         return resolve_got_target(obj, atom, reloc, resolve);
     }
-    resolve_referent(obj, atom, reloc.referent, resolve)
+    resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)
 }
 
 fn resolve_referent(
     obj: &ObjectFile,
     atom: &Atom,
+    kind: RelocKind,
     referent: Referent,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
@@ -462,7 +481,7 @@ fn resolve_referent(
                 atom,
                 &obj.path,
                 0,
-                RelocKind::Unsigned,
+                kind,
                 &format!("section #{section_idx}"),
                 "referenced input section was not laid out".to_string(),
             )
@@ -470,6 +489,7 @@ fn resolve_referent(
         Referent::Symbol(sym_idx) => resolve_symbol_referent(
             obj,
             atom,
+            kind,
             sym_idx as usize,
             resolve,
         ),
@@ -479,6 +499,7 @@ fn resolve_referent(
 fn resolve_symbol_referent(
     obj: &ObjectFile,
     atom: &Atom,
+    kind: RelocKind,
     sym_idx: usize,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
@@ -487,7 +508,7 @@ fn resolve_symbol_referent(
             atom,
             &obj.path,
             0,
-            RelocKind::Unsigned,
+            kind,
             &format!("symbol #{sym_idx}"),
             "symbol index is out of range".to_string(),
         )
@@ -499,11 +520,11 @@ fn resolve_symbol_referent(
             .iter()
             .find(|(_, symbol)| resolve.sym_table.interner.resolve(symbol.name()) == name)
         {
-            return resolve_global_symbol(obj, atom, name, symbol, resolve);
+            return resolve_global_symbol(obj, atom, kind, name, symbol, resolve);
         }
     }
 
-    resolve_input_symbol(obj, atom, input_sym, resolve)
+    resolve_input_symbol(obj, atom, kind, input_sym, resolve)
 }
 
 fn dylib_import_symbol_id(
@@ -525,6 +546,7 @@ fn dylib_import_symbol_id(
 fn resolve_global_symbol(
     obj: &ObjectFile,
     atom: &Atom,
+    kind: RelocKind,
     name: &str,
     symbol: &Symbol,
     resolve: &ResolveView<'_>,
@@ -544,17 +566,25 @@ fn resolve_global_symbol(
                     atom,
                     &obj.path,
                     0,
-                    RelocKind::Unsigned,
+                    kind,
                     name,
                     "target atom missing final address".to_string(),
                 )
             }),
-        Symbol::DylibImport { .. } => Ok(0),
+        Symbol::DylibImport { .. } => Err(reloc_error(
+            atom,
+            &obj.path,
+            0,
+            kind,
+            name,
+            "direct dylib import reference must use GOT/stub/TLV machinery or a bound pointer slot"
+                .to_string(),
+        )),
         other => Err(reloc_error(
             atom,
             &obj.path,
             0,
-            RelocKind::Unsigned,
+            kind,
             name,
             format!("symbol resolved to unsupported state {:?}", other.kind()),
         )),
@@ -564,6 +594,7 @@ fn resolve_global_symbol(
 fn resolve_input_symbol(
     obj: &ObjectFile,
     atom: &Atom,
+    kind: RelocKind,
     input_sym: &InputSymbol,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
@@ -575,7 +606,7 @@ fn resolve_input_symbol(
                     atom,
                     &obj.path,
                     0,
-                    RelocKind::Unsigned,
+                    kind,
                     &describe_input_symbol(obj, input_sym),
                     "section-backed symbol did not resolve to an input section".to_string(),
                 )
@@ -589,7 +620,7 @@ fn resolve_input_symbol(
                         atom,
                         &obj.path,
                         0,
-                        RelocKind::Unsigned,
+                        kind,
                         &describe_input_symbol(obj, input_sym),
                         "section-backed symbol's output section is missing".to_string(),
                     )
@@ -600,7 +631,7 @@ fn resolve_input_symbol(
             atom,
             &obj.path,
             0,
-            RelocKind::Unsigned,
+            kind,
             &describe_input_symbol(obj, input_sym),
             "symbol remained undefined at relocation time".to_string(),
         )),
@@ -608,7 +639,7 @@ fn resolve_input_symbol(
             atom,
             &obj.path,
             0,
-            RelocKind::Unsigned,
+            kind,
             &describe_input_symbol(obj, input_sym),
             "indirect symbol relocations are not yet implemented".to_string(),
         )),
@@ -654,6 +685,28 @@ fn patch_unsigned(
     }
 }
 
+fn direct_import_bind_supported(reloc: Reloc) -> bool {
+    matches!(reloc.length, RelocLength::Quad) && !reloc.pcrel && reloc.subtrahend.is_none()
+}
+
+fn clear_direct_import_slot(
+    bytes: &mut [u8],
+    atom: &Atom,
+    obj: &ObjectFile,
+    local_offset: u32,
+    reloc: Reloc,
+) -> Result<(), RelocError> {
+    write_u64(
+        bytes,
+        local_offset,
+        0,
+        atom,
+        obj,
+        reloc.kind,
+        &describe_referent(obj, reloc.referent),
+    )
+}
+
 fn patch_subtractor(
     bytes: &mut [u8],
     atom: &Atom,
@@ -666,6 +719,7 @@ fn patch_subtractor(
     let subtrahend = resolve_referent(
         obj,
         atom,
+        reloc.kind,
         reloc.subtrahend.ok_or_else(|| {
             reloc_error(
                 atom,

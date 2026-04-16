@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use crate::atom::AtomTable;
 use crate::input::ObjectFile;
+use crate::macho::constants::SG_READ_ONLY;
 use crate::resolve::InputId;
 use crate::section::{is_zerofill, OutputAtom, OutputSection, OutputSectionId, OutputSegment, Prot};
 use crate::synth::SyntheticPlan;
@@ -363,6 +364,7 @@ fn build_segments(kind: OutputKind, sections: &[OutputSection]) -> Vec<OutputSeg
             file_size: 0,
             init_prot: segment_init_prot(name),
             max_prot: segment_max_prot(name),
+            flags: segment_flags(name),
         })
         .collect();
 
@@ -391,6 +393,7 @@ fn build_segments(kind: OutputKind, sections: &[OutputSection]) -> Vec<OutputSeg
                 file_size: 0,
                 init_prot: prot.0,
                 max_prot: prot.1,
+                flags: 0,
             },
         );
     }
@@ -459,6 +462,13 @@ fn segment_max_prot(name: &str) -> Prot {
         "__DATA" => Prot::READ_WRITE,
         "__LINKEDIT" => Prot::READ_ONLY,
         _ => Prot::READ_WRITE,
+    }
+}
+
+fn segment_flags(name: &str) -> u32 {
+    match name {
+        "__DATA_CONST" => SG_READ_ONLY,
+        _ => 0,
     }
 }
 
@@ -762,6 +772,7 @@ mod tests {
                 entries: Vec::new(),
                 index: HashMap::new(),
             },
+            direct_binds: Vec::new(),
             binder_symbol: Some(SymbolId(2)),
             tlv_bootstrap_symbol: None,
             needs_dyld_private: true,
@@ -870,6 +881,7 @@ mod tests {
                 entries: Vec::new(),
                 index: HashMap::new(),
             },
+            direct_binds: Vec::new(),
             binder_symbol: None,
             tlv_bootstrap_symbol: None,
             needs_dyld_private: true,

@@ -278,6 +278,7 @@ pub struct OutputSegment {
     pub file_size: u64,
     pub init_prot: Prot,
     pub max_prot: Prot,
+    pub flags: u32,
 }
 
 impl OutputSection {

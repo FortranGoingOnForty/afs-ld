@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::leb::write_uleb;
+use crate::leb::{write_sleb, write_uleb};
 use crate::layout::{Layout, PAGE_SIZE};
 use crate::macho::constants::*;
 use crate::macho::dylib::DylibDependency;
@@ -30,6 +30,8 @@ pub enum WriteError {
     MissingSegment(&'static str),
     OffsetTooLarge(&'static str),
     EntryAtomMissing(crate::resolve::AtomId),
+    DirectBindAtomMissing(crate::resolve::AtomId),
+    DirectBindSectionMissing(crate::resolve::AtomId),
     ImportSymbolMissing(SymbolId),
     ImportSymbolWrongKind(SymbolId),
 }
@@ -40,6 +42,12 @@ impl fmt::Display for WriteError {
             WriteError::MissingSegment(name) => write!(f, "missing output segment `{name}`"),
             WriteError::OffsetTooLarge(what) => write!(f, "{what} exceeds 32-bit Mach-O field width"),
             WriteError::EntryAtomMissing(atom) => write!(f, "entry atom {:?} missing from layout", atom),
+            WriteError::DirectBindAtomMissing(atom) => {
+                write!(f, "direct bind atom {:?} missing from layout", atom)
+            }
+            WriteError::DirectBindSectionMissing(atom) => {
+                write!(f, "direct bind atom {:?} is not inside an output section", atom)
+            }
             WriteError::ImportSymbolMissing(symbol) => {
                 write!(f, "synthetic import symbol {:?} missing from symbol table", symbol)
             }
@@ -391,7 +399,7 @@ fn segment_command(layout: &Layout, segment_name: &str) -> Result<Segment64, Wri
         filesize: segment.file_size,
         maxprot: segment.max_prot.bits(),
         initprot: segment.init_prot.bits(),
-        flags: 0,
+        flags: segment.flags,
         sections,
     })
 }
@@ -698,6 +706,16 @@ struct BindStreams {
     lazy_offsets: HashMap<SymbolId, u32>,
 }
 
+struct BindRecordSpec<'a> {
+    segment_index: u8,
+    segment_offset: u64,
+    ordinal: u16,
+    name: &'a str,
+    weak_import: bool,
+    addend: i64,
+    terminate: bool,
+}
+
 fn build_rebase_stream(
     layout: &Layout,
     synthetic_plan: &SyntheticPlan,
@@ -758,6 +776,7 @@ fn collect_imports(
                 .iter()
                 .map(|entry| entry.symbol),
         )
+        .chain(synthetic_plan.direct_binds.iter().map(|entry| entry.symbol))
         .collect();
     if let Some(symbol) = synthetic_plan.tlv_bootstrap_symbol {
         ids.push(symbol);
@@ -833,12 +852,15 @@ fn build_bind_streams(
             let slot_addr = section.addr + (idx as u64) * 8;
             emit_bind_record(
                 &mut bind,
-                segment_index,
-                slot_addr - segment.vm_addr,
-                import.ordinal,
-                &import.name,
-                import.weak_import,
-                false,
+                BindRecordSpec {
+                    segment_index,
+                    segment_offset: slot_addr - segment.vm_addr,
+                    ordinal: import.ordinal,
+                    name: &import.name,
+                    weak_import: import.weak_import,
+                    addend: 0,
+                    terminate: false,
+                },
             );
         }
     }
@@ -864,16 +886,51 @@ fn build_bind_streams(
                     let slot_addr = section.addr + placed.offset + descriptor_offset;
                     emit_bind_record(
                         &mut bind,
-                        segment_index,
-                        slot_addr - segment.vm_addr,
-                        import.ordinal,
-                        &import.name,
-                        import.weak_import,
-                        false,
+                        BindRecordSpec {
+                            segment_index,
+                            segment_offset: slot_addr - segment.vm_addr,
+                            ordinal: import.ordinal,
+                            name: &import.name,
+                            weak_import: import.weak_import,
+                            addend: 0,
+                            terminate: false,
+                        },
                     );
                 }
             }
         }
+    }
+
+    for entry in &synthetic_plan.direct_binds {
+        let import = imports
+            .get(&entry.symbol)
+            .copied()
+            .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
+        let atom_addr = layout
+            .atom_addr(entry.atom)
+            .ok_or(WriteError::DirectBindAtomMissing(entry.atom))?;
+        let section = layout
+            .sections
+            .iter()
+            .find(|section| section.atoms.iter().any(|placed| placed.atom == entry.atom))
+            .ok_or(WriteError::DirectBindSectionMissing(entry.atom))?;
+        let segment_index = segment_index(layout, &section.segment)?;
+        let segment = layout
+            .segment(&section.segment)
+            .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
+        let slot_addr = atom_addr + entry.atom_offset as u64;
+        emit_bind_record(
+            &mut bind,
+            BindRecordSpec {
+                segment_index,
+                segment_offset: slot_addr - segment.vm_addr,
+                ordinal: import.ordinal,
+                name: &import.name,
+                weak_import: import.weak_import,
+                addend: entry.addend,
+                terminate: false,
+            },
+        );
     }
 
     if !bind.is_empty() {
@@ -915,24 +972,20 @@ fn build_bind_streams(
     })
 }
 
-fn emit_bind_record(
-    out: &mut Vec<u8>,
-    segment_index: u8,
-    segment_offset: u64,
-    ordinal: u16,
-    name: &str,
-    weak_import: bool,
-    terminate: bool,
-) {
-    emit_bind_ordinal(out, ordinal);
-    out.push(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | bind_symbol_flags(weak_import));
-    out.extend_from_slice(name.as_bytes());
+fn emit_bind_record(out: &mut Vec<u8>, spec: BindRecordSpec<'_>) {
+    emit_bind_ordinal(out, spec.ordinal);
+    out.push(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | bind_symbol_flags(spec.weak_import));
+    out.extend_from_slice(spec.name.as_bytes());
     out.push(0);
+    if spec.addend != 0 {
+        out.push(BIND_OPCODE_SET_ADDEND_SLEB);
+        write_sleb(spec.addend, out);
+    }
     out.push(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
-    out.push(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segment_index & BIND_IMMEDIATE_MASK));
-    write_uleb(segment_offset, out);
+    out.push(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (spec.segment_index & BIND_IMMEDIATE_MASK));
+    write_uleb(spec.segment_offset, out);
     out.push(BIND_OPCODE_DO_BIND);
-    if terminate {
+    if spec.terminate {
         out.push(BIND_OPCODE_DONE);
     }
 }

@@ -103,7 +103,10 @@ impl Layout {
                         segment: key.segment.clone(),
                         name: key.name.clone(),
                         kind: input_section.kind,
-                        align_pow2: input_section.align_pow2.min(u8::MAX as u32) as u8,
+                        align_pow2: normalize_output_alignment(
+                            input_section.kind,
+                            input_section.align_pow2.min(u8::MAX as u32) as u8,
+                        ),
                         flags: input_section.flags,
                         reserved1: input_section.reserved1,
                         reserved2: input_section.reserved2,
@@ -121,7 +124,10 @@ impl Layout {
             };
 
             let out = &mut sections[idx];
-            out.align_pow2 = out.align_pow2.max(atom.align_pow2);
+            out.align_pow2 = normalize_output_alignment(
+                out.kind,
+                out.align_pow2.max(atom.align_pow2),
+            );
             out.atoms.push(OutputAtom {
                 atom: atom_id,
                 offset: 0,
@@ -357,7 +363,10 @@ impl Layout {
 fn merge_synthetic_section(existing: &mut OutputSection, synthetic: OutputSection) {
     debug_assert_eq!(existing.segment, synthetic.segment);
     debug_assert_eq!(existing.name, synthetic.name);
-    existing.align_pow2 = existing.align_pow2.max(synthetic.align_pow2);
+    existing.align_pow2 = normalize_output_alignment(
+        existing.kind,
+        existing.align_pow2.max(synthetic.align_pow2),
+    );
     existing.flags = synthetic.flags;
     existing.reserved1 = synthetic.reserved1;
     existing.reserved2 = synthetic.reserved2;
@@ -366,6 +375,20 @@ fn merge_synthetic_section(existing: &mut OutputSection, synthetic: OutputSectio
         existing
             .synthetic_data
             .extend_from_slice(&synthetic.synthetic_data);
+    }
+}
+
+fn normalize_output_alignment(
+    kind: crate::section::SectionKind,
+    align_pow2: u8,
+) -> u8 {
+    match kind {
+        crate::section::SectionKind::ThreadLocalRegular
+        | crate::section::SectionKind::ThreadLocalZeroFill
+        | crate::section::SectionKind::ThreadLocalVariables
+        | crate::section::SectionKind::ThreadLocalVariablePointers
+        | crate::section::SectionKind::ThreadLocalInitPointers => align_pow2.max(3),
+        _ => align_pow2,
     }
 }
 

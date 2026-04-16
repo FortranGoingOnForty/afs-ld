@@ -20,6 +20,7 @@ use afs_ld::macho::constants::{
     REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB, REBASE_OPCODE_DONE, REBASE_OPCODE_MASK,
     REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM, REBASE_TYPE_POINTER,
+    SG_READ_ONLY,
 };
 use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand, Section64Header};
 use afs_ld::string_table::StringTable;
@@ -184,6 +185,19 @@ fn output_section_header(bytes: &[u8], segname: &str, sectname: &str) -> Option<
                 if section.segname_str() == segname && section.sectname_str() == sectname {
                     return Some(section);
                 }
+            }
+        }
+    }
+    None
+}
+
+fn segment_flags(bytes: &[u8], segname: &str) -> Option<u32> {
+    let header = parse_header(bytes).ok()?;
+    let commands = parse_commands(&header, bytes).ok()?;
+    for cmd in commands {
+        if let LoadCommand::Segment64(seg) = cmd {
+            if seg.segname_str() == segname {
+                return Some(seg.flags);
             }
         }
     }
@@ -1926,6 +1940,11 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
         load_dylib_names(&our_bytes).unwrap(),
         load_dylib_names(&apple_bytes).unwrap()
     );
+    assert_eq!(segment_flags(&our_bytes, "__DATA_CONST"), Some(SG_READ_ONLY));
+    assert_eq!(
+        segment_flags(&our_bytes, "__DATA_CONST"),
+        segment_flags(&apple_bytes, "__DATA_CONST")
+    );
 
     let our_rebases = decode_rebase_records(&our_bytes).unwrap();
     let apple_rebases = decode_rebase_records(&apple_bytes).unwrap();
@@ -1947,6 +1966,120 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
     let _ = fs::remove_file(apple_out);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn linker_run_binds_direct_dylib_import_pointers() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun clang or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let dylib = scratch("direct-data.dylib");
+    let obj = scratch("direct-data.o");
+    let our_out = scratch("direct-data-ours.out");
+    let apple_out = scratch("direct-data-apple.out");
+
+    let dylib_src = r#"
+        int ext_data = 5;
+    "#;
+    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
+        eprintln!("skipping: dylib compile failed: {e}");
+        return;
+    }
+
+    let main_src = r#"
+        extern int ext_data;
+        int *p = &ext_data;
+        int main(void) { return *p == 5 ? 0 : 1; }
+    "#;
+    if let Err(e) = compile_c(main_src, &obj) {
+        eprintln!("skipping: compile failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd.clone(), dylib.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    let apple = Command::new("xcrun")
+        .args([
+            "ld",
+            "-arch",
+            "arm64",
+            "-platform_version",
+            "macos",
+            &sdk_ver,
+            &sdk_ver,
+            "-syslibroot",
+            &sdk,
+            "-no_fixup_chains",
+            "-lSystem",
+            "-e",
+            "_main",
+            "-o",
+        ])
+        .arg(&apple_out)
+        .arg(&obj)
+        .arg(&dylib)
+        .output()
+        .unwrap();
+    assert!(
+        apple.status.success(),
+        "xcrun ld failed: {}",
+        String::from_utf8_lossy(&apple.stderr)
+    );
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let binds = decode_bind_records(&our_bytes, false).unwrap();
+    assert!(
+        binds.iter().any(|record| {
+            record.segment == "__DATA"
+                && record.section == "__data"
+                && record.section_offset == 0
+                && record.symbol == "_ext_data"
+        }),
+        "missing direct bind for imported data: {binds:#?}"
+    );
+    assert_eq!(
+        decode_bind_records(&our_bytes, false).unwrap(),
+        decode_bind_records(&apple_bytes, false).unwrap()
+    );
+
+    let verify = Command::new("codesign").arg("-v").arg(&our_out).output().unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let status = Command::new(&our_out).status().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "expected direct-import pointer executable to exit 0"
+    );
+
+    let _ = fs::remove_file(dylib);
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
 }
 
 #[test]

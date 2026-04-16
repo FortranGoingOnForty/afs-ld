@@ -28,6 +28,7 @@ use afs_ld::macho::exports::{ExportKind, Exports};
 use afs_ld::macho::reader::{parse_commands, parse_header, u32_le, LoadCommand, Section64Header};
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, SymKind};
+use afs_ld::synth::unwind::decode_unwind_info;
 use afs_ld::{LinkError, LinkOptions, Linker, OutputKind};
 use common::harness::diff_macho;
 
@@ -466,6 +467,7 @@ struct DataInCodeRecord {
 
 fn normalized_unwind_words(bytes: &[u8]) -> Vec<u32> {
     let (_, unwind) = output_section(bytes, "__TEXT", "__unwind_info").unwrap();
+    let decoded = decode_unwind_info(&unwind).unwrap();
     let mut words: Vec<u32> = unwind
         .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
@@ -482,7 +484,84 @@ fn normalized_unwind_words(bytes: &[u8]) -> Vec<u32> {
         let word = 7 + idx * 3;
         words[word] = words[word].saturating_sub(base);
     }
+    if !decoded.records.is_empty() {
+        assert_eq!(decoded.records[0].function_offset, base);
+    }
     words
+}
+
+fn normalized_eh_frame_dump(path: &PathBuf, text_base: u64) -> Result<String, String> {
+    let output = Command::new("xcrun")
+        .args(["dwarfdump", "--eh-frame"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("spawn xcrun dwarfdump: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "xcrun dwarfdump failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let mut normalized = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("0x") && trimmed.contains(": CFA=") {
+            let (addr, rest) = trimmed.split_once(':').unwrap();
+            let value = u64::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap();
+            normalized.push(format!("0x{:x}:{}", value - text_base, rest));
+            continue;
+        }
+        if let Some(pc_idx) = trimmed.find("pc=") {
+            let prefix = &trimmed[..pc_idx + 3];
+            let range = &trimmed[pc_idx + 3..];
+            if let Some((start, end)) = range.split_once("...") {
+                let start = u64::from_str_radix(start, 16).unwrap();
+                let end = u64::from_str_radix(end, 16).unwrap();
+                normalized.push(format!(
+                    "{}0x{:x}...0x{:x}",
+                    prefix,
+                    start - text_base,
+                    end - text_base
+                ));
+                continue;
+            }
+        }
+        if trimmed.is_empty()
+            || trimmed.starts_with(".debug_frame")
+            || trimmed.starts_with(".eh_frame")
+            || trimmed.ends_with("file format Mach-O arm64")
+        {
+            continue;
+        }
+        normalized.push(rebase_hex_addresses(trimmed, text_base));
+    }
+    Ok(normalized.join("\n"))
+}
+
+fn rebase_hex_addresses(line: &str, text_base: u64) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::new();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if idx + 2 <= bytes.len() && bytes[idx] == b'0' && bytes[idx + 1] == b'x' {
+            let mut end = idx + 2;
+            while end < bytes.len() && bytes[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            let token = &line[idx + 2..end];
+            let value = u64::from_str_radix(token, 16).unwrap();
+            if value >= text_base {
+                out.push_str(&format!("0x{:x}", value - text_base));
+            } else {
+                out.push_str(&line[idx..end]);
+            }
+            idx = end;
+            continue;
+        }
+        out.push(bytes[idx] as char);
+        idx += 1;
+    }
+    out
 }
 
 fn decode_data_in_code(bytes: &[u8]) -> Vec<DataInCodeRecord> {
@@ -3514,7 +3593,10 @@ fn linker_run_emits_leaf_unwind_info_like_ld() {
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
-    assert_eq!(normalized_unwind_words(&our_bytes), normalized_unwind_words(&apple_bytes));
+    assert_eq!(
+        normalized_unwind_words(&our_bytes),
+        normalized_unwind_words(&apple_bytes)
+    );
     assert!(output_section(&our_bytes, "__LD", "__compact_unwind").is_none());
 
     let _ = fs::remove_file(obj);
@@ -3565,8 +3647,97 @@ fn linker_run_emits_multi_function_unwind_info_like_ld() {
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
-    assert_eq!(normalized_unwind_words(&our_bytes), normalized_unwind_words(&apple_bytes));
+    assert_eq!(
+        normalized_unwind_words(&our_bytes),
+        normalized_unwind_words(&apple_bytes)
+    );
     assert!(output_section(&our_bytes, "__LD", "__compact_unwind").is_none());
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_preserves_eh_frame_like_ld() {
+    if !have_xcrun() || !have_xcrun_tool("dwarfdump") {
+        eprintln!("skipping: xcrun dwarfdump unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+
+    let obj = scratch("eh-frame.o");
+    let our_out = scratch("eh-frame-ours.out");
+    let apple_out = scratch("eh-frame-apple.out");
+    let asm = r#"
+        .text
+        .globl _main
+        .p2align 2
+    _main:
+        .cfi_startproc
+        sub sp, sp, #16
+        .cfi_def_cfa_offset 16
+        str x30, [sp, #8]
+        .cfi_offset w30, -8
+        bl _helper
+        ldr x30, [sp, #8]
+        add sp, sp, #16
+        ret
+        .cfi_endproc
+
+        .globl _helper
+        .p2align 2
+    _helper:
+        .cfi_startproc
+        ret
+        .cfi_endproc
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(asm, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert!(output_section(&our_bytes, "__TEXT", "__eh_frame").is_some());
+    assert_eq!(
+        output_section(&our_bytes, "__TEXT", "__eh_frame")
+            .unwrap()
+            .1
+            .len(),
+        output_section(&apple_bytes, "__TEXT", "__eh_frame")
+            .unwrap()
+            .1
+            .len()
+    );
+    let our_dump = normalized_eh_frame_dump(
+        &our_out,
+        output_section(&our_bytes, "__TEXT", "__text").unwrap().0,
+    )
+    .unwrap();
+    let apple_dump = normalized_eh_frame_dump(
+        &apple_out,
+        output_section(&apple_bytes, "__TEXT", "__text").unwrap().0,
+    )
+    .unwrap();
+    assert_eq!(our_dump, apple_dump);
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
@@ -3709,11 +3880,16 @@ fn linker_run_emits_function_starts_for_other_text_sections_like_ld() {
     assert_eq!(decode_function_starts(&apple_bytes).len(), 2);
 
     let our_text_addr = output_section(&our_bytes, "__TEXT", "__text").unwrap().0;
-    let our_textcoal_addr = output_section(&our_bytes, "__TEXT", "__textcoal_nt").unwrap().0;
+    let our_textcoal_addr = output_section(&our_bytes, "__TEXT", "__textcoal_nt")
+        .unwrap()
+        .0;
     let our_text_base = segment_vmaddr(&our_bytes, "__TEXT").unwrap();
     assert_eq!(
         decode_function_starts(&our_bytes),
-        vec![our_text_addr - our_text_base, our_textcoal_addr - our_text_base]
+        vec![
+            our_text_addr - our_text_base,
+            our_textcoal_addr - our_text_base
+        ]
     );
 
     let _ = fs::remove_file(obj);

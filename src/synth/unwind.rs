@@ -11,6 +11,7 @@ use crate::section::{OutputSection, SectionKind};
 
 const PAGE_SIZE: usize = 4096;
 const UNWIND_INFO_VERSION: u32 = 1;
+const UNWIND_SECOND_LEVEL_REGULAR: u32 = 2;
 const UNWIND_SECOND_LEVEL_COMPRESSED: u32 = 3;
 const FIRST_LEVEL_ENTRY_SIZE: usize = 12;
 const COMPRESSED_PAGE_HEADER_SIZE: usize = 12;
@@ -35,6 +36,53 @@ impl fmt::Display for UnwindError {
 }
 
 impl std::error::Error for UnwindError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnwindReadError {
+    Truncated(&'static str),
+    UnsupportedVersion(u32),
+    UnsupportedSecondLevelPageKind(u32),
+    BadFirstLevelIndexOrder { previous: u32, next: u32 },
+    BadEncodingIndex { index: u32, max: u32 },
+}
+
+impl fmt::Display for UnwindReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UnwindReadError::Truncated(what) => write!(f, "truncated {what}"),
+            UnwindReadError::UnsupportedVersion(version) => {
+                write!(f, "unsupported unwind info version {version}")
+            }
+            UnwindReadError::UnsupportedSecondLevelPageKind(kind) => {
+                write!(f, "unsupported second-level page kind {kind}")
+            }
+            UnwindReadError::BadFirstLevelIndexOrder { previous, next } => write!(
+                f,
+                "first-level index is not strictly ascending ({previous:#x} then {next:#x})"
+            ),
+            UnwindReadError::BadEncodingIndex { index, max } => {
+                write!(
+                    f,
+                    "encoding index {index} exceeds decoded encoding table size {max}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for UnwindReadError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedUnwindRecord {
+    pub function_offset: u32,
+    pub encoding: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedUnwindInfo {
+    pub version: u32,
+    pub records: Vec<DecodedUnwindRecord>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UnwindRecord {
@@ -67,6 +115,11 @@ pub fn synthesize(
     }
 
     let bytes = serialize_unwind_info(&records);
+    validate_serialized_unwind_info(&bytes, &records).map_err(|err| UnwindError {
+        input: PathBuf::from("<synthetic unwind>"),
+        atom: AtomId(0),
+        detail: err.to_string(),
+    })?;
     let section_changed = upsert_unwind_info_section(layout, bytes);
     if changed || section_changed {
         prune_empty_segments(layout);
@@ -299,9 +352,10 @@ fn serialize_unwind_info(records: &[UnwindRecord]) -> Vec<u8> {
     let pages = build_pages(records);
     let indices_offset = 7 * 4;
     let indices_count = (pages.len() + 1) as u32;
-    let second_level_start =
-        align_up((indices_offset + indices_count as usize * FIRST_LEVEL_ENTRY_SIZE) as u32, 16)
-            as usize;
+    let second_level_start = align_up(
+        (indices_offset + indices_count as usize * FIRST_LEVEL_ENTRY_SIZE) as u32,
+        16,
+    ) as usize;
     let page_blobs: Vec<Vec<u8>> = pages.iter().map(serialize_compressed_page).collect();
     let lsda_offset = second_level_start as u32;
     let sentinel = records
@@ -340,6 +394,114 @@ fn serialize_unwind_info(records: &[UnwindRecord]) -> Vec<u8> {
         out.push(0);
     }
     out
+}
+
+pub fn decode_unwind_info(bytes: &[u8]) -> Result<DecodedUnwindInfo, UnwindReadError> {
+    if bytes.len() < 28 {
+        return Err(UnwindReadError::Truncated("unwind_info header"));
+    }
+    let version = read_u32(bytes, 0, "unwind_info version")?;
+    if version != UNWIND_INFO_VERSION {
+        return Err(UnwindReadError::UnsupportedVersion(version));
+    }
+    let common_encodings_offset = read_u32(bytes, 4, "common encodings offset")? as usize;
+    let common_encodings_count = read_u32(bytes, 8, "common encodings count")? as usize;
+    let _personalities_offset = read_u32(bytes, 12, "personalities offset")? as usize;
+    let _personalities_count = read_u32(bytes, 16, "personalities count")? as usize;
+    let indices_offset = read_u32(bytes, 20, "indices offset")? as usize;
+    let indices_count = read_u32(bytes, 24, "indices count")? as usize;
+
+    let common_encodings = read_u32_array(
+        bytes,
+        common_encodings_offset,
+        common_encodings_count,
+        "common encodings",
+    )?;
+    let mut index_starts = Vec::new();
+    for idx in 0..indices_count {
+        let entry_off = indices_offset + idx * FIRST_LEVEL_ENTRY_SIZE;
+        if entry_off + FIRST_LEVEL_ENTRY_SIZE > bytes.len() {
+            return Err(UnwindReadError::Truncated("first-level index"));
+        }
+        index_starts.push(read_u32(bytes, entry_off, "first-level function offset")?);
+    }
+    for pair in index_starts.windows(2) {
+        if pair[0] > pair[1] {
+            return Err(UnwindReadError::BadFirstLevelIndexOrder {
+                previous: pair[0],
+                next: pair[1],
+            });
+        }
+    }
+
+    let mut records = Vec::new();
+    for idx in 0..indices_count.saturating_sub(1) {
+        let entry_off = indices_offset + idx * FIRST_LEVEL_ENTRY_SIZE;
+        let function_offset = read_u32(bytes, entry_off, "first-level function offset")?;
+        let second_level_off = read_u32(bytes, entry_off + 4, "second-level page offset")? as usize;
+        let kind = read_u32(bytes, second_level_off, "second-level page kind")?;
+        match kind {
+            UNWIND_SECOND_LEVEL_COMPRESSED => {
+                let entries_off = second_level_off
+                    + read_u16(bytes, second_level_off + 4, "page entry offset")? as usize;
+                let entry_count =
+                    read_u16(bytes, second_level_off + 6, "page entry count")? as usize;
+                let encodings_off = second_level_off
+                    + read_u16(bytes, second_level_off + 8, "page encoding offset")? as usize;
+                let encoding_count =
+                    read_u16(bytes, second_level_off + 10, "page encoding count")? as usize;
+                let local_encodings =
+                    read_u32_array(bytes, encodings_off, encoding_count, "page-local encodings")?;
+                for entry_idx in 0..entry_count {
+                    let word =
+                        read_u32(bytes, entries_off + entry_idx * 4, "compressed page entry")?;
+                    let encoding_index = word >> 24;
+                    let function_delta = word & 0x00ff_ffff;
+                    let encoding = if (encoding_index as usize) < common_encodings.len() {
+                        common_encodings[encoding_index as usize]
+                    } else {
+                        let local_idx = encoding_index as usize - common_encodings.len();
+                        *local_encodings.get(local_idx).ok_or_else(|| {
+                            UnwindReadError::BadEncodingIndex {
+                                index: encoding_index,
+                                max: (common_encodings.len() + local_encodings.len()) as u32,
+                            }
+                        })?
+                    };
+                    records.push(DecodedUnwindRecord {
+                        function_offset: function_offset + function_delta,
+                        encoding,
+                    });
+                }
+            }
+            UNWIND_SECOND_LEVEL_REGULAR => {
+                return Err(UnwindReadError::UnsupportedSecondLevelPageKind(kind));
+            }
+            other => return Err(UnwindReadError::UnsupportedSecondLevelPageKind(other)),
+        }
+    }
+
+    Ok(DecodedUnwindInfo { version, records })
+}
+
+fn validate_serialized_unwind_info(
+    bytes: &[u8],
+    records: &[UnwindRecord],
+) -> Result<(), UnwindReadError> {
+    let decoded = decode_unwind_info(bytes)?;
+    let expected: Vec<DecodedUnwindRecord> = records
+        .iter()
+        .map(|record| DecodedUnwindRecord {
+            function_offset: record.function_offset,
+            encoding: record.encoding,
+        })
+        .collect();
+    if decoded.records != expected {
+        return Err(UnwindReadError::Truncated(
+            "decoded unwind records do not round-trip",
+        ));
+    }
+    Ok(())
 }
 
 fn build_pages(records: &[UnwindRecord]) -> Vec<CompressedPage> {
@@ -404,6 +566,37 @@ fn align_up(value: u32, align: u32) -> u32 {
         .checked_add(mask)
         .map(|value| value & !mask)
         .unwrap_or(value)
+}
+
+fn read_u16(bytes: &[u8], offset: usize, what: &'static str) -> Result<u16, UnwindReadError> {
+    if offset + 2 > bytes.len() {
+        return Err(UnwindReadError::Truncated(what));
+    }
+    Ok(u16::from_le_bytes(
+        bytes[offset..offset + 2].try_into().unwrap(),
+    ))
+}
+
+fn read_u32(bytes: &[u8], offset: usize, what: &'static str) -> Result<u32, UnwindReadError> {
+    if offset + 4 > bytes.len() {
+        return Err(UnwindReadError::Truncated(what));
+    }
+    Ok(u32::from_le_bytes(
+        bytes[offset..offset + 4].try_into().unwrap(),
+    ))
+}
+
+fn read_u32_array(
+    bytes: &[u8],
+    offset: usize,
+    count: usize,
+    what: &'static str,
+) -> Result<Vec<u32>, UnwindReadError> {
+    let mut out = Vec::with_capacity(count);
+    for idx in 0..count {
+        out.push(read_u32(bytes, offset + idx * 4, what)?);
+    }
+    Ok(out)
 }
 
 fn serialize_compressed_page(page: &CompressedPage) -> Vec<u8> {
@@ -561,6 +754,14 @@ mod tests {
                 0,
             ]
         );
+        let decoded = decode_unwind_info(&bytes).unwrap();
+        assert_eq!(
+            decoded.records,
+            vec![DecodedUnwindRecord {
+                function_offset: 0x348,
+                encoding: 0x0200_1000,
+            }]
+        );
     }
 
     #[test]
@@ -610,5 +811,39 @@ mod tests {
                 0,
             ]
         );
+        let decoded = decode_unwind_info(&bytes).unwrap();
+        assert_eq!(
+            decoded.records,
+            vec![
+                DecodedUnwindRecord {
+                    function_offset: 0x348,
+                    encoding: 0x0200_0000,
+                },
+                DecodedUnwindRecord {
+                    function_offset: 0x350,
+                    encoding: 0x0400_0000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_rejects_bad_encoding_index() {
+        let mut bytes = serialize_unwind_info(&[UnwindRecord {
+            function_offset: 0x348,
+            code_len: 0x14,
+            encoding: 0x0200_1000,
+        }]);
+        let second_level_offset =
+            u32::from_le_bytes(bytes[28 + 4..28 + 8].try_into().unwrap()) as usize;
+        let entries_offset = second_level_offset
+            + u16::from_le_bytes(
+                bytes[second_level_offset + 4..second_level_offset + 6]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+        bytes[entries_offset..entries_offset + 4].copy_from_slice(&0xff00_0000u32.to_le_bytes());
+        let err = decode_unwind_info(&bytes).unwrap_err();
+        assert!(matches!(err, UnwindReadError::BadEncodingIndex { .. }));
     }
 }

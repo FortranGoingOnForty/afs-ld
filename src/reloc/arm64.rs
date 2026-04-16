@@ -8,10 +8,10 @@ use crate::layout::{Layout, LayoutInput};
 use crate::macho::writer::LinkEditPlan;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
 use crate::resolve::{InputId, Symbol, SymbolId, SymbolTable};
+use crate::symbol::{InputSymbol, SymKind};
 use crate::synth::stubs::{STUB_HELPER_ENTRY_SIZE, STUB_HELPER_HEADER_SIZE, STUB_SIZE};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::SyntheticPlan;
-use crate::symbol::{InputSymbol, SymKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelocError {
@@ -69,8 +69,10 @@ pub fn apply_layout(
     synthetic_plan: Option<&SyntheticPlan>,
     linkedit: &LinkEditPlan,
 ) -> Result<(), RelocError> {
-    let input_map: HashMap<InputId, &ObjectFile> =
-        inputs.iter().map(|input| (input.id, input.object)).collect();
+    let input_map: HashMap<InputId, &ObjectFile> = inputs
+        .iter()
+        .map(|input| (input.id, input.object))
+        .collect();
     let mut reloc_cache: HashMap<(InputId, u8), Vec<Reloc>> = HashMap::new();
     for input in inputs {
         for (sect_idx, section) in input.object.sections.iter().enumerate() {
@@ -122,21 +124,22 @@ pub fn apply_layout(
             if atom.size == 0 || placed.data.is_empty() {
                 continue;
             }
-            let obj = input_map
-                .get(&atom.origin)
-                .ok_or_else(|| reloc_error(atom, &PathBuf::from("<missing object>"), 0, RelocKind::Unsigned, "object", "missing parsed object".to_string()))?;
+            let obj = input_map.get(&atom.origin).ok_or_else(|| {
+                reloc_error(
+                    atom,
+                    &PathBuf::from("<missing object>"),
+                    0,
+                    RelocKind::Unsigned,
+                    "object",
+                    "missing parsed object".to_string(),
+                )
+            })?;
             let relocs = reloc_cache
                 .get(&(atom.origin, atom.input_section))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             for reloc in relocs_for_atom(relocs, atom) {
-                apply_one(
-                    &mut placed.data,
-                    atom,
-                    obj,
-                    reloc,
-                    &resolve,
-                )?;
+                apply_one(&mut placed.data, atom, obj, reloc, &resolve)?;
             }
         }
     }
@@ -170,10 +173,7 @@ fn atom_address_map(layout: &Layout) -> HashMap<crate::resolve::AtomId, u64> {
     out
 }
 
-fn input_section_address_map(
-    layout: &Layout,
-    atoms: &AtomTable,
-) -> HashMap<(InputId, u8), u64> {
+fn input_section_address_map(layout: &Layout, atoms: &AtomTable) -> HashMap<(InputId, u8), u64> {
     let mut out = HashMap::new();
     for section in &layout.sections {
         for placed in &section.atoms {
@@ -278,16 +278,26 @@ fn apply_one(
     reloc: Reloc,
     resolve: &ResolveView<'_>,
 ) -> Result<(), RelocError> {
-    let local_offset = reloc
-        .offset
-        .checked_sub(atom.input_offset)
-        .ok_or_else(|| reloc_error(atom, &obj.path, reloc.offset, reloc.kind, &describe_referent(obj, reloc.referent), "relocation lands before atom start".to_string()))?;
-    let place = resolve
-        .atom_addrs
-        .get(&atom.id)
-        .copied()
-        .ok_or_else(|| reloc_error(atom, &obj.path, local_offset, reloc.kind, &describe_referent(obj, reloc.referent), "atom missing final address".to_string()))?
-        + local_offset as u64;
+    let local_offset = reloc.offset.checked_sub(atom.input_offset).ok_or_else(|| {
+        reloc_error(
+            atom,
+            &obj.path,
+            reloc.offset,
+            reloc.kind,
+            &describe_referent(obj, reloc.referent),
+            "relocation lands before atom start".to_string(),
+        )
+    })?;
+    let place = resolve.atom_addrs.get(&atom.id).copied().ok_or_else(|| {
+        reloc_error(
+            atom,
+            &obj.path,
+            local_offset,
+            reloc.kind,
+            &describe_referent(obj, reloc.referent),
+            "atom missing final address".to_string(),
+        )
+    })? + local_offset as u64;
     match reloc.kind {
         RelocKind::Unsigned => {
             if dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table).is_some() {
@@ -476,23 +486,23 @@ fn resolve_referent(
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
     match referent {
-        Referent::Section(section_idx) => resolve.section_addrs.get(&(atom.origin, section_idx)).copied().ok_or_else(|| {
-            reloc_error(
-                atom,
-                &obj.path,
-                0,
-                kind,
-                &format!("section #{section_idx}"),
-                "referenced input section was not laid out".to_string(),
-            )
-        }),
-        Referent::Symbol(sym_idx) => resolve_symbol_referent(
-            obj,
-            atom,
-            kind,
-            sym_idx as usize,
-            resolve,
-        ),
+        Referent::Section(section_idx) => resolve
+            .section_addrs
+            .get(&(atom.origin, section_idx))
+            .copied()
+            .ok_or_else(|| {
+                reloc_error(
+                    atom,
+                    &obj.path,
+                    0,
+                    kind,
+                    &format!("section #{section_idx}"),
+                    "referenced input section was not laid out".to_string(),
+                )
+            }),
+        Referent::Symbol(sym_idx) => {
+            resolve_symbol_referent(obj, atom, kind, sym_idx as usize, resolve)
+        }
     }
 }
 
@@ -654,7 +664,18 @@ fn patch_unsigned(
     reloc: Reloc,
     target: u64,
 ) -> Result<(), RelocError> {
-    let value = target.wrapping_add_signed(reloc.addend);
+    let implicit_addend = read_implicit_addend(
+        bytes,
+        local_offset,
+        reloc.length,
+        atom,
+        obj,
+        reloc.kind,
+        reloc.referent,
+    )?;
+    let value = target
+        .wrapping_add_signed(reloc.addend)
+        .wrapping_add_signed(implicit_addend);
     match reloc.length {
         RelocLength::Word => write_u32(
             bytes,
@@ -732,9 +753,19 @@ fn patch_subtractor(
         })?,
         resolve,
     )?;
+    let implicit_addend = read_implicit_addend(
+        bytes,
+        local_offset,
+        reloc.length,
+        atom,
+        obj,
+        reloc.kind,
+        reloc.referent,
+    )?;
     let value = minuend
         .wrapping_sub(subtrahend)
         .wrapping_add_signed(reloc.addend);
+    let value = value.wrapping_add_signed(implicit_addend);
     match reloc.length {
         RelocLength::Word => write_u32(
             bytes,
@@ -774,9 +805,7 @@ fn patch_branch26(
     place: u64,
     target: u64,
 ) -> Result<(), RelocError> {
-    let delta = target
-        .wrapping_add_signed(reloc.addend)
-        .wrapping_sub(place) as i64;
+    let delta = target.wrapping_add_signed(reloc.addend).wrapping_sub(place) as i64;
     if delta & 0b11 != 0 {
         return Err(reloc_error(
             atom,
@@ -798,7 +827,14 @@ fn patch_branch26(
             format!("branch target is out of BRANCH26 range (delta {delta:#x})"),
         ));
     }
-    let insn = read_u32(bytes, local_offset, atom, obj, reloc.kind, &describe_referent(obj, reloc.referent))?;
+    let insn = read_u32(
+        bytes,
+        local_offset,
+        atom,
+        obj,
+        reloc.kind,
+        &describe_referent(obj, reloc.referent),
+    )?;
     let imm26 = (imm as u32) & 0x03ff_ffff;
     write_u32(
         bytes,
@@ -832,7 +868,14 @@ fn patch_page21(
             format!("page delta is out of PAGE21 range ({delta:#x})"),
         ));
     }
-    let insn = read_u32(bytes, local_offset, atom, obj, reloc.kind, &describe_referent(obj, reloc.referent))?;
+    let insn = read_u32(
+        bytes,
+        local_offset,
+        atom,
+        obj,
+        reloc.kind,
+        &describe_referent(obj, reloc.referent),
+    )?;
     let encoded = (imm as u32) & 0x1f_ffff;
     let immlo = encoded & 0x3;
     let immhi = (encoded >> 2) & 0x7ffff;
@@ -857,7 +900,14 @@ fn patch_pageoff12(
     target: u64,
 ) -> Result<(), RelocError> {
     let pageoff = target.wrapping_add_signed(reloc.addend) & 0xfff;
-    let insn = read_u32(bytes, local_offset, atom, obj, reloc.kind, &describe_referent(obj, reloc.referent))?;
+    let insn = read_u32(
+        bytes,
+        local_offset,
+        atom,
+        obj,
+        reloc.kind,
+        &describe_referent(obj, reloc.referent),
+    )?;
     let imm = if is_add_immediate(insn) {
         pageoff
     } else {
@@ -895,6 +945,29 @@ fn patch_pageoff12(
         reloc.kind,
         &describe_referent(obj, reloc.referent),
     )
+}
+
+fn read_implicit_addend(
+    bytes: &[u8],
+    local_offset: u32,
+    length: RelocLength,
+    atom: &Atom,
+    obj: &ObjectFile,
+    kind: RelocKind,
+    referent: Referent,
+) -> Result<i64, RelocError> {
+    match length {
+        RelocLength::Word => Ok(read_u32(bytes, local_offset, atom, obj, kind, &describe_referent(obj, referent))? as i32 as i64),
+        RelocLength::Quad => Ok(read_u64(bytes, local_offset, atom, obj, kind, &describe_referent(obj, referent))? as i64),
+        other => Err(reloc_error(
+            atom,
+            &obj.path,
+            local_offset,
+            kind,
+            &describe_referent(obj, referent),
+            format!("unsupported implicit addend width {:?}", other),
+        )),
+    }
 }
 
 fn patch_tlvp_pageoff12(
@@ -999,8 +1072,11 @@ fn synthesize_thread_variable_section(
             })?;
 
             descriptor[0..8].fill(0);
-            let init_addr =
-                u64::from_le_bytes(descriptor[16..24].try_into().expect("8-byte descriptor tail"));
+            let init_addr = u64::from_le_bytes(
+                descriptor[16..24]
+                    .try_into()
+                    .expect("8-byte descriptor tail"),
+            );
             if init_addr < template_base {
                 return Err(RelocError {
                     input: PathBuf::from("<synthetic tlv>"),
@@ -1141,8 +1217,7 @@ fn synthesize_stub_helper_section(
     section.synthetic_data[..STUB_HELPER_HEADER_SIZE as usize].copy_from_slice(&header);
 
     for (idx, entry) in plan.lazy_pointers.entries.iter().enumerate() {
-        let start =
-            STUB_HELPER_HEADER_SIZE as usize + idx * STUB_HELPER_ENTRY_SIZE as usize;
+        let start = STUB_HELPER_HEADER_SIZE as usize + idx * STUB_HELPER_ENTRY_SIZE as usize;
         let end = start + STUB_HELPER_ENTRY_SIZE as usize;
         let entry_addr = resolve
             .stub_helper_entry_addrs
@@ -1156,14 +1231,17 @@ fn synthesize_stub_helper_section(
                 referent: format!("symbol {:?}", entry.symbol),
                 detail: "stub helper entry missing final address".to_string(),
             })?;
-        let lazy_bind_offset = linkedit.lazy_bind_offset(entry.symbol).ok_or_else(|| RelocError {
-            input: PathBuf::from("<synthetic stub helper>"),
-            atom: crate::resolve::AtomId(0),
-            atom_offset: start as u32,
-            kind: RelocKind::Unsigned,
-            referent: format!("symbol {:?}", entry.symbol),
-            detail: "lazy bind offset missing for stub helper entry".to_string(),
-        })?;
+        let lazy_bind_offset =
+            linkedit
+                .lazy_bind_offset(entry.symbol)
+                .ok_or_else(|| RelocError {
+                    input: PathBuf::from("<synthetic stub helper>"),
+                    atom: crate::resolve::AtomId(0),
+                    atom_offset: start as u32,
+                    kind: RelocKind::Unsigned,
+                    referent: format!("symbol {:?}", entry.symbol),
+                    detail: "lazy bind offset missing for stub helper entry".to_string(),
+                })?;
         let bytes = encode_stub_helper_entry(entry_addr, header_addr, lazy_bind_offset)?;
         section.synthetic_data[start..end].copy_from_slice(&bytes);
     }
@@ -1171,7 +1249,10 @@ fn synthesize_stub_helper_section(
     Ok(())
 }
 
-fn encode_stub(stub_addr: u64, lazy_pointer_addr: u64) -> Result<[u8; STUB_SIZE as usize], RelocError> {
+fn encode_stub(
+    stub_addr: u64,
+    lazy_pointer_addr: u64,
+) -> Result<[u8; STUB_SIZE as usize], RelocError> {
     let adrp = encode_adrp_reg(16, stub_addr, lazy_pointer_addr, "lazy pointer")?;
     let ldr = encode_ldr_x_reg_pageoff(16, lazy_pointer_addr, "lazy pointer")?;
     let br = 0xd61f0200u32;
@@ -1193,7 +1274,12 @@ fn encode_stub_helper_header(
         encode_adrp_reg(17, header_addr, dyld_private_addr, "__dyld_private")?,
         encode_add_x_reg_pageoff(17, dyld_private_addr, "__dyld_private")?,
         encode_stp_x16_x17_sp_preindex(),
-        encode_adrp_reg(16, header_addr + 12, binder_got_addr, "dyld_stub_binder@GOT")?,
+        encode_adrp_reg(
+            16,
+            header_addr + 12,
+            binder_got_addr,
+            "dyld_stub_binder@GOT",
+        )?,
         encode_ldr_x_reg_pageoff(16, binder_got_addr, "dyld_stub_binder@GOT")?,
         0xd61f0200u32,
     ];
@@ -1218,12 +1304,7 @@ fn encode_stub_helper_entry(
     Ok(out)
 }
 
-fn encode_adrp_reg(
-    reg: u8,
-    place: u64,
-    target: u64,
-    referent: &str,
-) -> Result<u32, RelocError> {
+fn encode_adrp_reg(reg: u8, place: u64, target: u64, referent: &str) -> Result<u32, RelocError> {
     let delta = page(target).wrapping_sub(page(place)) as i64;
     let imm = delta >> 12;
     if !fits_signed(imm, 21) {
@@ -1330,6 +1411,31 @@ fn read_u32(
         )
     })?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_u64(
+    bytes: &[u8],
+    offset: u32,
+    atom: &Atom,
+    obj: &ObjectFile,
+    kind: RelocKind,
+    referent: &str,
+) -> Result<u64, RelocError> {
+    let start = offset as usize;
+    let end = start + 8;
+    let slice = bytes.get(start..end).ok_or_else(|| {
+        reloc_error(
+            atom,
+            &obj.path,
+            offset,
+            kind,
+            referent,
+            "relocation write would run past the atom bytes".to_string(),
+        )
+    })?;
+    Ok(u64::from_le_bytes([
+        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+    ]))
 }
 
 fn write_u32(

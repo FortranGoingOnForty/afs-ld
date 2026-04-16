@@ -22,6 +22,7 @@ pub mod symbol;
 
 use std::path::PathBuf;
 use std::{fs, io};
+use std::os::unix::fs::PermissionsExt;
 
 use atom::{atomize_object, backpatch_symbol_atoms, AtomTable};
 use layout::{Layout, LayoutInput};
@@ -305,7 +306,13 @@ impl Linker {
             &mut image,
         )?;
         let output = default_output_path(opts);
-        fs::write(output, image)?;
+        fs::write(&output, image)?;
+        if opts.kind == OutputKind::Executable {
+            let mut perms = fs::metadata(&output)?.permissions();
+            let mode = perms.mode();
+            perms.set_mode(mode | ((mode & 0o444) >> 2));
+            fs::set_permissions(&output, perms)?;
+        }
         Ok(())
     }
 }

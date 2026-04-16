@@ -1,6 +1,7 @@
 //! End-to-end `Linker::run` coverage for Sprint 10's newly wired pipeline.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -739,16 +740,32 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
     let header = parse_header(&bytes).unwrap();
     let commands = parse_commands(&header, &bytes).unwrap();
     let mut text_size = 0u64;
+    let mut has_dylinker = false;
     for cmd in commands {
-        if let LoadCommand::Segment64(seg) = cmd {
-            for section in seg.sections {
-                if section.sectname_str() == "__text" {
-                    text_size = section.size;
+        match cmd {
+            LoadCommand::Segment64(seg) => {
+                for section in seg.sections {
+                    if section.sectname_str() == "__text" {
+                        text_size = section.size;
+                    }
                 }
             }
+            LoadCommand::Raw { cmd, data, .. }
+                if cmd == afs_ld::macho::constants::LC_LOAD_DYLINKER =>
+            {
+                has_dylinker = data.windows(b"/usr/lib/dyld\0".len()).any(|window| {
+                    window == b"/usr/lib/dyld\0"
+                });
+            }
+            _ => {}
         }
     }
     assert!(text_size > 0, "expected non-empty __text output");
+    assert!(has_dylinker, "expected LC_LOAD_DYLINKER in executable output");
+    assert!(
+        fs::metadata(&out).unwrap().permissions().mode() & 0o111 != 0,
+        "expected executable output mode"
+    );
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);

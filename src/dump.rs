@@ -520,6 +520,7 @@ fn cmd_name(cmd: u32) -> String {
         LC_UUID => "LC_UUID".into(),
         LC_MAIN => "LC_MAIN".into(),
         LC_LOAD_DYLIB => "LC_LOAD_DYLIB".into(),
+        LC_LOAD_DYLINKER => "LC_LOAD_DYLINKER".into(),
         LC_LOAD_WEAK_DYLIB => "LC_LOAD_WEAK_DYLIB".into(),
         LC_ID_DYLIB => "LC_ID_DYLIB".into(),
         LC_REEXPORT_DYLIB => "LC_REEXPORT_DYLIB".into(),

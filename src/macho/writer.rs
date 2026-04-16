@@ -185,7 +185,7 @@ pub fn write_finalized_with_linkedit(
             continue;
         }
         if !section.synthetic_data.is_empty() {
-            let start = section.file_off as usize;
+            let start = (section.file_off + section.synthetic_offset) as usize;
             let end = start + section.synthetic_data.len();
             out[start..end].copy_from_slice(&section.synthetic_data);
         }
@@ -252,10 +252,10 @@ fn build_commands(
     }));
 
     match kind {
-        OutputKind::Executable => commands.push(raw_entry_point(
-            resolve_entryoff(layout, entry_point)?,
-            0,
-        )),
+        OutputKind::Executable => {
+            commands.push(raw_dylinker_command("/usr/lib/dyld"));
+            commands.push(raw_entry_point(resolve_entryoff(layout, entry_point)?, 0));
+        }
         OutputKind::Dylib => commands.push(LoadCommand::Dylib(DylibCmd {
             cmd: LC_ID_DYLIB,
             name: dylib_install_name(opts),
@@ -307,7 +307,7 @@ fn estimate_header_size(
     }
     .wire_size() as u64;
     size += match kind {
-        OutputKind::Executable => 24,
+        OutputKind::Executable => raw_dylinker_command("/usr/lib/dyld").cmdsize() as u64 + 24,
         OutputKind::Dylib => DylibCmd {
             cmd: LC_ID_DYLIB,
             name: dylib_install_name(opts),
@@ -388,6 +388,22 @@ fn raw_entry_point(entryoff: u64, stacksize: u64) -> LoadCommand {
     LoadCommand::Raw {
         cmd: LC_MAIN,
         cmdsize: 24,
+        data,
+    }
+}
+
+fn raw_dylinker_command(path: &str) -> LoadCommand {
+    let mut data = Vec::with_capacity(4 + path.len() + 1);
+    let path_offset: u32 = 12;
+    data.extend_from_slice(&path_offset.to_le_bytes());
+    data.extend_from_slice(path.as_bytes());
+    data.push(0);
+    while !(8 + data.len()).is_multiple_of(8) {
+        data.push(0);
+    }
+    LoadCommand::Raw {
+        cmd: LC_LOAD_DYLINKER,
+        cmdsize: (8 + data.len()) as u32,
         data,
     }
 }

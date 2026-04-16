@@ -6,7 +6,9 @@ use std::process::Command;
 
 mod common;
 
-use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand};
+use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand, Section64Header};
+use afs_ld::string_table::StringTable;
+use afs_ld::symbol::{parse_nlist_table, SymKind};
 use afs_ld::{LinkError, LinkOptions, Linker, OutputKind};
 use common::harness::diff_macho;
 
@@ -93,6 +95,21 @@ fn output_section(bytes: &[u8], segname: &str, sectname: &str) -> Option<(u64, V
                         bytes.get(start..end)?.to_vec()
                     };
                     return Some((section.addr, data));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn output_section_header(bytes: &[u8], segname: &str, sectname: &str) -> Option<Section64Header> {
+    let header = parse_header(bytes).ok()?;
+    let commands = parse_commands(&header, bytes).ok()?;
+    for cmd in commands {
+        if let LoadCommand::Segment64(seg) = cmd {
+            for section in seg.sections {
+                if section.segname_str() == segname && section.sectname_str() == sectname {
+                    return Some(section);
                 }
             }
         }
@@ -1233,14 +1250,43 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     Linker::run(&opts).unwrap();
 
     let bytes = fs::read(&out).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
     let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
     let (stubs_addr, stubs) = output_section(&bytes, "__TEXT", "__stubs").unwrap();
     let (got_addr, got) = output_section(&bytes, "__DATA_CONST", "__got").unwrap();
     let (lazy_addr, lazy) = output_section(&bytes, "__DATA", "__la_symbol_ptr").unwrap();
+    let stubs_hdr = output_section_header(&bytes, "__TEXT", "__stubs").unwrap();
+    let got_hdr = output_section_header(&bytes, "__DATA_CONST", "__got").unwrap();
+    let lazy_hdr = output_section_header(&bytes, "__DATA", "__la_symbol_ptr").unwrap();
+
+    let symtab = commands
+        .iter()
+        .find_map(|cmd| match cmd {
+            LoadCommand::Symtab(cmd) => Some(*cmd),
+            _ => None,
+        })
+        .unwrap();
+    let dysymtab = commands
+        .iter()
+        .find_map(|cmd| match cmd {
+            LoadCommand::Dysymtab(cmd) => Some(*cmd),
+            _ => None,
+        })
+        .unwrap();
+    let symbols = parse_nlist_table(&bytes, symtab.symoff, symtab.nsyms).unwrap();
+    let strings = StringTable::from_file(&bytes, symtab.stroff, symtab.strsize).unwrap();
 
     assert_eq!(got.len(), 8);
     assert_eq!(stubs.len(), 12);
     assert_eq!(lazy.len(), 8);
+    assert_eq!(symtab.nsyms, 1);
+    assert_eq!(dysymtab.nundefsym, 1);
+    assert_eq!(dysymtab.nindirectsyms, 3);
+    assert_eq!(stubs_hdr.reserved1, 0);
+    assert_eq!(got_hdr.reserved1, 1);
+    assert_eq!(lazy_hdr.reserved1, 2);
+    assert_eq!(stubs_hdr.reserved2, 12);
     assert_eq!(
         decode_page_reference(&text, text_addr, 0, &PageRefKind::Load).unwrap(),
         got_addr
@@ -1251,6 +1297,9 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
         lazy_addr
     );
     assert_eq!(read_insn(&stubs, 8).unwrap(), 0xd61f0200);
+    assert_eq!(symbols[0].kind(), SymKind::Undef);
+    assert!(symbols[0].library_ordinal().unwrap() > 0);
+    assert_eq!(strings.get(symbols[0].strx()).unwrap(), "_write");
 
     let _ = fs::remove_file(out);
     let _ = fs::remove_file(obj);

@@ -10,6 +10,7 @@
 
 use crate::macho::constants::*;
 use crate::macho::reader::{name16_str, ReadError, Section64Header};
+use crate::resolve::AtomId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SectionKind {
@@ -210,6 +211,72 @@ impl InputSection {
             data,
             raw_relocs,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output layout model — populated by Sprint 10's layout pass.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OutputSectionId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Prot(u32);
+
+impl Prot {
+    pub const NONE: Prot = Prot(0);
+    pub const READ: Prot = Prot(1);
+    pub const WRITE: Prot = Prot(2);
+    pub const EXECUTE: Prot = Prot(4);
+    pub const READ_ONLY: Prot = Prot(Self::READ.0);
+    pub const READ_WRITE: Prot = Prot(Self::READ.0 | Self::WRITE.0);
+    pub const READ_EXECUTE: Prot = Prot(Self::READ.0 | Self::EXECUTE.0);
+
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputAtom {
+    pub atom: AtomId,
+    pub offset: u64,
+    pub size: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputSection {
+    pub segment: String,
+    pub name: String,
+    pub kind: SectionKind,
+    pub align_pow2: u8,
+    pub flags: u32,
+    pub reserved1: u32,
+    pub reserved2: u32,
+    pub reserved3: u32,
+    pub atoms: Vec<OutputAtom>,
+    pub addr: u64,
+    pub size: u64,
+    pub file_off: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputSegment {
+    pub name: String,
+    pub sections: Vec<OutputSectionId>,
+    pub vm_addr: u64,
+    pub vm_size: u64,
+    pub file_off: u64,
+    pub file_size: u64,
+    pub init_prot: Prot,
+    pub max_prot: Prot,
+}
+
+impl OutputSection {
+    pub fn is_zerofill(&self) -> bool {
+        is_zerofill(self.kind)
     }
 }
 

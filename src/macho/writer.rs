@@ -867,6 +867,7 @@ fn build_output_symbols(
             &mut locals,
         )?;
     }
+    collect_synthetic_local_symbols(layout, inputs.0.synthetic_plan, &mut locals)?;
 
     for (symbol_id, symbol) in sym_table.iter() {
         let Symbol::Defined {
@@ -990,6 +991,36 @@ fn build_output_symbols(
     })
 }
 
+fn collect_synthetic_local_symbols(
+    layout: &Layout,
+    synthetic_plan: &SyntheticPlan,
+    out: &mut Vec<OutputSymbolSpec>,
+) -> Result<(), WriteError> {
+    if !synthetic_plan.needs_dyld_private {
+        return Ok(());
+    }
+
+    let Some((section_index, section)) = layout
+        .sections
+        .iter()
+        .enumerate()
+        .find(|(_, section)| section.segment == "__DATA" && section.name == "__data")
+    else {
+        return Err(WriteError::MissingSegment("__DATA"));
+    };
+
+    out.push(OutputSymbolSpec {
+        symbol: None,
+        name: "__dyld_private".to_string(),
+        partition: OutputSymbolPartition::Local,
+        n_type: N_SECT,
+        n_sect: u8::try_from(section_index + 1).expect("section index should fit in n_sect"),
+        n_desc: 0,
+        n_value: section.addr + section.synthetic_offset,
+    });
+    Ok(())
+}
+
 fn collect_local_symbols(
     layout: &Layout,
     atom_table: &AtomTable,
@@ -1079,8 +1110,7 @@ fn input_symbol_type(input_sym: &InputSymbol) -> u8 {
     };
     if input_sym.is_private_ext() {
         n_type |= N_PEXT;
-    }
-    if input_sym.is_ext() {
+    } else if input_sym.is_ext() {
         n_type |= N_EXT;
     }
     n_type

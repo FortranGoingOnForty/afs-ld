@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::resolve::SymbolId;
 
 pub const THREAD_POINTER_SIZE: u32 = 8;
+pub const THREAD_VARIABLE_DESCRIPTOR_SIZE: u32 = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ThreadPointerSection {

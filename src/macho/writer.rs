@@ -15,6 +15,7 @@ use crate::macho::reader::{
 };
 use crate::resolve::{Symbol, SymbolId, SymbolTable};
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist};
+use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::{code_sig::CodeSignaturePlan, SyntheticPlan};
 use crate::{LinkOptions, OutputKind};
 
@@ -169,7 +170,7 @@ pub fn write_finalized_with_linkedit(
         },
         ncmds: commands.len() as u32,
         sizeofcmds,
-        flags: header_flags(kind),
+        flags: header_flags(layout, kind),
         reserved: 0,
     };
 
@@ -433,11 +434,19 @@ fn raw_linkedit_command(cmd: u32, dataoff: u32, datasize: u32) -> LoadCommand {
     }
 }
 
-fn header_flags(kind: OutputKind) -> u32 {
-    match kind {
+fn header_flags(layout: &Layout, kind: OutputKind) -> u32 {
+    let mut flags = match kind {
         OutputKind::Executable => MH_DYLDLINK | MH_NOUNDEFS | MH_TWOLEVEL | MH_PIE,
         OutputKind::Dylib => MH_DYLDLINK | MH_TWOLEVEL | MH_NOUNDEFS,
+    };
+    if layout
+        .sections
+        .iter()
+        .any(|section| section.segment == "__DATA" && section.name == "__thread_vars")
+    {
+        flags |= MH_HAS_TLV_DESCRIPTORS;
     }
+    flags
 }
 
 fn dylib_install_name(opts: &LinkOptions) -> String {
@@ -737,12 +746,22 @@ fn collect_imports(
         .chain(synthetic_plan.got.entries.iter().map(|entry| entry.symbol))
         .chain(
             synthetic_plan
+                .thread_pointers
+                .entries
+                .iter()
+                .map(|entry| entry.symbol),
+        )
+        .chain(
+            synthetic_plan
                 .lazy_pointers
                 .entries
                 .iter()
                 .map(|entry| entry.symbol),
         )
         .collect();
+    if let Some(symbol) = synthetic_plan.tlv_bootstrap_symbol {
+        ids.push(symbol);
+    }
     ids.sort();
     ids.dedup();
 
@@ -822,9 +841,43 @@ fn build_bind_streams(
                 false,
             );
         }
-        if !bind.is_empty() {
-            bind.push(BIND_OPCODE_DONE);
+    }
+
+    if let Some(tlv_bootstrap) = synthetic_plan.tlv_bootstrap_symbol {
+        let segment_index = segment_index(layout, "__DATA")?;
+        let segment = layout
+            .segment("__DATA")
+            .ok_or(WriteError::MissingSegment("__DATA"))?;
+        if let Some(section) = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__DATA" && section.name == "__thread_vars")
+        {
+            let import = imports
+                .get(&tlv_bootstrap)
+                .copied()
+                .ok_or(WriteError::ImportSymbolMissing(tlv_bootstrap))?;
+            for placed in &section.atoms {
+                for descriptor_offset in
+                    (0..placed.size).step_by(THREAD_VARIABLE_DESCRIPTOR_SIZE as usize)
+                {
+                    let slot_addr = section.addr + placed.offset + descriptor_offset;
+                    emit_bind_record(
+                        &mut bind,
+                        segment_index,
+                        slot_addr - segment.vm_addr,
+                        import.ordinal,
+                        &import.name,
+                        import.weak_import,
+                        false,
+                    );
+                }
+            }
         }
+    }
+
+    if !bind.is_empty() {
+        bind.push(BIND_OPCODE_DONE);
     }
 
     if !synthetic_plan.lazy_pointers.entries.is_empty() {

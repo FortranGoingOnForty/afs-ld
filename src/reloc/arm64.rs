@@ -9,6 +9,7 @@ use crate::macho::writer::LinkEditPlan;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
 use crate::resolve::{InputId, Symbol, SymbolId, SymbolTable};
 use crate::synth::stubs::{STUB_HELPER_ENTRY_SIZE, STUB_HELPER_HEADER_SIZE, STUB_SIZE};
+use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::SyntheticPlan;
 use crate::symbol::{InputSymbol, SymKind};
 
@@ -45,6 +46,7 @@ struct ResolveView<'a> {
     section_addrs: &'a HashMap<(InputId, u8), u64>,
     stub_addrs: &'a HashMap<SymbolId, u64>,
     got_addrs: &'a HashMap<SymbolId, u64>,
+    thread_pointer_addrs: &'a HashMap<SymbolId, u64>,
     lazy_pointer_addrs: &'a HashMap<SymbolId, u64>,
     stub_helper_entry_addrs: &'a HashMap<SymbolId, u64>,
     stub_helper_header_addr: Option<u64>,
@@ -54,6 +56,7 @@ struct ResolveView<'a> {
 struct SyntheticAddressMaps {
     stub_addrs: HashMap<SymbolId, u64>,
     got_addrs: HashMap<SymbolId, u64>,
+    thread_pointer_addrs: HashMap<SymbolId, u64>,
     lazy_pointer_addrs: HashMap<SymbolId, u64>,
     stub_helper_entry_addrs: HashMap<SymbolId, u64>,
     stub_helper_header_addr: Option<u64>,
@@ -109,6 +112,7 @@ pub fn apply_layout(
         section_addrs: &section_addrs,
         stub_addrs: &synth_addrs.stub_addrs,
         got_addrs: &synth_addrs.got_addrs,
+        thread_pointer_addrs: &synth_addrs.thread_pointer_addrs,
         lazy_pointer_addrs: &synth_addrs.lazy_pointer_addrs,
         stub_helper_entry_addrs: &synth_addrs.stub_helper_entry_addrs,
         stub_helper_header_addr: synth_addrs.stub_helper_header_addr,
@@ -141,6 +145,7 @@ pub fn apply_layout(
     }
 
     if let Some(plan) = synthetic_plan {
+        synthesize_thread_variable_section(layout, plan)?;
         synthesize_stub_section(layout, plan, &resolve)?;
         synthesize_lazy_pointer_section(layout, plan, &resolve)?;
         synthesize_stub_helper_section(layout, plan, &resolve, linkedit)?;
@@ -191,6 +196,7 @@ fn synthetic_address_maps(
         return SyntheticAddressMaps {
             stub_addrs: HashMap::new(),
             got_addrs: HashMap::new(),
+            thread_pointer_addrs: HashMap::new(),
             lazy_pointer_addrs: HashMap::new(),
             stub_helper_entry_addrs: HashMap::new(),
             stub_helper_header_addr: None,
@@ -217,6 +223,17 @@ fn synthetic_address_maps(
     {
         for (idx, entry) in plan.got.entries.iter().enumerate() {
             got_addrs.insert(entry.symbol, section.addr + (idx as u64) * 8);
+        }
+    }
+
+    let mut thread_pointer_addrs = HashMap::new();
+    if let Some(section) = layout
+        .sections
+        .iter()
+        .find(|section| section.segment == "__DATA" && section.name == "__thread_ptrs")
+    {
+        for (idx, entry) in plan.thread_pointers.entries.iter().enumerate() {
+            thread_pointer_addrs.insert(entry.symbol, section.addr + (idx as u64) * 8);
         }
     }
 
@@ -262,6 +279,7 @@ fn synthetic_address_maps(
     SyntheticAddressMaps {
         stub_addrs,
         got_addrs,
+        thread_pointer_addrs,
         lazy_pointer_addrs,
         stub_helper_entry_addrs,
         stub_helper_header_addr,
@@ -355,14 +373,23 @@ fn apply_one(
             reloc,
             resolve_got_target(obj, atom, reloc, resolve)?,
         ),
-        RelocKind::TlvpLoadPage21 | RelocKind::TlvpLoadPageOff12 => Err(reloc_error(
+        RelocKind::TlvpLoadPage21 => patch_page21(
+            bytes,
             atom,
-            &obj.path,
+            obj,
             local_offset,
-            reloc.kind,
-            &describe_referent(obj, reloc.referent),
-            "not yet implemented (planned for Sprint 12/13)".to_string(),
-        )),
+            reloc,
+            place,
+            resolve_tlvp_target(obj, atom, reloc, resolve)?,
+        ),
+        RelocKind::TlvpLoadPageOff12 => patch_tlvp_pageoff12(
+            bytes,
+            atom,
+            obj,
+            local_offset,
+            reloc,
+            resolve_tlvp_pageoff_target(obj, atom, reloc, resolve)?,
+        ),
     }
 }
 
@@ -413,6 +440,43 @@ fn resolve_got_target(
             "dylib import is missing synthetic GOT slot".to_string(),
         )
     })
+}
+
+fn resolve_tlvp_target(
+    obj: &ObjectFile,
+    atom: &Atom,
+    reloc: Reloc,
+    resolve: &ResolveView<'_>,
+) -> Result<u64, RelocError> {
+    if let Some(symbol_id) = dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table) {
+        return resolve
+            .thread_pointer_addrs
+            .get(&symbol_id)
+            .copied()
+            .ok_or_else(|| {
+                reloc_error(
+                    atom,
+                    &obj.path,
+                    reloc.offset.saturating_sub(atom.input_offset),
+                    reloc.kind,
+                    &describe_referent(obj, reloc.referent),
+                    "dylib TLVP targets are not yet implemented".to_string(),
+                )
+            });
+    }
+    resolve_referent(obj, atom, reloc.referent, resolve)
+}
+
+fn resolve_tlvp_pageoff_target(
+    obj: &ObjectFile,
+    atom: &Atom,
+    reloc: Reloc,
+    resolve: &ResolveView<'_>,
+) -> Result<u64, RelocError> {
+    if dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table).is_some() {
+        return resolve_tlvp_target(obj, atom, reloc, resolve);
+    }
+    resolve_referent(obj, atom, reloc.referent, resolve)
 }
 
 fn resolve_referent(
@@ -806,6 +870,130 @@ fn patch_pageoff12(
         reloc.kind,
         &describe_referent(obj, reloc.referent),
     )
+}
+
+fn patch_tlvp_pageoff12(
+    bytes: &mut [u8],
+    atom: &Atom,
+    obj: &ObjectFile,
+    local_offset: u32,
+    reloc: Reloc,
+    target: u64,
+) -> Result<(), RelocError> {
+    let pageoff = target.wrapping_add_signed(reloc.addend) & 0xfff;
+    if pageoff > 0xfff {
+        return Err(reloc_error(
+            atom,
+            &obj.path,
+            local_offset,
+            reloc.kind,
+            &describe_referent(obj, reloc.referent),
+            format!("pageoff immediate 0x{pageoff:x} exceeds 12 bits"),
+        ));
+    }
+
+    let insn = read_u32(
+        bytes,
+        local_offset,
+        atom,
+        obj,
+        reloc.kind,
+        &describe_referent(obj, reloc.referent),
+    )?;
+    let rd = insn & 0x1f;
+    let rn = (insn >> 5) & 0x1f;
+    let patched = 0x9100_0000 | ((pageoff as u32) << 10) | (rn << 5) | rd;
+    write_u32(
+        bytes,
+        local_offset,
+        patched,
+        atom,
+        obj,
+        reloc.kind,
+        &describe_referent(obj, reloc.referent),
+    )
+}
+
+fn synthesize_thread_variable_section(
+    layout: &mut Layout,
+    plan: &SyntheticPlan,
+) -> Result<(), RelocError> {
+    let Some(_bootstrap_symbol) = plan.tlv_bootstrap_symbol else {
+        return Ok(());
+    };
+    let Some(template_base) = layout
+        .sections
+        .iter()
+        .find(|section| section.segment == "__DATA" && section.name == "__thread_data")
+        .map(|section| section.addr)
+        .or_else(|| {
+            layout
+                .sections
+                .iter()
+                .find(|section| section.segment == "__DATA" && section.name == "__thread_bss")
+                .map(|section| section.addr)
+        })
+    else {
+        return Ok(());
+    };
+    let Some(section) = layout
+        .sections
+        .iter_mut()
+        .find(|section| section.segment == "__DATA" && section.name == "__thread_vars")
+    else {
+        return Ok(());
+    };
+
+    for placed in &mut section.atoms {
+        if placed.size % THREAD_VARIABLE_DESCRIPTOR_SIZE as u64 != 0 {
+            return Err(RelocError {
+                input: PathBuf::from("<synthetic tlv>"),
+                atom: placed.atom,
+                atom_offset: 0,
+                kind: RelocKind::Unsigned,
+                referent: "__thread_vars".to_string(),
+                detail: format!(
+                    "TLV descriptor atom has unexpected size 0x{:x}",
+                    placed.size
+                ),
+            });
+        }
+
+        for descriptor_offset in
+            (0..placed.size as usize).step_by(THREAD_VARIABLE_DESCRIPTOR_SIZE as usize)
+        {
+            let start = descriptor_offset;
+            let end = start + THREAD_VARIABLE_DESCRIPTOR_SIZE as usize;
+            let descriptor = placed.data.get_mut(start..end).ok_or_else(|| RelocError {
+                input: PathBuf::from("<synthetic tlv>"),
+                atom: placed.atom,
+                atom_offset: descriptor_offset as u32,
+                kind: RelocKind::Unsigned,
+                referent: "__thread_vars".to_string(),
+                detail: "TLV descriptor lands outside atom bytes".to_string(),
+            })?;
+
+            descriptor[0..8].fill(0);
+            let init_addr =
+                u64::from_le_bytes(descriptor[16..24].try_into().expect("8-byte descriptor tail"));
+            if init_addr < template_base {
+                return Err(RelocError {
+                    input: PathBuf::from("<synthetic tlv>"),
+                    atom: placed.atom,
+                    atom_offset: descriptor_offset as u32 + 16,
+                    kind: RelocKind::Unsigned,
+                    referent: "__thread_vars".to_string(),
+                    detail: format!(
+                        "TLV init address 0x{init_addr:x} lands before TLS template base 0x{template_base:x}"
+                    ),
+                });
+            }
+            let init_offset = init_addr - template_base;
+            descriptor[16..24].copy_from_slice(&init_offset.to_le_bytes());
+        }
+    }
+
+    Ok(())
 }
 
 fn synthesize_stub_section(

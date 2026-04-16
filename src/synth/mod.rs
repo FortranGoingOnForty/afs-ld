@@ -161,7 +161,7 @@ impl SyntheticPlan {
             binder_symbol = Some(binder);
             needs_dyld_private = true;
         }
-        if !thread_pointers.entries.is_empty() {
+        if !thread_pointers.entries.is_empty() || inputs_have_tlv_descriptors(inputs) {
             tlv_bootstrap_symbol = ensure_tlv_support(sym_table, dylibs)?;
         }
 
@@ -358,10 +358,17 @@ fn dylib_import_is_weak(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
 }
 
 fn tlv_symbol_needs_thread_pointer(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
-    matches!(
-        sym_table.get(symbol_id),
-        Symbol::Defined { .. } | Symbol::Common { .. }
-    )
+    matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. })
+}
+
+fn inputs_have_tlv_descriptors(inputs: &[LayoutInput<'_>]) -> bool {
+    inputs.iter().any(|input| {
+        input
+            .object
+            .sections
+            .iter()
+            .any(|section| section.kind == SectionKind::ThreadLocalVariables)
+    })
 }
 
 fn ensure_stub_helper_support(
@@ -432,7 +439,7 @@ fn ensure_tlv_support(
         return Ok(None);
     };
 
-    let name = sym_table.intern("_tlv_bootstrap");
+    let name = sym_table.intern("__tlv_bootstrap");
     let symbol_id = if let Some(id) = sym_table.lookup(name) {
         match sym_table.get(id) {
             Symbol::DylibImport { .. } => id,
@@ -443,7 +450,7 @@ fn ensure_tlv_support(
                     reloc_offset: 0,
                     kind: RelocKind::TlvpLoadPage21,
                     detail: format!(
-                        "`_tlv_bootstrap` already exists as unsupported symbol kind {:?}",
+                        "`__tlv_bootstrap` already exists as unsupported symbol kind {:?}",
                         other.kind()
                     ),
                 });
@@ -666,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_plan_collects_thread_pointer_needs_for_tlvp() {
+    fn synthetic_plan_keeps_local_tlvp_on_descriptors() {
         let mut sym_table = SymbolTable::new();
         let name = sym_table.intern("_tlsvar");
         let input_id = InputId(0);
@@ -731,18 +738,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(plan.thread_pointers.entries.len(), 1);
+        assert!(plan.thread_pointers.entries.is_empty());
         assert!(plan.binder_symbol.is_none());
         assert!(plan.tlv_bootstrap_symbol.is_some());
 
         let sections = plan.output_sections();
-        let thread_ptrs = sections
+        assert!(sections
             .iter()
-            .find(|section| section.segment == "__DATA" && section.name == "__thread_ptrs")
-            .unwrap();
-        assert_eq!(thread_ptrs.kind, SectionKind::ThreadLocalVariablePointers);
-        assert_eq!(thread_ptrs.flags, S_THREAD_LOCAL_VARIABLE_POINTERS);
-        assert_eq!(thread_ptrs.size, THREAD_POINTER_SIZE as u64);
+            .all(|section| !(section.segment == "__DATA" && section.name == "__thread_ptrs")));
     }
 
     fn libsystem_input() -> DylibInput {
@@ -866,6 +869,23 @@ mod tests {
                     reserved3: 0,
                     data: vec![0; 8],
                     raw_relocs,
+                },
+                InputSection {
+                    segname: "__DATA".into(),
+                    sectname: "__thread_vars".into(),
+                    kind: SectionKind::ThreadLocalVariables,
+                    addr: 0,
+                    size: 24,
+                    align_pow2: 3,
+                    flags: crate::macho::constants::S_THREAD_LOCAL_VARIABLES,
+                    offset: 0,
+                    reloff: 0,
+                    nreloc: 0,
+                    reserved1: 0,
+                    reserved2: 0,
+                    reserved3: 0,
+                    data: vec![0; 24],
+                    raw_relocs: Vec::new(),
                 },
                 InputSection {
                     segname: "__DATA".into(),

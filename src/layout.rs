@@ -156,6 +156,17 @@ impl Layout {
         self.assign_addresses(header_size);
     }
 
+    pub fn atom_file_offset(&self, atom_id: crate::resolve::AtomId) -> Option<u64> {
+        for section in &self.sections {
+            for placed in &section.atoms {
+                if placed.atom == atom_id {
+                    return Some(section.file_off + placed.offset);
+                }
+            }
+        }
+        None
+    }
+
     fn assign_addresses(&mut self, header_size: u64) {
         for seg in &mut self.segments {
             seg.sections.clear();

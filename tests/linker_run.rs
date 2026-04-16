@@ -349,3 +349,71 @@ fn linker_run_handles_non_standard_segment_without_panicking() {
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
 }
+
+#[test]
+fn linker_run_uses_requested_entry_symbol() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("entry.o");
+    let out = scratch("entry.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            ret
+        .globl _alt
+        _alt:
+            mov x0, #1
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        entry: Some("_alt".into()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
+    let mut text_offset = None;
+    let mut main_entryoff = None;
+    for cmd in commands {
+        match cmd {
+            LoadCommand::Segment64(seg) => {
+                for section in seg.sections {
+                    if section.sectname_str() == "__text" {
+                        text_offset = Some(section.offset as u64);
+                    }
+                }
+            }
+            LoadCommand::Raw { cmd, data, .. } if cmd == afs_ld::macho::constants::LC_MAIN => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&data[0..8]);
+                main_entryoff = Some(u64::from_le_bytes(buf));
+            }
+            _ => {}
+        }
+    }
+
+    let text_offset = text_offset.expect("text section offset");
+    let main_entryoff = main_entryoff.expect("LC_MAIN entryoff");
+    assert!(
+        main_entryoff > text_offset,
+        "expected custom entry to land after start of __text: text={text_offset}, entry={main_entryoff}"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}

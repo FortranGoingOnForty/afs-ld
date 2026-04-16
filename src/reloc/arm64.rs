@@ -146,6 +146,7 @@ pub fn apply_layout(
 
     if let Some(plan) = synthetic_plan {
         synthesize_thread_variable_section(layout, plan)?;
+        synthesize_got_section(layout, plan, &resolve)?;
         synthesize_stub_section(layout, plan, &resolve)?;
         synthesize_lazy_pointer_section(layout, plan, &resolve)?;
         synthesize_stub_helper_section(layout, plan, &resolve, linkedit)?;
@@ -432,14 +433,14 @@ fn resolve_got_target(
     reloc: Reloc,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
-    let Some(symbol_id) = dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table) else {
+    let Some(symbol_id) = symbol_referent_id(obj, reloc.referent, resolve.sym_table) else {
         return Err(reloc_error(
             atom,
             &obj.path,
             reloc.offset.saturating_sub(atom.input_offset),
             reloc.kind,
             &describe_referent(obj, reloc.referent),
-            "GOT relocations currently require a dylib import target".to_string(),
+            "GOT relocations require a symbol target".to_string(),
         ));
     };
     resolve.got_addrs.get(&symbol_id).copied().ok_or_else(|| {
@@ -449,7 +450,7 @@ fn resolve_got_target(
             reloc.offset.saturating_sub(atom.input_offset),
             reloc.kind,
             &describe_referent(obj, reloc.referent),
-            "dylib import is missing synthetic GOT slot".to_string(),
+            "symbol is missing synthetic GOT slot".to_string(),
         )
     })
 }
@@ -542,6 +543,15 @@ fn dylib_import_symbol_id(
     referent: Referent,
     sym_table: &SymbolTable,
 ) -> Option<SymbolId> {
+    let symbol_id = symbol_referent_id(obj, referent, sym_table)?;
+    matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. }).then_some(symbol_id)
+}
+
+fn symbol_referent_id(
+    obj: &ObjectFile,
+    referent: Referent,
+    sym_table: &SymbolTable,
+) -> Option<SymbolId> {
     let Referent::Symbol(sym_idx) = referent else {
         return None;
     };
@@ -550,7 +560,8 @@ fn dylib_import_symbol_id(
     let (symbol_id, symbol) = sym_table
         .iter()
         .find(|(_, symbol)| sym_table.interner.resolve(symbol.name()) == name)?;
-    matches!(symbol, Symbol::DylibImport { .. }).then_some(symbol_id)
+    let _ = symbol;
+    Some(symbol_id)
 }
 
 fn resolve_global_symbol(
@@ -1106,6 +1117,63 @@ fn synthesize_thread_variable_section(
             let init_offset = init_addr - template_base;
             descriptor[16..24].copy_from_slice(&init_offset.to_le_bytes());
         }
+    }
+
+    Ok(())
+}
+
+fn synthesize_got_section(
+    layout: &mut Layout,
+    plan: &SyntheticPlan,
+    resolve: &ResolveView<'_>,
+) -> Result<(), RelocError> {
+    let Some(section) = layout
+        .sections
+        .iter_mut()
+        .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
+    else {
+        return Ok(());
+    };
+
+    for (idx, entry) in plan.got.entries.iter().enumerate() {
+        let start = idx * 8;
+        let end = start + 8;
+        let value = match resolve.sym_table.get(entry.symbol) {
+            Symbol::DylibImport { .. } => 0,
+            Symbol::Defined {
+                atom: target_atom,
+                value,
+                ..
+            } => {
+                resolve
+                    .atom_addrs
+                    .get(target_atom)
+                    .copied()
+                    .ok_or_else(|| RelocError {
+                        input: PathBuf::from("<synthetic got>"),
+                        atom: crate::resolve::AtomId(0),
+                        atom_offset: start as u32,
+                        kind: RelocKind::PointerToGot,
+                        referent: format!("symbol {:?}", entry.symbol),
+                        detail: "defined GOT target is missing final address".to_string(),
+                    })?
+                    + *value
+            }
+            other => {
+                return Err(RelocError {
+                    input: PathBuf::from("<synthetic got>"),
+                    atom: crate::resolve::AtomId(0),
+                    atom_offset: start as u32,
+                    kind: RelocKind::PointerToGot,
+                    referent: format!("symbol {:?}", entry.symbol),
+                    detail: format!(
+                        "synthetic GOT currently does not support symbol kind {:?}",
+                        other.kind()
+                    ),
+                });
+            }
+        };
+        section.synthetic_data[start..end].copy_from_slice(&value.to_le_bytes());
     }
 
     Ok(())

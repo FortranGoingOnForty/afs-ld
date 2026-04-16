@@ -989,6 +989,11 @@ fn collect_rebase_sites(
     inputs: LinkEditInputs<'_>,
 ) -> Result<Vec<RebaseSite>, WriteError> {
     let mut sites = collect_lazy_pointer_rebase_sites(layout, synthetic_plan)?;
+    sites.extend(collect_local_got_rebase_sites(
+        layout,
+        synthetic_plan,
+        inputs.0.sym_table,
+    )?);
     let mut reloc_cache: HashMap<(InputId, u8), Vec<Reloc>> = HashMap::new();
     let input_map: HashMap<InputId, &ObjectFile> = inputs
         .0
@@ -1076,6 +1081,38 @@ fn collect_lazy_pointer_rebase_sites(
 
     Ok((0..synthetic_plan.lazy_pointers.entries.len())
         .map(|idx| RebaseSite {
+            segment_index,
+            segment_offset: section.addr + (idx as u64) * 8 - segment.vm_addr,
+        })
+        .collect())
+}
+
+fn collect_local_got_rebase_sites(
+    layout: &Layout,
+    synthetic_plan: &SyntheticPlan,
+    sym_table: &SymbolTable,
+) -> Result<Vec<RebaseSite>, WriteError> {
+    if synthetic_plan.got.entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let segment_index = segment_index(layout, "__DATA_CONST")?;
+    let segment = layout
+        .segment("__DATA_CONST")
+        .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
+    let section = layout
+        .sections
+        .iter()
+        .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
+        .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
+
+    Ok(synthetic_plan
+        .got
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| !matches!(sym_table.get(entry.symbol), Symbol::DylibImport { .. }))
+        .map(|(idx, _)| RebaseSite {
             segment_index,
             segment_offset: section.addr + (idx as u64) * 8 - segment.vm_addr,
         })
@@ -1375,7 +1412,7 @@ fn collect_imports(
             ..
         } = symbol
         else {
-            return Err(WriteError::ImportSymbolWrongKind(id));
+            continue;
         };
         out.push(ImportSymbolRecord {
             symbol: id,
@@ -1712,15 +1749,17 @@ fn find_containing_atom_range(
     offset: u32,
     len: u32,
 ) -> Option<(crate::resolve::AtomId, u32)> {
-    atoms_by_input_section.get(&(input_id, input_section)).and_then(|ids| {
-        ids.iter().find_map(|atom_id| {
-            let atom = atom_table.get(*atom_id);
-            let start = atom.input_offset;
-            let end = atom.input_offset.saturating_add(atom.size);
-            let range_end = offset.checked_add(len)?;
-            (start <= offset && range_end <= end).then_some((*atom_id, offset - start))
+    atoms_by_input_section
+        .get(&(input_id, input_section))
+        .and_then(|ids| {
+            ids.iter().find_map(|atom_id| {
+                let atom = atom_table.get(*atom_id);
+                let start = atom.input_offset;
+                let end = atom.input_offset.saturating_add(atom.size);
+                let range_end = offset.checked_add(len)?;
+                (start <= offset && range_end <= end).then_some((*atom_id, offset - start))
+            })
         })
-    })
 }
 
 fn input_symbol_type(input_sym: &InputSymbol) -> u8 {
@@ -1861,7 +1900,12 @@ fn push_indirect_section(
     let mut saw_any = false;
     for symbol in symbols {
         saw_any = true;
-        indirect_symbols.push(*symbol_indices.get(&symbol).expect("symbol index missing"));
+        indirect_symbols.push(
+            symbol_indices
+                .get(&symbol)
+                .copied()
+                .unwrap_or(INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS),
+        );
     }
     if saw_any {
         indirect_starts.insert((key.0.to_string(), key.1.to_string()), start);
@@ -1889,10 +1933,9 @@ fn build_bind_streams(
             .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
             .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
         for (idx, entry) in synthetic_plan.got.entries.iter().enumerate() {
-            let import = imports
-                .get(&entry.symbol)
-                .copied()
-                .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
+            let Some(import) = imports.get(&entry.symbol).copied() else {
+                continue;
+            };
             let slot_addr = section.addr + (idx as u64) * 8;
             bind_specs.push(BindRecordSpec {
                 segment_index,

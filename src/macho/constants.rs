@@ -115,6 +115,10 @@ pub const N_WEAK_DEF: u16 = 0x0080;
 /// `alt_entries` during atomization.
 pub const N_ALT_ENTRY: u16 = 0x0200;
 
+// Indirect symbol table sentinels (<mach-o/loader.h>)
+pub const INDIRECT_SYMBOL_LOCAL: u32 = 0x8000_0000;
+pub const INDIRECT_SYMBOL_ABS: u32 = 0x4000_0000;
+
 // ARM64 relocation kinds
 pub const ARM64_RELOC_UNSIGNED: u8 = 0;
 pub const ARM64_RELOC_SUBTRACTOR: u8 = 1;

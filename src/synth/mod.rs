@@ -166,7 +166,7 @@ impl SyntheticPlan {
                     RelocKind::GotLoadPage21
                     | RelocKind::GotLoadPageOff12
                     | RelocKind::PointerToGot => {
-                        let Some(symbol_id) = dylib_import_referent(obj, reloc.referent, sym_table)
+                        let Some(symbol_id) = symbol_referent_id(obj, reloc.referent, sym_table)
                         else {
                             continue;
                         };

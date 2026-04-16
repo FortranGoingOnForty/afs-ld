@@ -3591,6 +3591,97 @@ fn linker_run_rebases_local_absolute_pointers_like_ld() {
 }
 
 #[test]
+fn linker_run_routes_local_got_loads_through_rebased_slots() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("local-got.o");
+    let our_out = scratch("local-got-ours.out");
+    let apple_out = scratch("local-got-apple.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            adrp x8, _value@GOTPAGE
+            ldr x8, [x8, _value@GOTPAGEOFF]
+            ldr w0, [x8]
+            ret
+
+        .section __DATA,__data
+        .globl _value
+        .p2align 2
+        _value:
+            .long 7
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_classic_lazy(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let our_binds = decode_bind_records(&our_bytes, false).unwrap();
+    let apple_binds = decode_bind_records(&apple_bytes, false).unwrap();
+    assert_eq!(our_binds, apple_binds);
+    assert!(
+        our_binds.iter().all(|record| record.symbol != "_value"),
+        "local GOT target should not be emitted as a dylib bind: {our_binds:#?}"
+    );
+    assert_eq!(
+        output_section(&our_bytes, "__DATA_CONST", "__got")
+            .expect("missing __got section")
+            .1
+            .len(),
+        8
+    );
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&our_out)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let status = Command::new(&our_out).status().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(7),
+        "expected local GOT executable to exit 7"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
 fn linker_run_partitions_symtab_like_ld() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");
@@ -4252,8 +4343,14 @@ fn linker_run_resolves_backtrace_symbols_at_runtime() {
 
     assert_eq!(our_output.status.code(), Some(0));
     assert_eq!(apple_output.status.code(), Some(0));
-    assert!(our_stdout.contains("helper"), "expected helper in output: {our_stdout}");
-    assert!(our_stdout.contains("main"), "expected main in output: {our_stdout}");
+    assert!(
+        our_stdout.contains("helper"),
+        "expected helper in output: {our_stdout}"
+    );
+    assert!(
+        our_stdout.contains("main"),
+        "expected main in output: {our_stdout}"
+    );
     assert!(
         apple_stdout.contains("helper"),
         "expected helper in apple output: {apple_stdout}"

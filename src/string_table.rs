@@ -9,6 +9,8 @@
 //! via its suffix-dedup sort. The walker here handles any strx that lands
 //! between nulls, not just those aligned to the start of a name.
 
+use std::collections::HashMap;
+
 use crate::macho::reader::ReadError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +93,72 @@ impl StringTable {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StringTableBuilder {
+    roots: Vec<(String, u32)>,
+    offsets: HashMap<String, u32>,
+}
+
+impl StringTableBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, name: &str) {
+        self.offsets.entry(name.to_string()).or_insert(0);
+    }
+
+    pub fn finish(mut self) -> (Vec<u8>, HashMap<String, u32>) {
+        let mut names: Vec<String> = self.offsets.keys().cloned().collect();
+        names.sort_by(|lhs, rhs| reverse_suffix_order(lhs, rhs));
+
+        let mut raw = vec![0u8];
+        for name in names {
+            if let Some(offset) = self.find_suffix_offset(&name) {
+                self.offsets.insert(name, offset);
+                continue;
+            }
+
+            let offset = raw.len() as u32;
+            raw.extend_from_slice(name.as_bytes());
+            raw.push(0);
+            self.roots.push((name.clone(), offset));
+            self.offsets.insert(name, offset);
+        }
+
+        while !raw.len().is_multiple_of(8) {
+            raw.push(0);
+        }
+        (raw, self.offsets)
+    }
+
+    fn find_suffix_offset(&self, name: &str) -> Option<u32> {
+        self.roots.iter().find_map(|(existing, offset)| {
+            if existing.ends_with(name) {
+                Some(*offset + (existing.len() - name.len()) as u32)
+            } else {
+                None
+            }
+        })
+    }
+}
+
+fn reverse_suffix_order(lhs: &str, rhs: &str) -> std::cmp::Ordering {
+    let mut lhs_rev = lhs.bytes().rev();
+    let mut rhs_rev = rhs.bytes().rev();
+    loop {
+        match (lhs_rev.next(), rhs_rev.next()) {
+            (Some(a), Some(b)) => match a.cmp(&b) {
+                std::cmp::Ordering::Equal => continue,
+                other => return other,
+            },
+            (Some(_), None) => return std::cmp::Ordering::Less,
+            (None, Some(_)) => return std::cmp::Ordering::Greater,
+            (None, None) => return lhs.cmp(rhs),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +228,22 @@ mod tests {
         let t = StringTable::from_file(&file, 8, 7).unwrap();
         assert_eq!(t.as_bytes(), b"\0_main\0");
         assert_eq!(t.get(1).unwrap(), "_main");
+    }
+
+    #[test]
+    fn builder_dedups_suffix_names() {
+        let mut builder = StringTableBuilder::new();
+        builder.insert("_array_sum");
+        builder.insert("_afs_array_sum");
+
+        let (bytes, offsets) = builder.finish();
+        let table = StringTable::from_bytes(bytes);
+        let afs = offsets["_afs_array_sum"];
+        let array = offsets["_array_sum"];
+
+        assert_eq!(table.get(afs).unwrap(), "_afs_array_sum");
+        assert_eq!(table.get(array).unwrap(), "_array_sum");
+        assert_eq!(array, afs + 4);
+        assert_eq!(table.as_bytes().len() % 8, 0);
     }
 }

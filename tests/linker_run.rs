@@ -10,19 +10,18 @@ mod common;
 
 use afs_ld::leb::read_uleb;
 use afs_ld::macho::constants::{
-    BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND,
+    BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DONE, BIND_OPCODE_DO_BIND,
     BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED, BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB,
-    BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_DONE, BIND_OPCODE_MASK,
-    LC_DATA_IN_CODE, LC_FUNCTION_STARTS,
+    BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_MASK,
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
-    BIND_SYMBOL_FLAGS_WEAK_IMPORT, REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED,
-    REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB,
-    REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
-    REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB, REBASE_OPCODE_DONE, REBASE_OPCODE_MASK,
-    REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM, REBASE_TYPE_POINTER,
-    SG_READ_ONLY,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, LC_DATA_IN_CODE, LC_FUNCTION_STARTS, REBASE_IMMEDIATE_MASK,
+    REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE,
+    REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
+    REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
+    REBASE_OPCODE_MASK, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
+    REBASE_TYPE_POINTER, SG_READ_ONLY,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::{ExportKind, Exports};
@@ -221,7 +220,12 @@ fn segment_vmaddr(bytes: &[u8], segname: &str) -> Option<u64> {
     None
 }
 
-fn symtab_and_dysymtab(bytes: &[u8]) -> (afs_ld::macho::reader::SymtabCmd, afs_ld::macho::reader::DysymtabCmd) {
+fn symtab_and_dysymtab(
+    bytes: &[u8],
+) -> (
+    afs_ld::macho::reader::SymtabCmd,
+    afs_ld::macho::reader::DysymtabCmd,
+) {
     let header = parse_header(bytes).unwrap();
     let commands = parse_commands(&header, bytes).unwrap();
     let mut symtab = None;
@@ -393,7 +397,12 @@ fn symbol_name_offsets(bytes: &[u8]) -> HashMap<String, u32> {
     let strings = StringTable::from_file(bytes, symtab.stroff, symtab.strsize).unwrap();
     symbols
         .iter()
-        .map(|symbol| (strings.get(symbol.strx()).unwrap().to_string(), symbol.strx()))
+        .map(|symbol| {
+            (
+                strings.get(symbol.strx()).unwrap().to_string(),
+                symbol.strx(),
+            )
+        })
         .collect()
 }
 
@@ -622,7 +631,8 @@ fn dyld_info_stream(bytes: &[u8], kind: DyldInfoStreamKind) -> Result<Vec<u8>, S
     }
     let start = off as usize;
     let end = start + size as usize;
-    bytes.get(start..end)
+    bytes
+        .get(start..end)
         .map(|slice| slice.to_vec())
         .ok_or_else(|| "dyld-info stream out of bounds".to_string())
 }
@@ -1000,11 +1010,7 @@ struct DirectBindParityCase {
     main_src: &'static str,
 }
 
-fn assert_case_matches_apple_ld(
-    case: &ParityCase,
-    sdk: &str,
-    sdk_ver: &str,
-) -> Result<(), String> {
+fn assert_case_matches_apple_ld(case: &ParityCase, sdk: &str, sdk_ver: &str) -> Result<(), String> {
     let obj = scratch(&format!("parity-{}.o", case.name));
     let our_out = scratch(&format!("parity-{}-ours.out", case.name));
     let apple_out = scratch(&format!("parity-{}-apple.out", case.name));
@@ -1028,15 +1034,18 @@ fn assert_case_matches_apple_ld(
             for section in sections {
                 let (_, ours) = output_section(&our_bytes, section.segname, section.sectname)
                     .ok_or_else(|| {
-                        format!("missing our section {},{}", section.segname, section.sectname)
-                    })?;
-                let (_, theirs) = output_section(&apple_bytes, section.segname, section.sectname)
-                    .ok_or_else(|| {
                         format!(
-                            "missing apple section {},{}",
+                            "missing our section {},{}",
                             section.segname, section.sectname
                         )
                     })?;
+                let (_, theirs) = output_section(&apple_bytes, section.segname, section.sectname)
+                    .ok_or_else(|| {
+                    format!(
+                        "missing apple section {},{}",
+                        section.segname, section.sectname
+                    )
+                })?;
                 let diff = diff_macho(&ours, &theirs);
                 if !diff.is_clean() {
                     return Err(format!(
@@ -1052,12 +1061,22 @@ fn assert_case_matches_apple_ld(
             target_offset,
             kind,
         } => {
-            let (our_addr, our_bytes_sec) = output_section(&our_bytes, section.segname, section.sectname)
-                .ok_or_else(|| format!("missing our section {},{}", section.segname, section.sectname))?;
-            let (apple_addr, apple_bytes_sec) =
-                output_section(&apple_bytes, section.segname, section.sectname).ok_or_else(|| {
-                    format!("missing apple section {},{}", section.segname, section.sectname)
+            let (our_addr, our_bytes_sec) =
+                output_section(&our_bytes, section.segname, section.sectname).ok_or_else(|| {
+                    format!(
+                        "missing our section {},{}",
+                        section.segname, section.sectname
+                    )
                 })?;
+            let (apple_addr, apple_bytes_sec) =
+                output_section(&apple_bytes, section.segname, section.sectname).ok_or_else(
+                    || {
+                        format!(
+                            "missing apple section {},{}",
+                            section.segname, section.sectname
+                        )
+                    },
+                )?;
             let our_target = decode_page_reference(&our_bytes_sec, our_addr, site_offset, &kind)?;
             let apple_target =
                 decode_page_reference(&apple_bytes_sec, apple_addr, site_offset, &kind)?;
@@ -1117,7 +1136,10 @@ fn assert_dylib_export_case_matches_apple_ld(
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind)
         != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::WeakBind)
     {
-        return Err(format!("{}: weak-bind stream diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: weak-bind stream diverged from Apple ld",
+            case.name
+        ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::Export)
         .map_err(|e| format!("read our export stream: {e}"))?
@@ -1164,9 +1186,8 @@ fn assert_classic_lazy_case_matches_apple_ld(
     for (segname, sectname) in [("__TEXT", "__stubs"), ("__TEXT", "__stub_helper")] {
         let (_, ours) = output_section(&our_bytes, segname, sectname)
             .ok_or_else(|| format!("{}: missing our section {segname},{sectname}", case.name))?;
-        let (_, theirs) = output_section(&apple_bytes, segname, sectname).ok_or_else(|| {
-            format!("{}: missing apple section {segname},{sectname}", case.name)
-        })?;
+        let (_, theirs) = output_section(&apple_bytes, segname, sectname)
+            .ok_or_else(|| format!("{}: missing apple section {segname},{sectname}", case.name))?;
         let diff = diff_macho(&ours, &theirs);
         if !diff.is_clean() {
             return Err(format!(
@@ -1179,20 +1200,32 @@ fn assert_classic_lazy_case_matches_apple_ld(
     if load_dylib_names(&our_bytes).map_err(|e| format!("our dylibs: {e}"))?
         != load_dylib_names(&apple_bytes).map_err(|e| format!("apple dylibs: {e}"))?
     {
-        return Err(format!("{}: LC_LOAD_DYLIB set diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: LC_LOAD_DYLIB set diverged from Apple ld",
+            case.name
+        ));
     }
     if segment_flags(&our_bytes, "__DATA_CONST") != segment_flags(&apple_bytes, "__DATA_CONST") {
-        return Err(format!("{}: __DATA_CONST flags diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: __DATA_CONST flags diverged from Apple ld",
+            case.name
+        ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::Rebase)
         != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::Rebase)
     {
-        return Err(format!("{}: rebase stream diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: rebase stream diverged from Apple ld",
+            case.name
+        ));
     }
     if decode_rebase_records(&our_bytes).map_err(|e| format!("our rebases: {e}"))?
         != decode_rebase_records(&apple_bytes).map_err(|e| format!("apple rebases: {e}"))?
     {
-        return Err(format!("{}: rebase records diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: rebase records diverged from Apple ld",
+            case.name
+        ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::Bind)
         != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::Bind)
@@ -1202,15 +1235,20 @@ fn assert_classic_lazy_case_matches_apple_ld(
     if decode_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?
         != decode_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?
     {
-        return Err(format!("{}: bind records diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: bind records diverged from Apple ld",
+            case.name
+        ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind)
         != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::WeakBind)
     {
-        return Err(format!("{}: weak-bind stream diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: weak-bind stream diverged from Apple ld",
+            case.name
+        ));
     }
-    if dyld_info_export_names(&our_bytes)
-        .map_err(|e| format!("our executable exports: {e}"))?
+    if dyld_info_export_names(&our_bytes).map_err(|e| format!("our executable exports: {e}"))?
         != dyld_info_export_names(&apple_bytes)
             .map_err(|e| format!("apple executable exports: {e}"))?
     {
@@ -1222,10 +1260,12 @@ fn assert_classic_lazy_case_matches_apple_ld(
     if decode_bind_records(&our_bytes, true).map_err(|e| format!("our lazy binds: {e}"))?
         != decode_bind_records(&apple_bytes, true).map_err(|e| format!("apple lazy binds: {e}"))?
     {
-        return Err(format!("{}: lazy bind records diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: lazy bind records diverged from Apple ld",
+            case.name
+        ));
     }
-    if canonical_lazy_bind_stream(&our_bytes)
-        .map_err(|e| format!("our lazy stream: {e}"))?
+    if canonical_lazy_bind_stream(&our_bytes).map_err(|e| format!("our lazy stream: {e}"))?
         != canonical_lazy_bind_stream(&apple_bytes)
             .map_err(|e| format!("apple lazy stream: {e}"))?
     {
@@ -1309,17 +1349,26 @@ fn assert_direct_bind_case_matches_apple_ld(
     if load_dylib_names(&our_bytes).map_err(|e| format!("our dylibs: {e}"))?
         != load_dylib_names(&apple_bytes).map_err(|e| format!("apple dylibs: {e}"))?
     {
-        return Err(format!("{}: LC_LOAD_DYLIB set diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: LC_LOAD_DYLIB set diverged from Apple ld",
+            case.name
+        ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::Rebase)
         != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::Rebase)
     {
-        return Err(format!("{}: rebase stream diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: rebase stream diverged from Apple ld",
+            case.name
+        ));
     }
     if decode_rebase_records(&our_bytes).map_err(|e| format!("our rebases: {e}"))?
         != decode_rebase_records(&apple_bytes).map_err(|e| format!("apple rebases: {e}"))?
     {
-        return Err(format!("{}: rebase records diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: rebase records diverged from Apple ld",
+            case.name
+        ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::Bind)
         != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::Bind)
@@ -1329,15 +1378,20 @@ fn assert_direct_bind_case_matches_apple_ld(
     if decode_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?
         != decode_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?
     {
-        return Err(format!("{}: bind records diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: bind records diverged from Apple ld",
+            case.name
+        ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind)
         != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::WeakBind)
     {
-        return Err(format!("{}: weak-bind stream diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: weak-bind stream diverged from Apple ld",
+            case.name
+        ));
     }
-    if dyld_info_export_names(&our_bytes)
-        .map_err(|e| format!("our executable exports: {e}"))?
+    if dyld_info_export_names(&our_bytes).map_err(|e| format!("our executable exports: {e}"))?
         != dyld_info_export_names(&apple_bytes)
             .map_err(|e| format!("apple executable exports: {e}"))?
     {
@@ -1349,7 +1403,10 @@ fn assert_direct_bind_case_matches_apple_ld(
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::LazyBind)
         != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::LazyBind)
     {
-        return Err(format!("{}: lazy-bind stream diverged from Apple ld", case.name));
+        return Err(format!(
+            "{}: lazy-bind stream diverged from Apple ld",
+            case.name
+        ));
     }
 
     let _ = fs::remove_file(dylib);
@@ -1387,7 +1444,9 @@ fn decode_branch_target(bytes: &[u8], section_addr: u64, site_offset: u64) -> Re
     let insn = read_insn(bytes, site_offset as usize)?;
     let imm26 = (insn & 0x03ff_ffff) as i64;
     let imm = sign_extend_26(imm26) << 2;
-    Ok(section_addr.wrapping_add(site_offset).wrapping_add_signed(imm))
+    Ok(section_addr
+        .wrapping_add(site_offset)
+        .wrapping_add_signed(imm))
 }
 
 fn read_insn(bytes: &[u8], start: usize) -> Result<u32, String> {
@@ -1453,20 +1512,27 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
             LoadCommand::Raw { cmd, data, .. }
                 if cmd == afs_ld::macho::constants::LC_LOAD_DYLINKER =>
             {
-                has_dylinker = data.windows(b"/usr/lib/dyld\0".len()).any(|window| {
-                    window == b"/usr/lib/dyld\0"
-                });
+                has_dylinker = data
+                    .windows(b"/usr/lib/dyld\0".len())
+                    .any(|window| window == b"/usr/lib/dyld\0");
             }
             _ => {}
         }
     }
     assert!(text_size > 0, "expected non-empty __text output");
-    assert!(has_dylinker, "expected LC_LOAD_DYLINKER in executable output");
+    assert!(
+        has_dylinker,
+        "expected LC_LOAD_DYLINKER in executable output"
+    );
     assert!(
         fs::metadata(&out).unwrap().permissions().mode() & 0o111 != 0,
         "expected executable output mode"
     );
-    let verify = Command::new("codesign").arg("-v").arg(&out).output().unwrap();
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&out)
+        .output()
+        .unwrap();
     assert!(
         verify.status.success(),
         "codesign verify failed: {}",
@@ -1516,11 +1582,9 @@ fn linker_run_emits_minimal_dylib_from_real_object() {
         _ => None,
     });
     assert_eq!(header.filetype, afs_ld::macho::constants::MH_DYLIB);
-    assert!(
-        commands
-            .iter()
-            .any(|cmd| matches!(cmd, LoadCommand::Dylib(d) if d.cmd == afs_ld::macho::constants::LC_ID_DYLIB))
-    );
+    assert!(commands.iter().any(
+        |cmd| matches!(cmd, LoadCommand::Dylib(d) if d.cmd == afs_ld::macho::constants::LC_ID_DYLIB)
+    ));
     let dyld_info = dyld_info.expect("expected LC_DYLD_INFO_ONLY in dylib output");
     assert!(dyld_info.export_size > 0, "expected non-empty export trie");
 
@@ -1816,7 +1880,10 @@ fn linker_run_reports_duplicate_from_fetched_archive_member() {
         .output()
         .unwrap();
     if !ar.status.success() {
-        eprintln!("skipping: ar failed: {}", String::from_utf8_lossy(&ar.stderr));
+        eprintln!(
+            "skipping: ar failed: {}",
+            String::from_utf8_lossy(&ar.stderr)
+        );
         return;
     }
 
@@ -1881,7 +1948,10 @@ fn fetched_archive_member_undefined_reports_member_referrer() {
         .output()
         .unwrap();
     if !ar.status.success() {
-        eprintln!("skipping: ar failed: {}", String::from_utf8_lossy(&ar.stderr));
+        eprintln!(
+            "skipping: ar failed: {}",
+            String::from_utf8_lossy(&ar.stderr)
+        );
         return;
     }
 
@@ -1894,7 +1964,10 @@ fn fetched_archive_member_undefined_reports_member_referrer() {
     let err = Linker::run(&opts).unwrap_err();
     match err {
         LinkError::UndefinedSymbols(msg) => {
-            assert!(msg.contains("undefined symbol: _missing_from_member"), "{msg}");
+            assert!(
+                msg.contains("undefined symbol: _missing_from_member"),
+                "{msg}"
+            );
             assert!(
                 msg.contains(&format!("referenced by {}(", archive.display())),
                 "expected archive-member referrer in:\n{msg}"
@@ -2134,9 +2207,20 @@ fn linker_run_applies_core_arm64_relocations() {
     let add_imm = ((add >> 10) & 0xfff) as u64;
     let reconstructed_target = (adrp_base as u64) + add_imm;
 
-    assert_eq!(reconstructed_target, data_addr, "ADRP+ADD should resolve _target");
-    assert_eq!(branch & 0x03ff_ffff, 0x2, "BL should branch forward 8 bytes");
-    assert_eq!(data_ptr, text_addr + 16, ".quad _helper should point at helper");
+    assert_eq!(
+        reconstructed_target, data_addr,
+        "ADRP+ADD should resolve _target"
+    );
+    assert_eq!(
+        branch & 0x03ff_ffff,
+        0x2,
+        "BL should branch forward 8 bytes"
+    );
+    assert_eq!(
+        data_ptr,
+        text_addr + 16,
+        ".quad _helper should point at helper"
+    );
     assert_eq!(delta, 16, "_helper - _main should fold through SUBTRACTOR");
 
     let _ = fs::remove_file(obj);
@@ -2643,13 +2727,19 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
         decode_page_reference(&text, text_addr, 0, &PageRefKind::Load).unwrap(),
         got_addr
     );
-    assert_eq!(decode_branch_target(&text, text_addr, 8).unwrap(), stubs_addr);
+    assert_eq!(
+        decode_branch_target(&text, text_addr, 8).unwrap(),
+        stubs_addr
+    );
     assert_eq!(
         decode_page_reference(&stubs, stubs_addr, 0, &PageRefKind::Load).unwrap(),
         lazy_addr
     );
     assert_eq!(read_insn(&stubs, 8).unwrap(), 0xd61f0200);
-    assert_eq!(u64::from_le_bytes(lazy[0..8].try_into().unwrap()), helper_addr + 24);
+    assert_eq!(
+        u64::from_le_bytes(lazy[0..8].try_into().unwrap()),
+        helper_addr + 24
+    );
     assert_eq!(
         decode_page_reference(&helper, helper_addr, 0, &PageRefKind::Add).unwrap(),
         dyld_private_addr
@@ -2660,12 +2750,21 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     );
     assert_eq!(read_insn(&helper, 20).unwrap(), 0xd61f0200);
     assert_eq!(read_insn(&helper, 24).unwrap(), 0x1800_0050);
-    assert_eq!(decode_branch_target(&helper, helper_addr, 28).unwrap(), helper_addr);
+    assert_eq!(
+        decode_branch_target(&helper, helper_addr, 28).unwrap(),
+        helper_addr
+    );
     assert_eq!(u32::from_le_bytes(helper[32..36].try_into().unwrap()), 0);
     let (locals, extdefs, undefs) = symbol_partition_names(&bytes);
     assert_eq!(locals, vec!["__dyld_private".to_string()]);
-    assert_eq!(extdefs, vec!["__mh_execute_header".to_string(), "_main".to_string()]);
-    assert_eq!(undefs, vec!["_write".to_string(), "dyld_stub_binder".to_string()]);
+    assert_eq!(
+        extdefs,
+        vec!["__mh_execute_header".to_string(), "_main".to_string()]
+    );
+    assert_eq!(
+        undefs,
+        vec!["_write".to_string(), "dyld_stub_binder".to_string()]
+    );
     assert!(symbol_names.contains(&"__dyld_private"));
     assert!(symbols[dysymtab.iundefsym as usize..]
         .iter()
@@ -2758,7 +2857,10 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
         load_dylib_names(&our_bytes).unwrap(),
         load_dylib_names(&apple_bytes).unwrap()
     );
-    assert_eq!(segment_flags(&our_bytes, "__DATA_CONST"), Some(SG_READ_ONLY));
+    assert_eq!(
+        segment_flags(&our_bytes, "__DATA_CONST"),
+        Some(SG_READ_ONLY)
+    );
     assert_eq!(
         segment_flags(&our_bytes, "__DATA_CONST"),
         segment_flags(&apple_bytes, "__DATA_CONST")
@@ -2766,7 +2868,9 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
 
     let our_rebases = decode_rebase_records(&our_bytes).unwrap();
     let apple_rebases = decode_rebase_records(&apple_bytes).unwrap();
-    assert!(our_rebases.iter().all(|record| record.rebase_type == REBASE_TYPE_POINTER));
+    assert!(our_rebases
+        .iter()
+        .all(|record| record.rebase_type == REBASE_TYPE_POINTER));
     assert_eq!(our_rebases, apple_rebases);
     assert_eq!(
         decode_bind_records(&our_bytes, false).unwrap(),
@@ -2784,7 +2888,10 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
         canonical_lazy_bind_stream(&our_bytes).unwrap(),
         canonical_lazy_bind_stream(&apple_bytes).unwrap()
     );
-    assert_eq!(indirect_symbol_table(&our_bytes), indirect_symbol_table(&apple_bytes));
+    assert_eq!(
+        indirect_symbol_table(&our_bytes),
+        indirect_symbol_table(&apple_bytes)
+    );
 
     let _ = fs::remove_file(apple_out);
     let _ = fs::remove_file(our_out);
@@ -2958,7 +3065,11 @@ fn linker_run_binds_direct_dylib_import_pointers() {
         }),
         "missing direct bind for imported data: {binds:#?}"
     );
-    let verify = Command::new("codesign").arg("-v").arg(&our_out).output().unwrap();
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&our_out)
+        .output()
+        .unwrap();
     assert!(
         verify.status.success(),
         "codesign verify failed: {}",
@@ -3092,11 +3203,9 @@ fn linker_run_rebases_local_absolute_pointers_like_ld() {
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
-    assert!(
-        !dyld_info_stream(&our_bytes, DyldInfoStreamKind::Rebase)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(!dyld_info_stream(&our_bytes, DyldInfoStreamKind::Rebase)
+        .unwrap()
+        .is_empty());
     assert_eq!(
         dyld_info_stream(&our_bytes, DyldInfoStreamKind::Rebase).unwrap(),
         dyld_info_stream(&apple_bytes, DyldInfoStreamKind::Rebase).unwrap()
@@ -3193,8 +3302,14 @@ fn linker_run_partitions_symtab_like_ld() {
     assert_eq!(our_dysymtab.nextdefsym, apple_dysymtab.nextdefsym);
     assert_eq!(our_dysymtab.iundefsym, apple_dysymtab.iundefsym);
     assert_eq!(our_dysymtab.nundefsym, apple_dysymtab.nundefsym);
-    assert_eq!(canonical_symbol_records(&our_bytes), canonical_symbol_records(&apple_bytes));
-    assert_strtab_within_five_percent(&raw_string_table(&our_bytes), &raw_string_table(&apple_bytes));
+    assert_eq!(
+        canonical_symbol_records(&our_bytes),
+        canonical_symbol_records(&apple_bytes)
+    );
+    assert_strtab_within_five_percent(
+        &raw_string_table(&our_bytes),
+        &raw_string_table(&apple_bytes),
+    );
 
     assert_eq!(
         symbol_partition_names(&our_bytes),
@@ -3285,7 +3400,10 @@ fn linker_run_strips_locals_with_x_like_ld() {
     assert_eq!(our_dysymtab.nextdefsym, apple_dysymtab.nextdefsym);
     assert_eq!(our_dysymtab.iundefsym, apple_dysymtab.iundefsym);
     assert_eq!(our_dysymtab.nundefsym, apple_dysymtab.nundefsym);
-    assert_eq!(canonical_symbol_records(&our_bytes), canonical_symbol_records(&apple_bytes));
+    assert_eq!(
+        canonical_symbol_records(&our_bytes),
+        canonical_symbol_records(&apple_bytes)
+    );
 
     let (locals, extdefs, undefs) = symbol_partition_names(&our_bytes);
     assert!(locals.is_empty());
@@ -3329,10 +3447,13 @@ fn linker_run_emits_function_starts_like_ld() {
     let our_out = scratch("function-starts-ours.out");
     let apple_out = scratch("function-starts-apple.out");
     let asm = r#"
-        .text
+        .section __TEXT,__text,regular,pure_instructions
         .globl _main
         .p2align 2
     _main:
+        adrp x0, _write@GOTPAGE
+        ldr x0, [x0, _write@GOTPAGEOFF]
+        bl _write
         ret
         .subsections_via_symbols
     "#;
@@ -3348,7 +3469,7 @@ fn linker_run_emits_function_starts_like_ld() {
         ..LinkOptions::default()
     };
     Linker::run(&opts).unwrap();
-    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+    apple_link_classic_lazy(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
@@ -3357,13 +3478,18 @@ fn linker_run_emits_function_starts_like_ld() {
     assert_ne!(our_fstarts.0, 0);
     assert_eq!(our_fstarts.1, apple_fstarts.1);
     assert_eq!(our_fstarts.1, 8);
+    assert!(output_section(&our_bytes, "__TEXT", "__stubs").is_some());
+    assert!(output_section(&our_bytes, "__TEXT", "__stub_helper").is_some());
     assert_eq!(decode_function_starts(&our_bytes).len(), 1);
     assert_eq!(decode_function_starts(&apple_bytes).len(), 1);
     let our_text_addr = output_section(&our_bytes, "__TEXT", "__text").unwrap().0;
     let apple_text_addr = output_section(&apple_bytes, "__TEXT", "__text").unwrap().0;
     let our_text_base = segment_vmaddr(&our_bytes, "__TEXT").unwrap();
     let apple_text_base = segment_vmaddr(&apple_bytes, "__TEXT").unwrap();
-    assert_eq!(decode_function_starts(&our_bytes), vec![our_text_addr - our_text_base]);
+    assert_eq!(
+        decode_function_starts(&our_bytes),
+        vec![our_text_addr - our_text_base]
+    );
     assert_eq!(
         decode_function_starts(&apple_bytes),
         vec![apple_text_addr - apple_text_base]
@@ -3404,9 +3530,8 @@ fn linker_run_dedups_output_strtab_like_ld() {
     let obj = scratch("strtab-dedup.o");
     let our_out = scratch("strtab-dedup-ours.out");
     let apple_out = scratch("strtab-dedup-apple.out");
-    let mut asm = String::from(
-        "        .text\n        .globl _afs_array_sum\n        .globl _main\n",
-    );
+    let mut asm =
+        String::from("        .text\n        .globl _afs_array_sum\n        .globl _main\n");
     for idx in 0..20 {
         let symbol = format!("_pad_symbol_{idx:02}");
         asm.push_str(&format!("        .globl {symbol}\n"));
@@ -3436,7 +3561,10 @@ fn linker_run_dedups_output_strtab_like_ld() {
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
-    assert_eq!(canonical_symbol_records(&our_bytes), canonical_symbol_records(&apple_bytes));
+    assert_eq!(
+        canonical_symbol_records(&our_bytes),
+        canonical_symbol_records(&apple_bytes)
+    );
     let our_strtab = raw_string_table(&our_bytes);
     let apple_strtab = raw_string_table(&apple_bytes);
     assert_strtab_within_five_percent(&our_strtab, &apple_strtab);
@@ -3500,7 +3628,11 @@ fn linker_run_launches_with_classic_lazy_dylib_import() {
     };
     Linker::run(&opts).unwrap();
 
-    let verify = Command::new("codesign").arg("-v").arg(&out).output().unwrap();
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&out)
+        .output()
+        .unwrap();
     assert!(
         verify.status.success(),
         "codesign verify failed: {}",
@@ -3567,8 +3699,14 @@ fn linker_run_handles_local_tlv_descriptors() {
     assert!(output_section(&bytes, "__DATA", "__thread_ptrs").is_none());
     assert_eq!(thread_vars.len(), 48);
     assert_eq!(thread_data.len(), 8);
-    assert_eq!(u64::from_le_bytes(thread_vars[16..24].try_into().unwrap()), 0);
-    assert_eq!(u64::from_le_bytes(thread_vars[40..48].try_into().unwrap()), 8);
+    assert_eq!(
+        u64::from_le_bytes(thread_vars[16..24].try_into().unwrap()),
+        0
+    );
+    assert_eq!(
+        u64::from_le_bytes(thread_vars[40..48].try_into().unwrap()),
+        8
+    );
 
     let binds = decode_bind_records(&bytes, false).unwrap();
     let mut tlv_binds: Vec<_> = binds
@@ -3597,7 +3735,11 @@ fn linker_run_handles_local_tlv_descriptors() {
         .collect();
     assert!(symbol_names.contains(&"__tlv_bootstrap"));
 
-    let verify = Command::new("codesign").arg("-v").arg(&out).output().unwrap();
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&out)
+        .output()
+        .unwrap();
     assert!(
         verify.status.success(),
         "codesign verify failed: {}",
@@ -3717,15 +3859,26 @@ fn linker_run_routes_imported_tlv_through_got() {
         decode_bind_records(&our_bytes, false).unwrap(),
         decode_bind_records(&apple_bytes, false).unwrap()
     );
-    assert_eq!(load_dylib_names(&our_bytes).unwrap(), load_dylib_names(&apple_bytes).unwrap());
-    let verify = Command::new("codesign").arg("-v").arg(&our_out).output().unwrap();
+    assert_eq!(
+        load_dylib_names(&our_bytes).unwrap(),
+        load_dylib_names(&apple_bytes).unwrap()
+    );
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&our_out)
+        .output()
+        .unwrap();
     assert!(
         verify.status.success(),
         "codesign verify failed: {}",
         String::from_utf8_lossy(&verify.stderr)
     );
     let status = Command::new(&our_out).status().unwrap();
-    assert_eq!(status.code(), Some(0), "expected imported TLV executable to exit 0");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "expected imported TLV executable to exit 0"
+    );
 
     let _ = fs::remove_file(dylib);
     let _ = fs::remove_file(obj);

@@ -8,27 +8,28 @@ use std::path::PathBuf;
 
 use crate::atom::AtomTable;
 use crate::input::ObjectFile;
-use crate::leb::write_uleb;
 use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
+use crate::leb::write_uleb;
 use crate::macho::constants::*;
-use crate::macho::exports::{ExportEntry, ExportKind};
 use crate::macho::dylib::DylibDependency;
+use crate::macho::exports::{ExportEntry, ExportKind};
 use crate::macho::reader::{
-    write_commands, write_header, BuildVersionCmd, BuildTool, DyldInfoCmd, DysymtabCmd,
-    DylibCmd, LinkEditDataCmd, LoadCommand, MachHeader64, Section64Header, Segment64, SymtabCmd,
-    HEADER_SIZE,
+    write_commands, write_header, BuildTool, BuildVersionCmd, DyldInfoCmd, DylibCmd, DysymtabCmd,
+    LinkEditDataCmd, LoadCommand, MachHeader64, Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
 };
+use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
 use crate::resolve::InputId;
 use crate::resolve::{Symbol, SymbolId, SymbolTable};
-use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
 use crate::section::is_executable;
 use crate::string_table::StringTableBuilder;
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind};
-use crate::synth::stubs::{STUB_HELPER_ENTRY_SIZE, STUB_HELPER_HEADER_SIZE, STUB_SIZE};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::{
     code_sig::CodeSignaturePlan,
-    dyld_info::{build_export_trie, emit_bind_records, emit_lazy_bind_record, emit_rebase_run, BindRecordSpec, OpcodeStream},
+    dyld_info::{
+        build_export_trie, emit_bind_records, emit_lazy_bind_record, emit_rebase_run,
+        BindRecordSpec, OpcodeStream,
+    },
     SyntheticPlan,
 };
 use crate::{LinkOptions, OutputKind};
@@ -65,8 +66,12 @@ impl fmt::Display for WriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WriteError::MissingSegment(name) => write!(f, "missing output segment `{name}`"),
-            WriteError::OffsetTooLarge(what) => write!(f, "{what} exceeds 32-bit Mach-O field width"),
-            WriteError::EntryAtomMissing(atom) => write!(f, "entry atom {:?} missing from layout", atom),
+            WriteError::OffsetTooLarge(what) => {
+                write!(f, "{what} exceeds 32-bit Mach-O field width")
+            }
+            WriteError::EntryAtomMissing(atom) => {
+                write!(f, "entry atom {:?} missing from layout", atom)
+            }
             WriteError::DefinedSymbolAtomMissing(symbol, atom) => write!(
                 f,
                 "defined symbol {:?} points at missing atom {:?} in final layout",
@@ -81,13 +86,25 @@ impl fmt::Display for WriteError {
                 write!(f, "direct bind atom {:?} missing from layout", atom)
             }
             WriteError::DirectBindSectionMissing(atom) => {
-                write!(f, "direct bind atom {:?} is not inside an output section", atom)
+                write!(
+                    f,
+                    "direct bind atom {:?} is not inside an output section",
+                    atom
+                )
             }
             WriteError::ImportSymbolMissing(symbol) => {
-                write!(f, "synthetic import symbol {:?} missing from symbol table", symbol)
+                write!(
+                    f,
+                    "synthetic import symbol {:?} missing from symbol table",
+                    symbol
+                )
             }
             WriteError::ImportSymbolWrongKind(symbol) => {
-                write!(f, "synthetic import symbol {:?} is not a dylib import", symbol)
+                write!(
+                    f,
+                    "synthetic import symbol {:?} is not a dylib import",
+                    symbol
+                )
             }
             WriteError::MalformedRelocations(path, section, detail) => write!(
                 f,
@@ -138,13 +155,7 @@ pub fn finalize_layout_with_linkedit(
     dylibs: &[DylibDependency],
     context: LinkEditContext<'_>,
 ) -> Result<(Layout, LinkEditPlan), WriteError> {
-    finalize_with_linkedit(
-        layout,
-        kind,
-        opts,
-        dylibs,
-        Some(LinkEditInputs(context)),
-    )
+    finalize_with_linkedit(layout, kind, opts, dylibs, Some(LinkEditInputs(context)))
 }
 
 fn finalize_with_linkedit(
@@ -204,14 +215,7 @@ pub fn write_finalized_with_linkedit(
         .segment("__LINKEDIT")
         .cloned()
         .ok_or(WriteError::MissingSegment("__LINKEDIT"))?;
-    let commands = build_commands(
-        layout,
-        kind,
-        opts,
-        entry_point,
-        dylibs,
-        linkedit_plan,
-    )?;
+    let commands = build_commands(layout, kind, opts, entry_point, dylibs, linkedit_plan)?;
 
     let sizeofcmds: u32 = commands.iter().map(LoadCommand::cmdsize).sum();
     let header = MachHeader64 {
@@ -319,7 +323,10 @@ fn build_commands(
 ) -> Result<Vec<LoadCommand>, WriteError> {
     let mut commands = Vec::new();
     for segment in &layout.segments {
-        commands.push(LoadCommand::Segment64(segment_command(layout, segment.name.as_str())?));
+        commands.push(LoadCommand::Segment64(segment_command(
+            layout,
+            segment.name.as_str(),
+        )?));
     }
 
     commands.push(LoadCommand::BuildVersion(BuildVersionCmd {
@@ -626,7 +633,12 @@ fn build_linkedit_plan(
             function_starts_bytes: Vec::new(),
             data_in_code_bytes: Vec::new(),
             strtab_bytes: vec![0; 8],
-            code_signature: Some(build_code_signature(layout, kind, opts, base_off as u64 + 8)?),
+            code_signature: Some(build_code_signature(
+                layout,
+                kind,
+                opts,
+                base_off as u64 + 8,
+            )?),
             indirect_starts: HashMap::new(),
             lazy_bind_offsets: HashMap::new(),
         });
@@ -635,8 +647,10 @@ fn build_linkedit_plan(
     let synthetic_plan = inputs.0.synthetic_plan;
 
     let imports = collect_imports(sym_table, synthetic_plan)?;
-    let import_lookup: HashMap<SymbolId, &ImportSymbolRecord> =
-        imports.iter().map(|record| (record.symbol, record)).collect();
+    let import_lookup: HashMap<SymbolId, &ImportSymbolRecord> = imports
+        .iter()
+        .map(|record| (record.symbol, record))
+        .collect();
     let symbol_plan = build_output_symbols(layout, kind, opts.strip_locals, inputs, &imports)?;
 
     let mut symtab_bytes = Vec::new();
@@ -685,7 +699,7 @@ fn build_linkedit_plan(
     let weak_bind_bytes = pad_dyld_info_stream(bind_streams.weak_bind);
     let lazy_bind_bytes = pad_dyld_info_stream(bind_streams.lazy_bind);
     let export_bytes = pad_dyld_info_stream(build_export_trie(&symbol_plan.exports));
-    let function_starts_bytes = build_function_starts(layout)?;
+    let function_starts_bytes = build_function_starts(layout, inputs.0.atom_table)?;
     let data_in_code_bytes = Vec::new();
 
     let mut cursor = base_off as u64;
@@ -852,7 +866,9 @@ fn build_rebase_stream(
     let mut idx = 0usize;
     while idx < sites.len() {
         let segment_index = sites[idx].segment_index;
-        out.byte(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segment_index & REBASE_IMMEDIATE_MASK));
+        out.byte(
+            REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segment_index & REBASE_IMMEDIATE_MASK),
+        );
         out.uleb(sites[idx].segment_offset);
         let mut cursor = sites[idx].segment_offset;
         while idx < sites.len() && sites[idx].segment_index == segment_index {
@@ -988,11 +1004,7 @@ fn relocs_for_rebase<'a>(
     })
 }
 
-fn reloc_needs_rebase(
-    obj: &ObjectFile,
-    reloc: Reloc,
-    sym_table: &SymbolTable,
-) -> bool {
+fn reloc_needs_rebase(obj: &ObjectFile, reloc: Reloc, sym_table: &SymbolTable) -> bool {
     if reloc.kind != RelocKind::Unsigned
         || reloc.length != RelocLength::Quad
         || reloc.pcrel
@@ -1031,7 +1043,7 @@ fn symbol_referent_id(
     Some(symbol_id)
 }
 
-fn build_function_starts(layout: &Layout) -> Result<Vec<u8>, WriteError> {
+fn build_function_starts(layout: &Layout, atom_table: &AtomTable) -> Result<Vec<u8>, WriteError> {
     let image_base = layout
         .segment("__TEXT")
         .ok_or(WriteError::MissingSegment("__TEXT"))?
@@ -1039,37 +1051,17 @@ fn build_function_starts(layout: &Layout) -> Result<Vec<u8>, WriteError> {
     let mut starts = Vec::new();
 
     for section in &layout.sections {
-        if section.segment != "__TEXT" || !is_executable(section.kind) {
+        if section.segment != "__TEXT" || section.name != "__text" || !is_executable(section.kind) {
             continue;
         }
         for placed in &section.atoms {
             starts.push(section.addr + placed.offset - image_base);
-        }
-        match section.name.as_str() {
-            "__stubs" => {
-                for idx in 0..(section.synthetic_data.len() / STUB_SIZE as usize) {
-                    starts.push(section.addr + idx as u64 * STUB_SIZE as u64 - image_base);
-                }
+            let atom = atom_table.get(placed.atom);
+            for alt in &atom.alt_entries {
+                starts.push(
+                    section.addr + placed.offset + alt.offset_within_atom as u64 - image_base,
+                );
             }
-            "__stub_helper" => {
-                if !section.synthetic_data.is_empty() {
-                    starts.push(section.addr - image_base);
-                    let entry_count = section
-                        .synthetic_data
-                        .len()
-                        .saturating_sub(STUB_HELPER_HEADER_SIZE as usize)
-                        / STUB_HELPER_ENTRY_SIZE as usize;
-                    for idx in 0..entry_count {
-                        starts.push(
-                            section.addr
-                                + STUB_HELPER_HEADER_SIZE as u64
-                                + idx as u64 * STUB_HELPER_ENTRY_SIZE as u64
-                                - image_base,
-                        );
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -1259,7 +1251,13 @@ fn build_output_symbols(
             .map(|spec| ExportEntry {
                 name: spec.name.clone(),
                 flags: export_symbol_flags(layout, spec.n_desc, spec.n_type, spec.n_sect),
-                kind: export_symbol_kind(layout, image_base, spec.n_type, spec.n_sect, spec.n_value),
+                kind: export_symbol_kind(
+                    layout,
+                    image_base,
+                    spec.n_type,
+                    spec.n_sect,
+                    spec.n_value,
+                ),
             })
             .collect()
     } else {
@@ -1379,17 +1377,28 @@ fn collect_local_symbols(
         }
         match input_sym.kind() {
             SymKind::Sect => {
-                let section = object.section_for_symbol(input_sym).expect("section symbol without section");
+                let section = object
+                    .section_for_symbol(input_sym)
+                    .expect("section symbol without section");
                 let offset = input_sym.value().saturating_sub(section.addr) as u32;
-                let (atom_id, delta) = find_containing_atom(atom_table, input_id, input_sym.sect_idx(), offset)
-                    .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
-                let addr = layout
-                    .atom_addr(atom_id)
-                    .ok_or(WriteError::DefinedSymbolAtomMissing(SymbolId(u32::MAX), atom_id))?
-                    + delta as u64;
-                let n_sect = *atom_sections
-                    .get(&atom_id)
-                    .ok_or(WriteError::DefinedSymbolSectionMissing(SymbolId(u32::MAX), atom_id))?;
+                let (atom_id, delta) =
+                    find_containing_atom(atom_table, input_id, input_sym.sect_idx(), offset)
+                        .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
+                let addr =
+                    layout
+                        .atom_addr(atom_id)
+                        .ok_or(WriteError::DefinedSymbolAtomMissing(
+                            SymbolId(u32::MAX),
+                            atom_id,
+                        ))?
+                        + delta as u64;
+                let n_sect =
+                    *atom_sections
+                        .get(&atom_id)
+                        .ok_or(WriteError::DefinedSymbolSectionMissing(
+                            SymbolId(u32::MAX),
+                            atom_id,
+                        ))?;
                 out.push(OutputSymbolSpec {
                     symbol: None,
                     name,
@@ -1807,21 +1816,51 @@ fn u32_fit(value: u64, what: &'static str) -> Result<u32, WriteError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::atom::{AltEntry, Atom, AtomFlags, AtomSection, AtomTable};
     use crate::layout::{Layout, PAGE_SIZE};
+    use crate::leb::read_uleb;
+    use crate::resolve::{AtomId, InputId, SymbolId};
+    use crate::section::{
+        OutputAtom, OutputSection, OutputSectionId, OutputSegment, Prot, SectionKind,
+    };
 
     use super::*;
+
+    fn decode_function_starts_blob(blob: &[u8]) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut cursor = 0usize;
+        let mut current = 0u64;
+        while cursor < blob.len() {
+            let (delta, used) = read_uleb(&blob[cursor..]).unwrap();
+            cursor += used;
+            if delta == 0 {
+                break;
+            }
+            current += delta;
+            out.push(current);
+        }
+        out
+    }
 
     #[test]
     fn minimal_executable_writes_parseable_header() {
         let layout = Layout::empty(OutputKind::Executable, 0);
         let mut bytes = Vec::new();
-        write(&layout, OutputKind::Executable, &LinkOptions::default(), &mut bytes).unwrap();
+        write(
+            &layout,
+            OutputKind::Executable,
+            &LinkOptions::default(),
+            &mut bytes,
+        )
+        .unwrap();
 
         let header = crate::macho::reader::parse_header(&bytes).unwrap();
         let commands = crate::macho::reader::parse_commands(&header, &bytes).unwrap();
         assert_eq!(header.filetype, MH_EXECUTE);
         assert!(
-            commands.iter().any(|cmd| matches!(cmd, LoadCommand::Raw { cmd, .. } if *cmd == LC_MAIN)),
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd, LoadCommand::Raw { cmd, .. } if *cmd == LC_MAIN)),
             "expected LC_MAIN in {commands:?}"
         );
         assert!(bytes.len() >= HEADER_SIZE);
@@ -1852,7 +1891,13 @@ mod tests {
     fn linkedit_starts_on_page_boundary_after_text() {
         let layout = Layout::empty(OutputKind::Executable, 0);
         let mut bytes = Vec::new();
-        write(&layout, OutputKind::Executable, &LinkOptions::default(), &mut bytes).unwrap();
+        write(
+            &layout,
+            OutputKind::Executable,
+            &LinkOptions::default(),
+            &mut bytes,
+        )
+        .unwrap();
 
         let header = crate::macho::reader::parse_header(&bytes).unwrap();
         let commands = crate::macho::reader::parse_commands(&header, &bytes).unwrap();
@@ -1879,7 +1924,13 @@ mod tests {
     fn text_only_executable_omits_empty_data_segments() {
         let layout = Layout::empty(OutputKind::Executable, 0);
         let mut bytes = Vec::new();
-        write(&layout, OutputKind::Executable, &LinkOptions::default(), &mut bytes).unwrap();
+        write(
+            &layout,
+            OutputKind::Executable,
+            &LinkOptions::default(),
+            &mut bytes,
+        )
+        .unwrap();
 
         let header = crate::macho::reader::parse_header(&bytes).unwrap();
         let commands = crate::macho::reader::parse_commands(&header, &bytes).unwrap();
@@ -1895,5 +1946,99 @@ mod tests {
         assert!(segment_names.iter().any(|name| name == "__LINKEDIT"));
         assert!(!segment_names.iter().any(|name| name == "__DATA_CONST"));
         assert!(!segment_names.iter().any(|name| name == "__DATA"));
+    }
+
+    #[test]
+    fn function_starts_use_text_atoms_and_alt_entries_only() {
+        let mut atoms = AtomTable::new();
+        let atom_id = atoms.push(Atom {
+            id: AtomId(0),
+            origin: InputId(1),
+            input_section: 1,
+            section: AtomSection::Text,
+            input_offset: 0,
+            size: 16,
+            align_pow2: 2,
+            owner: None,
+            alt_entries: vec![AltEntry {
+                symbol: SymbolId(1),
+                offset_within_atom: 8,
+            }],
+            data: vec![0; 16],
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        });
+        let layout = Layout {
+            kind: OutputKind::Executable,
+            segments: vec![OutputSegment {
+                name: "__TEXT".into(),
+                sections: vec![OutputSectionId(0), OutputSectionId(1), OutputSectionId(2)],
+                vm_addr: 0x1_0000_0000,
+                vm_size: 0x4000,
+                file_off: 0,
+                file_size: 0x4000,
+                init_prot: Prot::READ_EXECUTE,
+                max_prot: Prot::READ_EXECUTE,
+                flags: 0,
+            }],
+            sections: vec![
+                OutputSection {
+                    segment: "__TEXT".into(),
+                    name: "__text".into(),
+                    kind: SectionKind::Text,
+                    align_pow2: 2,
+                    flags: 0,
+                    reserved1: 0,
+                    reserved2: 0,
+                    reserved3: 0,
+                    atoms: vec![OutputAtom {
+                        atom: atom_id,
+                        offset: 0,
+                        size: 16,
+                        data: vec![0; 16],
+                    }],
+                    synthetic_offset: 0,
+                    synthetic_data: Vec::new(),
+                    addr: 0x1_0000_1000,
+                    size: 16,
+                    file_off: 0x1000,
+                },
+                OutputSection {
+                    segment: "__TEXT".into(),
+                    name: "__stubs".into(),
+                    kind: SectionKind::SymbolStubs,
+                    align_pow2: 2,
+                    flags: 0,
+                    reserved1: 0,
+                    reserved2: 0,
+                    reserved3: 0,
+                    atoms: Vec::new(),
+                    synthetic_offset: 0,
+                    synthetic_data: vec![0; 12],
+                    addr: 0x1_0000_1010,
+                    size: 12,
+                    file_off: 0x1010,
+                },
+                OutputSection {
+                    segment: "__TEXT".into(),
+                    name: "__stub_helper".into(),
+                    kind: SectionKind::Text,
+                    align_pow2: 2,
+                    flags: 0,
+                    reserved1: 0,
+                    reserved2: 0,
+                    reserved3: 0,
+                    atoms: Vec::new(),
+                    synthetic_offset: 0,
+                    synthetic_data: vec![0; 36],
+                    addr: 0x1_0000_101c,
+                    size: 36,
+                    file_off: 0x101c,
+                },
+            ],
+        };
+
+        let blob = build_function_starts(&layout, &atoms).unwrap();
+        assert_eq!(decode_function_starts_blob(&blob), vec![0x1000, 0x1008]);
     }
 }

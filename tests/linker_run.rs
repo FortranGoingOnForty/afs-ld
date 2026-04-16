@@ -515,32 +515,6 @@ struct DataInCodeRecord {
     kind: u16,
 }
 
-fn normalized_unwind_words(bytes: &[u8]) -> Vec<u32> {
-    let (_, unwind) = output_section(bytes, "__TEXT", "__unwind_info").unwrap();
-    let decoded = decode_unwind_info(&unwind).unwrap();
-    let mut words: Vec<u32> = unwind
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect();
-    if words.len() < 7 {
-        return words;
-    }
-    let indices_offset_words = words[5] as usize / 4;
-    let indices_count = words[6] as usize;
-    if indices_count == 0 || words.len() < indices_offset_words + indices_count * 3 {
-        return words;
-    }
-    let base = words[indices_offset_words];
-    for idx in 0..indices_count {
-        let word = indices_offset_words + idx * 3;
-        words[word] = words[word].saturating_sub(base);
-    }
-    if !decoded.records.is_empty() {
-        assert_eq!(decoded.records[0].function_offset, base);
-    }
-    words
-}
-
 fn rebased_unwind_bytes(bytes: &[u8]) -> Vec<u8> {
     let header_base = segment_vmaddr(bytes, "__TEXT").unwrap_or(0);
     let text_base = output_section(bytes, "__TEXT", "__text").unwrap().0 - header_base;
@@ -4119,8 +4093,8 @@ fn linker_run_emits_backtrace_metadata_like_apple_ld() {
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
     assert_eq!(
-        normalized_unwind_words(&our_bytes),
-        normalized_unwind_words(&apple_bytes)
+        rebased_unwind_bytes(&our_bytes),
+        rebased_unwind_bytes(&apple_bytes)
     );
     assert_eq!(
         normalize_function_start_offsets(&decode_function_starts(&our_bytes)),

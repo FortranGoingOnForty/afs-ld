@@ -64,6 +64,20 @@ fn sdk_version() -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+fn find_runtime_archive() -> Option<PathBuf> {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    for profile in ["debug", "release"] {
+        let candidate = workspace
+            .join("target")
+            .join(profile)
+            .join("libarmfortas_rt.a");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn have_xcrun_tool(tool: &str) -> bool {
     Command::new("xcrun")
         .arg("-f")
@@ -244,6 +258,28 @@ fn segment_vmaddr(bytes: &[u8], segname: &str) -> Option<u64> {
         }
     }
     None
+}
+
+fn symbol_values(bytes: &[u8]) -> HashMap<String, u64> {
+    let header = parse_header(bytes).unwrap();
+    let commands = parse_commands(&header, bytes).unwrap();
+    let symtab = commands
+        .iter()
+        .find_map(|cmd| match cmd {
+            LoadCommand::Symtab(cmd) => Some(*cmd),
+            _ => None,
+        })
+        .unwrap();
+    let symbols = parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).unwrap();
+    let strings = StringTable::from_file(bytes, symtab.stroff, symtab.strsize).unwrap();
+    let mut out = HashMap::new();
+    for symbol in symbols {
+        let Ok(name) = strings.get(symbol.strx()) else {
+            continue;
+        };
+        out.insert(name.to_string(), symbol.value());
+    }
+    out
 }
 
 fn symtab_and_dysymtab(
@@ -5152,4 +5188,113 @@ fn linker_run_routes_imported_tlv_through_got() {
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+    let Some(runtime) = find_runtime_archive() else {
+        eprintln!("skipping: libarmfortas_rt.a not built");
+        return;
+    };
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: no macOS SDK path");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("runtime-hello.o");
+    let out = scratch("runtime-hello.out");
+    let src = r#"
+        extern void afs_program_init(void);
+        extern void afs_program_finalize(void);
+        extern void afs_write_string(const char *, long);
+        extern void afs_write_newline(void);
+
+        int main(void) {
+            afs_program_init();
+            afs_write_string("Hello, World!", 13);
+            afs_write_newline();
+            afs_program_finalize();
+            return 0;
+        }
+    "#;
+    if let Err(e) = compile_c(src, &obj) {
+        eprintln!("skipping: compile failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), runtime.clone(), tbd],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    let bytes = fs::read(&out).unwrap();
+    let (thread_vars_addr, thread_vars) =
+        output_section(&bytes, "__DATA", "__thread_vars").unwrap();
+    let (thread_data_addr, _) = output_section(&bytes, "__DATA", "__thread_data").unwrap();
+    let symbols = symbol_values(&bytes);
+    let tlv_binds: Vec<_> = decode_bind_records(&bytes, false)
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.section == "__thread_vars")
+        .collect();
+    assert_eq!(
+        tlv_binds.len(),
+        thread_vars.len() / 24,
+        "every TLV descriptor should carry exactly one bootstrap bind"
+    );
+    assert!(tlv_binds.iter().all(|record| record.symbol == "__tlv_bootstrap"));
+
+    for (name, descriptor_addr) in symbols.iter().filter(|(name, value)| {
+        !name.ends_with("$tlv$init")
+            && **value >= thread_vars_addr
+            && **value < thread_vars_addr + thread_vars.len() as u64
+    }) {
+        let init_name = format!("{name}$tlv$init");
+        let Some(init_addr) = symbols.get(&init_name) else {
+            continue;
+        };
+        let offset = (*descriptor_addr - thread_vars_addr) as usize;
+        let actual = u64::from_le_bytes(thread_vars[offset + 16..offset + 24].try_into().unwrap());
+        let expected = init_addr - thread_data_addr;
+        assert_eq!(
+            actual, expected,
+            "TLV descriptor {} should point at {} via template offset",
+            name, init_name
+        );
+    }
+
+    let output = Command::new(&out).output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "expected runtime hello executable to exit 0, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "Hello, World!\n");
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
 }

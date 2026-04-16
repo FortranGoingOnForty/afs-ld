@@ -42,7 +42,9 @@ impl std::error::Error for RelocError {}
 
 struct ResolveView<'a> {
     sym_table: &'a SymbolTable,
+    atom_table: &'a AtomTable,
     atom_addrs: &'a HashMap<crate::resolve::AtomId, u64>,
+    atoms_by_input_section: &'a HashMap<(InputId, u8), Vec<crate::resolve::AtomId>>,
     section_addrs: &'a HashMap<(InputId, u8), u64>,
     stub_addrs: &'a HashMap<SymbolId, u64>,
     got_addrs: &'a HashMap<SymbolId, u64>,
@@ -104,11 +106,14 @@ pub fn apply_layout(
     }
 
     let atom_addrs = atom_address_map(layout);
+    let atoms_by_input_section = atoms.by_input_section();
     let section_addrs = input_section_address_map(layout, atoms);
     let synth_addrs = synthetic_address_maps(layout, synthetic_plan);
     let resolve = ResolveView {
         sym_table,
+        atom_table: atoms,
         atom_addrs: &atom_addrs,
+        atoms_by_input_section: &atoms_by_input_section,
         section_addrs: &section_addrs,
         stub_addrs: &synth_addrs.stub_addrs,
         got_addrs: &synth_addrs.got_addrs,
@@ -145,7 +150,14 @@ pub fn apply_layout(
     }
 
     if let Some(plan) = synthetic_plan {
-        synthesize_thread_variable_section(layout, plan)?;
+        synthesize_thread_variable_section(
+            layout,
+            plan,
+            atoms,
+            &input_map,
+            &reloc_cache,
+            &resolve,
+        )?;
         synthesize_got_section(layout, plan, &resolve)?;
         synthesize_stub_section(layout, plan, &resolve)?;
         synthesize_lazy_pointer_section(layout, plan, &resolve)?;
@@ -619,6 +631,17 @@ fn resolve_input_symbol(
     input_sym: &InputSymbol,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
+    resolve_input_symbol_at_origin(atom.origin, obj, atom, kind, input_sym, resolve)
+}
+
+fn resolve_input_symbol_at_origin(
+    origin: InputId,
+    obj: &ObjectFile,
+    atom: &Atom,
+    kind: RelocKind,
+    input_sym: &InputSymbol,
+    resolve: &ResolveView<'_>,
+) -> Result<u64, RelocError> {
     match input_sym.kind() {
         SymKind::Abs => Ok(input_sym.value()),
         SymKind::Sect => {
@@ -632,21 +655,17 @@ fn resolve_input_symbol(
                     "section-backed symbol did not resolve to an input section".to_string(),
                 )
             })?;
-            let section_addr = resolve
-                .section_addrs
-                .get(&(atom.origin, input_sym.sect_idx()))
-                .copied()
-                .ok_or_else(|| {
-                    reloc_error(
-                        atom,
-                        &obj.path,
-                        0,
-                        kind,
-                        &describe_input_symbol(obj, input_sym),
-                        "section-backed symbol's output section is missing".to_string(),
-                    )
-                })?;
-            Ok(section_addr + input_sym.value().saturating_sub(section.addr))
+            let section_offset = input_sym.value().saturating_sub(section.addr) as u32;
+            resolve_input_section_offset(
+                origin,
+                obj,
+                atom,
+                kind,
+                input_sym.sect_idx(),
+                section_offset,
+                &describe_input_symbol(obj, input_sym),
+                resolve,
+            )
         }
         SymKind::Undef => Err(reloc_error(
             atom,
@@ -665,6 +684,65 @@ fn resolve_input_symbol(
             "indirect symbol relocations are not yet implemented".to_string(),
         )),
     }
+}
+
+fn resolve_input_section_offset(
+    origin: InputId,
+    obj: &ObjectFile,
+    atom: &Atom,
+    kind: RelocKind,
+    input_section: u8,
+    input_offset: u32,
+    referent: &str,
+    resolve: &ResolveView<'_>,
+) -> Result<u64, RelocError> {
+    if let Some(atom_ids) = resolve.atoms_by_input_section.get(&(origin, input_section)) {
+        if let Some((target_atom, delta)) = atom_ids.iter().find_map(|atom_id| {
+            let candidate = resolve.atom_table.get(*atom_id);
+            let start = candidate.input_offset;
+            let end = candidate.input_offset.saturating_add(candidate.size);
+            if start <= input_offset && input_offset < end {
+                Some((*atom_id, input_offset - start))
+            } else if input_offset == end {
+                Some((*atom_id, candidate.size))
+            } else {
+                None
+            }
+        }) {
+            let atom_addr = resolve
+                .atom_addrs
+                .get(&target_atom)
+                .copied()
+                .ok_or_else(|| {
+                    reloc_error(
+                        atom,
+                        &obj.path,
+                        0,
+                        kind,
+                        referent,
+                        "section-backed symbol's containing atom is missing a final address"
+                            .to_string(),
+                    )
+                })?;
+            return Ok(atom_addr + delta as u64);
+        }
+    }
+
+    let section_addr = resolve
+        .section_addrs
+        .get(&(origin, input_section))
+        .copied()
+        .ok_or_else(|| {
+            reloc_error(
+                atom,
+                &obj.path,
+                0,
+                kind,
+                referent,
+                "section-backed symbol's output section is missing".to_string(),
+            )
+        })?;
+    Ok(section_addr + input_offset as u64)
 }
 
 fn patch_unsigned(
@@ -1040,6 +1118,10 @@ fn patch_tlvp_pageoff12(
 fn synthesize_thread_variable_section(
     layout: &mut Layout,
     plan: &SyntheticPlan,
+    atoms: &AtomTable,
+    input_map: &HashMap<InputId, &ObjectFile>,
+    reloc_cache: &HashMap<(InputId, u8), Vec<Reloc>>,
+    resolve: &ResolveView<'_>,
 ) -> Result<(), RelocError> {
     let Some(_bootstrap_symbol) = plan.tlv_bootstrap_symbol else {
         return Ok(());
@@ -1068,6 +1150,19 @@ fn synthesize_thread_variable_section(
     };
 
     for placed in &mut section.atoms {
+        let atom = atoms.get(placed.atom);
+        let obj = input_map.get(&atom.origin).ok_or_else(|| RelocError {
+            input: PathBuf::from("<missing object>"),
+            atom: placed.atom,
+            atom_offset: 0,
+            kind: RelocKind::Unsigned,
+            referent: "__thread_vars".to_string(),
+            detail: "missing parsed object for TLV descriptor atom".to_string(),
+        })?;
+        let relocs = reloc_cache
+            .get(&(atom.origin, atom.input_section))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         if placed.size % THREAD_VARIABLE_DESCRIPTOR_SIZE as u64 != 0 {
             return Err(RelocError {
                 input: PathBuf::from("<synthetic tlv>"),
@@ -1085,6 +1180,7 @@ fn synthesize_thread_variable_section(
         for descriptor_offset in
             (0..placed.size as usize).step_by(THREAD_VARIABLE_DESCRIPTOR_SIZE as usize)
         {
+            let descriptor_offset_u32 = descriptor_offset as u32;
             let start = descriptor_offset;
             let end = start + THREAD_VARIABLE_DESCRIPTOR_SIZE as usize;
             let descriptor = placed.data.get_mut(start..end).ok_or_else(|| RelocError {
@@ -1097,11 +1193,15 @@ fn synthesize_thread_variable_section(
             })?;
 
             descriptor[0..8].fill(0);
-            let init_addr = u64::from_le_bytes(
-                descriptor[16..24]
-                    .try_into()
-                    .expect("8-byte descriptor tail"),
-            );
+            let init_addr = resolve_tlv_init_address(
+                descriptor,
+                atom,
+                obj,
+                relocs,
+                descriptor_offset_u32,
+                input_map,
+                resolve,
+            )?;
             if init_addr < template_base {
                 return Err(RelocError {
                     input: PathBuf::from("<synthetic tlv>"),
@@ -1120,6 +1220,123 @@ fn synthesize_thread_variable_section(
     }
 
     Ok(())
+}
+
+fn resolve_tlv_init_address(
+    descriptor: &[u8],
+    atom: &Atom,
+    obj: &ObjectFile,
+    relocs: &[Reloc],
+    descriptor_offset: u32,
+    input_map: &HashMap<InputId, &ObjectFile>,
+    resolve: &ResolveView<'_>,
+) -> Result<u64, RelocError> {
+    for owner in descriptor_owner_symbols(obj, atom, descriptor_offset) {
+        if let Some(init_addr) = resolve_named_tlv_init(owner, atom, input_map, resolve)? {
+            return Ok(init_addr);
+        }
+    }
+
+    let field_offset = atom.input_offset + descriptor_offset + 16;
+    if let Some(reloc) = relocs_for_atom(relocs, atom).find(|reloc| reloc.offset == field_offset) {
+        let target = resolve_tlv_descriptor_referent(obj, atom, reloc, resolve)?;
+        return Ok(target.wrapping_add_signed(reloc.addend));
+    }
+
+    Ok(u64::from_le_bytes(
+        descriptor[16..24]
+            .try_into()
+            .expect("8-byte descriptor tail"),
+    ))
+}
+
+fn descriptor_owner_symbols<'a>(
+    obj: &'a ObjectFile,
+    atom: &'a Atom,
+    descriptor_offset: u32,
+) -> impl Iterator<Item = &'a InputSymbol> + 'a {
+    let descriptor_start = atom.input_offset as u64 + descriptor_offset as u64;
+    obj.symbols.iter().filter(move |input_sym| {
+        input_sym.kind() == SymKind::Sect
+            && input_sym.sect_idx() == atom.input_section
+            && obj.section_for_symbol(input_sym).is_some_and(|section| {
+                input_sym.value().saturating_sub(section.addr) == descriptor_start
+            })
+    })
+}
+
+fn matching_tlv_init_symbol<'a>(
+    obj: &'a ObjectFile,
+    owner: &InputSymbol,
+) -> Result<Option<&'a InputSymbol>, RelocError> {
+    let owner_name = match obj.symbol_name(owner) {
+        Ok(name) => name,
+        Err(_) => return Ok(None),
+    };
+    let init_name = format!("{owner_name}$tlv$init");
+    Ok(obj.symbols.iter().find(|input_sym| {
+        obj.symbol_name(input_sym)
+            .is_ok_and(|name| name == init_name)
+    }))
+}
+
+fn resolve_named_tlv_init(
+    owner: &InputSymbol,
+    atom: &Atom,
+    input_map: &HashMap<InputId, &ObjectFile>,
+    resolve: &ResolveView<'_>,
+) -> Result<Option<u64>, RelocError> {
+    for (&origin, obj) in input_map {
+        let Some(init_symbol) = matching_tlv_init_symbol(obj, owner)? else {
+            continue;
+        };
+        return Ok(Some(resolve_input_symbol_at_origin(
+            origin,
+            obj,
+            atom,
+            RelocKind::Unsigned,
+            init_symbol,
+            resolve,
+        )?));
+    }
+    Ok(None)
+}
+
+fn resolve_tlv_descriptor_referent(
+    obj: &ObjectFile,
+    atom: &Atom,
+    reloc: Reloc,
+    resolve: &ResolveView<'_>,
+) -> Result<u64, RelocError> {
+    match reloc.referent {
+        Referent::Section(section_idx) => resolve
+            .section_addrs
+            .get(&(atom.origin, section_idx))
+            .copied()
+            .ok_or_else(|| {
+                reloc_error(
+                    atom,
+                    &obj.path,
+                    reloc.offset.saturating_sub(atom.input_offset),
+                    reloc.kind,
+                    &format!("section #{section_idx}"),
+                    "TLV descriptor referent section was not laid out".to_string(),
+                )
+            }),
+        Referent::Symbol(sym_idx) => {
+            let input_sym = obj.symbols.get(sym_idx as usize).ok_or_else(|| {
+                reloc_error(
+                    atom,
+                    &obj.path,
+                    reloc.offset.saturating_sub(atom.input_offset),
+                    reloc.kind,
+                    &format!("symbol #{sym_idx}"),
+                    "TLV descriptor symbol index is out of range".to_string(),
+                )
+            })?;
+            resolve_input_symbol_at_origin(atom.origin, obj, atom, reloc.kind, input_sym, resolve)
+        }
+    }
 }
 
 fn synthesize_got_section(

@@ -1300,12 +1300,21 @@ mod tests {
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-        assert_eq!(words[2], 0, "all encodings are unique so nothing should be common");
-        assert_eq!(words[6], 3, "expected the encoding pressure to force a second page");
+        assert_eq!(
+            words[2], 0,
+            "all encodings are unique so nothing should be common"
+        );
+        assert_eq!(
+            words[6], 3,
+            "expected the encoding pressure to force a second page"
+        );
         let decoded = decode_unwind_info(&bytes).unwrap();
         assert_eq!(decoded.records.len(), records.len());
         assert_eq!(decoded.records[0].function_offset, 0x400);
-        assert_eq!(decoded.records.last().unwrap().function_offset, 0x400 + 299 * 4);
+        assert_eq!(
+            decoded.records.last().unwrap().function_offset,
+            0x400 + 299 * 4
+        );
     }
 
     #[test]

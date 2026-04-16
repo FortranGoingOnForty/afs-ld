@@ -450,6 +450,7 @@ fn resolve_entry_point(
 
 fn symbol_defined(sym_table: &SymbolTable, name: &str) -> bool {
     sym_table.iter().any(|(_, symbol)| {
-        sym_table.interner.resolve(symbol.name()) == name && matches!(symbol, Symbol::Defined { .. })
+        sym_table.interner.resolve(symbol.name()) == name
+            && matches!(symbol, Symbol::Defined { .. })
     })
 }

@@ -1060,7 +1060,7 @@ fn build_function_starts(layout: &Layout, atom_table: &AtomTable) -> Result<Vec<
     let mut starts = Vec::new();
 
     for section in &layout.sections {
-        if section.segment != "__TEXT" || section.name != "__text" || !is_executable(section.kind) {
+        if section.segment != "__TEXT" || !is_executable(section.kind) {
             continue;
         }
         for placed in &section.atoms {
@@ -2087,7 +2087,7 @@ mod tests {
     }
 
     #[test]
-    fn function_starts_use_text_atoms_and_alt_entries_only() {
+    fn function_starts_use_all_executable_text_atoms_and_alt_entries_only() {
         let mut atoms = AtomTable::new();
         let atom_id = atoms.push(Atom {
             id: AtomId(0),
@@ -2106,11 +2106,30 @@ mod tests {
             flags: AtomFlags::NONE,
             parent_of: None,
         });
+        let coalesced_atom_id = atoms.push(Atom {
+            id: AtomId(1),
+            origin: InputId(1),
+            input_section: 2,
+            section: AtomSection::Text,
+            input_offset: 0,
+            size: 4,
+            align_pow2: 2,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 4],
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        });
         let layout = Layout {
             kind: OutputKind::Executable,
             segments: vec![OutputSegment {
                 name: "__TEXT".into(),
-                sections: vec![OutputSectionId(0), OutputSectionId(1), OutputSectionId(2)],
+                sections: vec![
+                    OutputSectionId(0),
+                    OutputSectionId(1),
+                    OutputSectionId(2),
+                    OutputSectionId(3),
+                ],
                 vm_addr: 0x1_0000_0000,
                 vm_size: 0x4000,
                 file_off: 0,
@@ -2173,10 +2192,31 @@ mod tests {
                     size: 36,
                     file_off: 0x101c,
                 },
+                OutputSection {
+                    segment: "__TEXT".into(),
+                    name: "__textcoal_nt".into(),
+                    kind: SectionKind::Coalesced,
+                    align_pow2: 2,
+                    flags: 0,
+                    reserved1: 0,
+                    reserved2: 0,
+                    reserved3: 0,
+                    atoms: vec![OutputAtom {
+                        atom: coalesced_atom_id,
+                        offset: 0,
+                        size: 4,
+                        data: vec![0; 4],
+                    }],
+                    synthetic_offset: 0,
+                    synthetic_data: Vec::new(),
+                    addr: 0x1_0000_1040,
+                    size: 4,
+                    file_off: 0x1040,
+                },
             ],
         };
 
         let blob = build_function_starts(&layout, &atoms).unwrap();
-        assert_eq!(decode_function_starts_blob(&blob), vec![0x1000, 0x1008]);
+        assert_eq!(decode_function_starts_blob(&blob), vec![0x1000, 0x1008, 0x1040]);
     }
 }

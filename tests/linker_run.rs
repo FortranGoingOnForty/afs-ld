@@ -3539,6 +3539,70 @@ fn linker_run_emits_function_starts_like_ld() {
 }
 
 #[test]
+fn linker_run_emits_function_starts_for_other_text_sections_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+
+    let obj = scratch("function-starts-textcoal.o");
+    let our_out = scratch("function-starts-textcoal-ours.out");
+    let apple_out = scratch("function-starts-textcoal-apple.out");
+    let asm = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        .p2align 2
+    _main:
+        ret
+
+        .section __TEXT,__textcoal_nt,regular,pure_instructions
+        .globl _helper
+        .p2align 2
+    _helper:
+        ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(asm, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert_eq!(decode_function_starts(&our_bytes).len(), 2);
+    assert_eq!(decode_function_starts(&apple_bytes).len(), 2);
+
+    let our_text_addr = output_section(&our_bytes, "__TEXT", "__text").unwrap().0;
+    let our_textcoal_addr = output_section(&our_bytes, "__TEXT", "__textcoal_nt").unwrap().0;
+    let our_text_base = segment_vmaddr(&our_bytes, "__TEXT").unwrap();
+    assert_eq!(
+        decode_function_starts(&our_bytes),
+        vec![our_text_addr - our_text_base, our_textcoal_addr - our_text_base]
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
 fn linker_run_remaps_data_in_code_like_ld() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");

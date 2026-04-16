@@ -5265,7 +5265,9 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
         thread_vars.len() / 24,
         "every TLV descriptor should carry exactly one bootstrap bind"
     );
-    assert!(tlv_binds.iter().all(|record| record.symbol == "__tlv_bootstrap"));
+    assert!(tlv_binds
+        .iter()
+        .all(|record| record.symbol == "__tlv_bootstrap"));
 
     for (name, descriptor_addr) in symbols.iter().filter(|(name, value)| {
         !name.ends_with("$tlv$init")

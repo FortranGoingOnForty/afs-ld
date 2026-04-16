@@ -1468,6 +1468,7 @@ fn build_output_symbols(
         )?;
     }
     collect_synthetic_local_symbols(layout, inputs.0.synthetic_plan, &mut locals)?;
+    sort_local_symbols(&mut locals);
 
     for (symbol_id, symbol) in sym_table.iter() {
         let Symbol::Defined {
@@ -1612,6 +1613,16 @@ fn build_output_symbols(
             ..DysymtabCmd::default()
         },
     })
+}
+
+fn sort_local_symbols(locals: &mut [OutputSymbolSpec]) {
+    locals.sort_by(|lhs, rhs| {
+        lhs.n_sect
+            .cmp(&rhs.n_sect)
+            .then_with(|| lhs.n_value.cmp(&rhs.n_value))
+            .then_with(|| lhs.n_type.cmp(&rhs.n_type))
+            .then_with(|| lhs.name.cmp(&rhs.name))
+    });
 }
 
 fn collect_synthetic_local_symbols(

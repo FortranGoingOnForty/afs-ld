@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::leb::write_uleb;
-use crate::layout::Layout;
+use crate::layout::{Layout, PAGE_SIZE};
 use crate::macho::constants::*;
 use crate::macho::dylib::DylibDependency;
 use crate::macho::reader::{
@@ -121,7 +121,7 @@ fn finalize_with_linkedit(
         .segment_mut("__LINKEDIT")
         .ok_or(WriteError::MissingSegment("__LINKEDIT"))?;
     linkedit_seg.file_size = linkedit.total_size().max(1);
-    linkedit_seg.vm_size = linkedit.total_size().max(1);
+    linkedit_seg.vm_size = align_up(linkedit.total_size().max(1), PAGE_SIZE);
     Ok((layout, linkedit))
 }
 
@@ -897,14 +897,13 @@ fn build_bind_streams(
                 .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
             let slot_addr = section.addr + (idx as u64) * 8;
             lazy_offsets.insert(entry.symbol, lazy_bind.len() as u32);
-            emit_bind_record(
+            emit_lazy_bind_record(
                 &mut lazy_bind,
                 segment_index,
                 slot_addr - segment.vm_addr,
                 import.ordinal,
                 &import.name,
                 import.weak_import,
-                true,
             );
         }
     }
@@ -936,6 +935,25 @@ fn emit_bind_record(
     if terminate {
         out.push(BIND_OPCODE_DONE);
     }
+}
+
+fn emit_lazy_bind_record(
+    out: &mut Vec<u8>,
+    segment_index: u8,
+    segment_offset: u64,
+    ordinal: u16,
+    name: &str,
+    weak_import: bool,
+) {
+    // dyld's lazy-bind stream only accepts the classic lazy subset; pointer type is implicit.
+    out.push(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segment_index & BIND_IMMEDIATE_MASK));
+    write_uleb(segment_offset, out);
+    emit_bind_ordinal(out, ordinal);
+    out.push(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | bind_symbol_flags(weak_import));
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    out.push(BIND_OPCODE_DO_BIND);
+    out.push(BIND_OPCODE_DONE);
 }
 
 fn emit_bind_ordinal(out: &mut Vec<u8>, ordinal: u16) {

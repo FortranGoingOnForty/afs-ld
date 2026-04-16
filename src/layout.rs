@@ -314,11 +314,17 @@ impl Layout {
             let segment = self.segment_mut(&seg_name).expect("segment disappeared");
             segment.vm_addr = seg_start_vm;
             segment.file_off = seg_start_file;
-            segment.vm_size = seg_vm_end.saturating_sub(seg_start_vm);
-            segment.file_size = if is_linkedit {
-                0
+            let raw_vm_size = seg_vm_end.saturating_sub(seg_start_vm);
+            let raw_file_size = seg_file_end.saturating_sub(seg_start_file);
+            segment.vm_size = if raw_vm_size == 0 || is_linkedit {
+                raw_vm_size
             } else {
-                seg_file_end.saturating_sub(seg_start_file)
+                align_up(raw_vm_size, PAGE_SIZE)
+            };
+            segment.file_size = if is_linkedit || raw_file_size == 0 {
+                if is_linkedit { 0 } else { raw_file_size }
+            } else {
+                align_up(raw_file_size, PAGE_SIZE)
             };
 
             next_vm = if is_linkedit { seg_start_vm } else { seg_vm_end };
@@ -438,7 +444,7 @@ fn segment_init_prot(name: &str) -> Prot {
     match name {
         "__PAGEZERO" => Prot::NONE,
         "__TEXT" => Prot::READ_EXECUTE,
-        "__DATA_CONST" => Prot::READ_ONLY,
+        "__DATA_CONST" => Prot::READ_WRITE,
         "__DATA" => Prot::READ_WRITE,
         "__LINKEDIT" => Prot::READ_ONLY,
         _ => Prot::READ_WRITE,
@@ -636,6 +642,59 @@ mod tests {
         let bss = layout.sections.iter().find(|s| s.name == "__bss").unwrap();
         assert_eq!(bss.file_off, 0);
         assert!(bss.addr >= EXECUTABLE_TEXT_BASE + PAGE_SIZE);
+    }
+
+    #[test]
+    fn file_backed_segments_round_to_page_boundaries() {
+        let object = ObjectFile {
+            path: PathBuf::from("/tmp/layout-pages.o"),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections: vec![
+                input_section(
+                    "__TEXT",
+                    "__text",
+                    SectionKind::Text,
+                    2,
+                    S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                ),
+                input_section("__DATA", "__data", SectionKind::Data, 3, S_REGULAR),
+            ],
+            symbols: Vec::new(),
+            strings: crate::string_table::StringTable::from_bytes(vec![0]),
+            symtab: None,
+            dysymtab: None,
+        };
+
+        let mut atoms = AtomTable::new();
+        atoms.push(atom(InputId(0), 1, AtomSection::Text, 0, 16, 2, vec![0; 16]));
+        atoms.push(atom(InputId(0), 2, AtomSection::Data, 0, 8, 3, vec![0; 8]));
+
+        let layout = Layout::build(
+            OutputKind::Executable,
+            &[LayoutInput {
+                id: InputId(0),
+                object: &object,
+            }],
+            &atoms,
+            0x200,
+        );
+
+        let text = layout.segment("__TEXT").unwrap();
+        let data = layout.segment("__DATA").unwrap();
+        assert_eq!(text.file_size % PAGE_SIZE, 0);
+        assert_eq!(text.vm_size % PAGE_SIZE, 0);
+        assert_eq!(data.file_size % PAGE_SIZE, 0);
+        assert_eq!(data.vm_size % PAGE_SIZE, 0);
     }
 
     #[test]

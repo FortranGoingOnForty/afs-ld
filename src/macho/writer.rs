@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::atom::AtomTable;
-use crate::input::ObjectFile;
+use crate::input::{DataInCodeEntry, ObjectFile};
 use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
 use crate::leb::write_uleb;
 use crate::macho::constants::*;
@@ -60,6 +60,7 @@ pub enum WriteError {
     ImportSymbolMissing(SymbolId),
     ImportSymbolWrongKind(SymbolId),
     MalformedRelocations(PathBuf, u8, String),
+    MalformedDataInCode(PathBuf, String),
 }
 
 impl fmt::Display for WriteError {
@@ -112,6 +113,13 @@ impl fmt::Display for WriteError {
                 path.display(),
                 section
             ),
+            WriteError::MalformedDataInCode(path, detail) => {
+                write!(
+                    f,
+                    "failed to remap LC_DATA_IN_CODE in {}: {detail}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -700,7 +708,8 @@ fn build_linkedit_plan(
     let lazy_bind_bytes = pad_dyld_info_stream(bind_streams.lazy_bind);
     let export_bytes = pad_dyld_info_stream(build_export_trie(&symbol_plan.exports));
     let function_starts_bytes = build_function_starts(layout, inputs.0.atom_table)?;
-    let data_in_code_bytes = Vec::new();
+    let data_in_code_bytes =
+        build_data_in_code(layout, inputs.0.layout_inputs, inputs.0.atom_table)?;
 
     let mut cursor = base_off as u64;
     let rebase_off = place_optional_block(&mut cursor, rebase_bytes.len(), "rebase stream offset")?;
@@ -1084,6 +1093,120 @@ fn build_function_starts(layout: &Layout, atom_table: &AtomTable) -> Result<Vec<
     Ok(out)
 }
 
+fn build_data_in_code(
+    layout: &Layout,
+    inputs: &[LayoutInput<'_>],
+    atom_table: &AtomTable,
+) -> Result<Vec<u8>, WriteError> {
+    #[derive(Clone, Copy)]
+    struct RemappedEntry {
+        input_order: usize,
+        input_entry_index: usize,
+        offset: u32,
+        length: u16,
+        kind: u16,
+    }
+
+    let mut remapped = Vec::new();
+    for (input_order, input) in inputs.iter().enumerate() {
+        for (input_entry_index, entry) in input.object.data_in_code.iter().copied().enumerate() {
+            let (section_index, section_relative) =
+                remap_data_in_code_to_section(input.object, entry)?;
+            let (atom_id, atom_delta) = find_containing_atom_range(
+                atom_table,
+                input.id,
+                section_index,
+                section_relative,
+                entry.length as u32,
+            )
+            .ok_or_else(|| {
+                WriteError::MalformedDataInCode(
+                    input.object.path.clone(),
+                    format!(
+                        "entry at file offset {} (len {}) did not land inside any atom",
+                        entry.offset, entry.length
+                    ),
+                )
+            })?;
+            let output_offset = layout.atom_file_offset(atom_id).ok_or_else(|| {
+                WriteError::MalformedDataInCode(
+                    input.object.path.clone(),
+                    format!(
+                        "atom {:?} for entry at file offset {} is missing from final layout",
+                        atom_id, entry.offset
+                    ),
+                )
+            })? + atom_delta as u64;
+            remapped.push(RemappedEntry {
+                input_order,
+                input_entry_index,
+                offset: u32_fit(output_offset, "data-in-code output offset")?,
+                length: entry.length,
+                kind: entry.kind,
+            });
+        }
+    }
+
+    remapped.sort_by(|a, b| {
+        a.offset
+            .cmp(&b.offset)
+            .then_with(|| a.input_order.cmp(&b.input_order))
+            .then_with(|| a.input_entry_index.cmp(&b.input_entry_index))
+    });
+
+    let mut out = Vec::with_capacity(remapped.len() * 8);
+    for entry in remapped {
+        out.extend_from_slice(&entry.offset.to_le_bytes());
+        out.extend_from_slice(&entry.length.to_le_bytes());
+        out.extend_from_slice(&entry.kind.to_le_bytes());
+    }
+    Ok(out)
+}
+
+fn remap_data_in_code_to_section(
+    object: &ObjectFile,
+    entry: DataInCodeEntry,
+) -> Result<(u8, u32), WriteError> {
+    let entry_end = entry
+        .offset
+        .checked_add(entry.length as u32)
+        .ok_or_else(|| {
+            WriteError::MalformedDataInCode(
+                object.path.clone(),
+                format!(
+                    "entry at file offset {} with len {} overflows u32",
+                    entry.offset, entry.length
+                ),
+            )
+        })?;
+    let mut matches = object
+        .sections
+        .iter()
+        .enumerate()
+        .filter(|(_, section)| !section.data.is_empty() && is_executable(section.kind))
+        .filter(|(_, section)| entry_end <= section.size as u32)
+        .map(|(idx, _)| (idx + 1) as u8);
+    if let Some(section_index) = matches.next() {
+        if matches.next().is_none() {
+            return Ok((section_index, entry.offset));
+        }
+        return Err(WriteError::MalformedDataInCode(
+            object.path.clone(),
+            format!(
+                "entry at section-relative offset {} (len {}) ambiguously matches multiple executable input sections",
+                entry.offset, entry.length
+            ),
+        ));
+    }
+    Err(WriteError::MalformedDataInCode(
+        object.path.clone(),
+        format!(
+            "entry at section-relative offset {} (len {}) does not map to any executable input section",
+            entry.offset, entry.length
+        ),
+    ))
+}
+
 fn collect_imports(
     sym_table: &SymbolTable,
     synthetic_plan: &SyntheticPlan,
@@ -1436,13 +1559,24 @@ fn find_containing_atom(
     input_section: u8,
     offset: u32,
 ) -> Option<(crate::resolve::AtomId, u32)> {
+    find_containing_atom_range(atom_table, input_id, input_section, offset, 1)
+}
+
+fn find_containing_atom_range(
+    atom_table: &AtomTable,
+    input_id: InputId,
+    input_section: u8,
+    offset: u32,
+    len: u32,
+) -> Option<(crate::resolve::AtomId, u32)> {
     let atoms = atom_table.by_input_section();
     atoms.get(&(input_id, input_section)).and_then(|ids| {
         ids.iter().find_map(|atom_id| {
             let atom = atom_table.get(*atom_id);
             let start = atom.input_offset;
             let end = atom.input_offset.saturating_add(atom.size);
-            (start <= offset && offset < end).then_some((*atom_id, offset - start))
+            let range_end = offset.checked_add(len)?;
+            (start <= offset && range_end <= end).then_some((*atom_id, offset - start))
         })
     })
 }

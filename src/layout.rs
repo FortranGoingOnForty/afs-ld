@@ -568,6 +568,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            data_in_code: Vec::new(),
         };
 
         let mut atoms = AtomTable::new();
@@ -630,6 +631,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            data_in_code: Vec::new(),
         };
 
         let mut atoms = AtomTable::new();
@@ -683,6 +685,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            data_in_code: Vec::new(),
         };
 
         let mut atoms = AtomTable::new();
@@ -733,6 +736,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            data_in_code: Vec::new(),
         };
 
         let mut atoms = AtomTable::new();
@@ -859,6 +863,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            data_in_code: Vec::new(),
         };
 
         let mut atoms = AtomTable::new();
@@ -929,6 +934,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            data_in_code: Vec::new(),
         };
 
         let mut atoms = AtomTable::new();

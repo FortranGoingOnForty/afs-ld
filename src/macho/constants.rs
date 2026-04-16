@@ -86,6 +86,13 @@ pub const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x0000_0400;
 pub const S_ATTR_EXT_RELOC: u32 = 0x0000_0200;
 pub const S_ATTR_LOC_RELOC: u32 = 0x0000_0100;
 
+// data_in_code_entry kinds
+pub const DICE_KIND_DATA: u16 = 1;
+pub const DICE_KIND_JUMP_TABLE8: u16 = 2;
+pub const DICE_KIND_JUMP_TABLE16: u16 = 3;
+pub const DICE_KIND_JUMP_TABLE32: u16 = 4;
+pub const DICE_KIND_ABS_JUMP_TABLE32: u16 = 5;
+
 // nlist_64 n_type
 pub const N_STAB: u8 = 0xe0;
 pub const N_PEXT: u8 = 0x10;

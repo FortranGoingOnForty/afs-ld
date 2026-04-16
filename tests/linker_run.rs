@@ -16,9 +16,9 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
-    BIND_SYMBOL_FLAGS_WEAK_IMPORT, LC_DATA_IN_CODE, LC_FUNCTION_STARTS, REBASE_IMMEDIATE_MASK,
-    REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE,
-    REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, DICE_KIND_JUMP_TABLE32, LC_DATA_IN_CODE, LC_FUNCTION_STARTS,
+    REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB,
+    REBASE_OPCODE_DONE, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
     REBASE_OPCODE_MASK, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
     REBASE_TYPE_POINTER, SG_READ_ONLY,
@@ -455,6 +455,37 @@ fn decode_function_starts(bytes: &[u8]) -> Vec<u64> {
         offsets.push(current);
     }
     offsets
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DataInCodeRecord {
+    offset: u32,
+    length: u16,
+    kind: u16,
+}
+
+fn decode_data_in_code(bytes: &[u8]) -> Vec<DataInCodeRecord> {
+    let payload = linkedit_payload(bytes, LC_DATA_IN_CODE);
+    payload
+        .chunks_exact(8)
+        .map(|chunk| DataInCodeRecord {
+            offset: u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
+            length: u16::from_le_bytes(chunk[4..6].try_into().unwrap()),
+            kind: u16::from_le_bytes(chunk[6..8].try_into().unwrap()),
+        })
+        .collect()
+}
+
+fn canonical_data_in_code(bytes: &[u8]) -> Vec<DataInCodeRecord> {
+    let text = output_section_header(bytes, "__TEXT", "__text").unwrap();
+    decode_data_in_code(bytes)
+        .into_iter()
+        .map(|record| DataInCodeRecord {
+            offset: record.offset - text.offset,
+            length: record.length,
+            kind: record.kind,
+        })
+        .collect()
 }
 
 fn assert_strtab_within_five_percent(ours: &[u8], apple: &[u8]) {
@@ -3501,6 +3532,93 @@ fn linker_run_emits_function_starts_like_ld() {
     assert_eq!(our_dic.1, apple_dic.1);
     assert_eq!(our_dic.0, our_fstarts.0 + our_fstarts.1);
     assert_eq!(apple_dic.0, apple_fstarts.0 + apple_fstarts.1);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_remaps_data_in_code_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("data-in-code.o");
+    let our_out = scratch("data-in-code-ours.out");
+    let apple_out = scratch("data-in-code-apple.out");
+    let asm = r#"
+        .text
+        .globl _main
+        .p2align 2
+    _main:
+        mov w0, #0
+        b Ldispatch
+        .p2align 2
+    Ltable:
+        .data_region jt32
+        .long Lcase0-Ltable
+        .long Lcase1-Ltable
+        .end_data_region
+    Ldispatch:
+        cmp w0, #0
+        b.eq Lcase0
+        b Lcase1
+    Lcase0:
+        mov w0, #1
+        ret
+    Lcase1:
+        mov w0, #2
+        ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(asm, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let our_dic = raw_linkedit_data_cmd(&our_bytes, LC_DATA_IN_CODE);
+    let apple_dic = raw_linkedit_data_cmd(&apple_bytes, LC_DATA_IN_CODE);
+    assert_ne!(our_dic.1, 0);
+    assert_eq!(our_dic.1, apple_dic.1);
+    assert_eq!(decode_data_in_code(&our_bytes).len(), 1);
+    assert_eq!(
+        canonical_data_in_code(&our_bytes),
+        canonical_data_in_code(&apple_bytes)
+    );
+    assert_eq!(
+        canonical_data_in_code(&our_bytes),
+        vec![DataInCodeRecord {
+            offset: 8,
+            length: 8,
+            kind: DICE_KIND_JUMP_TABLE32,
+        }]
+    );
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);

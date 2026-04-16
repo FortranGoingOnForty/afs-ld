@@ -57,6 +57,8 @@ fn libsystem_tbd_materializes_into_dylib_file() {
     let dy = DylibFile::from_tbd(&path, main, &target);
 
     assert_eq!(dy.install_name, "/usr/lib/libSystem.B.dylib");
+    assert!(dy.current_version >= (1 << 16));
+    assert_eq!(dy.compatibility_version, 1 << 16);
 
     // libSystem's main TBD doc only exposes a short list of internal
     // symbols directly; everything useful (malloc, printf, dyld binder)

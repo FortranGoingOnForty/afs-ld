@@ -35,6 +35,8 @@ use resolve::{
     seed_all, DylibLoadMeta, InputAddError, Inputs, Symbol, SymbolTable, UndefinedTreatment,
 };
 
+const DEFAULT_TBD_VERSION: u32 = 1 << 16;
+
 /// What kind of Mach-O file the linker is producing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputKind {
@@ -385,12 +387,12 @@ fn register_input(inputs: &mut Inputs, path: &std::path::Path) -> Result<(), Lin
                     .current_version
                     .as_deref()
                     .map(parse_version)
-                    .unwrap_or(0),
+                    .unwrap_or(DEFAULT_TBD_VERSION),
                 compatibility_version: canonical
                     .compatibility_version
                     .as_deref()
                     .map(parse_version)
-                    .unwrap_or(0),
+                    .unwrap_or(DEFAULT_TBD_VERSION),
                 ordinal: inputs.next_dylib_ordinal(),
             };
             let mut loaded = false;

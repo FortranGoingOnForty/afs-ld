@@ -16,6 +16,8 @@ use super::reader::{
 };
 use super::tbd::{parse_version, SymbolLists, Target, Tbd};
 
+const DEFAULT_TBD_VERSION: u32 = 1 << 16;
+
 /// How a consumer loaded this dylib. The filetype of the dylib itself is
 /// always `MH_DYLIB`; this kind captures the *relationship*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,12 +224,12 @@ impl DylibFile {
                 .current_version
                 .as_deref()
                 .map(parse_version)
-                .unwrap_or(0),
+                .unwrap_or(DEFAULT_TBD_VERSION),
             compatibility_version: tbd
                 .compatibility_version
                 .as_deref()
                 .map(parse_version)
-                .unwrap_or(0),
+                .unwrap_or(DEFAULT_TBD_VERSION),
             dependencies,
             rpaths: Vec::new(),
             symtab: None,

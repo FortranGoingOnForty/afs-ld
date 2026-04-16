@@ -2920,6 +2920,18 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
             _ => None,
         })
         .unwrap();
+    let libsystem_load = commands
+        .iter()
+        .find_map(|cmd| match cmd {
+            LoadCommand::Dylib(cmd)
+                if cmd.cmd == afs_ld::macho::constants::LC_LOAD_DYLIB
+                    && cmd.name == "/usr/lib/libSystem.B.dylib" =>
+            {
+                Some(cmd.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
     let symbols = parse_nlist_table(&bytes, symtab.symoff, symtab.nsyms).unwrap();
     let strings = StringTable::from_file(&bytes, symtab.stroff, symtab.strsize).unwrap();
     let symbol_names: Vec<&str> = symbols
@@ -2940,6 +2952,8 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     assert_eq!(got_hdr.reserved1, 1);
     assert_eq!(lazy_hdr.reserved1, 3);
     assert_eq!(stubs_hdr.reserved2, 12);
+    assert!(libsystem_load.current_version >= (1 << 16));
+    assert_eq!(libsystem_load.compatibility_version, 1 << 16);
     assert!(dyld_info.rebase_size > 0);
     assert!(dyld_info.bind_size > 0);
     assert!(dyld_info.lazy_bind_size > 0);

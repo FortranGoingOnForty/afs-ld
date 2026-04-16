@@ -14,6 +14,8 @@ const PAGE_SIZE: usize = 4096;
 const UNWIND_INFO_VERSION: u32 = 1;
 const UNWIND_SECOND_LEVEL_REGULAR: u32 = 2;
 const UNWIND_SECOND_LEVEL_COMPRESSED: u32 = 3;
+const MAX_COMPRESSED_FUNCTION_DELTA: u32 = 0x00ff_ffff;
+const MAX_COMPRESSED_ENCODING_INDEX: usize = 0xff;
 const FIRST_LEVEL_ENTRY_SIZE: usize = 12;
 const FIRST_LEVEL_INDEX_GAP_SIZE: usize = FIRST_LEVEL_ENTRY_SIZE;
 const COMPRESSED_PAGE_HEADER_SIZE: usize = 12;
@@ -863,49 +865,53 @@ fn build_pages(records: &[UnwindRecord], common_encodings: &[u32]) -> Vec<Compre
         .collect();
 
     for record in records {
-        let page = current.get_or_insert_with(|| CompressedPage {
-            start_function_offset: record.function_offset,
-            entries: Vec::new(),
-            local_encodings: Vec::new(),
-        });
-
-        let mut encodings = page.local_encodings.clone();
-        if !common_indices.contains_key(&record.encoding)
-            && encodings
-                .iter()
-                .all(|encoding| *encoding != record.encoding)
-        {
-            encodings.push(record.encoding);
-        }
-        let delta = record
-            .function_offset
-            .saturating_sub(page.start_function_offset);
-        let projected_size =
-            COMPRESSED_PAGE_HEADER_SIZE + (page.entries.len() + 1) * 4 + encodings.len() * 4;
-        if projected_size > PAGE_SIZE && !page.entries.is_empty() {
-            pages.push(current.take().unwrap());
-            current = Some(CompressedPage {
+        loop {
+            let page = current.get_or_insert_with(|| CompressedPage {
                 start_function_offset: record.function_offset,
                 entries: Vec::new(),
                 local_encodings: Vec::new(),
             });
-        }
 
-        let page = current.as_mut().unwrap();
-        let encoding_index = if let Some(index) = common_indices.get(&record.encoding) {
-            *index
-        } else if let Some(index) = page
-            .local_encodings
-            .iter()
-            .position(|encoding| *encoding == record.encoding)
-        {
-            common_encodings.len() + index
-        } else {
-            page.local_encodings.push(record.encoding);
-            common_encodings.len() + page.local_encodings.len() - 1
-        };
-        page.entries
-            .push(((encoding_index as u32) << 24) | (delta & 0x00ff_ffff));
+            let needs_local_encoding = !common_indices.contains_key(&record.encoding)
+                && page
+                    .local_encodings
+                    .iter()
+                    .all(|encoding| *encoding != record.encoding);
+            let prospective_local_count =
+                page.local_encodings.len() + usize::from(needs_local_encoding);
+            let delta = record
+                .function_offset
+                .saturating_sub(page.start_function_offset);
+            let projected_size = COMPRESSED_PAGE_HEADER_SIZE
+                + (page.entries.len() + 1) * 4
+                + prospective_local_count * 4;
+            let projected_encoding_count = common_encodings.len() + prospective_local_count;
+
+            if !page.entries.is_empty()
+                && (projected_size > PAGE_SIZE
+                    || delta > MAX_COMPRESSED_FUNCTION_DELTA
+                    || projected_encoding_count > MAX_COMPRESSED_ENCODING_INDEX + 1)
+            {
+                pages.push(current.take().unwrap());
+                continue;
+            }
+
+            let page = current.as_mut().unwrap();
+            let encoding_index = if let Some(index) = common_indices.get(&record.encoding) {
+                *index
+            } else if let Some(index) = page
+                .local_encodings
+                .iter()
+                .position(|encoding| *encoding == record.encoding)
+            {
+                common_encodings.len() + index
+            } else {
+                page.local_encodings.push(record.encoding);
+                common_encodings.len() + page.local_encodings.len() - 1
+            };
+            page.entries.push(((encoding_index as u32) << 24) | delta);
+            break;
+        }
     }
 
     if let Some(page) = current {
@@ -1236,6 +1242,70 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn large_function_gaps_start_new_pages_before_delta_overflow() {
+        let bytes = serialize_unwind_info(&[
+            UnwindRecord {
+                function_offset: 0x348,
+                code_len: 0x14,
+                encoding: 0x0200_0000,
+                personality_offset: None,
+                lsda_offset: None,
+            },
+            UnwindRecord {
+                function_offset: 0x0100_0360,
+                code_len: 0x14,
+                encoding: 0x0200_0000,
+                personality_offset: None,
+                lsda_offset: None,
+            },
+        ])
+        .unwrap();
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(words[6], 3, "expected two pages plus the sentinel index");
+        let decoded = decode_unwind_info(&bytes).unwrap();
+        assert_eq!(
+            decoded.records,
+            vec![
+                DecodedUnwindRecord {
+                    function_offset: 0x348,
+                    encoding: 0x0200_0000,
+                },
+                DecodedUnwindRecord {
+                    function_offset: 0x0100_0360,
+                    encoding: 0x0200_0000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pages_split_before_encoding_index_overflow() {
+        let records = (0..300u32)
+            .map(|idx| UnwindRecord {
+                function_offset: 0x400 + idx * 4,
+                code_len: 4,
+                encoding: 0x0200_0000 | idx,
+                personality_offset: None,
+                lsda_offset: None,
+            })
+            .collect::<Vec<_>>();
+        let bytes = serialize_unwind_info(&records).unwrap();
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(words[2], 0, "all encodings are unique so nothing should be common");
+        assert_eq!(words[6], 3, "expected the encoding pressure to force a second page");
+        let decoded = decode_unwind_info(&bytes).unwrap();
+        assert_eq!(decoded.records.len(), records.len());
+        assert_eq!(decoded.records[0].function_offset, 0x400);
+        assert_eq!(decoded.records.last().unwrap().function_offset, 0x400 + 299 * 4);
     }
 
     #[test]

@@ -541,6 +541,70 @@ fn normalized_unwind_words(bytes: &[u8]) -> Vec<u32> {
     words
 }
 
+fn rebased_unwind_bytes(bytes: &[u8]) -> Vec<u8> {
+    let header_base = segment_vmaddr(bytes, "__TEXT").unwrap_or(0);
+    let text_base = output_section(bytes, "__TEXT", "__text").unwrap().0 - header_base;
+    let got_range = output_section(bytes, "__DATA_CONST", "__got")
+        .map(|(addr, data)| (addr - header_base, addr - header_base + data.len() as u64));
+    let lsda_base =
+        output_section(bytes, "__TEXT", "__gcc_except_tab").map(|(addr, _)| addr - header_base);
+    let (_, unwind) = output_section(bytes, "__TEXT", "__unwind_info").unwrap();
+    let mut out = unwind;
+    if out.len() < 28 {
+        return out;
+    }
+
+    let personalities_offset = u32_le(&out[12..16]) as usize;
+    let personalities_count = u32_le(&out[16..20]) as usize;
+    let indices_offset = u32_le(&out[20..24]) as usize;
+    let indices_count = u32_le(&out[24..28]) as usize;
+
+    for idx in 0..personalities_count {
+        let off = personalities_offset + idx * 4;
+        let value = u32_le(&out[off..off + 4]) as u64;
+        let rebased = if let Some((got_start, got_end)) = got_range {
+            if got_start <= value && value < got_end {
+                value - got_start
+            } else if value >= text_base {
+                value - text_base
+            } else {
+                value
+            }
+        } else if value >= text_base {
+            value - text_base
+        } else {
+            value
+        };
+        out[off..off + 4].copy_from_slice(&(rebased as u32).to_le_bytes());
+    }
+
+    let mut lsda_offsets = Vec::with_capacity(indices_count);
+    for idx in 0..indices_count {
+        let entry_off = indices_offset + idx * 12;
+        let function_offset = u32_le(&out[entry_off..entry_off + 4]) as u64;
+        let rebased = function_offset.saturating_sub(text_base);
+        out[entry_off..entry_off + 4].copy_from_slice(&(rebased as u32).to_le_bytes());
+        lsda_offsets.push(u32_le(&out[entry_off + 8..entry_off + 12]) as usize);
+    }
+
+    if let (Some(lsda_base), Some(&start), Some(&end)) =
+        (lsda_base, lsda_offsets.first(), lsda_offsets.last())
+    {
+        let mut entry_off = start;
+        while entry_off < end {
+            let function_offset = u32_le(&out[entry_off..entry_off + 4]) as u64;
+            let lsda_offset = u32_le(&out[entry_off + 4..entry_off + 8]) as u64;
+            out[entry_off..entry_off + 4]
+                .copy_from_slice(&(function_offset.saturating_sub(text_base) as u32).to_le_bytes());
+            out[entry_off + 4..entry_off + 8]
+                .copy_from_slice(&(lsda_offset.saturating_sub(lsda_base) as u32).to_le_bytes());
+            entry_off += 8;
+        }
+    }
+
+    out
+}
+
 fn normalized_eh_frame_dump(path: &PathBuf, text_base: u64) -> Result<String, String> {
     let output = Command::new("xcrun")
         .args(["dwarfdump", "--eh-frame"])
@@ -3790,8 +3854,8 @@ fn linker_run_emits_leaf_unwind_info_like_ld() {
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
     assert_eq!(
-        normalized_unwind_words(&our_bytes),
-        normalized_unwind_words(&apple_bytes)
+        rebased_unwind_bytes(&our_bytes),
+        rebased_unwind_bytes(&apple_bytes)
     );
     assert!(output_section(&our_bytes, "__LD", "__compact_unwind").is_none());
 
@@ -3844,14 +3908,69 @@ fn linker_run_emits_multi_function_unwind_info_like_ld() {
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
     assert_eq!(
-        normalized_unwind_words(&our_bytes),
-        normalized_unwind_words(&apple_bytes)
+        rebased_unwind_bytes(&our_bytes),
+        rebased_unwind_bytes(&apple_bytes)
     );
     assert!(output_section(&our_bytes, "__LD", "__compact_unwind").is_none());
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_handles_large_unwind_function_gaps() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+
+    let obj = scratch("unwind-gap.o");
+    let out = scratch("unwind-gap-ours.out");
+    let asm = r#"
+        .text
+        .globl _main
+        .p2align 2
+    _main:
+        .cfi_startproc
+        bl _helper
+        ret
+        .cfi_endproc
+        .space 0x1000010
+        .globl _helper
+        .p2align 2
+    _helper:
+        .cfi_startproc
+        ret
+        .cfi_endproc
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(asm, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (_, unwind) = output_section(&bytes, "__TEXT", "__unwind_info").unwrap();
+    let decoded = decode_unwind_info(&unwind).unwrap();
+    assert!(
+        decoded
+            .records
+            .windows(2)
+            .all(|pair| pair[0].function_offset < pair[1].function_offset),
+        "expected strictly ascending unwind records after large-gap pagination"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
 }
 
 #[test]

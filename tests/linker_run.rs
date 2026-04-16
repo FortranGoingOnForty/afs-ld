@@ -123,6 +123,32 @@ fn compile_c(src: &str, out: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+fn compile_dylib_c(src: &str, out: &PathBuf) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "afs-ld-linker-run-{}-{}.c",
+        std::process::id(),
+        out.file_stem().and_then(|s| s.to_str()).unwrap_or("lib")
+    ));
+    fs::write(&tmp, src).map_err(|e| format!("write: {e}"))?;
+    let install_name = out.to_string_lossy().to_string();
+    let output = Command::new("xcrun")
+        .args(["--sdk", "macosx", "clang", "-arch", "arm64", "-dynamiclib"])
+        .arg(&tmp)
+        .arg(format!("-Wl,-install_name,{install_name}"))
+        .arg("-o")
+        .arg(out)
+        .output()
+        .map_err(|e| format!("spawn xcrun clang dylib: {e}"))?;
+    let _ = fs::remove_file(&tmp);
+    if !output.status.success() {
+        return Err(format!(
+            "xcrun clang dylib failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
 fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-linker-run-{}-{name}", std::process::id()))
 }
@@ -1981,4 +2007,119 @@ fn linker_run_handles_local_tlv_descriptors() {
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_routes_imported_tlv_through_got() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun clang or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let dylib = scratch("libtlvprobe.dylib");
+    let obj = scratch("imported-tlv.o");
+    let our_out = scratch("imported-tlv-ours.out");
+    let apple_out = scratch("imported-tlv-apple.out");
+
+    let dylib_src = r#"
+        __thread long ext_tls = 5;
+        long read_lib_tls(void) { return ext_tls; }
+    "#;
+    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
+        eprintln!("skipping: dylib compile failed: {e}");
+        return;
+    }
+
+    let main_src = r#"
+        extern __thread long ext_tls;
+        int main(void) { return ext_tls == 5 ? 0 : 1; }
+    "#;
+    if let Err(e) = compile_c(main_src, &obj) {
+        eprintln!("skipping: compile failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd.clone(), dylib.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let apple = Command::new("xcrun")
+        .args([
+            "ld",
+            "-arch",
+            "arm64",
+            "-platform_version",
+            "macos",
+            &sdk_ver,
+            &sdk_ver,
+            "-syslibroot",
+            &sdk,
+            "-no_fixup_chains",
+            "-lSystem",
+            "-e",
+            "_main",
+            "-o",
+        ])
+        .arg(&apple_out)
+        .arg(&obj)
+        .arg(&dylib)
+        .output()
+        .unwrap();
+    assert!(
+        apple.status.success(),
+        "xcrun ld failed: {}",
+        String::from_utf8_lossy(&apple.stderr)
+    );
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let (our_text_addr, our_text) = output_section(&our_bytes, "__TEXT", "__text").unwrap();
+    let (apple_text_addr, apple_text) = output_section(&apple_bytes, "__TEXT", "__text").unwrap();
+    let (our_got_addr, our_got) = output_section(&our_bytes, "__DATA_CONST", "__got").unwrap();
+    let (apple_got_addr, apple_got) =
+        output_section(&apple_bytes, "__DATA_CONST", "__got").unwrap();
+
+    assert!(output_section(&our_bytes, "__DATA", "__thread_ptrs").is_none());
+    assert!(output_section(&apple_bytes, "__DATA", "__thread_ptrs").is_none());
+    assert_eq!(our_got.len(), 8);
+    assert_eq!(our_got, apple_got);
+    assert_eq!(
+        decode_page_reference(&our_text, our_text_addr, 20, &PageRefKind::Load).unwrap(),
+        our_got_addr
+    );
+    assert_eq!(
+        decode_page_reference(&apple_text, apple_text_addr, 20, &PageRefKind::Load).unwrap(),
+        apple_got_addr
+    );
+    assert_eq!(our_text, apple_text);
+    assert_eq!(read_insn(&our_text, 24).unwrap(), 0xf9400000);
+    assert_eq!(read_insn(&our_text, 28).unwrap(), 0xf9400008);
+    assert_eq!(read_insn(&our_text, 32).unwrap(), 0xd63f0100);
+    assert_eq!(
+        decode_bind_records(&our_bytes, false).unwrap(),
+        decode_bind_records(&apple_bytes, false).unwrap()
+    );
+    assert_eq!(load_dylib_names(&our_bytes).unwrap(), load_dylib_names(&apple_bytes).unwrap());
+
+    let _ = fs::remove_file(dylib);
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
 }

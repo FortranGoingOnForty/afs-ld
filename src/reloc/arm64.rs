@@ -6,7 +6,9 @@ use crate::atom::{Atom, AtomTable};
 use crate::input::ObjectFile;
 use crate::layout::{Layout, LayoutInput};
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
-use crate::resolve::{InputId, Symbol, SymbolTable};
+use crate::resolve::{InputId, Symbol, SymbolId, SymbolTable};
+use crate::synth::stubs::STUB_SIZE;
+use crate::synth::SyntheticPlan;
 use crate::symbol::{InputSymbol, SymKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +42,9 @@ struct ResolveView<'a> {
     sym_table: &'a SymbolTable,
     atom_addrs: &'a HashMap<crate::resolve::AtomId, u64>,
     section_addrs: &'a HashMap<(InputId, u8), u64>,
+    stub_addrs: &'a HashMap<SymbolId, u64>,
+    got_addrs: &'a HashMap<SymbolId, u64>,
+    lazy_pointer_addrs: &'a HashMap<SymbolId, u64>,
 }
 
 pub fn apply_layout(
@@ -47,6 +52,7 @@ pub fn apply_layout(
     inputs: &[LayoutInput<'_>],
     atoms: &AtomTable,
     sym_table: &SymbolTable,
+    synthetic_plan: Option<&SyntheticPlan>,
 ) -> Result<(), RelocError> {
     let input_map: HashMap<InputId, &ObjectFile> =
         inputs.iter().map(|input| (input.id, input.object)).collect();
@@ -82,10 +88,15 @@ pub fn apply_layout(
 
     let atom_addrs = atom_address_map(layout);
     let section_addrs = input_section_address_map(layout, atoms);
+    let (stub_addrs, got_addrs, lazy_pointer_addrs) =
+        synthetic_address_maps(layout, synthetic_plan);
     let resolve = ResolveView {
         sym_table,
         atom_addrs: &atom_addrs,
         section_addrs: &section_addrs,
+        stub_addrs: &stub_addrs,
+        got_addrs: &got_addrs,
+        lazy_pointer_addrs: &lazy_pointer_addrs,
     };
 
     for out_section in &mut layout.sections {
@@ -111,6 +122,10 @@ pub fn apply_layout(
                 )?;
             }
         }
+    }
+
+    if let Some(plan) = synthetic_plan {
+        synthesize_stub_section(layout, plan, &resolve)?;
     }
 
     Ok(())
@@ -150,6 +165,54 @@ fn input_section_address_map(
     out
 }
 
+fn synthetic_address_maps(
+    layout: &Layout,
+    synthetic_plan: Option<&SyntheticPlan>,
+) -> (
+    HashMap<SymbolId, u64>,
+    HashMap<SymbolId, u64>,
+    HashMap<SymbolId, u64>,
+) {
+    let Some(plan) = synthetic_plan else {
+        return (HashMap::new(), HashMap::new(), HashMap::new());
+    };
+
+    let mut stub_addrs = HashMap::new();
+    if let Some(section) = layout
+        .sections
+        .iter()
+        .find(|section| section.segment == "__TEXT" && section.name == "__stubs")
+    {
+        for (idx, entry) in plan.stubs.entries.iter().enumerate() {
+            stub_addrs.insert(entry.symbol, section.addr + (idx as u64) * STUB_SIZE as u64);
+        }
+    }
+
+    let mut got_addrs = HashMap::new();
+    if let Some(section) = layout
+        .sections
+        .iter()
+        .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
+    {
+        for (idx, entry) in plan.got.entries.iter().enumerate() {
+            got_addrs.insert(entry.symbol, section.addr + (idx as u64) * 8);
+        }
+    }
+
+    let mut lazy_pointer_addrs = HashMap::new();
+    if let Some(section) = layout
+        .sections
+        .iter()
+        .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
+    {
+        for (idx, entry) in plan.lazy_pointers.entries.iter().enumerate() {
+            lazy_pointer_addrs.insert(entry.symbol, section.addr + (idx as u64) * 8);
+        }
+    }
+
+    (stub_addrs, got_addrs, lazy_pointer_addrs)
+}
+
 fn apply_one(
     bytes: &mut [u8],
     atom: &Atom,
@@ -167,27 +230,76 @@ fn apply_one(
         .copied()
         .ok_or_else(|| reloc_error(atom, &obj.path, local_offset, reloc.kind, &describe_referent(obj, reloc.referent), "atom missing final address".to_string()))?
         + local_offset as u64;
-    let target = resolve_referent(obj, atom, reloc.referent, resolve)?;
-
     match reloc.kind {
-        RelocKind::Unsigned => patch_unsigned(bytes, atom, obj, local_offset, reloc, target),
+        RelocKind::Unsigned => patch_unsigned(
+            bytes,
+            atom,
+            obj,
+            local_offset,
+            reloc,
+            resolve_referent(obj, atom, reloc.referent, resolve)?,
+        ),
         RelocKind::Subtractor => patch_subtractor(
             bytes,
             atom,
             obj,
             local_offset,
             reloc,
-            target,
+            resolve_referent(obj, atom, reloc.referent, resolve)?,
             resolve,
         ),
-        RelocKind::Branch26 => patch_branch26(bytes, atom, obj, local_offset, reloc, place, target),
-        RelocKind::Page21 => patch_page21(bytes, atom, obj, local_offset, reloc, place, target),
-        RelocKind::PageOff12 => patch_pageoff12(bytes, atom, obj, local_offset, reloc, target),
-        RelocKind::GotLoadPage21
-        | RelocKind::GotLoadPageOff12
-        | RelocKind::PointerToGot
-        | RelocKind::TlvpLoadPage21
-        | RelocKind::TlvpLoadPageOff12 => Err(reloc_error(
+        RelocKind::Branch26 => patch_branch26(
+            bytes,
+            atom,
+            obj,
+            local_offset,
+            reloc,
+            place,
+            resolve_branch_target(obj, atom, reloc, resolve)?,
+        ),
+        RelocKind::Page21 => patch_page21(
+            bytes,
+            atom,
+            obj,
+            local_offset,
+            reloc,
+            place,
+            resolve_referent(obj, atom, reloc.referent, resolve)?,
+        ),
+        RelocKind::PageOff12 => patch_pageoff12(
+            bytes,
+            atom,
+            obj,
+            local_offset,
+            reloc,
+            resolve_referent(obj, atom, reloc.referent, resolve)?,
+        ),
+        RelocKind::GotLoadPage21 => patch_page21(
+            bytes,
+            atom,
+            obj,
+            local_offset,
+            reloc,
+            place,
+            resolve_got_target(obj, atom, reloc, resolve)?,
+        ),
+        RelocKind::GotLoadPageOff12 => patch_pageoff12(
+            bytes,
+            atom,
+            obj,
+            local_offset,
+            reloc,
+            resolve_got_target(obj, atom, reloc, resolve)?,
+        ),
+        RelocKind::PointerToGot => patch_unsigned(
+            bytes,
+            atom,
+            obj,
+            local_offset,
+            reloc,
+            resolve_got_target(obj, atom, reloc, resolve)?,
+        ),
+        RelocKind::TlvpLoadPage21 | RelocKind::TlvpLoadPageOff12 => Err(reloc_error(
             atom,
             &obj.path,
             local_offset,
@@ -196,6 +308,55 @@ fn apply_one(
             "not yet implemented (planned for Sprint 12/13)".to_string(),
         )),
     }
+}
+
+fn resolve_branch_target(
+    obj: &ObjectFile,
+    atom: &Atom,
+    reloc: Reloc,
+    resolve: &ResolveView<'_>,
+) -> Result<u64, RelocError> {
+    if let Some(symbol_id) = dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table) {
+        return resolve.stub_addrs.get(&symbol_id).copied().ok_or_else(|| {
+            reloc_error(
+                atom,
+                &obj.path,
+                reloc.offset.saturating_sub(atom.input_offset),
+                reloc.kind,
+                &describe_referent(obj, reloc.referent),
+                "dylib import is missing synthetic stub".to_string(),
+            )
+        });
+    }
+    resolve_referent(obj, atom, reloc.referent, resolve)
+}
+
+fn resolve_got_target(
+    obj: &ObjectFile,
+    atom: &Atom,
+    reloc: Reloc,
+    resolve: &ResolveView<'_>,
+) -> Result<u64, RelocError> {
+    let Some(symbol_id) = dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table) else {
+        return Err(reloc_error(
+            atom,
+            &obj.path,
+            reloc.offset.saturating_sub(atom.input_offset),
+            reloc.kind,
+            &describe_referent(obj, reloc.referent),
+            "GOT relocations currently require a dylib import target".to_string(),
+        ));
+    };
+    resolve.got_addrs.get(&symbol_id).copied().ok_or_else(|| {
+        reloc_error(
+            atom,
+            &obj.path,
+            reloc.offset.saturating_sub(atom.input_offset),
+            reloc.kind,
+            &describe_referent(obj, reloc.referent),
+            "dylib import is missing synthetic GOT slot".to_string(),
+        )
+    })
 }
 
 fn resolve_referent(
@@ -252,6 +413,22 @@ fn resolve_symbol_referent(
     }
 
     resolve_input_symbol(obj, atom, input_sym, resolve)
+}
+
+fn dylib_import_symbol_id(
+    obj: &ObjectFile,
+    referent: Referent,
+    sym_table: &SymbolTable,
+) -> Option<SymbolId> {
+    let Referent::Symbol(sym_idx) = referent else {
+        return None;
+    };
+    let input_sym = obj.symbols.get(sym_idx as usize)?;
+    let name = obj.symbol_name(input_sym).ok()?;
+    let (symbol_id, symbol) = sym_table
+        .iter()
+        .find(|(_, symbol)| sym_table.interner.resolve(symbol.name()) == name)?;
+    matches!(symbol, Symbol::DylibImport { .. }).then_some(symbol_id)
 }
 
 fn resolve_global_symbol(
@@ -573,6 +750,90 @@ fn patch_pageoff12(
         reloc.kind,
         &describe_referent(obj, reloc.referent),
     )
+}
+
+fn synthesize_stub_section(
+    layout: &mut Layout,
+    plan: &SyntheticPlan,
+    resolve: &ResolveView<'_>,
+) -> Result<(), RelocError> {
+    let Some(section) = layout
+        .sections
+        .iter_mut()
+        .find(|section| section.segment == "__TEXT" && section.name == "__stubs")
+    else {
+        return Ok(());
+    };
+
+    for (idx, entry) in plan.stubs.entries.iter().enumerate() {
+        let start = idx * STUB_SIZE as usize;
+        let end = start + STUB_SIZE as usize;
+        let stub_addr = section.addr + (idx as u64) * STUB_SIZE as u64;
+        let lazy_addr = resolve
+            .lazy_pointer_addrs
+            .get(&entry.symbol)
+            .copied()
+            .ok_or_else(|| RelocError {
+                input: PathBuf::from("<synthetic stubs>"),
+                atom: crate::resolve::AtomId(0),
+                atom_offset: start as u32,
+                kind: RelocKind::Branch26,
+                referent: format!("symbol {:?}", entry.symbol),
+                detail: "synthetic stub is missing lazy pointer target".to_string(),
+            })?;
+        let bytes = encode_stub(stub_addr, lazy_addr)?;
+        section.synthetic_data[start..end].copy_from_slice(&bytes);
+    }
+
+    Ok(())
+}
+
+fn encode_stub(stub_addr: u64, lazy_pointer_addr: u64) -> Result<[u8; STUB_SIZE as usize], RelocError> {
+    let adrp = encode_adrp_x16(stub_addr, lazy_pointer_addr)?;
+    let ldr = encode_ldr_x16_pageoff(lazy_pointer_addr)?;
+    let br = 0xd61f0200u32;
+
+    let mut out = [0u8; STUB_SIZE as usize];
+    out[0..4].copy_from_slice(&adrp.to_le_bytes());
+    out[4..8].copy_from_slice(&ldr.to_le_bytes());
+    out[8..12].copy_from_slice(&br.to_le_bytes());
+    Ok(out)
+}
+
+fn encode_adrp_x16(place: u64, target: u64) -> Result<u32, RelocError> {
+    let delta = page(target).wrapping_sub(page(place)) as i64;
+    let imm = delta >> 12;
+    if !fits_signed(imm, 21) {
+        return Err(RelocError {
+            input: PathBuf::from("<synthetic stubs>"),
+            atom: crate::resolve::AtomId(0),
+            atom_offset: 0,
+            kind: RelocKind::Page21,
+            referent: format!("lazy pointer @ {target:#x}"),
+            detail: format!("page delta is out of PAGE21 range ({delta:#x})"),
+        });
+    }
+
+    let encoded = (imm as u32) & 0x1f_ffff;
+    let immlo = encoded & 0x3;
+    let immhi = (encoded >> 2) & 0x7ffff;
+    Ok(0x9000_0010 | (immlo << 29) | (immhi << 5))
+}
+
+fn encode_ldr_x16_pageoff(target: u64) -> Result<u32, RelocError> {
+    let low = target & 0xfff;
+    if low & 0b111 != 0 {
+        return Err(RelocError {
+            input: PathBuf::from("<synthetic stubs>"),
+            atom: crate::resolve::AtomId(0),
+            atom_offset: 4,
+            kind: RelocKind::PageOff12,
+            referent: format!("lazy pointer @ {target:#x}"),
+            detail: format!("lazy pointer page offset {low:#x} is not 8-byte aligned"),
+        });
+    }
+    let imm12 = ((low >> 3) as u32) & 0xfff;
+    Ok(0xf940_0210 | (imm12 << 10))
 }
 
 fn read_u32(

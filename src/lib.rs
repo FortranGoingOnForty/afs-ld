@@ -87,6 +87,7 @@ pub enum LinkError {
     Write(macho::writer::WriteError),
     Tbd(macho::tbd::TbdError),
     Reloc(RelocError),
+    Synth(synth::SynthError),
     DuplicateSymbols(String),
     UndefinedSymbols(String),
     UnsupportedArch(String),
@@ -105,6 +106,7 @@ impl std::fmt::Display for LinkError {
             LinkError::Write(e) => write!(f, "{e}"),
             LinkError::Tbd(e) => write!(f, "{e}"),
             LinkError::Reloc(e) => write!(f, "{e}"),
+            LinkError::Synth(e) => write!(f, "{e}"),
             LinkError::DuplicateSymbols(msg) | LinkError::UndefinedSymbols(msg) => {
                 write!(f, "{msg}")
             }
@@ -170,6 +172,12 @@ impl From<macho::tbd::TbdError> for LinkError {
 impl From<RelocError> for LinkError {
     fn from(value: RelocError) -> Self {
         LinkError::Reloc(value)
+    }
+}
+
+impl From<synth::SynthError> for LinkError {
+    fn from(value: synth::SynthError) -> Self {
+        LinkError::Synth(value)
     }
 }
 
@@ -252,9 +260,22 @@ impl Linker {
                 ordinal: dylib.ordinal,
             })
             .collect();
-        let base_layout = Layout::build(opts.kind, &layout_inputs, &atom_table, 0);
+        let synthetic_plan = synth::SyntheticPlan::build(&layout_inputs, &atom_table, &sym_table)?;
+        let base_layout = Layout::build_with_synthetics(
+            opts.kind,
+            &layout_inputs,
+            &atom_table,
+            0,
+            Some(&synthetic_plan),
+        );
         let mut layout = macho::writer::finalize_layout(&base_layout, opts.kind, opts, &dylib_loads)?;
-        reloc::arm64::apply_layout(&mut layout, &layout_inputs, &atom_table, &sym_table)?;
+        reloc::arm64::apply_layout(
+            &mut layout,
+            &layout_inputs,
+            &atom_table,
+            &sym_table,
+            Some(&synthetic_plan),
+        )?;
 
         let mut image = Vec::new();
         let entry_point = resolve_entry_point(opts, &sym_table)?;

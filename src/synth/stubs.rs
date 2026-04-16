@@ -32,6 +32,11 @@ impl StubsSection {
         self.index.insert(symbol, idx);
         idx
     }
+
+    pub fn get(&self, symbol: SymbolId) -> Option<(usize, &StubEntry)> {
+        let idx = *self.index.get(&symbol)?;
+        Some((idx, &self.entries[idx]))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -60,6 +65,11 @@ impl LazyPointerSection {
         });
         self.index.insert(symbol, idx);
         idx
+    }
+
+    pub fn get(&self, symbol: SymbolId) -> Option<(usize, &LazyPointerEntry)> {
+        let idx = *self.index.get(&symbol)?;
+        Some((idx, &self.entries[idx]))
     }
 }
 

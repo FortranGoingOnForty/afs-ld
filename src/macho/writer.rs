@@ -337,29 +337,44 @@ fn build_commands(
         )?));
     }
 
-    commands.push(LoadCommand::BuildVersion(BuildVersionCmd {
-        platform: PLATFORM_MACOS,
-        minos: pack_version(11, 0, 0),
-        sdk: pack_version(11, 0, 0),
-        tools: vec![BuildTool {
-            tool: 3,
-            version: pack_version(0, 1, 0),
-        }],
-    }));
-    commands.push(raw_uuid_command(stable_uuid(layout, kind)));
-
     match kind {
         OutputKind::Executable => {
+            commands.push(LoadCommand::DyldInfoOnly(linkedit.dyld_info));
+            commands.push(LoadCommand::Symtab(linkedit.symtab));
+            commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
             commands.push(raw_dylinker_command("/usr/lib/dyld"));
+            commands.push(raw_uuid_command(stable_uuid(layout, kind)));
+            commands.push(LoadCommand::BuildVersion(BuildVersionCmd {
+                platform: PLATFORM_MACOS,
+                minos: pack_version(11, 0, 0),
+                sdk: pack_version(11, 0, 0),
+                tools: vec![BuildTool {
+                    tool: 3,
+                    version: pack_version(0, 1, 0),
+                }],
+            }));
+            commands.push(raw_source_version_command(0));
             commands.push(raw_entry_point(resolve_entryoff(layout, entry_point)?, 0));
         }
-        OutputKind::Dylib => commands.push(LoadCommand::Dylib(DylibCmd {
-            cmd: LC_ID_DYLIB,
-            name: dylib_install_name(opts),
-            timestamp: 2,
-            current_version: pack_version(1, 0, 0),
-            compatibility_version: pack_version(1, 0, 0),
-        })),
+        OutputKind::Dylib => {
+            commands.push(LoadCommand::BuildVersion(BuildVersionCmd {
+                platform: PLATFORM_MACOS,
+                minos: pack_version(11, 0, 0),
+                sdk: pack_version(11, 0, 0),
+                tools: vec![BuildTool {
+                    tool: 3,
+                    version: pack_version(0, 1, 0),
+                }],
+            }));
+            commands.push(raw_uuid_command(stable_uuid(layout, kind)));
+            commands.push(LoadCommand::Dylib(DylibCmd {
+                cmd: LC_ID_DYLIB,
+                name: dylib_install_name(opts),
+                timestamp: 2,
+                current_version: pack_version(1, 0, 0),
+                compatibility_version: pack_version(1, 0, 0),
+            }));
+        }
     }
 
     for dylib in dylibs {
@@ -372,8 +387,6 @@ fn build_commands(
         }));
     }
 
-    commands.push(LoadCommand::Symtab(linkedit.symtab));
-    commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
     commands.push(raw_linkedit_command(
         LC_FUNCTION_STARTS,
         linkedit.function_starts.dataoff,
@@ -393,7 +406,11 @@ fn build_commands(
     } else {
         commands.push(raw_linkedit_command(LC_CODE_SIGNATURE, 0, 0));
     }
-    commands.push(LoadCommand::DyldInfoOnly(linkedit.dyld_info));
+    if kind == OutputKind::Dylib {
+        commands.push(LoadCommand::DyldInfoOnly(linkedit.dyld_info));
+        commands.push(LoadCommand::Symtab(linkedit.symtab));
+        commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
+    }
 
     Ok(commands)
 }
@@ -421,7 +438,11 @@ fn estimate_header_size(
     .wire_size() as u64;
     size += 24;
     size += match kind {
-        OutputKind::Executable => raw_dylinker_command("/usr/lib/dyld").cmdsize() as u64 + 24,
+        OutputKind::Executable => {
+            raw_dylinker_command("/usr/lib/dyld").cmdsize() as u64
+                + 24
+                + raw_source_version_command(0).cmdsize() as u64
+        }
         OutputKind::Dylib => DylibCmd {
             cmd: LC_ID_DYLIB,
             name: dylib_install_name(opts),
@@ -527,6 +548,14 @@ fn raw_uuid_command(uuid: [u8; 16]) -> LoadCommand {
         cmd: LC_UUID,
         cmdsize: 24,
         data: uuid.to_vec(),
+    }
+}
+
+fn raw_source_version_command(version: u64) -> LoadCommand {
+    LoadCommand::Raw {
+        cmd: LC_SOURCE_VERSION,
+        cmdsize: 16,
+        data: version.to_le_bytes().to_vec(),
     }
 }
 

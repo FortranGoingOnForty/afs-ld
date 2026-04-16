@@ -16,7 +16,8 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
-    BIND_SYMBOL_FLAGS_WEAK_IMPORT, DICE_KIND_JUMP_TABLE32, LC_DATA_IN_CODE, LC_FUNCTION_STARTS,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, DICE_KIND_JUMP_TABLE32, LC_BUILD_VERSION, LC_DATA_IN_CODE,
+    LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS, LC_SEGMENT_64, LC_SYMTAB,
     REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB,
     REBASE_OPCODE_DONE, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
@@ -480,6 +481,24 @@ fn decode_function_starts(bytes: &[u8]) -> Vec<u64> {
         offsets.push(current);
     }
     offsets
+}
+
+fn command_ids(bytes: &[u8]) -> Vec<u32> {
+    let header = parse_header(bytes).unwrap();
+    let commands = parse_commands(&header, bytes).unwrap();
+    commands
+        .into_iter()
+        .map(|cmd| match cmd {
+            LoadCommand::Segment64(_) => LC_SEGMENT_64,
+            LoadCommand::Symtab(_) => LC_SYMTAB,
+            LoadCommand::Dysymtab(_) => LC_DYSYMTAB,
+            LoadCommand::BuildVersion(_) => LC_BUILD_VERSION,
+            LoadCommand::Dylib(d) => d.cmd,
+            LoadCommand::DyldInfoOnly(_) => LC_DYLD_INFO_ONLY,
+            LoadCommand::Raw { cmd, .. } => cmd,
+            other => panic!("unexpected load command in command_ids helper: {other:?}"),
+        })
+        .collect()
 }
 
 fn normalize_function_start_offsets(starts: &[u64]) -> Vec<u64> {
@@ -1686,9 +1705,18 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
         eprintln!("skipping: xcrun as or codesign unavailable");
         return;
     }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
 
     let obj = scratch("main.o");
     let out = scratch("a.out");
+    let apple_out = scratch("a-apple.out");
     let src = r#"
         .section __TEXT,__text,regular,pure_instructions
         .globl _main
@@ -1709,13 +1737,16 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
         ..LinkOptions::default()
     };
     Linker::run(&opts).unwrap();
+    apple_link_classic_lazy(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
 
     let bytes = fs::read(&out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
     let header = parse_header(&bytes).unwrap();
     let commands = parse_commands(&header, &bytes).unwrap();
     let mut text_size = 0u64;
     let mut has_dylinker = false;
     let mut has_uuid = false;
+    let mut has_source_version = false;
     for cmd in commands {
         match cmd {
             LoadCommand::Segment64(seg) => {
@@ -1735,6 +1766,11 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
             LoadCommand::Raw { cmd, data, .. } if cmd == afs_ld::macho::constants::LC_UUID => {
                 has_uuid = data.len() == 16 && data.iter().any(|byte| *byte != 0);
             }
+            LoadCommand::Raw { cmd, .. }
+                if cmd == afs_ld::macho::constants::LC_SOURCE_VERSION =>
+            {
+                has_source_version = true;
+            }
             _ => {}
         }
     }
@@ -1744,6 +1780,19 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
         "expected LC_LOAD_DYLINKER in executable output"
     );
     assert!(has_uuid, "expected LC_UUID in executable output");
+    assert!(
+        has_source_version,
+        "expected LC_SOURCE_VERSION in executable output"
+    );
+    let our_cmds: Vec<u32> = command_ids(&bytes)
+        .into_iter()
+        .filter(|cmd| *cmd != afs_ld::macho::constants::LC_LOAD_DYLIB)
+        .collect();
+    let apple_cmds: Vec<u32> = command_ids(&apple_bytes)
+        .into_iter()
+        .filter(|cmd| *cmd != afs_ld::macho::constants::LC_LOAD_DYLIB)
+        .collect();
+    assert_eq!(our_cmds, apple_cmds);
     assert!(
         fs::metadata(&out).unwrap().permissions().mode() & 0o111 != 0,
         "expected executable output mode"
@@ -1763,6 +1812,7 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
+    let _ = fs::remove_file(apple_out);
 }
 
 #[test]

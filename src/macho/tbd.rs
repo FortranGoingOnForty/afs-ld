@@ -356,6 +356,18 @@ impl Target {
         };
         format!("{arch}-{plat}")
     }
+
+    /// Apple SDK TBDs sometimes scope umbrella documents to `arm64e-macos`
+    /// only even though the same symbols are consumable by plain `arm64`
+    /// linkers on Apple Silicon. Treat that as compatible for our arm64-only
+    /// linker, while still requiring the platform to match exactly.
+    pub fn matches_requested(&self, wanted: &Target) -> bool {
+        if self.platform != wanted.platform {
+            return false;
+        }
+        self.arch == wanted.arch
+            || matches!((&self.arch, &wanted.arch), (Arch::Arm64e, Arch::Arm64))
+    }
 }
 
 #[cfg(test)]
@@ -459,6 +471,32 @@ mod tests {
             platform: Platform::MacCatalyst,
         };
         assert_eq!(t.as_string(), "arm64e-maccatalyst");
+    }
+
+    #[test]
+    fn arm64_request_accepts_arm64e_scope() {
+        let scoped = Target {
+            arch: Arch::Arm64e,
+            platform: Platform::MacOs,
+        };
+        let wanted = Target {
+            arch: Arch::Arm64,
+            platform: Platform::MacOs,
+        };
+        assert!(scoped.matches_requested(&wanted));
+    }
+
+    #[test]
+    fn arm64_request_still_rejects_wrong_platform() {
+        let scoped = Target {
+            arch: Arch::Arm64e,
+            platform: Platform::MacCatalyst,
+        };
+        let wanted = Target {
+            arch: Arch::Arm64,
+            platform: Platform::MacOs,
+        };
+        assert!(!scoped.matches_requested(&wanted));
     }
 
     #[test]

@@ -238,7 +238,7 @@ impl DylibFile {
 }
 
 fn scope_matches(targets: &[Target], wanted: &Target) -> bool {
-    targets.iter().any(|t| t == wanted)
+    targets.iter().any(|t| t.matches_requested(wanted))
 }
 
 fn append_entries(lists: &SymbolLists, out: &mut Vec<ExportEntry>) {
@@ -447,6 +447,27 @@ mod tests {
         assert!(names.contains(&"_arm_only".to_string()));
         assert!(names.contains(&"_shared_sym".to_string()));
         assert!(!names.contains(&"_x86_only".to_string()));
+    }
+
+    #[test]
+    fn from_tbd_arm64_uses_arm64e_scopes() {
+        let src = "--- !tapi-tbd\n\
+                   tbd-version: 4\n\
+                   targets: [ arm64e-macos ]\n\
+                   install-name: '/usr/lib/libdemo.dylib'\n\
+                   exports:\n\
+                   \x20 - targets: [ arm64e-macos ]\n\
+                   \x20   symbols: [ _umbrella_only ]\n";
+        let tbd = &parse_tbd(src).unwrap()[0];
+        let dy = DylibFile::from_tbd("/stub/libdemo.tbd", tbd, &arm64_macos());
+        let names: Vec<String> = dy
+            .exports
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["_umbrella_only".to_string()]);
     }
 
     #[test]

@@ -362,7 +362,7 @@ fn register_input(inputs: &mut Inputs, path: &std::path::Path) -> Result<(), Lin
             let mut loaded = false;
             for doc in docs
                 .iter()
-                .filter(|doc| doc.targets.iter().any(|t| t == &target))
+                .filter(|doc| doc.targets.iter().any(|t| t.matches_requested(&target)))
             {
                 let file = DylibFile::from_tbd(path, doc, &target);
                 let _ =

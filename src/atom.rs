@@ -68,6 +68,7 @@ impl AtomSection {
             SectionKind::ThreadLocalRegular => AtomSection::ThreadLocalData,
             SectionKind::ThreadLocalZeroFill => AtomSection::ThreadLocalBss,
             SectionKind::ThreadLocalVariables => AtomSection::ThreadLocalVariables,
+            SectionKind::ThreadLocalVariablePointers => AtomSection::ThreadLocalVariables,
             SectionKind::ThreadLocalInitPointers => AtomSection::ThreadLocalInitPointers,
             SectionKind::Coalesced => AtomSection::Coalesced,
             SectionKind::CompactUnwind => AtomSection::CompactUnwind,

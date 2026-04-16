@@ -37,6 +37,8 @@ pub enum SectionKind {
     ThreadLocalZeroFill,
     /// TLV descriptors (`S_THREAD_LOCAL_VARIABLES`).
     ThreadLocalVariables,
+    /// TLV descriptor pointer slots (`S_THREAD_LOCAL_VARIABLE_POINTERS`).
+    ThreadLocalVariablePointers,
     /// TLV init function pointers.
     ThreadLocalInitPointers,
     /// `__TEXT,__compact_unwind` (`S_REGULAR` + `S_ATTR_DEBUG`).
@@ -78,6 +80,7 @@ pub fn classify_section(segname: &str, sectname: &str, flags: u32) -> SectionKin
         S_THREAD_LOCAL_REGULAR => SectionKind::ThreadLocalRegular,
         S_THREAD_LOCAL_ZEROFILL => SectionKind::ThreadLocalZeroFill,
         S_THREAD_LOCAL_VARIABLES => SectionKind::ThreadLocalVariables,
+        S_THREAD_LOCAL_VARIABLE_POINTERS => SectionKind::ThreadLocalVariablePointers,
         S_THREAD_LOCAL_INIT_FUNCTION_POINTERS => SectionKind::ThreadLocalInitPointers,
         S_REGULAR => classify_regular(segname, sectname, flags),
         _ => SectionKind::Unknown(ty as u8),
@@ -363,6 +366,10 @@ mod tests {
         assert_eq!(
             classify_section("__DATA", "__thread_vars", S_THREAD_LOCAL_VARIABLES),
             SectionKind::ThreadLocalVariables
+        );
+        assert_eq!(
+            classify_section("__DATA", "__thread_ptrs", S_THREAD_LOCAL_VARIABLE_POINTERS),
+            SectionKind::ThreadLocalVariablePointers
         );
     }
 

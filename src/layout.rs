@@ -699,7 +699,12 @@ mod tests {
                 }],
                 index: [(SymbolId(1), 0)].into_iter().collect(),
             },
+            thread_pointers: crate::synth::tlv::ThreadPointerSection {
+                entries: Vec::new(),
+                index: HashMap::new(),
+            },
             binder_symbol: Some(SymbolId(2)),
+            tlv_bootstrap_symbol: None,
             needs_dyld_private: true,
         };
 
@@ -802,7 +807,12 @@ mod tests {
                 entries: Vec::new(),
                 index: HashMap::new(),
             },
+            thread_pointers: crate::synth::tlv::ThreadPointerSection {
+                entries: Vec::new(),
+                index: HashMap::new(),
+            },
             binder_symbol: None,
+            tlv_bootstrap_symbol: None,
             needs_dyld_private: true,
         };
 

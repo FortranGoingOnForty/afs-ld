@@ -1,6 +1,7 @@
 pub mod code_sig;
 pub mod got;
 pub mod stubs;
+pub mod tlv;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -12,6 +13,7 @@ use crate::layout::LayoutInput;
 use crate::macho::constants::{
     S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_LAZY_SYMBOL_POINTERS,
     S_NON_LAZY_SYMBOL_POINTERS, S_REGULAR, S_SYMBOL_STUBS,
+    S_THREAD_LOCAL_VARIABLE_POINTERS,
 };
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind};
 use crate::resolve::{DylibId, DylibInput, InputId, InsertOutcome, Symbol, SymbolId, SymbolTable};
@@ -22,13 +24,16 @@ use self::stubs::{
     LazyPointerSection, StubsSection, DYLD_PRIVATE_SIZE, STUB_HELPER_ENTRY_SIZE,
     STUB_HELPER_HEADER_SIZE,
 };
+use self::tlv::{ThreadPointerSection, THREAD_POINTER_SIZE};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntheticPlan {
     pub got: GotSection,
     pub stubs: StubsSection,
     pub lazy_pointers: LazyPointerSection,
+    pub thread_pointers: ThreadPointerSection,
     pub binder_symbol: Option<SymbolId>,
+    pub tlv_bootstrap_symbol: Option<SymbolId>,
     pub needs_dyld_private: bool,
 }
 
@@ -97,6 +102,7 @@ impl SyntheticPlan {
         let mut got = GotSection::default();
         let mut stubs = StubsSection::default();
         let mut lazy_pointers = LazyPointerSection::default();
+        let mut thread_pointers = ThreadPointerSection::default();
 
         for (atom_id, atom) in atoms.iter() {
             let obj = input_map.get(&atom.origin).ok_or_else(|| SynthError {
@@ -111,43 +117,61 @@ impl SyntheticPlan {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             for reloc in relocs_for_atom(relocs, atom) {
-                let Some(symbol_id) = dylib_import_referent(obj, reloc.referent, sym_table) else {
-                    continue;
-                };
-                let dylib = match sym_table.get(symbol_id) {
-                    Symbol::DylibImport { dylib, .. } => *dylib,
-                    _ => continue,
-                };
                 match reloc.kind {
                     RelocKind::GotLoadPage21
                     | RelocKind::GotLoadPageOff12
                     | RelocKind::PointerToGot => {
+                        let Some(symbol_id) = dylib_import_referent(obj, reloc.referent, sym_table)
+                        else {
+                            continue;
+                        };
                         got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
                     }
                     RelocKind::Branch26 => {
+                        let Some(symbol_id) = dylib_import_referent(obj, reloc.referent, sym_table)
+                        else {
+                            continue;
+                        };
+                        let dylib = match sym_table.get(symbol_id) {
+                            Symbol::DylibImport { dylib, .. } => *dylib,
+                            _ => continue,
+                        };
                         stubs.intern(symbol_id, dylib, dylib_import_is_weak(sym_table, symbol_id));
                         lazy_pointers
                             .intern(symbol_id, dylib, dylib_import_is_weak(sym_table, symbol_id));
                     }
-                    RelocKind::TlvpLoadPage21 | RelocKind::TlvpLoadPageOff12 => {}
+                    RelocKind::TlvpLoadPage21 | RelocKind::TlvpLoadPageOff12 => {
+                        if let Some(symbol_id) = symbol_referent_id(obj, reloc.referent, sym_table)
+                        {
+                            if tlv_symbol_needs_thread_pointer(sym_table, symbol_id) {
+                                thread_pointers.intern(symbol_id);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
         }
 
         let mut binder_symbol = None;
+        let mut tlv_bootstrap_symbol = None;
         let mut needs_dyld_private = false;
         if !stubs.entries.is_empty() {
             let binder = ensure_stub_helper_support(sym_table, dylibs, &mut got)?;
             binder_symbol = Some(binder);
             needs_dyld_private = true;
         }
+        if !thread_pointers.entries.is_empty() {
+            tlv_bootstrap_symbol = ensure_tlv_support(sym_table, dylibs)?;
+        }
 
         Ok(SyntheticPlan {
             got,
             stubs,
             lazy_pointers,
+            thread_pointers,
             binder_symbol,
+            tlv_bootstrap_symbol,
             needs_dyld_private,
         })
     }
@@ -249,6 +273,24 @@ impl SyntheticPlan {
                 file_off: 0,
             });
         }
+        if !self.thread_pointers.entries.is_empty() {
+            out.push(OutputSection {
+                segment: "__DATA".into(),
+                name: "__thread_ptrs".into(),
+                kind: SectionKind::ThreadLocalVariablePointers,
+                align_pow2: 3,
+                flags: S_THREAD_LOCAL_VARIABLE_POINTERS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                atoms: Vec::new(),
+                synthetic_offset: 0,
+                synthetic_data: vec![0; self.thread_pointers.entries.len() * THREAD_POINTER_SIZE as usize],
+                addr: 0,
+                size: (self.thread_pointers.entries.len() as u64) * THREAD_POINTER_SIZE as u64,
+                file_off: 0,
+            });
+        }
         out
     }
 }
@@ -285,15 +327,24 @@ fn dylib_import_referent(
     referent: Referent,
     sym_table: &SymbolTable,
 ) -> Option<SymbolId> {
+    let symbol_id = symbol_referent_id(obj, referent, sym_table)?;
+    matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. }).then_some(symbol_id)
+}
+
+fn symbol_referent_id(
+    obj: &ObjectFile,
+    referent: Referent,
+    sym_table: &SymbolTable,
+) -> Option<SymbolId> {
     let Referent::Symbol(sym_idx) = referent else {
         return None;
     };
     let input_sym = obj.symbols.get(sym_idx as usize)?;
     let name = obj.symbol_name(input_sym).ok()?;
-    let (symbol_id, symbol) = sym_table
+    let (symbol_id, _) = sym_table
         .iter()
         .find(|(_, symbol)| sym_table.interner.resolve(symbol.name()) == name)?;
-    matches!(symbol, Symbol::DylibImport { .. }).then_some(symbol_id)
+    Some(symbol_id)
 }
 
 fn dylib_import_is_weak(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
@@ -306,27 +357,19 @@ fn dylib_import_is_weak(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
     )
 }
 
+fn tlv_symbol_needs_thread_pointer(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
+    matches!(
+        sym_table.get(symbol_id),
+        Symbol::Defined { .. } | Symbol::Common { .. }
+    )
+}
+
 fn ensure_stub_helper_support(
     sym_table: &mut SymbolTable,
     dylibs: &[DylibInput],
     got: &mut GotSection,
 ) -> Result<SymbolId, SynthError> {
-    let (libsystem_id, libsystem) = dylibs
-        .iter()
-        .enumerate()
-        .find(|(_, dylib)| dylib.load_install_name == "/usr/lib/libSystem.B.dylib")
-        .or_else(|| {
-            dylibs
-                .iter()
-                .enumerate()
-                .find(|(_, dylib)| dylib.load_install_name.contains("libSystem"))
-        })
-        .or_else(|| {
-            dylibs
-                .iter()
-                .enumerate()
-                .find(|(_, dylib)| dylib.path.to_string_lossy().contains("libSystem.tbd"))
-        })
+    let (libsystem_id, libsystem) = find_libsystem_input(dylibs)
         .ok_or_else(|| SynthError {
             input: PathBuf::from("<synthetic stubs>"),
             atom: crate::resolve::AtomId(0),
@@ -379,6 +422,77 @@ fn ensure_stub_helper_support(
 
     got.intern(symbol_id, false);
     Ok(symbol_id)
+}
+
+fn ensure_tlv_support(
+    sym_table: &mut SymbolTable,
+    dylibs: &[DylibInput],
+) -> Result<Option<SymbolId>, SynthError> {
+    let Some((libsystem_id, libsystem)) = find_libsystem_input(dylibs) else {
+        return Ok(None);
+    };
+
+    let name = sym_table.intern("_tlv_bootstrap");
+    let symbol_id = if let Some(id) = sym_table.lookup(name) {
+        match sym_table.get(id) {
+            Symbol::DylibImport { .. } => id,
+            other => {
+                return Err(SynthError {
+                    input: PathBuf::from("<synthetic tlv>"),
+                    atom: crate::resolve::AtomId(0),
+                    reloc_offset: 0,
+                    kind: RelocKind::TlvpLoadPage21,
+                    detail: format!(
+                        "`_tlv_bootstrap` already exists as unsupported symbol kind {:?}",
+                        other.kind()
+                    ),
+                });
+            }
+        }
+    } else {
+        match sym_table
+            .insert(Symbol::DylibImport {
+                name,
+                dylib: DylibId(libsystem_id as u32),
+                ordinal: libsystem.ordinal,
+                weak_import: false,
+            })
+            .map_err(|err| SynthError {
+                input: PathBuf::from("<synthetic tlv>"),
+                atom: crate::resolve::AtomId(0),
+                reloc_offset: 0,
+                kind: RelocKind::TlvpLoadPage21,
+                detail: format!("{err:?}"),
+            })? {
+            InsertOutcome::Inserted(id)
+            | InsertOutcome::Kept(id)
+            | InsertOutcome::PendingArchiveFetch { id, .. }
+            | InsertOutcome::PendingObjectLoad { id, .. }
+            | InsertOutcome::CommonCoalesced { id }
+            | InsertOutcome::Replaced { id, .. } => id,
+        }
+    };
+
+    Ok(Some(symbol_id))
+}
+
+fn find_libsystem_input(dylibs: &[DylibInput]) -> Option<(usize, &DylibInput)> {
+    dylibs
+        .iter()
+        .enumerate()
+        .find(|(_, dylib)| dylib.load_install_name == "/usr/lib/libSystem.B.dylib")
+        .or_else(|| {
+            dylibs
+                .iter()
+                .enumerate()
+                .find(|(_, dylib)| dylib.load_install_name.contains("libSystem"))
+        })
+        .or_else(|| {
+            dylibs
+                .iter()
+                .enumerate()
+                .find(|(_, dylib)| dylib.path.to_string_lossy().contains("libSystem.tbd"))
+        })
 }
 
 #[cfg(test)]
@@ -480,7 +594,9 @@ mod tests {
         assert_eq!(plan.got.entries.len(), 2);
         assert_eq!(plan.stubs.entries.len(), 1);
         assert_eq!(plan.lazy_pointers.entries.len(), 1);
+        assert!(plan.thread_pointers.entries.is_empty());
         assert!(plan.binder_symbol.is_some());
+        assert!(plan.tlv_bootstrap_symbol.is_none());
         assert!(plan.needs_dyld_private);
         assert_eq!(plan.stubs.entries[0].dylib, DylibId(2));
         assert_eq!(plan.lazy_pointers.entries[0].symbol, plan.stubs.entries[0].symbol);
@@ -543,8 +659,90 @@ mod tests {
         assert!(plan.got.entries.is_empty());
         assert!(plan.stubs.entries.is_empty());
         assert!(plan.lazy_pointers.entries.is_empty());
+        assert!(plan.thread_pointers.entries.is_empty());
         assert!(plan.binder_symbol.is_none());
+        assert!(plan.tlv_bootstrap_symbol.is_none());
         assert!(!plan.needs_dyld_private);
+    }
+
+    #[test]
+    fn synthetic_plan_collects_thread_pointer_needs_for_tlvp() {
+        let mut sym_table = SymbolTable::new();
+        let name = sym_table.intern("_tlsvar");
+        let input_id = InputId(0);
+        sym_table
+            .insert(Symbol::Defined {
+                name,
+                origin: input_id,
+                atom: crate::resolve::AtomId(1),
+                value: 0,
+                weak: false,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap();
+
+        let relocs = vec![
+            Reloc {
+                offset: 0,
+                kind: RelocKind::TlvpLoadPage21,
+                length: RelocLength::Word,
+                pcrel: true,
+                referent: Referent::Symbol(0),
+                addend: 0,
+                subtrahend: None,
+            },
+            Reloc {
+                offset: 4,
+                kind: RelocKind::TlvpLoadPageOff12,
+                length: RelocLength::Word,
+                pcrel: false,
+                referent: Referent::Symbol(0),
+                addend: 0,
+                subtrahend: None,
+            },
+        ];
+        let object = tlvp_object("_tlsvar", encode_raw_relocs(&relocs));
+
+        let mut atoms = AtomTable::new();
+        atoms.push(Atom {
+            id: crate::resolve::AtomId(0),
+            origin: input_id,
+            input_section: 1,
+            section: AtomSection::Text,
+            input_offset: 0,
+            size: 8,
+            align_pow2: 2,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 8],
+            flags: AtomFlags::default().with(AtomFlags::PURE_INSTRUCTIONS),
+            parent_of: None,
+        });
+
+        let plan = SyntheticPlan::build(
+            &[LayoutInput {
+                id: input_id,
+                object: &object,
+            }],
+            &atoms,
+            &mut sym_table,
+            &[libsystem_input()],
+        )
+        .unwrap();
+
+        assert_eq!(plan.thread_pointers.entries.len(), 1);
+        assert!(plan.binder_symbol.is_none());
+        assert!(plan.tlv_bootstrap_symbol.is_some());
+
+        let sections = plan.output_sections();
+        let thread_ptrs = sections
+            .iter()
+            .find(|section| section.segment == "__DATA" && section.name == "__thread_ptrs")
+            .unwrap();
+        assert_eq!(thread_ptrs.kind, SectionKind::ThreadLocalVariablePointers);
+        assert_eq!(thread_ptrs.flags, S_THREAD_LOCAL_VARIABLE_POINTERS);
+        assert_eq!(thread_ptrs.size, THREAD_POINTER_SIZE as u64);
     }
 
     fn libsystem_input() -> DylibInput {
@@ -624,6 +822,73 @@ mod tests {
                 strx,
                 n_type: N_UNDF | N_EXT,
                 n_sect: 0,
+                n_desc: 0,
+                n_value: 0,
+            })],
+            strings: StringTable::from_bytes(strings),
+            symtab: None,
+            dysymtab: None,
+        }
+    }
+
+    fn tlvp_object(symbol_name: &str, raw_relocs: Vec<u8>) -> ObjectFile {
+        let mut strings = vec![0];
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(symbol_name.as_bytes());
+        strings.push(0);
+        ObjectFile {
+            path: PathBuf::from("/tmp/synth-tlv.o"),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections: vec![
+                InputSection {
+                    segname: "__TEXT".into(),
+                    sectname: "__text".into(),
+                    kind: SectionKind::Text,
+                    addr: 0,
+                    size: 8,
+                    align_pow2: 2,
+                    flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                    offset: 0,
+                    reloff: 0,
+                    nreloc: (raw_relocs.len() / 8) as u32,
+                    reserved1: 0,
+                    reserved2: 0,
+                    reserved3: 0,
+                    data: vec![0; 8],
+                    raw_relocs,
+                },
+                InputSection {
+                    segname: "__DATA".into(),
+                    sectname: "__thread_data".into(),
+                    kind: SectionKind::ThreadLocalRegular,
+                    addr: 0,
+                    size: 8,
+                    align_pow2: 3,
+                    flags: crate::macho::constants::S_THREAD_LOCAL_REGULAR,
+                    offset: 0,
+                    reloff: 0,
+                    nreloc: 0,
+                    reserved1: 0,
+                    reserved2: 0,
+                    reserved3: 0,
+                    data: vec![0; 8],
+                    raw_relocs: Vec::new(),
+                },
+            ],
+            symbols: vec![InputSymbol::from_raw(RawNlist {
+                strx,
+                n_type: N_EXT | crate::macho::constants::N_SECT,
+                n_sect: 2,
                 n_desc: 0,
                 n_value: 0,
             })],

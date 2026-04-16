@@ -539,9 +539,10 @@ fn read_u64(atom: &Atom, offset: usize) -> Result<u64, UnwindError> {
 
 fn serialize_unwind_info(records: &[UnwindRecord]) -> Result<Vec<u8>, UnwindReadError> {
     let (records, personalities, lsdas) = finalize_unwind_records(records)?;
-    let pages = build_pages(&records);
+    let common_encodings = select_common_encodings(&records);
+    let pages = build_pages(&records, &common_encodings);
     let common_encodings_offset = 7 * 4;
-    let common_encodings_count = 0u32;
+    let common_encodings_count = common_encodings.len() as u32;
     let personalities_offset = common_encodings_offset + common_encodings_count as usize * 4;
     let indices_offset = personalities_offset + personalities.len() * 4;
     let indices_count = (pages.len() + 1) as u32;
@@ -564,6 +565,9 @@ fn serialize_unwind_info(records: &[UnwindRecord]) -> Result<Vec<u8>, UnwindRead
     out.extend_from_slice(&(indices_offset as u32).to_le_bytes());
     out.extend_from_slice(&indices_count.to_le_bytes());
 
+    for encoding in &common_encodings {
+        out.extend_from_slice(&encoding.to_le_bytes());
+    }
     for personality in &personalities {
         out.extend_from_slice(&personality.to_le_bytes());
     }
@@ -825,9 +829,38 @@ fn finalize_unwind_records(
     Ok((finalized, personalities, lsdas))
 }
 
-fn build_pages(records: &[UnwindRecord]) -> Vec<CompressedPage> {
+fn select_common_encodings(records: &[UnwindRecord]) -> Vec<u32> {
+    let mut stats: HashMap<u32, (u32, usize)> = HashMap::new();
+    for (idx, record) in records.iter().enumerate() {
+        stats
+            .entry(record.encoding)
+            .and_modify(|(count, _)| *count += 1)
+            .or_insert((1, idx));
+    }
+
+    let mut encodings: Vec<(u32, u32, usize)> = stats
+        .into_iter()
+        .filter_map(|(encoding, (count, first_seen))| {
+            (count > 1).then_some((encoding, count, first_seen))
+        })
+        .collect();
+    encodings.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+    encodings.truncate(127);
+    encodings
+        .into_iter()
+        .map(|(encoding, _, _)| encoding)
+        .collect()
+}
+
+fn build_pages(records: &[UnwindRecord], common_encodings: &[u32]) -> Vec<CompressedPage> {
     let mut pages = Vec::new();
     let mut current: Option<CompressedPage> = None;
+    let common_indices: HashMap<u32, usize> = common_encodings
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(idx, encoding)| (encoding, idx))
+        .collect();
 
     for record in records {
         let page = current.get_or_insert_with(|| CompressedPage {
@@ -837,9 +870,10 @@ fn build_pages(records: &[UnwindRecord]) -> Vec<CompressedPage> {
         });
 
         let mut encodings = page.local_encodings.clone();
-        if encodings
-            .iter()
-            .all(|encoding| *encoding != record.encoding)
+        if !common_indices.contains_key(&record.encoding)
+            && encodings
+                .iter()
+                .all(|encoding| *encoding != record.encoding)
         {
             encodings.push(record.encoding);
         }
@@ -858,15 +892,17 @@ fn build_pages(records: &[UnwindRecord]) -> Vec<CompressedPage> {
         }
 
         let page = current.as_mut().unwrap();
-        let encoding_index = if let Some(index) = page
+        let encoding_index = if let Some(index) = common_indices.get(&record.encoding) {
+            *index
+        } else if let Some(index) = page
             .local_encodings
             .iter()
             .position(|encoding| *encoding == record.encoding)
         {
-            index
+            common_encodings.len() + index
         } else {
             page.local_encodings.push(record.encoding);
-            page.local_encodings.len() - 1
+            common_encodings.len() + page.local_encodings.len() - 1
         };
         page.entries
             .push(((encoding_index as u32) << 24) | (delta & 0x00ff_ffff));
@@ -1143,6 +1179,59 @@ mod tests {
                 },
                 DecodedUnwindRecord {
                     function_offset: 0x350,
+                    encoding: 0x0400_0000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_encodings_promote_to_common_table() {
+        let bytes = serialize_unwind_info(&[
+            UnwindRecord {
+                function_offset: 0x348,
+                code_len: 0x18,
+                encoding: 0x0400_0000,
+                personality_offset: None,
+                lsda_offset: None,
+            },
+            UnwindRecord {
+                function_offset: 0x360,
+                code_len: 0x20,
+                encoding: 0x0200_2000,
+                personality_offset: None,
+                lsda_offset: None,
+            },
+            UnwindRecord {
+                function_offset: 0x390,
+                code_len: 0x10,
+                encoding: 0x0400_0000,
+                personality_offset: None,
+                lsda_offset: None,
+            },
+        ])
+        .unwrap();
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(words[2], 1, "expected one promoted common encoding");
+        assert_eq!(words[7], 0x0400_0000);
+
+        let decoded = decode_unwind_info(&bytes).unwrap();
+        assert_eq!(
+            decoded.records,
+            vec![
+                DecodedUnwindRecord {
+                    function_offset: 0x348,
+                    encoding: 0x0400_0000,
+                },
+                DecodedUnwindRecord {
+                    function_offset: 0x360,
+                    encoding: 0x0200_2000,
+                },
+                DecodedUnwindRecord {
+                    function_offset: 0x390,
                     encoding: 0x0400_0000,
                 },
             ]

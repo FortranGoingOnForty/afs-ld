@@ -482,6 +482,13 @@ fn decode_function_starts(bytes: &[u8]) -> Vec<u64> {
     offsets
 }
 
+fn normalize_function_start_offsets(starts: &[u64]) -> Vec<u64> {
+    let Some(&base) = starts.first() else {
+        return Vec::new();
+    };
+    starts.iter().map(|offset| offset - base).collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DataInCodeRecord {
     offset: u32,
@@ -3820,6 +3827,79 @@ fn linker_run_preserves_eh_frame_like_ld() {
     )
     .unwrap();
     assert_eq!(our_dump, apple_dump);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_emits_backtrace_metadata_like_apple_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("unwind-backtrace.o");
+    let our_out = scratch("unwind-backtrace-ours.out");
+    let apple_out = scratch("unwind-backtrace-apple.out");
+    let src = r#"
+        #include <unwind.h>
+
+        static _Unwind_Reason_Code cb(struct _Unwind_Context* ctx, void* arg) {
+            (void)ctx;
+            int* count = (int*)arg;
+            (*count)++;
+            return *count >= 8 ? _URC_END_OF_STACK : _URC_NO_REASON;
+        }
+
+        __attribute__((noinline)) int helper(void) {
+            int count = 0;
+            _Unwind_Backtrace(cb, &count);
+            return count;
+        }
+
+        int main(void) {
+            return helper() > 1 ? 0 : 1;
+        }
+    "#;
+    if let Err(e) = compile_c(src, &obj) {
+        eprintln!("skipping: clang compile failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_classic_lazy(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert_eq!(
+        normalized_unwind_words(&our_bytes),
+        normalized_unwind_words(&apple_bytes)
+    );
+    assert_eq!(
+        normalize_function_start_offsets(&decode_function_starts(&our_bytes)),
+        normalize_function_start_offsets(&decode_function_starts(&apple_bytes))
+    );
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);

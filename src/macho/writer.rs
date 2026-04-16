@@ -758,7 +758,8 @@ fn build_linkedit_plan(
     let weak_bind_bytes = pad_dyld_info_stream(bind_streams.weak_bind);
     let lazy_bind_bytes = pad_dyld_info_stream(bind_streams.lazy_bind);
     let export_bytes = pad_dyld_info_stream(build_export_trie(&symbol_plan.exports));
-    let function_starts_bytes = build_function_starts(layout, inputs.0.atom_table)?;
+    let function_starts_bytes =
+        build_function_starts(layout, inputs.0.layout_inputs, inputs.0.atom_table)?;
     let data_in_code_bytes =
         build_data_in_code(layout, inputs.0.layout_inputs, inputs.0.atom_table)?;
 
@@ -1103,11 +1104,19 @@ fn symbol_referent_id(
     Some(symbol_id)
 }
 
-fn build_function_starts(layout: &Layout, atom_table: &AtomTable) -> Result<Vec<u8>, WriteError> {
+fn build_function_starts(
+    layout: &Layout,
+    inputs: &[LayoutInput<'_>],
+    atom_table: &AtomTable,
+) -> Result<Vec<u8>, WriteError> {
     let image_base = layout
         .segment("__TEXT")
         .ok_or(WriteError::MissingSegment("__TEXT"))?
         .vm_addr;
+    let input_map: HashMap<InputId, &ObjectFile> = inputs
+        .iter()
+        .map(|input| (input.id, input.object))
+        .collect();
     let mut starts = Vec::new();
 
     for section in &layout.sections {
@@ -1121,6 +1130,37 @@ fn build_function_starts(layout: &Layout, atom_table: &AtomTable) -> Result<Vec<
                 starts.push(
                     section.addr + placed.offset + alt.offset_within_atom as u64 - image_base,
                 );
+            }
+            let Some(object) = input_map.get(&atom.origin) else {
+                continue;
+            };
+            let Some(input_section) = object
+                .sections
+                .get((atom.input_section as usize).saturating_sub(1))
+            else {
+                continue;
+            };
+            let atom_start = input_section.addr + atom.input_offset as u64;
+            let atom_end = atom_start + atom.size as u64;
+            for input_sym in &object.symbols {
+                if input_sym.stab_kind().is_some()
+                    || input_sym.kind() != SymKind::Sect
+                    || input_sym.alt_entry()
+                    || input_sym.sect_idx() != atom.input_section
+                {
+                    continue;
+                }
+                let Ok(name) = object.symbol_name(input_sym) else {
+                    continue;
+                };
+                if is_assembler_temporary_symbol(name) {
+                    continue;
+                }
+                let value = input_sym.value();
+                if !(atom_start < value && value < atom_end) {
+                    continue;
+                }
+                starts.push(section.addr + placed.offset + (value - atom_start) - image_base);
             }
         }
     }
@@ -2267,7 +2307,7 @@ mod tests {
             ],
         };
 
-        let blob = build_function_starts(&layout, &atoms).unwrap();
+        let blob = build_function_starts(&layout, &[], &atoms).unwrap();
         assert_eq!(
             decode_function_starts_blob(&blob),
             vec![0x1000, 0x1008, 0x1040]

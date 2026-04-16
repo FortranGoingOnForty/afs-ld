@@ -392,6 +392,7 @@ fn section_rank(segment: &str, section: &str) -> usize {
         "__DATA_CONST" => &["__got", "__const"],
         "__DATA" => &[
             "__la_symbol_ptr",
+            "__dyld_private",
             "__data",
             "__thread_vars",
             "__thread_ptrs",
@@ -642,11 +643,17 @@ mod tests {
 
         let plan = SyntheticPlan {
             got: GotSection {
-                entries: vec![crate::synth::got::GotEntry {
-                    symbol: SymbolId(1),
-                    weak_import: false,
-                }],
-                index: [(SymbolId(1), 0)].into_iter().collect(),
+                entries: vec![
+                    crate::synth::got::GotEntry {
+                        symbol: SymbolId(1),
+                        weak_import: false,
+                    },
+                    crate::synth::got::GotEntry {
+                        symbol: SymbolId(2),
+                        weak_import: false,
+                    },
+                ],
+                index: [(SymbolId(1), 0), (SymbolId(2), 1)].into_iter().collect(),
             },
             stubs: StubsSection {
                 entries: vec![StubEntry {
@@ -664,6 +671,8 @@ mod tests {
                 }],
                 index: [(SymbolId(1), 0)].into_iter().collect(),
             },
+            binder_symbol: Some(SymbolId(2)),
+            needs_dyld_private: true,
         };
 
         let layout = Layout::build_with_synthetics(
@@ -687,8 +696,10 @@ mod tests {
             vec![
                 ("__TEXT", "__text"),
                 ("__TEXT", "__stubs"),
+                ("__TEXT", "__stub_helper"),
                 ("__DATA_CONST", "__got"),
                 ("__DATA", "__la_symbol_ptr"),
+                ("__DATA", "__dyld_private"),
             ]
         );
 
@@ -704,13 +715,25 @@ mod tests {
             .iter()
             .find(|section| section.name == "__got")
             .unwrap();
-        assert_eq!(got.size, 8);
+        assert_eq!(got.size, 16);
+        let helper = layout
+            .sections
+            .iter()
+            .find(|section| section.name == "__stub_helper")
+            .unwrap();
+        assert_eq!(helper.size, 36);
         let lazy = layout
             .sections
             .iter()
             .find(|section| section.name == "__la_symbol_ptr")
             .unwrap();
         assert_eq!(lazy.size, 8);
+        let dyld_private = layout
+            .sections
+            .iter()
+            .find(|section| section.name == "__dyld_private")
+            .unwrap();
+        assert_eq!(dyld_private.size, 8);
     }
 
     #[test]

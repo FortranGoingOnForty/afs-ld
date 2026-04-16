@@ -260,7 +260,12 @@ impl Linker {
                 ordinal: dylib.ordinal,
             })
             .collect();
-        let synthetic_plan = synth::SyntheticPlan::build(&layout_inputs, &atom_table, &sym_table)?;
+        let synthetic_plan = synth::SyntheticPlan::build(
+            &layout_inputs,
+            &atom_table,
+            &mut sym_table,
+            &inputs.dylibs,
+        )?;
         let base_layout = Layout::build_with_synthetics(
             opts.kind,
             &layout_inputs,
@@ -282,6 +287,7 @@ impl Linker {
             &atom_table,
             &sym_table,
             Some(&synthetic_plan),
+            &linkedit,
         )?;
 
         let mut image = Vec::new();

@@ -4,6 +4,9 @@ use crate::resolve::{DylibId, SymbolId};
 
 pub const STUB_SIZE: u32 = 12;
 pub const LAZY_POINTER_SIZE: u32 = 8;
+pub const STUB_HELPER_HEADER_SIZE: u32 = 24;
+pub const STUB_HELPER_ENTRY_SIZE: u32 = 12;
+pub const DYLD_PRIVATE_SIZE: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StubsSection {

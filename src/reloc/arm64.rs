@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use crate::atom::{Atom, AtomTable};
 use crate::input::ObjectFile;
 use crate::layout::{Layout, LayoutInput};
+use crate::macho::writer::LinkEditPlan;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
 use crate::resolve::{InputId, Symbol, SymbolId, SymbolTable};
-use crate::synth::stubs::STUB_SIZE;
+use crate::synth::stubs::{STUB_HELPER_ENTRY_SIZE, STUB_HELPER_HEADER_SIZE, STUB_SIZE};
 use crate::synth::SyntheticPlan;
 use crate::symbol::{InputSymbol, SymKind};
 
@@ -45,6 +46,18 @@ struct ResolveView<'a> {
     stub_addrs: &'a HashMap<SymbolId, u64>,
     got_addrs: &'a HashMap<SymbolId, u64>,
     lazy_pointer_addrs: &'a HashMap<SymbolId, u64>,
+    stub_helper_entry_addrs: &'a HashMap<SymbolId, u64>,
+    stub_helper_header_addr: Option<u64>,
+    dyld_private_addr: Option<u64>,
+}
+
+struct SyntheticAddressMaps {
+    stub_addrs: HashMap<SymbolId, u64>,
+    got_addrs: HashMap<SymbolId, u64>,
+    lazy_pointer_addrs: HashMap<SymbolId, u64>,
+    stub_helper_entry_addrs: HashMap<SymbolId, u64>,
+    stub_helper_header_addr: Option<u64>,
+    dyld_private_addr: Option<u64>,
 }
 
 pub fn apply_layout(
@@ -53,6 +66,7 @@ pub fn apply_layout(
     atoms: &AtomTable,
     sym_table: &SymbolTable,
     synthetic_plan: Option<&SyntheticPlan>,
+    linkedit: &LinkEditPlan,
 ) -> Result<(), RelocError> {
     let input_map: HashMap<InputId, &ObjectFile> =
         inputs.iter().map(|input| (input.id, input.object)).collect();
@@ -88,15 +102,17 @@ pub fn apply_layout(
 
     let atom_addrs = atom_address_map(layout);
     let section_addrs = input_section_address_map(layout, atoms);
-    let (stub_addrs, got_addrs, lazy_pointer_addrs) =
-        synthetic_address_maps(layout, synthetic_plan);
+    let synth_addrs = synthetic_address_maps(layout, synthetic_plan);
     let resolve = ResolveView {
         sym_table,
         atom_addrs: &atom_addrs,
         section_addrs: &section_addrs,
-        stub_addrs: &stub_addrs,
-        got_addrs: &got_addrs,
-        lazy_pointer_addrs: &lazy_pointer_addrs,
+        stub_addrs: &synth_addrs.stub_addrs,
+        got_addrs: &synth_addrs.got_addrs,
+        lazy_pointer_addrs: &synth_addrs.lazy_pointer_addrs,
+        stub_helper_entry_addrs: &synth_addrs.stub_helper_entry_addrs,
+        stub_helper_header_addr: synth_addrs.stub_helper_header_addr,
+        dyld_private_addr: synth_addrs.dyld_private_addr,
     };
 
     for out_section in &mut layout.sections {
@@ -126,6 +142,8 @@ pub fn apply_layout(
 
     if let Some(plan) = synthetic_plan {
         synthesize_stub_section(layout, plan, &resolve)?;
+        synthesize_lazy_pointer_section(layout, plan, &resolve)?;
+        synthesize_stub_helper_section(layout, plan, &resolve, linkedit)?;
     }
 
     Ok(())
@@ -168,13 +186,16 @@ fn input_section_address_map(
 fn synthetic_address_maps(
     layout: &Layout,
     synthetic_plan: Option<&SyntheticPlan>,
-) -> (
-    HashMap<SymbolId, u64>,
-    HashMap<SymbolId, u64>,
-    HashMap<SymbolId, u64>,
-) {
+) -> SyntheticAddressMaps {
     let Some(plan) = synthetic_plan else {
-        return (HashMap::new(), HashMap::new(), HashMap::new());
+        return SyntheticAddressMaps {
+            stub_addrs: HashMap::new(),
+            got_addrs: HashMap::new(),
+            lazy_pointer_addrs: HashMap::new(),
+            stub_helper_entry_addrs: HashMap::new(),
+            stub_helper_header_addr: None,
+            dyld_private_addr: None,
+        };
     };
 
     let mut stub_addrs = HashMap::new();
@@ -210,7 +231,38 @@ fn synthetic_address_maps(
         }
     }
 
-    (stub_addrs, got_addrs, lazy_pointer_addrs)
+    let mut stub_helper_entry_addrs = HashMap::new();
+    let mut stub_helper_header_addr = None;
+    if let Some(section) = layout
+        .sections
+        .iter()
+        .find(|section| section.segment == "__TEXT" && section.name == "__stub_helper")
+    {
+        stub_helper_header_addr = Some(section.addr);
+        for (idx, entry) in plan.lazy_pointers.entries.iter().enumerate() {
+            stub_helper_entry_addrs.insert(
+                entry.symbol,
+                section.addr
+                    + STUB_HELPER_HEADER_SIZE as u64
+                    + (idx as u64) * STUB_HELPER_ENTRY_SIZE as u64,
+            );
+        }
+    }
+
+    let dyld_private_addr = layout
+        .sections
+        .iter()
+        .find(|section| section.segment == "__DATA" && section.name == "__dyld_private")
+        .map(|section| section.addr);
+
+    SyntheticAddressMaps {
+        stub_addrs,
+        got_addrs,
+        lazy_pointer_addrs,
+        stub_helper_entry_addrs,
+        stub_helper_header_addr,
+        dyld_private_addr,
+    }
 }
 
 fn apply_one(
@@ -788,9 +840,123 @@ fn synthesize_stub_section(
     Ok(())
 }
 
+fn synthesize_lazy_pointer_section(
+    layout: &mut Layout,
+    plan: &SyntheticPlan,
+    resolve: &ResolveView<'_>,
+) -> Result<(), RelocError> {
+    let Some(section) = layout
+        .sections
+        .iter_mut()
+        .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
+    else {
+        return Ok(());
+    };
+
+    for (idx, entry) in plan.lazy_pointers.entries.iter().enumerate() {
+        let start = idx * 8;
+        let end = start + 8;
+        let helper_addr = resolve
+            .stub_helper_entry_addrs
+            .get(&entry.symbol)
+            .copied()
+            .ok_or_else(|| RelocError {
+                input: PathBuf::from("<synthetic lazy pointers>"),
+                atom: crate::resolve::AtomId(0),
+                atom_offset: start as u32,
+                kind: RelocKind::Unsigned,
+                referent: format!("symbol {:?}", entry.symbol),
+                detail: "lazy pointer is missing stub helper target".to_string(),
+            })?;
+        section.synthetic_data[start..end].copy_from_slice(&helper_addr.to_le_bytes());
+    }
+
+    Ok(())
+}
+
+fn synthesize_stub_helper_section(
+    layout: &mut Layout,
+    plan: &SyntheticPlan,
+    resolve: &ResolveView<'_>,
+    linkedit: &LinkEditPlan,
+) -> Result<(), RelocError> {
+    let Some(binder_symbol) = plan.binder_symbol else {
+        return Ok(());
+    };
+    let Some(section) = layout
+        .sections
+        .iter_mut()
+        .find(|section| section.segment == "__TEXT" && section.name == "__stub_helper")
+    else {
+        return Ok(());
+    };
+
+    let header_addr = resolve.stub_helper_header_addr.ok_or_else(|| RelocError {
+        input: PathBuf::from("<synthetic stub helper>"),
+        atom: crate::resolve::AtomId(0),
+        atom_offset: 0,
+        kind: RelocKind::Branch26,
+        referent: "__stub_helper".to_string(),
+        detail: "stub helper section missing final address".to_string(),
+    })?;
+    let dyld_private_addr = resolve.dyld_private_addr.ok_or_else(|| RelocError {
+        input: PathBuf::from("<synthetic stub helper>"),
+        atom: crate::resolve::AtomId(0),
+        atom_offset: 0,
+        kind: RelocKind::Unsigned,
+        referent: "__dyld_private".to_string(),
+        detail: "dyld-private slot missing final address".to_string(),
+    })?;
+    let binder_got_addr = resolve
+        .got_addrs
+        .get(&binder_symbol)
+        .copied()
+        .ok_or_else(|| RelocError {
+            input: PathBuf::from("<synthetic stub helper>"),
+            atom: crate::resolve::AtomId(0),
+            atom_offset: 0,
+            kind: RelocKind::GotLoadPage21,
+            referent: "_dyld_stub_binder".to_string(),
+            detail: "binder GOT slot missing final address".to_string(),
+        })?;
+
+    let header = encode_stub_helper_header(header_addr, dyld_private_addr, binder_got_addr)?;
+    section.synthetic_data[..STUB_HELPER_HEADER_SIZE as usize].copy_from_slice(&header);
+
+    for (idx, entry) in plan.lazy_pointers.entries.iter().enumerate() {
+        let start =
+            STUB_HELPER_HEADER_SIZE as usize + idx * STUB_HELPER_ENTRY_SIZE as usize;
+        let end = start + STUB_HELPER_ENTRY_SIZE as usize;
+        let entry_addr = resolve
+            .stub_helper_entry_addrs
+            .get(&entry.symbol)
+            .copied()
+            .ok_or_else(|| RelocError {
+                input: PathBuf::from("<synthetic stub helper>"),
+                atom: crate::resolve::AtomId(0),
+                atom_offset: start as u32,
+                kind: RelocKind::Branch26,
+                referent: format!("symbol {:?}", entry.symbol),
+                detail: "stub helper entry missing final address".to_string(),
+            })?;
+        let lazy_bind_offset = linkedit.lazy_bind_offset(entry.symbol).ok_or_else(|| RelocError {
+            input: PathBuf::from("<synthetic stub helper>"),
+            atom: crate::resolve::AtomId(0),
+            atom_offset: start as u32,
+            kind: RelocKind::Unsigned,
+            referent: format!("symbol {:?}", entry.symbol),
+            detail: "lazy bind offset missing for stub helper entry".to_string(),
+        })?;
+        let bytes = encode_stub_helper_entry(entry_addr, header_addr, lazy_bind_offset)?;
+        section.synthetic_data[start..end].copy_from_slice(&bytes);
+    }
+
+    Ok(())
+}
+
 fn encode_stub(stub_addr: u64, lazy_pointer_addr: u64) -> Result<[u8; STUB_SIZE as usize], RelocError> {
-    let adrp = encode_adrp_x16(stub_addr, lazy_pointer_addr)?;
-    let ldr = encode_ldr_x16_pageoff(lazy_pointer_addr)?;
+    let adrp = encode_adrp_reg(16, stub_addr, lazy_pointer_addr, "lazy pointer")?;
+    let ldr = encode_ldr_x_reg_pageoff(16, lazy_pointer_addr, "lazy pointer")?;
     let br = 0xd61f0200u32;
 
     let mut out = [0u8; STUB_SIZE as usize];
@@ -800,7 +966,47 @@ fn encode_stub(stub_addr: u64, lazy_pointer_addr: u64) -> Result<[u8; STUB_SIZE 
     Ok(out)
 }
 
-fn encode_adrp_x16(place: u64, target: u64) -> Result<u32, RelocError> {
+fn encode_stub_helper_header(
+    header_addr: u64,
+    dyld_private_addr: u64,
+    binder_got_addr: u64,
+) -> Result<[u8; STUB_HELPER_HEADER_SIZE as usize], RelocError> {
+    let mut out = [0u8; STUB_HELPER_HEADER_SIZE as usize];
+    let words = [
+        encode_adrp_reg(17, header_addr, dyld_private_addr, "__dyld_private")?,
+        encode_add_x_reg_pageoff(17, dyld_private_addr, "__dyld_private")?,
+        encode_stp_x16_x17_sp_preindex(),
+        encode_adrp_reg(16, header_addr + 12, binder_got_addr, "_dyld_stub_binder@GOT")?,
+        encode_ldr_x_reg_pageoff(16, binder_got_addr, "_dyld_stub_binder@GOT")?,
+        0xd61f0200u32,
+    ];
+    for (idx, word) in words.iter().enumerate() {
+        let start = idx * 4;
+        out[start..start + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    Ok(out)
+}
+
+fn encode_stub_helper_entry(
+    entry_addr: u64,
+    header_addr: u64,
+    lazy_bind_offset: u32,
+) -> Result<[u8; STUB_HELPER_ENTRY_SIZE as usize], RelocError> {
+    let mut out = [0u8; STUB_HELPER_ENTRY_SIZE as usize];
+    let ldr = encode_ldr_w16_literal_plus8();
+    let branch = encode_branch26(entry_addr + 4, header_addr, "__stub_helper header")?;
+    out[0..4].copy_from_slice(&ldr.to_le_bytes());
+    out[4..8].copy_from_slice(&branch.to_le_bytes());
+    out[8..12].copy_from_slice(&lazy_bind_offset.to_le_bytes());
+    Ok(out)
+}
+
+fn encode_adrp_reg(
+    reg: u8,
+    place: u64,
+    target: u64,
+    referent: &str,
+) -> Result<u32, RelocError> {
     let delta = page(target).wrapping_sub(page(place)) as i64;
     let imm = delta >> 12;
     if !fits_signed(imm, 21) {
@@ -809,7 +1015,7 @@ fn encode_adrp_x16(place: u64, target: u64) -> Result<u32, RelocError> {
             atom: crate::resolve::AtomId(0),
             atom_offset: 0,
             kind: RelocKind::Page21,
-            referent: format!("lazy pointer @ {target:#x}"),
+            referent: format!("{referent} @ {target:#x}"),
             detail: format!("page delta is out of PAGE21 range ({delta:#x})"),
         });
     }
@@ -817,10 +1023,10 @@ fn encode_adrp_x16(place: u64, target: u64) -> Result<u32, RelocError> {
     let encoded = (imm as u32) & 0x1f_ffff;
     let immlo = encoded & 0x3;
     let immhi = (encoded >> 2) & 0x7ffff;
-    Ok(0x9000_0010 | (immlo << 29) | (immhi << 5))
+    Ok(0x9000_0000 | (immlo << 29) | (immhi << 5) | reg as u32)
 }
 
-fn encode_ldr_x16_pageoff(target: u64) -> Result<u32, RelocError> {
+fn encode_ldr_x_reg_pageoff(reg: u8, target: u64, referent: &str) -> Result<u32, RelocError> {
     let low = target & 0xfff;
     if low & 0b111 != 0 {
         return Err(RelocError {
@@ -828,12 +1034,62 @@ fn encode_ldr_x16_pageoff(target: u64) -> Result<u32, RelocError> {
             atom: crate::resolve::AtomId(0),
             atom_offset: 4,
             kind: RelocKind::PageOff12,
-            referent: format!("lazy pointer @ {target:#x}"),
+            referent: format!("{referent} @ {target:#x}"),
             detail: format!("lazy pointer page offset {low:#x} is not 8-byte aligned"),
         });
     }
     let imm12 = ((low >> 3) as u32) & 0xfff;
-    Ok(0xf940_0210 | (imm12 << 10))
+    Ok(0xf940_0000 | (imm12 << 10) | ((reg as u32) << 5) | reg as u32)
+}
+
+fn encode_add_x_reg_pageoff(reg: u8, target: u64, referent: &str) -> Result<u32, RelocError> {
+    let low = target & 0xfff;
+    if low > 0xfff {
+        return Err(RelocError {
+            input: PathBuf::from("<synthetic stubs>"),
+            atom: crate::resolve::AtomId(0),
+            atom_offset: 4,
+            kind: RelocKind::PageOff12,
+            referent: format!("{referent} @ {target:#x}"),
+            detail: format!("pageoff immediate 0x{low:x} exceeds 12 bits"),
+        });
+    }
+    Ok(0x9100_0000 | ((low as u32) << 10) | ((reg as u32) << 5) | reg as u32)
+}
+
+fn encode_stp_x16_x17_sp_preindex() -> u32 {
+    let imm7 = ((-2i8 as u8) & 0x7f) as u32;
+    0xa980_0000 | (imm7 << 15) | (17 << 10) | (31 << 5) | 16
+}
+
+fn encode_ldr_w16_literal_plus8() -> u32 {
+    0x1800_0050
+}
+
+fn encode_branch26(place: u64, target: u64, referent: &str) -> Result<u32, RelocError> {
+    let delta = target.wrapping_sub(place) as i64;
+    if delta & 0b11 != 0 {
+        return Err(RelocError {
+            input: PathBuf::from("<synthetic stubs>"),
+            atom: crate::resolve::AtomId(0),
+            atom_offset: 0,
+            kind: RelocKind::Branch26,
+            referent: referent.to_string(),
+            detail: format!("branch target delta 0x{delta:x} is not 4-byte aligned"),
+        });
+    }
+    let imm = delta >> 2;
+    if !fits_signed(imm, 26) {
+        return Err(RelocError {
+            input: PathBuf::from("<synthetic stubs>"),
+            atom: crate::resolve::AtomId(0),
+            atom_offset: 0,
+            kind: RelocKind::Branch26,
+            referent: referent.to_string(),
+            detail: format!("branch target is out of BRANCH26 range (delta {delta:#x})"),
+        });
+    }
+    Ok(0x1400_0000 | ((imm as u32) & 0x03ff_ffff))
 }
 
 fn read_u32(

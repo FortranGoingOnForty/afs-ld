@@ -1254,8 +1254,10 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     let commands = parse_commands(&header, &bytes).unwrap();
     let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
     let (stubs_addr, stubs) = output_section(&bytes, "__TEXT", "__stubs").unwrap();
+    let (helper_addr, helper) = output_section(&bytes, "__TEXT", "__stub_helper").unwrap();
     let (got_addr, got) = output_section(&bytes, "__DATA_CONST", "__got").unwrap();
     let (lazy_addr, lazy) = output_section(&bytes, "__DATA", "__la_symbol_ptr").unwrap();
+    let (dyld_private_addr, _) = output_section(&bytes, "__DATA", "__dyld_private").unwrap();
     let stubs_hdr = output_section_header(&bytes, "__TEXT", "__stubs").unwrap();
     let got_hdr = output_section_header(&bytes, "__DATA_CONST", "__got").unwrap();
     let lazy_hdr = output_section_header(&bytes, "__DATA", "__la_symbol_ptr").unwrap();
@@ -1274,19 +1276,33 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
             _ => None,
         })
         .unwrap();
+    let dyld_info = commands
+        .iter()
+        .find_map(|cmd| match cmd {
+            LoadCommand::DyldInfoOnly(cmd) => Some(*cmd),
+            _ => None,
+        })
+        .unwrap();
     let symbols = parse_nlist_table(&bytes, symtab.symoff, symtab.nsyms).unwrap();
     let strings = StringTable::from_file(&bytes, symtab.stroff, symtab.strsize).unwrap();
+    let symbol_names: Vec<&str> = symbols
+        .iter()
+        .map(|symbol| strings.get(symbol.strx()).unwrap())
+        .collect();
 
-    assert_eq!(got.len(), 8);
+    assert_eq!(got.len(), 16);
     assert_eq!(stubs.len(), 12);
+    assert_eq!(helper.len(), 36);
     assert_eq!(lazy.len(), 8);
-    assert_eq!(symtab.nsyms, 1);
-    assert_eq!(dysymtab.nundefsym, 1);
-    assert_eq!(dysymtab.nindirectsyms, 3);
+    assert_eq!(symtab.nsyms, 2);
+    assert_eq!(dysymtab.nundefsym, 2);
+    assert_eq!(dysymtab.nindirectsyms, 4);
     assert_eq!(stubs_hdr.reserved1, 0);
     assert_eq!(got_hdr.reserved1, 1);
-    assert_eq!(lazy_hdr.reserved1, 2);
+    assert_eq!(lazy_hdr.reserved1, 3);
     assert_eq!(stubs_hdr.reserved2, 12);
+    assert!(dyld_info.bind_size > 0);
+    assert!(dyld_info.lazy_bind_size > 0);
     assert_eq!(
         decode_page_reference(&text, text_addr, 0, &PageRefKind::Load).unwrap(),
         got_addr
@@ -1297,9 +1313,25 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
         lazy_addr
     );
     assert_eq!(read_insn(&stubs, 8).unwrap(), 0xd61f0200);
-    assert_eq!(symbols[0].kind(), SymKind::Undef);
-    assert!(symbols[0].library_ordinal().unwrap() > 0);
-    assert_eq!(strings.get(symbols[0].strx()).unwrap(), "_write");
+    assert_eq!(u64::from_le_bytes(lazy[0..8].try_into().unwrap()), helper_addr + 24);
+    assert_eq!(
+        decode_page_reference(&helper, helper_addr, 0, &PageRefKind::Add).unwrap(),
+        dyld_private_addr
+    );
+    assert_eq!(
+        decode_page_reference(&helper, helper_addr, 12, &PageRefKind::Load).unwrap(),
+        got_addr + 8
+    );
+    assert_eq!(read_insn(&helper, 20).unwrap(), 0xd61f0200);
+    assert_eq!(read_insn(&helper, 24).unwrap(), 0x1800_0050);
+    assert_eq!(decode_branch_target(&helper, helper_addr, 28).unwrap(), helper_addr);
+    assert_eq!(u32::from_le_bytes(helper[32..36].try_into().unwrap()), 0);
+    assert!(symbols.iter().all(|symbol| symbol.kind() == SymKind::Undef));
+    assert!(symbols
+        .iter()
+        .all(|symbol| symbol.library_ordinal().unwrap() > 0));
+    assert!(symbol_names.contains(&"_write"));
+    assert!(symbol_names.contains(&"_dyld_stub_binder"));
 
     let _ = fs::remove_file(out);
     let _ = fs::remove_file(obj);

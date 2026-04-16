@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::leb::write_uleb;
 use crate::layout::Layout;
 use crate::macho::constants::*;
 use crate::macho::dylib::DylibDependency;
@@ -197,6 +198,8 @@ pub fn write_finalized_with_linkedit(
 
     let symoff = linkedit_plan.symtab.symoff as usize;
     let indirectoff = linkedit_plan.dysymtab.indirectsymoff as usize;
+    let bindoff = linkedit_plan.dyld_info.bind_off as usize;
+    let lazy_bind_off = linkedit_plan.dyld_info.lazy_bind_off as usize;
     let stroff = linkedit_plan.symtab.stroff as usize;
     if !linkedit_plan.symtab_bytes.is_empty() {
         let end = symoff + linkedit_plan.symtab_bytes.len();
@@ -205,6 +208,14 @@ pub fn write_finalized_with_linkedit(
     if !linkedit_plan.indirect_bytes.is_empty() {
         let end = indirectoff + linkedit_plan.indirect_bytes.len();
         out[indirectoff..end].copy_from_slice(&linkedit_plan.indirect_bytes);
+    }
+    if !linkedit_plan.bind_bytes.is_empty() {
+        let end = bindoff + linkedit_plan.bind_bytes.len();
+        out[bindoff..end].copy_from_slice(&linkedit_plan.bind_bytes);
+    }
+    if !linkedit_plan.lazy_bind_bytes.is_empty() {
+        let end = lazy_bind_off + linkedit_plan.lazy_bind_bytes.len();
+        out[lazy_bind_off..end].copy_from_slice(&linkedit_plan.lazy_bind_bytes);
     }
     let end = stroff + linkedit_plan.strtab_bytes.len();
     out[stroff..end].copy_from_slice(&linkedit_plan.strtab_bytes);
@@ -411,8 +422,11 @@ pub struct LinkEditPlan {
     pub dyld_info: DyldInfoCmd,
     pub symtab_bytes: Vec<u8>,
     pub indirect_bytes: Vec<u8>,
+    bind_bytes: Vec<u8>,
+    lazy_bind_bytes: Vec<u8>,
     pub strtab_bytes: Vec<u8>,
     indirect_starts: HashMap<(String, String), u32>,
+    lazy_bind_offsets: HashMap<SymbolId, u32>,
 }
 
 impl LinkEditPlan {
@@ -421,7 +435,15 @@ impl LinkEditPlan {
     }
 
     fn total_size(&self) -> u64 {
-        (self.symtab_bytes.len() + self.indirect_bytes.len() + self.strtab_bytes.len()) as u64
+        (self.symtab_bytes.len()
+            + self.indirect_bytes.len()
+            + self.bind_bytes.len()
+            + self.lazy_bind_bytes.len()
+            + self.strtab_bytes.len()) as u64
+    }
+
+    pub fn lazy_bind_offset(&self, symbol: SymbolId) -> Option<u32> {
+        self.lazy_bind_offsets.get(&symbol).copied()
     }
 }
 
@@ -447,12 +469,17 @@ fn build_linkedit_plan(
             dyld_info: DyldInfoCmd::default(),
             symtab_bytes: Vec::new(),
             indirect_bytes: Vec::new(),
+            bind_bytes: Vec::new(),
+            lazy_bind_bytes: Vec::new(),
             strtab_bytes: vec![0],
             indirect_starts: HashMap::new(),
+            lazy_bind_offsets: HashMap::new(),
         });
     };
 
     let imports = collect_imports(sym_table, synthetic_plan)?;
+    let import_lookup: HashMap<SymbolId, &ImportSymbolRecord> =
+        imports.iter().map(|record| (record.symbol, record)).collect();
     let mut strtab_bytes = vec![0];
     let mut symbols = Vec::with_capacity(imports.len());
     let mut symbol_indices = HashMap::new();
@@ -514,13 +541,36 @@ fn build_linkedit_plan(
         indirect_bytes.extend_from_slice(&index.to_le_bytes());
     }
 
+    let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
+
     let symoff = base_off;
     let indirectsymoff = u32_fit(
         symoff as u64 + symtab_bytes.len() as u64,
         "indirect symbol table offset",
     )?;
+    let bindoff = if bind_streams.bind.is_empty() {
+        0
+    } else {
+        u32_fit(
+            indirectsymoff as u64 + indirect_bytes.len() as u64,
+            "bind stream offset",
+        )?
+    };
+    let lazy_bind_off = if bind_streams.lazy_bind.is_empty() {
+        0
+    } else {
+        u32_fit(
+            indirectsymoff as u64
+                + indirect_bytes.len() as u64
+                + bind_streams.bind.len() as u64,
+            "lazy bind stream offset",
+        )?
+    };
     let stroff = u32_fit(
-        indirectsymoff as u64 + indirect_bytes.len() as u64,
+        indirectsymoff as u64
+            + indirect_bytes.len() as u64
+            + bind_streams.bind.len() as u64
+            + bind_streams.lazy_bind.len() as u64,
         "string table offset",
     )?;
     Ok(LinkEditPlan {
@@ -537,11 +587,20 @@ fn build_linkedit_plan(
             nindirectsyms: indirect_symbols.len() as u32,
             ..DysymtabCmd::default()
         },
-        dyld_info: DyldInfoCmd::default(),
+        dyld_info: DyldInfoCmd {
+            bind_off: bindoff,
+            bind_size: bind_streams.bind.len() as u32,
+            lazy_bind_off,
+            lazy_bind_size: bind_streams.lazy_bind.len() as u32,
+            ..DyldInfoCmd::default()
+        },
         symtab_bytes,
         indirect_bytes,
+        bind_bytes: bind_streams.bind,
+        lazy_bind_bytes: bind_streams.lazy_bind,
         strtab_bytes,
         indirect_starts,
+        lazy_bind_offsets: bind_streams.lazy_offsets,
     })
 }
 
@@ -551,6 +610,12 @@ struct ImportSymbolRecord {
     name: String,
     ordinal: u16,
     weak_import: bool,
+}
+
+struct BindStreams {
+    bind: Vec<u8>,
+    lazy_bind: Vec<u8>,
+    lazy_offsets: HashMap<SymbolId, u32>,
 }
 
 fn collect_imports(
@@ -613,6 +678,139 @@ fn push_indirect_section(
     if saw_any {
         indirect_starts.insert((key.0.to_string(), key.1.to_string()), start);
     }
+}
+
+fn build_bind_streams(
+    layout: &Layout,
+    synthetic_plan: &SyntheticPlan,
+    imports: &HashMap<SymbolId, &ImportSymbolRecord>,
+) -> Result<BindStreams, WriteError> {
+    let mut bind = Vec::new();
+    let mut lazy_bind = Vec::new();
+    let mut lazy_offsets = HashMap::new();
+
+    if !synthetic_plan.got.entries.is_empty() {
+        let segment_index = segment_index(layout, "__DATA_CONST")?;
+        let segment = layout
+            .segment("__DATA_CONST")
+            .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
+        let section = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
+            .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
+        for (idx, entry) in synthetic_plan.got.entries.iter().enumerate() {
+            let import = imports
+                .get(&entry.symbol)
+                .copied()
+                .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
+            let slot_addr = section.addr + (idx as u64) * 8;
+            emit_bind_record(
+                &mut bind,
+                segment_index,
+                slot_addr - segment.vm_addr,
+                import.ordinal,
+                &import.name,
+                import.weak_import,
+                false,
+            );
+        }
+        if !bind.is_empty() {
+            bind.push(BIND_OPCODE_DONE);
+        }
+    }
+
+    if !synthetic_plan.lazy_pointers.entries.is_empty() {
+        let segment_index = segment_index(layout, "__DATA")?;
+        let segment = layout
+            .segment("__DATA")
+            .ok_or(WriteError::MissingSegment("__DATA"))?;
+        let section = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
+            .ok_or(WriteError::MissingSegment("__DATA"))?;
+        for (idx, entry) in synthetic_plan.lazy_pointers.entries.iter().enumerate() {
+            let import = imports
+                .get(&entry.symbol)
+                .copied()
+                .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
+            let slot_addr = section.addr + (idx as u64) * 8;
+            lazy_offsets.insert(entry.symbol, lazy_bind.len() as u32);
+            emit_bind_record(
+                &mut lazy_bind,
+                segment_index,
+                slot_addr - segment.vm_addr,
+                import.ordinal,
+                &import.name,
+                import.weak_import,
+                true,
+            );
+        }
+    }
+
+    Ok(BindStreams {
+        bind,
+        lazy_bind,
+        lazy_offsets,
+    })
+}
+
+fn emit_bind_record(
+    out: &mut Vec<u8>,
+    segment_index: u8,
+    segment_offset: u64,
+    ordinal: u16,
+    name: &str,
+    weak_import: bool,
+    terminate: bool,
+) {
+    emit_bind_ordinal(out, ordinal);
+    out.push(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | bind_symbol_flags(weak_import));
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    out.push(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
+    out.push(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segment_index & BIND_IMMEDIATE_MASK));
+    write_uleb(segment_offset, out);
+    out.push(BIND_OPCODE_DO_BIND);
+    if terminate {
+        out.push(BIND_OPCODE_DONE);
+    }
+}
+
+fn emit_bind_ordinal(out: &mut Vec<u8>, ordinal: u16) {
+    let signed = ordinal as i16;
+    if (-8..=-1).contains(&signed) {
+        out.push(BIND_OPCODE_SET_DYLIB_SPECIAL_IMM | ((signed as u8) & BIND_IMMEDIATE_MASK));
+    } else if ordinal <= BIND_IMMEDIATE_MASK as u16 {
+        out.push(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | ordinal as u8);
+    } else {
+        out.push(BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB);
+        write_uleb(ordinal as u64, out);
+    }
+}
+
+fn bind_symbol_flags(weak_import: bool) -> u8 {
+    if weak_import {
+        BIND_SYMBOL_FLAGS_WEAK_IMPORT
+    } else {
+        0
+    }
+}
+
+fn segment_index(layout: &Layout, name: &str) -> Result<u8, WriteError> {
+    let idx = layout
+        .segments
+        .iter()
+        .position(|segment| segment.name == name)
+        .ok_or(WriteError::MissingSegment(match name {
+            "__DATA_CONST" => "__DATA_CONST",
+            "__DATA" => "__DATA",
+            "__TEXT" => "__TEXT",
+            "__LINKEDIT" => "__LINKEDIT",
+            _ => "__UNKNOWN",
+        }))?;
+    u8::try_from(idx).map_err(|_| WriteError::OffsetTooLarge("segment index"))
 }
 
 fn apply_indirect_starts(layout: &mut Layout, linkedit: &LinkEditPlan) {

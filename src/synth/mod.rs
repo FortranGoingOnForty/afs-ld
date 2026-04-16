@@ -10,20 +10,25 @@ use crate::input::ObjectFile;
 use crate::layout::LayoutInput;
 use crate::macho::constants::{
     S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_LAZY_SYMBOL_POINTERS,
-    S_NON_LAZY_SYMBOL_POINTERS, S_SYMBOL_STUBS,
+    S_NON_LAZY_SYMBOL_POINTERS, S_REGULAR, S_SYMBOL_STUBS,
 };
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind};
-use crate::resolve::{InputId, Symbol, SymbolId, SymbolTable};
+use crate::resolve::{DylibId, DylibInput, InputId, InsertOutcome, Symbol, SymbolId, SymbolTable};
 use crate::section::{OutputSection, SectionKind};
 
 use self::got::GotSection;
-use self::stubs::{LazyPointerSection, StubsSection};
+use self::stubs::{
+    LazyPointerSection, StubsSection, DYLD_PRIVATE_SIZE, STUB_HELPER_ENTRY_SIZE,
+    STUB_HELPER_HEADER_SIZE,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntheticPlan {
     pub got: GotSection,
     pub stubs: StubsSection,
     pub lazy_pointers: LazyPointerSection,
+    pub binder_symbol: Option<SymbolId>,
+    pub needs_dyld_private: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +60,8 @@ impl SyntheticPlan {
     pub fn build(
         inputs: &[LayoutInput<'_>],
         atoms: &AtomTable,
-        sym_table: &SymbolTable,
+        sym_table: &mut SymbolTable,
+        dylibs: &[DylibInput],
     ) -> Result<Self, SynthError> {
         let input_map: HashMap<InputId, &ObjectFile> =
             inputs.iter().map(|input| (input.id, input.object)).collect();
@@ -128,10 +134,20 @@ impl SyntheticPlan {
             }
         }
 
+        let mut binder_symbol = None;
+        let mut needs_dyld_private = false;
+        if !stubs.entries.is_empty() {
+            let binder = ensure_stub_helper_support(sym_table, dylibs, &mut got)?;
+            binder_symbol = Some(binder);
+            needs_dyld_private = true;
+        }
+
         Ok(SyntheticPlan {
             got,
             stubs,
             lazy_pointers,
+            binder_symbol,
+            needs_dyld_private,
         })
     }
 
@@ -154,6 +170,28 @@ impl SyntheticPlan {
                 file_off: 0,
             });
         }
+        if self.binder_symbol.is_some() {
+            out.push(OutputSection {
+                segment: "__TEXT".into(),
+                name: "__stub_helper".into(),
+                kind: SectionKind::Text,
+                align_pow2: 2,
+                flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                atoms: Vec::new(),
+                synthetic_data: vec![
+                    0;
+                    STUB_HELPER_HEADER_SIZE as usize
+                        + self.lazy_pointers.entries.len() * STUB_HELPER_ENTRY_SIZE as usize
+                ],
+                addr: 0,
+                size: STUB_HELPER_HEADER_SIZE as u64
+                    + (self.lazy_pointers.entries.len() as u64) * STUB_HELPER_ENTRY_SIZE as u64,
+                file_off: 0,
+            });
+        }
         if !self.got.entries.is_empty() {
             out.push(OutputSection {
                 segment: "__DATA_CONST".into(),
@@ -168,6 +206,23 @@ impl SyntheticPlan {
                 synthetic_data: vec![0; self.got.entries.len() * 8],
                 addr: 0,
                 size: (self.got.entries.len() as u64) * 8,
+                file_off: 0,
+            });
+        }
+        if self.needs_dyld_private {
+            out.push(OutputSection {
+                segment: "__DATA".into(),
+                name: "__dyld_private".into(),
+                kind: SectionKind::Data,
+                align_pow2: 3,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                atoms: Vec::new(),
+                synthetic_data: vec![0; DYLD_PRIVATE_SIZE as usize],
+                addr: 0,
+                size: DYLD_PRIVATE_SIZE as u64,
                 file_off: 0,
             });
         }
@@ -245,6 +300,81 @@ fn dylib_import_is_weak(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
     )
 }
 
+fn ensure_stub_helper_support(
+    sym_table: &mut SymbolTable,
+    dylibs: &[DylibInput],
+    got: &mut GotSection,
+) -> Result<SymbolId, SynthError> {
+    let (libsystem_id, libsystem) = dylibs
+        .iter()
+        .enumerate()
+        .find(|(_, dylib)| dylib.file.install_name == "/usr/lib/libSystem.B.dylib")
+        .or_else(|| {
+            dylibs
+                .iter()
+                .enumerate()
+                .find(|(_, dylib)| dylib.file.install_name.contains("libSystem"))
+        })
+        .or_else(|| {
+            dylibs
+                .iter()
+                .enumerate()
+                .find(|(_, dylib)| dylib.path.to_string_lossy().contains("libSystem.tbd"))
+        })
+        .ok_or_else(|| SynthError {
+            input: PathBuf::from("<synthetic stubs>"),
+            atom: crate::resolve::AtomId(0),
+            reloc_offset: 0,
+            kind: RelocKind::Branch26,
+            detail: "stub helper requires a libSystem dylib/TBD input for `_dyld_stub_binder`"
+                .to_string(),
+        })?;
+
+    let name = sym_table.intern("_dyld_stub_binder");
+    let symbol_id = if let Some(id) = sym_table.lookup(name) {
+        match sym_table.get(id) {
+            Symbol::DylibImport { .. } => id,
+            other => {
+                return Err(SynthError {
+                    input: PathBuf::from("<synthetic stubs>"),
+                    atom: crate::resolve::AtomId(0),
+                    reloc_offset: 0,
+                    kind: RelocKind::Branch26,
+                    detail: format!(
+                        "`_dyld_stub_binder` already exists as unsupported symbol kind {:?}",
+                        other.kind()
+                    ),
+                });
+            }
+        }
+    } else {
+        match sym_table
+            .insert(Symbol::DylibImport {
+                name,
+                dylib: DylibId(libsystem_id as u32),
+                ordinal: libsystem.ordinal,
+                weak_import: false,
+            })
+            .map_err(|err| SynthError {
+                input: PathBuf::from("<synthetic stubs>"),
+                atom: crate::resolve::AtomId(0),
+                reloc_offset: 0,
+                kind: RelocKind::Branch26,
+                detail: format!("{err:?}"),
+            })? {
+            InsertOutcome::Inserted(id)
+            | InsertOutcome::Kept(id)
+            | InsertOutcome::PendingArchiveFetch { id, .. }
+            | InsertOutcome::PendingObjectLoad { id, .. }
+            | InsertOutcome::CommonCoalesced { id }
+            | InsertOutcome::Replaced { id, .. } => id,
+        }
+    };
+
+    got.intern(symbol_id, false);
+    Ok(symbol_id)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -253,12 +383,14 @@ mod tests {
     use crate::input::ObjectFile;
     use crate::layout::LayoutInput;
     use crate::macho::constants::{
-        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, N_EXT, N_UNDF,
+        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_DYLIB, MH_MAGIC_64, MH_OBJECT, N_EXT, N_UNDF,
         S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_REGULAR,
     };
-    use crate::macho::reader::MachHeader64;
+    use crate::macho::dylib::DylibFile;
+    use crate::macho::exports::Exports;
+    use crate::macho::reader::{LoadCommand, MachHeader64};
     use crate::reloc::{write_raw_relocs, write_relocs, Referent, Reloc, RelocKind, RelocLength};
-    use crate::resolve::{DylibId, InputId, Symbol, SymbolTable};
+    use crate::resolve::{DylibId, DylibInput, InputId, Symbol, SymbolTable};
     use crate::section::{InputSection, SectionKind};
     use crate::string_table::StringTable;
     use crate::symbol::{InputSymbol, RawNlist};
@@ -326,6 +458,7 @@ mod tests {
             flags: AtomFlags::default().with(AtomFlags::PURE_INSTRUCTIONS),
             parent_of: None,
         });
+        let dylibs = vec![libsystem_input()];
 
         let plan = SyntheticPlan::build(
             &[LayoutInput {
@@ -333,13 +466,16 @@ mod tests {
                 object: &object,
             }],
             &atoms,
-            &sym_table,
+            &mut sym_table,
+            &dylibs,
         )
         .unwrap();
 
-        assert_eq!(plan.got.entries.len(), 1);
+        assert_eq!(plan.got.entries.len(), 2);
         assert_eq!(plan.stubs.entries.len(), 1);
         assert_eq!(plan.lazy_pointers.entries.len(), 1);
+        assert!(plan.binder_symbol.is_some());
+        assert!(plan.needs_dyld_private);
         assert_eq!(plan.stubs.entries[0].dylib, DylibId(2));
         assert_eq!(plan.lazy_pointers.entries[0].symbol, plan.stubs.entries[0].symbol);
     }
@@ -394,12 +530,43 @@ mod tests {
                 object: &object,
             }],
             &atoms,
-            &sym_table,
+            &mut sym_table,
+            &[],
         )
         .unwrap();
         assert!(plan.got.entries.is_empty());
         assert!(plan.stubs.entries.is_empty());
         assert!(plan.lazy_pointers.entries.is_empty());
+        assert!(plan.binder_symbol.is_none());
+        assert!(!plan.needs_dyld_private);
+    }
+
+    fn libsystem_input() -> DylibInput {
+        DylibInput {
+            path: PathBuf::from("/tmp/libSystem.tbd"),
+            file: DylibFile {
+                path: PathBuf::from("/tmp/libSystem.tbd"),
+                header: MachHeader64 {
+                    magic: MH_MAGIC_64,
+                    cputype: CPU_TYPE_ARM64,
+                    cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                    filetype: MH_DYLIB,
+                    ncmds: 0,
+                    sizeofcmds: 0,
+                    flags: 0,
+                    reserved: 0,
+                },
+                commands: Vec::<LoadCommand>::new(),
+                install_name: "/usr/lib/libSystem.B.dylib".into(),
+                current_version: 0,
+                compatibility_version: 0,
+                dependencies: Vec::new(),
+                rpaths: Vec::new(),
+                symtab: None,
+                exports: Exports::empty(),
+            },
+            ordinal: 1,
+        }
     }
 
     fn encode_raw_relocs(relocs: &[Reloc]) -> Vec<u8> {

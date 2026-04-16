@@ -562,6 +562,34 @@ fn normalized_eh_frame_dump(path: &PathBuf, text_base: u64) -> Result<String, St
     Ok(normalized.join("\n"))
 }
 
+fn canonical_unwind_info(bytes: &[u8]) -> afs_ld::synth::unwind::DecodedUnwindInfo {
+    let (_, unwind) = output_section(bytes, "__TEXT", "__unwind_info").unwrap();
+    let mut decoded = decode_unwind_info(&unwind).unwrap();
+    let header_base = segment_vmaddr(bytes, "__TEXT").unwrap_or(0);
+    let text_base = output_section(bytes, "__TEXT", "__text").unwrap().0 - header_base;
+    for record in &mut decoded.records {
+        record.function_offset -= text_base as u32;
+    }
+    if let Some((lsda_addr, _)) = output_section(bytes, "__TEXT", "__gcc_except_tab") {
+        let lsda_base = lsda_addr - header_base;
+        for record in &mut decoded.lsdas {
+            record.function_offset -= text_base as u32;
+            record.lsda_offset -= lsda_base as u32;
+        }
+    }
+    if let Some((got_addr, got)) = output_section(bytes, "__DATA_CONST", "__got") {
+        let got_base = got_addr - header_base;
+        let got_end = got_base + got.len() as u64;
+        for personality in &mut decoded.personalities {
+            let offset = *personality as u64;
+            if got_base <= offset && offset < got_end {
+                *personality -= got_base as u32;
+            }
+        }
+    }
+    decoded
+}
+
 fn rebase_hex_addresses(line: &str, text_base: u64) -> String {
     let bytes = line.as_bytes();
     let mut out = String::new();
@@ -3840,10 +3868,8 @@ fn linker_run_preserves_exception_unwind_metadata_like_apple_ld() {
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
-    let (_, our_unwind) = output_section(&our_bytes, "__TEXT", "__unwind_info").unwrap();
-    let (_, apple_unwind) = output_section(&apple_bytes, "__TEXT", "__unwind_info").unwrap();
-    let our_decoded = decode_unwind_info(&our_unwind).unwrap();
-    let apple_decoded = decode_unwind_info(&apple_unwind).unwrap();
+    let our_decoded = canonical_unwind_info(&our_bytes);
+    let apple_decoded = canonical_unwind_info(&apple_bytes);
     assert_eq!(our_decoded, apple_decoded);
     assert_eq!(our_decoded.personalities.len(), 1);
     assert_eq!(our_decoded.lsdas.len(), 1);

@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 
 use crate::atom::AtomTable;
 use crate::input::ObjectFile;
@@ -19,6 +20,7 @@ use crate::macho::reader::{
 };
 use crate::resolve::InputId;
 use crate::resolve::{Symbol, SymbolId, SymbolTable};
+use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
 use crate::section::is_executable;
 use crate::string_table::StringTableBuilder;
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind};
@@ -56,6 +58,7 @@ pub enum WriteError {
     DirectBindSectionMissing(crate::resolve::AtomId),
     ImportSymbolMissing(SymbolId),
     ImportSymbolWrongKind(SymbolId),
+    MalformedRelocations(PathBuf, u8, String),
 }
 
 impl fmt::Display for WriteError {
@@ -86,6 +89,12 @@ impl fmt::Display for WriteError {
             WriteError::ImportSymbolWrongKind(symbol) => {
                 write!(f, "synthetic import symbol {:?} is not a dylib import", symbol)
             }
+            WriteError::MalformedRelocations(path, section, detail) => write!(
+                f,
+                "failed to parse relocations in {} section {}: {detail}",
+                path.display(),
+                section
+            ),
         }
     }
 }
@@ -671,7 +680,7 @@ fn build_linkedit_plan(
     }
 
     let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
-    let rebase_bytes = pad_dyld_info_stream(build_rebase_stream(layout, synthetic_plan)?);
+    let rebase_bytes = pad_dyld_info_stream(build_rebase_stream(layout, synthetic_plan, inputs)?);
     let bind_bytes = pad_dyld_info_stream(bind_streams.bind);
     let weak_bind_bytes = pad_dyld_info_stream(bind_streams.weak_bind);
     let lazy_bind_bytes = pad_dyld_info_stream(bind_streams.lazy_bind);
@@ -820,10 +829,131 @@ struct BindStreams {
     lazy_offsets: HashMap<SymbolId, u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RebaseSite {
+    segment_index: u8,
+    segment_offset: u64,
+}
+
 fn build_rebase_stream(
     layout: &Layout,
     synthetic_plan: &SyntheticPlan,
+    inputs: LinkEditInputs<'_>,
 ) -> Result<Vec<u8>, WriteError> {
+    let mut sites = collect_rebase_sites(layout, synthetic_plan, inputs)?;
+    if sites.is_empty() {
+        return Ok(Vec::new());
+    }
+    sites.sort_unstable();
+    sites.dedup();
+
+    let mut out = OpcodeStream::new();
+    out.byte(REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER);
+    let mut idx = 0usize;
+    while idx < sites.len() {
+        let segment_index = sites[idx].segment_index;
+        out.byte(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segment_index & REBASE_IMMEDIATE_MASK));
+        out.uleb(sites[idx].segment_offset);
+        let mut cursor = sites[idx].segment_offset;
+        while idx < sites.len() && sites[idx].segment_index == segment_index {
+            if sites[idx].segment_offset > cursor {
+                out.byte(REBASE_OPCODE_ADD_ADDR_ULEB);
+                out.uleb(sites[idx].segment_offset - cursor);
+            }
+            let run_start = sites[idx].segment_offset;
+            let mut run_len = 1usize;
+            while idx + run_len < sites.len()
+                && sites[idx + run_len].segment_index == segment_index
+                && sites[idx + run_len].segment_offset == run_start + (run_len as u64) * 8
+            {
+                run_len += 1;
+            }
+            emit_rebase_run(&mut out, run_len);
+            cursor = run_start + (run_len as u64) * 8;
+            idx += run_len;
+        }
+    }
+    out.done();
+    Ok(out.into_vec())
+}
+
+fn collect_rebase_sites(
+    layout: &Layout,
+    synthetic_plan: &SyntheticPlan,
+    inputs: LinkEditInputs<'_>,
+) -> Result<Vec<RebaseSite>, WriteError> {
+    let mut sites = collect_lazy_pointer_rebase_sites(layout, synthetic_plan)?;
+    let mut reloc_cache: HashMap<(InputId, u8), Vec<Reloc>> = HashMap::new();
+    let input_map: HashMap<InputId, &ObjectFile> = inputs
+        .0
+        .layout_inputs
+        .iter()
+        .map(|input| (input.id, input.object))
+        .collect();
+
+    for input in inputs.0.layout_inputs {
+        for (sect_idx, section) in input.object.sections.iter().enumerate() {
+            if section.raw_relocs.is_empty() {
+                continue;
+            }
+            let raws = parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(|err| {
+                WriteError::MalformedRelocations(
+                    input.object.path.clone(),
+                    (sect_idx + 1) as u8,
+                    err.to_string(),
+                )
+            })?;
+            let relocs = parse_relocs(&raws).map_err(|err| {
+                WriteError::MalformedRelocations(
+                    input.object.path.clone(),
+                    (sect_idx + 1) as u8,
+                    err.to_string(),
+                )
+            })?;
+            reloc_cache.insert((input.id, (sect_idx + 1) as u8), relocs);
+        }
+    }
+
+    for section in &layout.sections {
+        if !matches!(section.segment.as_str(), "__DATA" | "__DATA_CONST") {
+            continue;
+        }
+        if section.name == "__thread_vars" {
+            continue;
+        }
+        let segment = layout
+            .segment(&section.segment)
+            .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
+        let segment_index = segment_index(layout, &section.segment)?;
+        for placed in &section.atoms {
+            let atom = inputs.0.atom_table.get(placed.atom);
+            let Some(obj) = input_map.get(&atom.origin).copied() else {
+                continue;
+            };
+            let relocs = reloc_cache
+                .get(&(atom.origin, atom.input_section))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for reloc in relocs_for_rebase(relocs, atom) {
+                if !reloc_needs_rebase(obj, reloc, inputs.0.sym_table) {
+                    continue;
+                }
+                let local_offset = reloc.offset.saturating_sub(atom.input_offset) as u64;
+                sites.push(RebaseSite {
+                    segment_index,
+                    segment_offset: section.addr + placed.offset + local_offset - segment.vm_addr,
+                });
+            }
+        }
+    }
+
+    Ok(sites)
+}
+
+fn collect_lazy_pointer_rebase_sites(
+    layout: &Layout,
+    synthetic_plan: &SyntheticPlan,
+) -> Result<Vec<RebaseSite>, WriteError> {
     if synthetic_plan.lazy_pointers.entries.is_empty() {
         return Ok(Vec::new());
     }
@@ -838,13 +968,67 @@ fn build_rebase_stream(
         .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
         .ok_or(WriteError::MissingSegment("__DATA"))?;
 
-    let mut out = OpcodeStream::new();
-    out.byte(REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER);
-    out.byte(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segment_index & REBASE_IMMEDIATE_MASK));
-    out.uleb(section.addr - segment.vm_addr);
-    emit_rebase_run(&mut out, synthetic_plan.lazy_pointers.entries.len());
-    out.done();
-    Ok(out.into_vec())
+    Ok((0..synthetic_plan.lazy_pointers.entries.len())
+        .map(|idx| RebaseSite {
+            segment_index,
+            segment_offset: section.addr + (idx as u64) * 8 - segment.vm_addr,
+        })
+        .collect())
+}
+
+fn relocs_for_rebase<'a>(
+    relocs: &'a [Reloc],
+    atom: &crate::atom::Atom,
+) -> impl Iterator<Item = Reloc> + 'a {
+    let start = atom.input_offset;
+    let end = atom.input_offset + atom.size;
+    relocs.iter().copied().filter(move |reloc| {
+        let reloc_end = reloc.offset + reloc.length.byte_width() as u32;
+        reloc.offset >= start && reloc_end <= end
+    })
+}
+
+fn reloc_needs_rebase(
+    obj: &ObjectFile,
+    reloc: Reloc,
+    sym_table: &SymbolTable,
+) -> bool {
+    if reloc.kind != RelocKind::Unsigned
+        || reloc.length != RelocLength::Quad
+        || reloc.pcrel
+        || reloc.subtrahend.is_some()
+    {
+        return false;
+    }
+
+    match reloc.referent {
+        Referent::Section(_) => true,
+        Referent::Symbol(_) => match symbol_referent_id(obj, reloc.referent, sym_table) {
+            Some(symbol_id) => match sym_table.get(symbol_id) {
+                Symbol::DylibImport { .. } => false,
+                Symbol::Defined { atom, .. } => atom.0 != 0,
+                Symbol::Common { .. } => true,
+                _ => false,
+            },
+            None => false,
+        },
+    }
+}
+
+fn symbol_referent_id(
+    obj: &ObjectFile,
+    referent: Referent,
+    sym_table: &SymbolTable,
+) -> Option<SymbolId> {
+    let Referent::Symbol(sym_idx) = referent else {
+        return None;
+    };
+    let input_sym = obj.symbols.get(sym_idx as usize)?;
+    let name = obj.symbol_name(input_sym).ok()?;
+    let (symbol_id, _) = sym_table
+        .iter()
+        .find(|(_, symbol)| sym_table.interner.resolve(symbol.name()) == name)?;
+    Some(symbol_id)
 }
 
 fn build_function_starts(layout: &Layout) -> Result<Vec<u8>, WriteError> {
@@ -1069,7 +1253,7 @@ fn build_output_symbols(
     }
     undefineds.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
 
-    let exports = if kind == OutputKind::Dylib {
+    let exports = if matches!(kind, OutputKind::Dylib | OutputKind::Executable) {
         external_defineds
             .iter()
             .map(|spec| ExportEntry {

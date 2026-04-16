@@ -25,7 +25,7 @@ use afs_ld::macho::constants::{
     SG_READ_ONLY,
 };
 use afs_ld::macho::dylib::DylibFile;
-use afs_ld::macho::exports::ExportKind;
+use afs_ld::macho::exports::{ExportKind, Exports};
 use afs_ld::macho::reader::{parse_commands, parse_header, u32_le, LoadCommand, Section64Header};
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, SymKind};
@@ -363,6 +363,21 @@ fn canonical_export_records(bytes: &[u8]) -> Vec<CanonicalExportRecord> {
         .collect::<Vec<_>>();
     out.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
     out
+}
+
+fn dyld_info_export_names(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let trie = dyld_info_stream(bytes, DyldInfoStreamKind::Export)?;
+    if trie.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Exports::from_trie_bytes(&trie)
+        .entries()
+        .map_err(|e| format!("decode export trie: {e}"))?
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    out.sort();
+    Ok(out)
 }
 
 fn raw_string_table(bytes: &[u8]) -> Vec<u8> {
@@ -1194,6 +1209,16 @@ fn assert_classic_lazy_case_matches_apple_ld(
     {
         return Err(format!("{}: weak-bind stream diverged from Apple ld", case.name));
     }
+    if dyld_info_export_names(&our_bytes)
+        .map_err(|e| format!("our executable exports: {e}"))?
+        != dyld_info_export_names(&apple_bytes)
+            .map_err(|e| format!("apple executable exports: {e}"))?
+    {
+        return Err(format!(
+            "{}: executable export trie diverged from Apple ld",
+            case.name
+        ));
+    }
     if decode_bind_records(&our_bytes, true).map_err(|e| format!("our lazy binds: {e}"))?
         != decode_bind_records(&apple_bytes, true).map_err(|e| format!("apple lazy binds: {e}"))?
     {
@@ -1310,6 +1335,16 @@ fn assert_direct_bind_case_matches_apple_ld(
         != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::WeakBind)
     {
         return Err(format!("{}: weak-bind stream diverged from Apple ld", case.name));
+    }
+    if dyld_info_export_names(&our_bytes)
+        .map_err(|e| format!("our executable exports: {e}"))?
+        != dyld_info_export_names(&apple_bytes)
+            .map_err(|e| format!("apple executable exports: {e}"))?
+    {
+        return Err(format!(
+            "{}: executable export trie diverged from Apple ld",
+            case.name
+        ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::LazyBind)
         != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::LazyBind)
@@ -3011,6 +3046,74 @@ fn direct_bind_surfaces_match_apple_ld_across_fixture_matrix() {
         failures.len(),
         failures.join("\n\n")
     );
+}
+
+#[test]
+fn linker_run_rebases_local_absolute_pointers_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("local-rebase.o");
+    let our_out = scratch("local-rebase-ours.out");
+    let apple_out = scratch("local-rebase-apple.out");
+    let src = r#"
+        int ext = 7;
+        int *p = &ext;
+        int main(void) { return *p == 7 ? 0 : 1; }
+    "#;
+    if let Err(e) = compile_c(src, &obj) {
+        eprintln!("skipping: clang compile failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_classic_lazy(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert!(
+        !dyld_info_stream(&our_bytes, DyldInfoStreamKind::Rebase)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        dyld_info_stream(&our_bytes, DyldInfoStreamKind::Rebase).unwrap(),
+        dyld_info_stream(&apple_bytes, DyldInfoStreamKind::Rebase).unwrap()
+    );
+    assert_eq!(
+        decode_rebase_records(&our_bytes).unwrap(),
+        decode_rebase_records(&apple_bytes).unwrap()
+    );
+
+    let our_status = Command::new(&our_out).status().unwrap();
+    let apple_status = Command::new(&apple_out).status().unwrap();
+    assert_eq!(our_status.code(), Some(0));
+    assert_eq!(apple_status.code(), Some(0));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
 }
 
 #[test]

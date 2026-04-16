@@ -96,8 +96,10 @@ pub const N_UNDF: u8 = 0x0;
 pub const N_ABS: u8 = 0x2;
 pub const N_SECT: u8 = 0xe;
 pub const N_INDR: u8 = 0xa;
+pub const NO_SECT: u8 = 0;
 
 // nlist_64 n_desc bits
+pub const REFERENCED_DYNAMICALLY: u16 = 0x0010;
 pub const N_NO_DEAD_STRIP: u16 = 0x0020;
 pub const N_WEAK_REF: u16 = 0x0040;
 pub const N_WEAK_DEF: u16 = 0x0080;

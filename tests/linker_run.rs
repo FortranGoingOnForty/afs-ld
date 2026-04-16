@@ -204,6 +204,38 @@ fn segment_flags(bytes: &[u8], segname: &str) -> Option<u32> {
     None
 }
 
+fn symtab_and_dysymtab(bytes: &[u8]) -> (afs_ld::macho::reader::SymtabCmd, afs_ld::macho::reader::DysymtabCmd) {
+    let header = parse_header(bytes).unwrap();
+    let commands = parse_commands(&header, bytes).unwrap();
+    let mut symtab = None;
+    let mut dysymtab = None;
+    for cmd in commands {
+        match cmd {
+            LoadCommand::Symtab(cmd) => symtab = Some(cmd),
+            LoadCommand::Dysymtab(cmd) => dysymtab = Some(cmd),
+            _ => {}
+        }
+    }
+    (symtab.unwrap(), dysymtab.unwrap())
+}
+
+fn symbol_partition_names(bytes: &[u8]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let (symtab, dysymtab) = symtab_and_dysymtab(bytes);
+    let symbols = parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).unwrap();
+    let strings = StringTable::from_file(bytes, symtab.stroff, symtab.strsize).unwrap();
+    let names_for = |start: u32, count: u32| -> Vec<String> {
+        symbols[start as usize..(start + count) as usize]
+            .iter()
+            .map(|symbol| strings.get(symbol.strx()).unwrap().to_string())
+            .collect()
+    };
+    (
+        names_for(dysymtab.ilocalsym, dysymtab.nlocalsym),
+        names_for(dysymtab.iextdefsym, dysymtab.nextdefsym),
+        names_for(dysymtab.iundefsym, dysymtab.nundefsym),
+    )
+}
+
 fn apple_link(
     obj: &PathBuf,
     out: &PathBuf,
@@ -1818,7 +1850,9 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     assert_eq!(stubs.len(), 12);
     assert_eq!(helper.len(), 36);
     assert_eq!(lazy.len(), 8);
-    assert_eq!(symtab.nsyms, 2);
+    assert_eq!(symtab.nsyms, 4);
+    assert_eq!(dysymtab.nlocalsym, 0);
+    assert_eq!(dysymtab.nextdefsym, 2);
     assert_eq!(dysymtab.nundefsym, 2);
     assert_eq!(dysymtab.nindirectsyms, 4);
     assert_eq!(stubs_hdr.reserved1, 0);
@@ -1851,8 +1885,14 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     assert_eq!(read_insn(&helper, 24).unwrap(), 0x1800_0050);
     assert_eq!(decode_branch_target(&helper, helper_addr, 28).unwrap(), helper_addr);
     assert_eq!(u32::from_le_bytes(helper[32..36].try_into().unwrap()), 0);
-    assert!(symbols.iter().all(|symbol| symbol.kind() == SymKind::Undef));
-    assert!(symbols
+    let (locals, extdefs, undefs) = symbol_partition_names(&bytes);
+    assert!(locals.is_empty());
+    assert_eq!(extdefs, vec!["__mh_execute_header".to_string(), "_main".to_string()]);
+    assert_eq!(undefs, vec!["_write".to_string(), "dyld_stub_binder".to_string()]);
+    assert!(symbols[dysymtab.iundefsym as usize..]
+        .iter()
+        .all(|symbol| symbol.kind() == SymKind::Undef));
+    assert!(symbols[dysymtab.iundefsym as usize..]
         .iter()
         .all(|symbol| symbol.library_ordinal().unwrap() > 0));
     assert!(symbol_names.contains(&"_write"));
@@ -2074,6 +2114,93 @@ fn linker_run_binds_direct_dylib_import_pointers() {
         status.code(),
         Some(0),
         "expected direct-import pointer executable to exit 0"
+    );
+
+    let _ = fs::remove_file(dylib);
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_partitions_symtab_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+
+    let dylib = scratch("symtab-partition.dylib");
+    let obj = scratch("symtab-partition.o");
+    let our_out = scratch("symtab-partition-ours.out");
+    let apple_out = scratch("symtab-partition-apple.out");
+
+    let dylib_src = r#"
+        int ext_data = 5;
+    "#;
+    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
+        eprintln!("skipping: dylib compile failed: {e}");
+        return;
+    }
+
+    let asm = r#"
+        .text
+        .private_extern _hidden
+        .globl _visible
+        .globl _main
+        .p2align 2
+    _hidden:
+        ret
+    _visible:
+        ret
+    _main:
+        ret
+
+        .data
+        .quad _ext_data
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(asm, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), dylib.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let apple = Command::new("xcrun")
+        .args(["ld", "-arch", "arm64", "-e", "_main", "-o"])
+        .arg(&apple_out)
+        .arg(&obj)
+        .arg(&dylib)
+        .output()
+        .unwrap();
+    assert!(
+        apple.status.success(),
+        "xcrun ld failed: {}",
+        String::from_utf8_lossy(&apple.stderr)
+    );
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let (our_symtab, our_dysymtab) = symtab_and_dysymtab(&our_bytes);
+    let (apple_symtab, apple_dysymtab) = symtab_and_dysymtab(&apple_bytes);
+
+    assert_eq!(our_symtab.nsyms, apple_symtab.nsyms);
+    assert_eq!(our_dysymtab.ilocalsym, apple_dysymtab.ilocalsym);
+    assert_eq!(our_dysymtab.nlocalsym, apple_dysymtab.nlocalsym);
+    assert_eq!(our_dysymtab.iextdefsym, apple_dysymtab.iextdefsym);
+    assert_eq!(our_dysymtab.nextdefsym, apple_dysymtab.nextdefsym);
+    assert_eq!(our_dysymtab.iundefsym, apple_dysymtab.iundefsym);
+    assert_eq!(our_dysymtab.nundefsym, apple_dysymtab.nundefsym);
+
+    assert_eq!(
+        symbol_partition_names(&our_bytes),
+        symbol_partition_names(&apple_bytes)
     );
 
     let _ = fs::remove_file(dylib);

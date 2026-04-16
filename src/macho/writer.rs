@@ -14,6 +14,7 @@ use crate::macho::reader::{
     DylibCmd, LoadCommand, MachHeader64, Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
 };
 use crate::resolve::{Symbol, SymbolId, SymbolTable};
+use crate::string_table::StringTableBuilder;
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::{code_sig::CodeSignaturePlan, SyntheticPlan};
@@ -30,6 +31,8 @@ pub enum WriteError {
     MissingSegment(&'static str),
     OffsetTooLarge(&'static str),
     EntryAtomMissing(crate::resolve::AtomId),
+    DefinedSymbolAtomMissing(SymbolId, crate::resolve::AtomId),
+    DefinedSymbolSectionMissing(SymbolId, crate::resolve::AtomId),
     DirectBindAtomMissing(crate::resolve::AtomId),
     DirectBindSectionMissing(crate::resolve::AtomId),
     ImportSymbolMissing(SymbolId),
@@ -42,6 +45,16 @@ impl fmt::Display for WriteError {
             WriteError::MissingSegment(name) => write!(f, "missing output segment `{name}`"),
             WriteError::OffsetTooLarge(what) => write!(f, "{what} exceeds 32-bit Mach-O field width"),
             WriteError::EntryAtomMissing(atom) => write!(f, "entry atom {:?} missing from layout", atom),
+            WriteError::DefinedSymbolAtomMissing(symbol, atom) => write!(
+                f,
+                "defined symbol {:?} points at missing atom {:?} in final layout",
+                symbol, atom
+            ),
+            WriteError::DefinedSymbolSectionMissing(symbol, atom) => write!(
+                f,
+                "defined symbol {:?} points at atom {:?} outside any output section",
+                symbol, atom
+            ),
             WriteError::DirectBindAtomMissing(atom) => {
                 write!(f, "direct bind atom {:?} missing from layout", atom)
             }
@@ -469,6 +482,7 @@ fn dylib_install_name(opts: &LinkOptions) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkEditPlan {
+    base_off: u32,
     pub symtab: SymtabCmd,
     pub dysymtab: DysymtabCmd,
     pub dyld_info: DyldInfoCmd,
@@ -489,7 +503,7 @@ impl LinkEditPlan {
     }
 
     fn total_size(&self) -> u64 {
-        let base_off = self.symtab.symoff as u64;
+        let base_off = self.base_off as u64;
         let regular_end = self.symtab.stroff as u64 + self.strtab_bytes.len() as u64;
         let regular_size = regular_end.saturating_sub(base_off);
         if let Some(code_signature) = &self.code_signature {
@@ -518,11 +532,12 @@ fn build_linkedit_plan(
 
     let Some((sym_table, synthetic_plan)) = imports else {
         return Ok(LinkEditPlan {
+            base_off,
             symtab: SymtabCmd {
                 symoff: base_off,
                 nsyms: 0,
                 stroff: base_off,
-                strsize: 1,
+                strsize: 8,
             },
             dysymtab: DysymtabCmd::default(),
             dyld_info: DyldInfoCmd::default(),
@@ -531,8 +546,8 @@ fn build_linkedit_plan(
             rebase_bytes: Vec::new(),
             bind_bytes: Vec::new(),
             lazy_bind_bytes: Vec::new(),
-            strtab_bytes: vec![0],
-            code_signature: Some(build_code_signature(layout, kind, opts, base_off as u64 + 1)?),
+            strtab_bytes: vec![0; 8],
+            code_signature: Some(build_code_signature(layout, kind, opts, base_off as u64 + 8)?),
             indirect_starts: HashMap::new(),
             lazy_bind_offsets: HashMap::new(),
         });
@@ -541,29 +556,10 @@ fn build_linkedit_plan(
     let imports = collect_imports(sym_table, synthetic_plan)?;
     let import_lookup: HashMap<SymbolId, &ImportSymbolRecord> =
         imports.iter().map(|record| (record.symbol, record)).collect();
-    let mut strtab_bytes = vec![0];
-    let mut symbols = Vec::with_capacity(imports.len());
-    let mut symbol_indices = HashMap::new();
-    for (idx, import) in imports.iter().enumerate() {
-        let strx = strtab_bytes.len() as u32;
-        strtab_bytes.extend_from_slice(import.name.as_bytes());
-        strtab_bytes.push(0);
-        let mut n_desc = import.ordinal << 8;
-        if import.weak_import {
-            n_desc |= N_WEAK_REF;
-        }
-        symbols.push(InputSymbol::from_raw(RawNlist {
-            strx,
-            n_type: N_UNDF | N_EXT,
-            n_sect: 0,
-            n_desc,
-            n_value: 0,
-        }));
-        symbol_indices.insert(import.symbol, idx as u32);
-    }
+    let symbol_plan = build_output_symbols(layout, kind, sym_table, &imports)?;
 
     let mut symtab_bytes = Vec::new();
-    write_nlist_table(&symbols, &mut symtab_bytes);
+    write_nlist_table(&symbol_plan.symbols, &mut symtab_bytes);
 
     let mut indirect_symbols = Vec::new();
     let mut indirect_starts = HashMap::new();
@@ -576,14 +572,14 @@ fn build_linkedit_plan(
             .entries
             .iter()
             .map(|entry| entry.symbol),
-        &symbol_indices,
+        &symbol_plan.symbol_indices,
     );
     push_indirect_section(
         &mut indirect_symbols,
         &mut indirect_starts,
         ("__DATA_CONST", "__got"),
         synthetic_plan.got.entries.iter().map(|entry| entry.symbol),
-        &symbol_indices,
+        &symbol_plan.symbol_indices,
     );
     push_indirect_section(
         &mut indirect_symbols,
@@ -594,7 +590,7 @@ fn build_linkedit_plan(
             .entries
             .iter()
             .map(|entry| entry.symbol),
-        &symbol_indices,
+        &symbol_plan.symbol_indices,
     );
 
     let mut indirect_bytes = Vec::with_capacity(indirect_symbols.len() * 4);
@@ -605,60 +601,39 @@ fn build_linkedit_plan(
     let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
     let rebase_bytes = build_rebase_stream(layout, synthetic_plan)?;
 
-    let symoff = base_off;
-    let indirectsymoff = u32_fit(
-        symoff as u64 + symtab_bytes.len() as u64,
+    let mut cursor = base_off as u64;
+    let rebase_off = place_optional_block(&mut cursor, rebase_bytes.len(), "rebase stream offset")?;
+    let bindoff =
+        place_optional_block(&mut cursor, bind_streams.bind.len(), "bind stream offset")?;
+    let lazy_bind_off = place_optional_block(
+        &mut cursor,
+        bind_streams.lazy_bind.len(),
+        "lazy bind stream offset",
+    )?;
+    let symoff = place_required_block(&mut cursor, symtab_bytes.len(), "symbol table offset")?;
+    let indirectsymoff = place_optional_block(
+        &mut cursor,
+        indirect_bytes.len(),
         "indirect symbol table offset",
     )?;
-    let rebase_off = if rebase_bytes.is_empty() {
-        0
-    } else {
-        u32_fit(
-            indirectsymoff as u64 + indirect_bytes.len() as u64,
-            "rebase stream offset",
-        )?
-    };
-    let bindoff = if bind_streams.bind.is_empty() {
-        0
-    } else {
-        u32_fit(
-            indirectsymoff as u64 + indirect_bytes.len() as u64 + rebase_bytes.len() as u64,
-            "bind stream offset",
-        )?
-    };
-    let lazy_bind_off = if bind_streams.lazy_bind.is_empty() {
-        0
-    } else {
-        u32_fit(
-            indirectsymoff as u64
-                + indirect_bytes.len() as u64
-                + rebase_bytes.len() as u64
-                + bind_streams.bind.len() as u64,
-            "lazy bind stream offset",
-        )?
-    };
-    let stroff = u32_fit(
-        indirectsymoff as u64
-            + indirect_bytes.len() as u64
-            + rebase_bytes.len() as u64
-            + bind_streams.bind.len() as u64
-            + bind_streams.lazy_bind.len() as u64,
+    let stroff = place_required_block(
+        &mut cursor,
+        symbol_plan.strtab_bytes.len(),
         "string table offset",
     )?;
-    let regular_end = stroff as u64 + strtab_bytes.len() as u64;
+    let regular_end = stroff as u64 + symbol_plan.strtab_bytes.len() as u64;
     Ok(LinkEditPlan {
+        base_off,
         symtab: SymtabCmd {
             symoff,
-            nsyms: symbols.len() as u32,
+            nsyms: symbol_plan.symbols.len() as u32,
             stroff,
-            strsize: strtab_bytes.len() as u32,
+            strsize: symbol_plan.strtab_bytes.len() as u32,
         },
         dysymtab: DysymtabCmd {
-            iundefsym: 0,
-            nundefsym: symbols.len() as u32,
             indirectsymoff,
             nindirectsyms: indirect_symbols.len() as u32,
-            ..DysymtabCmd::default()
+            ..symbol_plan.dysymtab
         },
         dyld_info: DyldInfoCmd {
             rebase_off,
@@ -674,7 +649,7 @@ fn build_linkedit_plan(
         rebase_bytes,
         bind_bytes: bind_streams.bind,
         lazy_bind_bytes: bind_streams.lazy_bind,
-        strtab_bytes,
+        strtab_bytes: symbol_plan.strtab_bytes,
         code_signature: Some(build_code_signature(layout, kind, opts, regular_end)?),
         indirect_starts,
         lazy_bind_offsets: bind_streams.lazy_offsets,
@@ -698,6 +673,32 @@ struct ImportSymbolRecord {
     name: String,
     ordinal: u16,
     weak_import: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputSymbolPartition {
+    Local,
+    ExternalDefined,
+    Undefined,
+}
+
+#[derive(Debug, Clone)]
+struct OutputSymbolSpec {
+    symbol: Option<SymbolId>,
+    name: String,
+    partition: OutputSymbolPartition,
+    n_type: u8,
+    n_sect: u8,
+    n_desc: u16,
+    n_value: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SymbolTablePlan {
+    symbols: Vec<InputSymbol>,
+    strtab_bytes: Vec<u8>,
+    symbol_indices: HashMap<SymbolId, u32>,
+    dysymtab: DysymtabCmd,
 }
 
 struct BindStreams {
@@ -805,6 +806,210 @@ fn collect_imports(
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+fn build_output_symbols(
+    layout: &Layout,
+    kind: OutputKind,
+    sym_table: &SymbolTable,
+    imports: &[ImportSymbolRecord],
+) -> Result<SymbolTablePlan, WriteError> {
+    let atom_sections = atom_section_ordinals(layout);
+    let mut locals = Vec::new();
+    let mut external_defineds = Vec::new();
+    let mut undefineds = Vec::with_capacity(imports.len());
+
+    if kind == OutputKind::Executable && !layout.sections.is_empty() {
+        let text_vmaddr = layout
+            .segment("__TEXT")
+            .ok_or(WriteError::MissingSegment("__TEXT"))?
+            .vm_addr;
+        external_defineds.push(OutputSymbolSpec {
+            symbol: None,
+            name: "__mh_execute_header".to_string(),
+            partition: OutputSymbolPartition::ExternalDefined,
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: REFERENCED_DYNAMICALLY,
+            n_value: text_vmaddr,
+        });
+    }
+
+    for (symbol_id, symbol) in sym_table.iter() {
+        let Symbol::Defined {
+            name,
+            atom,
+            value,
+            weak,
+            private_extern,
+            no_dead_strip,
+            ..
+        } = symbol
+        else {
+            continue;
+        };
+        let name = sym_table.interner.resolve(*name).to_string();
+        let (n_type, n_sect, n_value) = if atom.0 == 0 {
+            (absolute_symbol_type(*private_extern), NO_SECT, *value)
+        } else {
+            let addr = layout
+                .atom_addr(*atom)
+                .ok_or(WriteError::DefinedSymbolAtomMissing(symbol_id, *atom))?;
+            let sect = *atom_sections
+                .get(atom)
+                .ok_or(WriteError::DefinedSymbolSectionMissing(symbol_id, *atom))?;
+            (defined_symbol_type(*private_extern), sect, addr + *value)
+        };
+        let mut n_desc = 0;
+        if *weak {
+            n_desc |= N_WEAK_DEF;
+        }
+        if *no_dead_strip {
+            n_desc |= N_NO_DEAD_STRIP;
+        }
+        let spec = OutputSymbolSpec {
+            symbol: Some(symbol_id),
+            name,
+            partition: if *private_extern {
+                OutputSymbolPartition::Local
+            } else {
+                OutputSymbolPartition::ExternalDefined
+            },
+            n_type,
+            n_sect,
+            n_desc,
+            n_value,
+        };
+        if *private_extern {
+            locals.push(spec);
+        } else {
+            external_defineds.push(spec);
+        }
+    }
+
+    external_defineds.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+    for import in imports {
+        let mut n_desc = import.ordinal << 8;
+        if import.weak_import {
+            n_desc |= N_WEAK_REF;
+        }
+        undefineds.push(OutputSymbolSpec {
+            symbol: Some(import.symbol),
+            name: import.name.clone(),
+            partition: OutputSymbolPartition::Undefined,
+            n_type: N_UNDF | N_EXT,
+            n_sect: NO_SECT,
+            n_desc,
+            n_value: 0,
+        });
+    }
+    undefineds.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+
+    let mut specs = Vec::with_capacity(locals.len() + external_defineds.len() + undefineds.len());
+    specs.extend(locals);
+    specs.extend(external_defineds);
+    specs.extend(undefineds);
+
+    let mut strtab = StringTableBuilder::new();
+    for spec in &specs {
+        strtab.insert(&spec.name);
+    }
+    let (strtab_bytes, strx_by_name) = strtab.finish();
+
+    let nlocalsym = specs
+        .iter()
+        .filter(|spec| spec.partition == OutputSymbolPartition::Local)
+        .count() as u32;
+    let nextdefsym = specs
+        .iter()
+        .filter(|spec| spec.partition == OutputSymbolPartition::ExternalDefined)
+        .count() as u32;
+    let nundefsym = specs
+        .iter()
+        .filter(|spec| spec.partition == OutputSymbolPartition::Undefined)
+        .count() as u32;
+
+    let mut symbols = Vec::with_capacity(specs.len());
+    let mut symbol_indices = HashMap::new();
+    for (idx, spec) in specs.into_iter().enumerate() {
+        let strx = *strx_by_name
+            .get(&spec.name)
+            .expect("string table offset missing for output symbol");
+        symbols.push(InputSymbol::from_raw(RawNlist {
+            strx,
+            n_type: spec.n_type,
+            n_sect: spec.n_sect,
+            n_desc: spec.n_desc,
+            n_value: spec.n_value,
+        }));
+        if let Some(symbol) = spec.symbol {
+            symbol_indices.insert(symbol, idx as u32);
+        }
+    }
+
+    Ok(SymbolTablePlan {
+        symbols,
+        strtab_bytes,
+        symbol_indices,
+        dysymtab: DysymtabCmd {
+            ilocalsym: 0,
+            nlocalsym,
+            iextdefsym: nlocalsym,
+            nextdefsym,
+            iundefsym: nlocalsym + nextdefsym,
+            nundefsym,
+            ..DysymtabCmd::default()
+        },
+    })
+}
+
+fn atom_section_ordinals(layout: &Layout) -> HashMap<crate::resolve::AtomId, u8> {
+    let mut out = HashMap::new();
+    for (idx, section) in layout.sections.iter().enumerate() {
+        let ordinal = (idx + 1) as u8;
+        for placed in &section.atoms {
+            out.insert(placed.atom, ordinal);
+        }
+    }
+    out
+}
+
+fn defined_symbol_type(private_extern: bool) -> u8 {
+    let mut n_type = N_SECT | N_EXT;
+    if private_extern {
+        n_type |= N_PEXT;
+    }
+    n_type
+}
+
+fn absolute_symbol_type(private_extern: bool) -> u8 {
+    let mut n_type = N_ABS | N_EXT;
+    if private_extern {
+        n_type |= N_PEXT;
+    }
+    n_type
+}
+
+fn place_optional_block(
+    cursor: &mut u64,
+    size: usize,
+    context: &'static str,
+) -> Result<u32, WriteError> {
+    if size == 0 {
+        return Ok(0);
+    }
+    place_required_block(cursor, size, context)
+}
+
+fn place_required_block(
+    cursor: &mut u64,
+    size: usize,
+    context: &'static str,
+) -> Result<u32, WriteError> {
+    *cursor = align_up(*cursor, 8);
+    let offset = u32_fit(*cursor, context)?;
+    *cursor += size as u64;
+    Ok(offset)
 }
 
 fn push_indirect_section(

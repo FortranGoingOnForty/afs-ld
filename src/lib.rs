@@ -17,6 +17,7 @@ pub mod reloc;
 pub mod resolve;
 pub mod section;
 pub mod string_table;
+pub mod synth;
 pub mod symbol;
 
 use std::path::PathBuf;

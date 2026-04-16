@@ -6,6 +6,20 @@ use std::process::Command;
 
 mod common;
 
+use afs_ld::leb::read_uleb;
+use afs_ld::macho::constants::{
+    BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND,
+    BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED, BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB,
+    BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_DONE, BIND_OPCODE_MASK,
+    BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
+    BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
+    BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED,
+    REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB,
+    REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
+    REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB, REBASE_OPCODE_DONE, REBASE_OPCODE_MASK,
+    REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM, REBASE_TYPE_POINTER,
+};
 use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand, Section64Header};
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, SymKind};
@@ -124,6 +138,17 @@ fn apple_link(
     syslibroot: &str,
     platform_version: &str,
 ) -> Result<(), String> {
+    apple_link_with_args(obj, out, entry, syslibroot, platform_version, &[])
+}
+
+fn apple_link_with_args(
+    obj: &PathBuf,
+    out: &PathBuf,
+    entry: &str,
+    syslibroot: &str,
+    platform_version: &str,
+    extra_args: &[&str],
+) -> Result<(), String> {
     let output = Command::new("xcrun")
         .args([
             "ld",
@@ -138,8 +163,9 @@ fn apple_link(
             "-lSystem",
             "-e",
             entry,
-            "-o",
         ])
+        .args(extra_args)
+        .arg("-o")
         .arg(out)
         .arg(obj)
         .output()
@@ -151,6 +177,379 @@ fn apple_link(
         ));
     }
     Ok(())
+}
+
+fn apple_link_classic_lazy(
+    obj: &PathBuf,
+    out: &PathBuf,
+    entry: &str,
+    syslibroot: &str,
+    platform_version: &str,
+) -> Result<(), String> {
+    apple_link_with_args(
+        obj,
+        out,
+        entry,
+        syslibroot,
+        platform_version,
+        &["-no_fixup_chains"],
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RebaseRecord {
+    segment: String,
+    section: String,
+    section_offset: u64,
+    rebase_type: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BindRecord {
+    segment: String,
+    section: String,
+    section_offset: u64,
+    ordinal: u16,
+    symbol: String,
+    weak_import: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SegmentView {
+    name: String,
+    vm_addr: u64,
+    vm_size: u64,
+    sections: Vec<Section64Header>,
+}
+
+fn dyld_info_command(bytes: &[u8]) -> Result<afs_ld::macho::reader::DyldInfoCmd, String> {
+    let header = parse_header(bytes).map_err(|e| e.to_string())?;
+    let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
+    commands
+        .into_iter()
+        .find_map(|cmd| match cmd {
+            LoadCommand::DyldInfoOnly(cmd) => Some(cmd),
+            _ => None,
+        })
+        .ok_or_else(|| "missing LC_DYLD_INFO_ONLY".to_string())
+}
+
+fn segment_views(bytes: &[u8]) -> Result<Vec<SegmentView>, String> {
+    let header = parse_header(bytes).map_err(|e| e.to_string())?;
+    let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
+    Ok(commands
+        .into_iter()
+        .filter_map(|cmd| match cmd {
+            LoadCommand::Segment64(seg) => Some(SegmentView {
+                name: seg.segname_str().to_string(),
+                vm_addr: seg.vmaddr,
+                vm_size: seg.vmsize,
+                sections: seg.sections,
+            }),
+            _ => None,
+        })
+        .collect())
+}
+
+fn read_cstr(bytes: &[u8], cursor: &mut usize) -> Result<String, String> {
+    let start = *cursor;
+    let end = bytes[start..]
+        .iter()
+        .position(|b| *b == 0)
+        .map(|len| start + len)
+        .ok_or_else(|| "unterminated dyld-info string".to_string())?;
+    *cursor = end + 1;
+    std::str::from_utf8(&bytes[start..end])
+        .map(|s| s.to_string())
+        .map_err(|e| format!("dyld-info string is not UTF-8: {e}"))
+}
+
+fn locate_section(
+    segments: &[SegmentView],
+    segment_index: u8,
+    segment_offset: u64,
+) -> Result<(String, String, u64), String> {
+    let segment = segments
+        .get(segment_index as usize)
+        .ok_or_else(|| format!("segment index {segment_index} out of range"))?;
+    let addr = segment.vm_addr + segment_offset;
+    for section in &segment.sections {
+        if addr >= section.addr && addr < section.addr + section.size {
+            return Ok((
+                section.segname_str().to_string(),
+                section.sectname_str().to_string(),
+                addr - section.addr,
+            ));
+        }
+    }
+    if segment_offset <= segment.vm_size {
+        return Ok((segment.name.clone(), String::new(), segment_offset));
+    }
+    Err(format!(
+        "address 0x{addr:x} does not land in any section of {}",
+        segment.name
+    ))
+}
+
+fn decode_rebase_records(bytes: &[u8]) -> Result<Vec<RebaseRecord>, String> {
+    let dyld_info = dyld_info_command(bytes)?;
+    if dyld_info.rebase_size == 0 {
+        return Ok(Vec::new());
+    }
+    let segments = segment_views(bytes)?;
+    let start = dyld_info.rebase_off as usize;
+    let end = start + dyld_info.rebase_size as usize;
+    let stream = bytes
+        .get(start..end)
+        .ok_or_else(|| "rebase stream out of bounds".to_string())?;
+
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    let mut segment_index = 0u8;
+    let mut segment_offset = 0u64;
+    let mut rebase_type = 0u8;
+    while cursor < stream.len() {
+        let byte = stream[cursor];
+        cursor += 1;
+        let opcode = byte & REBASE_OPCODE_MASK;
+        let imm = byte & REBASE_IMMEDIATE_MASK;
+        match opcode {
+            REBASE_OPCODE_DONE => break,
+            REBASE_OPCODE_SET_TYPE_IMM => rebase_type = imm,
+            REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
+                segment_index = imm;
+                let (offset, len) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("rebase ULEB: {e}"))?;
+                cursor += len;
+                segment_offset = offset;
+            }
+            REBASE_OPCODE_ADD_ADDR_ULEB => {
+                let (delta, len) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("rebase ULEB: {e}"))?;
+                cursor += len;
+                segment_offset += delta;
+            }
+            REBASE_OPCODE_ADD_ADDR_IMM_SCALED => {
+                segment_offset += (imm as u64) * 8;
+            }
+            REBASE_OPCODE_DO_REBASE_IMM_TIMES => {
+                for _ in 0..imm {
+                    let (segment, section, section_offset) =
+                        locate_section(&segments, segment_index, segment_offset)?;
+                    out.push(RebaseRecord {
+                        segment,
+                        section,
+                        section_offset,
+                        rebase_type,
+                    });
+                    segment_offset += 8;
+                }
+            }
+            REBASE_OPCODE_DO_REBASE_ULEB_TIMES => {
+                let (count, len) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("rebase ULEB: {e}"))?;
+                cursor += len;
+                for _ in 0..count {
+                    let (segment, section, section_offset) =
+                        locate_section(&segments, segment_index, segment_offset)?;
+                    out.push(RebaseRecord {
+                        segment,
+                        section,
+                        section_offset,
+                        rebase_type,
+                    });
+                    segment_offset += 8;
+                }
+            }
+            REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB => {
+                let (segment, section, section_offset) =
+                    locate_section(&segments, segment_index, segment_offset)?;
+                out.push(RebaseRecord {
+                    segment,
+                    section,
+                    section_offset,
+                    rebase_type,
+                });
+                segment_offset += 8;
+                let (delta, len) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("rebase ULEB: {e}"))?;
+                cursor += len;
+                segment_offset += delta;
+            }
+            REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB => {
+                let (count, count_len) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("rebase ULEB: {e}"))?;
+                cursor += count_len;
+                let (skip, skip_len) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("rebase ULEB: {e}"))?;
+                cursor += skip_len;
+                for _ in 0..count {
+                    let (segment, section, section_offset) =
+                        locate_section(&segments, segment_index, segment_offset)?;
+                    out.push(RebaseRecord {
+                        segment,
+                        section,
+                        section_offset,
+                        rebase_type,
+                    });
+                    segment_offset += 8 + skip;
+                }
+            }
+            _ => return Err(format!("unsupported rebase opcode 0x{byte:02x}")),
+        }
+    }
+    Ok(out)
+}
+
+fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, String> {
+    let dyld_info = dyld_info_command(bytes)?;
+    let (off, size) = if lazy {
+        (dyld_info.lazy_bind_off, dyld_info.lazy_bind_size)
+    } else {
+        (dyld_info.bind_off, dyld_info.bind_size)
+    };
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let segments = segment_views(bytes)?;
+    let start = off as usize;
+    let end = start + size as usize;
+    let stream = bytes
+        .get(start..end)
+        .ok_or_else(|| "bind stream out of bounds".to_string())?;
+
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    let mut segment_index = 0u8;
+    let mut segment_offset = 0u64;
+    let mut ordinal = 0u16;
+    let mut symbol = String::new();
+    let mut weak_import = false;
+    while cursor < stream.len() {
+        let byte = stream[cursor];
+        cursor += 1;
+        let opcode = byte & BIND_OPCODE_MASK;
+        let imm = byte & BIND_IMMEDIATE_MASK;
+        match opcode {
+            BIND_OPCODE_DONE => {
+                if lazy {
+                    symbol.clear();
+                    weak_import = false;
+                } else {
+                    break;
+                }
+            }
+            BIND_OPCODE_SET_DYLIB_ORDINAL_IMM => ordinal = imm as u16,
+            BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB => {
+                let (value, len) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("bind ULEB: {e}"))?;
+                cursor += len;
+                ordinal = value as u16;
+            }
+            BIND_OPCODE_SET_DYLIB_SPECIAL_IMM => {
+                let signed = ((imm as i8) << 4) >> 4;
+                ordinal = signed as i16 as u16;
+            }
+            BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM => {
+                weak_import = (imm & BIND_SYMBOL_FLAGS_WEAK_IMPORT) != 0;
+                symbol = read_cstr(stream, &mut cursor)?;
+            }
+            BIND_OPCODE_SET_TYPE_IMM => {}
+            BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
+                segment_index = imm;
+                let (offset, len) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("bind ULEB: {e}"))?;
+                cursor += len;
+                segment_offset = offset;
+            }
+            BIND_OPCODE_ADD_ADDR_ULEB => {
+                let (delta, len) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("bind ULEB: {e}"))?;
+                cursor += len;
+                segment_offset += delta;
+            }
+            BIND_OPCODE_DO_BIND => {
+                let (segment, section, section_offset) =
+                    locate_section(&segments, segment_index, segment_offset)?;
+                out.push(BindRecord {
+                    segment,
+                    section,
+                    section_offset,
+                    ordinal,
+                    symbol: symbol.clone(),
+                    weak_import,
+                });
+                segment_offset += 8;
+            }
+            BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB => {
+                let (segment, section, section_offset) =
+                    locate_section(&segments, segment_index, segment_offset)?;
+                out.push(BindRecord {
+                    segment,
+                    section,
+                    section_offset,
+                    ordinal,
+                    symbol: symbol.clone(),
+                    weak_import,
+                });
+                segment_offset += 8;
+                let (delta, len) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("bind ULEB: {e}"))?;
+                cursor += len;
+                segment_offset += delta;
+            }
+            BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED => {
+                let (segment, section, section_offset) =
+                    locate_section(&segments, segment_index, segment_offset)?;
+                out.push(BindRecord {
+                    segment,
+                    section,
+                    section_offset,
+                    ordinal,
+                    symbol: symbol.clone(),
+                    weak_import,
+                });
+                segment_offset += 8 + (imm as u64) * 8;
+            }
+            BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB => {
+                let (count, count_len) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("bind ULEB: {e}"))?;
+                cursor += count_len;
+                let (skip, skip_len) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("bind ULEB: {e}"))?;
+                cursor += skip_len;
+                for _ in 0..count {
+                    let (segment, section, section_offset) =
+                        locate_section(&segments, segment_index, segment_offset)?;
+                    out.push(BindRecord {
+                        segment,
+                        section,
+                        section_offset,
+                        ordinal,
+                        symbol: symbol.clone(),
+                        weak_import,
+                    });
+                    segment_offset += 8 + skip;
+                }
+            }
+            _ => return Err(format!("unsupported bind opcode 0x{byte:02x}")),
+        }
+    }
+    Ok(out)
+}
+
+fn load_dylib_names(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let header = parse_header(bytes).map_err(|e| e.to_string())?;
+    let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
+    Ok(commands
+        .into_iter()
+        .filter_map(|cmd| match cmd {
+            LoadCommand::Dylib(cmd) if cmd.cmd == afs_ld::macho::constants::LC_LOAD_DYLIB => {
+                Some(cmd.name)
+            }
+            _ => None,
+        })
+        .collect())
 }
 
 #[derive(Clone, Copy)]
@@ -1301,6 +1700,7 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     assert_eq!(got_hdr.reserved1, 1);
     assert_eq!(lazy_hdr.reserved1, 3);
     assert_eq!(stubs_hdr.reserved2, 12);
+    assert!(dyld_info.rebase_size > 0);
     assert!(dyld_info.bind_size > 0);
     assert!(dyld_info.lazy_bind_size > 0);
     assert_eq!(
@@ -1331,9 +1731,106 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
         .iter()
         .all(|symbol| symbol.library_ordinal().unwrap() > 0));
     assert!(symbol_names.contains(&"_write"));
-    assert!(symbol_names.contains(&"_dyld_stub_binder"));
+    assert!(symbol_names.contains(&"dyld_stub_binder"));
 
     let _ = fs::remove_file(out);
+    let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
+    if !have_xcrun() || !have_xcrun_tool("ld") {
+        eprintln!("skipping: xcrun as/ld unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("import-parity.o");
+    let our_out = scratch("import-parity-ours.out");
+    let apple_out = scratch("import-parity-apple.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            adrp x0, _write@GOTPAGE
+            ldr x0, [x0, _write@GOTPAGEOFF]
+            bl _write
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_classic_lazy(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+
+    for (segname, sectname) in [("__TEXT", "__stubs"), ("__TEXT", "__stub_helper")] {
+        let (_, ours) = output_section(&our_bytes, segname, sectname).unwrap();
+        let (_, apple) = output_section(&apple_bytes, segname, sectname).unwrap();
+        let diff = diff_macho(&ours, &apple);
+        assert!(
+            diff.is_clean(),
+            "{segname},{sectname} diverged from Apple ld: {:#?}",
+            diff.critical
+        );
+    }
+
+    let (our_helper_addr, _) = output_section(&our_bytes, "__TEXT", "__stub_helper").unwrap();
+    let (apple_helper_addr, _) = output_section(&apple_bytes, "__TEXT", "__stub_helper").unwrap();
+    let (_, our_lazy) = output_section(&our_bytes, "__DATA", "__la_symbol_ptr").unwrap();
+    let (_, apple_lazy) = output_section(&apple_bytes, "__DATA", "__la_symbol_ptr").unwrap();
+    assert_eq!(
+        u64::from_le_bytes(our_lazy[0..8].try_into().unwrap()) - our_helper_addr,
+        24
+    );
+    assert_eq!(
+        u64::from_le_bytes(apple_lazy[0..8].try_into().unwrap()) - apple_helper_addr,
+        24
+    );
+
+    assert_eq!(
+        load_dylib_names(&our_bytes).unwrap(),
+        load_dylib_names(&apple_bytes).unwrap()
+    );
+
+    let our_rebases = decode_rebase_records(&our_bytes).unwrap();
+    let apple_rebases = decode_rebase_records(&apple_bytes).unwrap();
+    assert!(our_rebases.iter().all(|record| record.rebase_type == REBASE_TYPE_POINTER));
+    assert_eq!(our_rebases, apple_rebases);
+    assert_eq!(
+        decode_bind_records(&our_bytes, false).unwrap(),
+        decode_bind_records(&apple_bytes, false).unwrap()
+    );
+    assert_eq!(
+        decode_bind_records(&our_bytes, true).unwrap(),
+        decode_bind_records(&apple_bytes, true).unwrap()
+    );
+
+    let _ = fs::remove_file(apple_out);
+    let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(obj);
 }
 

@@ -1,5 +1,6 @@
 //! End-to-end `Linker::run` coverage for Sprint 10's newly wired pipeline.
 
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -234,6 +235,98 @@ fn symbol_partition_names(bytes: &[u8]) -> (Vec<String>, Vec<String>, Vec<String
         names_for(dysymtab.iextdefsym, dysymtab.nextdefsym),
         names_for(dysymtab.iundefsym, dysymtab.nundefsym),
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalSymbolRecord {
+    name: String,
+    n_type: u8,
+    n_sect: u8,
+    n_desc: u16,
+    value: u64,
+}
+
+fn section_addrs(bytes: &[u8]) -> Vec<u64> {
+    let header = parse_header(bytes).unwrap();
+    let commands = parse_commands(&header, bytes).unwrap();
+    let mut out = Vec::new();
+    for cmd in commands {
+        if let LoadCommand::Segment64(seg) = cmd {
+            for section in seg.sections {
+                out.push(section.addr);
+            }
+        }
+    }
+    out
+}
+
+fn canonical_symbol_records(bytes: &[u8]) -> Vec<CanonicalSymbolRecord> {
+    let (symtab, _) = symtab_and_dysymtab(bytes);
+    let symbols = parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).unwrap();
+    let strings = StringTable::from_file(bytes, symtab.stroff, symtab.strsize).unwrap();
+    let section_addrs = section_addrs(bytes);
+    symbols
+        .iter()
+        .map(|symbol| {
+            let value = if symbol.kind() == SymKind::Sect && symbol.sect_idx() != 0 {
+                let section_addr = section_addrs[symbol.sect_idx() as usize - 1];
+                if symbol.value() >= section_addr {
+                    symbol.value() - section_addr
+                } else {
+                    symbol.value()
+                }
+            } else {
+                symbol.value()
+            };
+            CanonicalSymbolRecord {
+                name: strings.get(symbol.strx()).unwrap().to_string(),
+                n_type: symbol.raw.n_type,
+                n_sect: symbol.raw.n_sect,
+                n_desc: symbol.raw.n_desc,
+                value,
+            }
+        })
+        .collect()
+}
+
+fn raw_string_table(bytes: &[u8]) -> Vec<u8> {
+    let (symtab, _) = symtab_and_dysymtab(bytes);
+    let start = symtab.stroff as usize;
+    let end = start + symtab.strsize as usize;
+    bytes[start..end].to_vec()
+}
+
+fn symbol_name_offsets(bytes: &[u8]) -> HashMap<String, u32> {
+    let (symtab, _) = symtab_and_dysymtab(bytes);
+    let symbols = parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).unwrap();
+    let strings = StringTable::from_file(bytes, symtab.stroff, symtab.strsize).unwrap();
+    symbols
+        .iter()
+        .map(|symbol| (strings.get(symbol.strx()).unwrap().to_string(), symbol.strx()))
+        .collect()
+}
+
+fn indirect_symbol_table(bytes: &[u8]) -> Vec<u32> {
+    let (_, dysymtab) = symtab_and_dysymtab(bytes);
+    if dysymtab.nindirectsyms == 0 {
+        return Vec::new();
+    }
+    let start = dysymtab.indirectsymoff as usize;
+    let end = start + dysymtab.nindirectsyms as usize * 4;
+    bytes[start..end]
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
+fn assert_strtab_within_five_percent(ours: &[u8], apple: &[u8]) {
+    let delta = ours.len().abs_diff(apple.len());
+    assert!(
+        delta * 20 <= apple.len(),
+        "string table length drifted too far from Apple ld: ours={} apple={}",
+        ours.len(),
+        apple.len()
+    );
 }
 
 fn apple_link(
@@ -1850,8 +1943,8 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     assert_eq!(stubs.len(), 12);
     assert_eq!(helper.len(), 36);
     assert_eq!(lazy.len(), 8);
-    assert_eq!(symtab.nsyms, 4);
-    assert_eq!(dysymtab.nlocalsym, 0);
+    assert_eq!(symtab.nsyms, 5);
+    assert_eq!(dysymtab.nlocalsym, 1);
     assert_eq!(dysymtab.nextdefsym, 2);
     assert_eq!(dysymtab.nundefsym, 2);
     assert_eq!(dysymtab.nindirectsyms, 4);
@@ -1886,9 +1979,10 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     assert_eq!(decode_branch_target(&helper, helper_addr, 28).unwrap(), helper_addr);
     assert_eq!(u32::from_le_bytes(helper[32..36].try_into().unwrap()), 0);
     let (locals, extdefs, undefs) = symbol_partition_names(&bytes);
-    assert!(locals.is_empty());
+    assert_eq!(locals, vec!["__dyld_private".to_string()]);
     assert_eq!(extdefs, vec!["__mh_execute_header".to_string(), "_main".to_string()]);
     assert_eq!(undefs, vec!["_write".to_string(), "dyld_stub_binder".to_string()]);
+    assert!(symbol_names.contains(&"__dyld_private"));
     assert!(symbols[dysymtab.iundefsym as usize..]
         .iter()
         .all(|symbol| symbol.kind() == SymKind::Undef));
@@ -2002,6 +2096,7 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
         canonical_lazy_bind_stream(&our_bytes).unwrap(),
         canonical_lazy_bind_stream(&apple_bytes).unwrap()
     );
+    assert_eq!(indirect_symbol_table(&our_bytes), indirect_symbol_table(&apple_bytes));
 
     let _ = fs::remove_file(apple_out);
     let _ = fs::remove_file(our_out);
@@ -2199,6 +2294,8 @@ fn linker_run_partitions_symtab_like_ld() {
     assert_eq!(our_dysymtab.nextdefsym, apple_dysymtab.nextdefsym);
     assert_eq!(our_dysymtab.iundefsym, apple_dysymtab.iundefsym);
     assert_eq!(our_dysymtab.nundefsym, apple_dysymtab.nundefsym);
+    assert_eq!(canonical_symbol_records(&our_bytes), canonical_symbol_records(&apple_bytes));
+    assert_strtab_within_five_percent(&raw_string_table(&our_bytes), &raw_string_table(&apple_bytes));
 
     assert_eq!(
         symbol_partition_names(&our_bytes),
@@ -2206,6 +2303,80 @@ fn linker_run_partitions_symtab_like_ld() {
     );
 
     let _ = fs::remove_file(dylib);
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_dedups_output_strtab_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("strtab-dedup.o");
+    let our_out = scratch("strtab-dedup-ours.out");
+    let apple_out = scratch("strtab-dedup-apple.out");
+    let mut asm = String::from(
+        "        .text\n        .globl _afs_array_sum\n        .globl _main\n",
+    );
+    for idx in 0..20 {
+        let symbol = format!("_pad_symbol_{idx:02}");
+        asm.push_str(&format!("        .globl {symbol}\n"));
+    }
+    asm.push_str("        .p2align 2\n");
+    asm.push_str("    _array_sum:\n        ret\n");
+    asm.push_str("    _afs_array_sum:\n        ret\n");
+    for idx in 0..20 {
+        let symbol = format!("_pad_symbol_{idx:02}");
+        asm.push_str(&format!("    {symbol}:\n        ret\n"));
+    }
+    asm.push_str("    _main:\n        bl _afs_array_sum\n        ret\n");
+    asm.push_str("        .subsections_via_symbols\n");
+    if let Err(e) = assemble(&asm, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert_eq!(canonical_symbol_records(&our_bytes), canonical_symbol_records(&apple_bytes));
+    let our_strtab = raw_string_table(&our_bytes);
+    let apple_strtab = raw_string_table(&apple_bytes);
+    assert_strtab_within_five_percent(&our_strtab, &apple_strtab);
+    assert!(
+        our_strtab.len() <= apple_strtab.len(),
+        "suffix dedup should not grow the output string table: ours={} apple={}",
+        our_strtab.len(),
+        apple_strtab.len()
+    );
+
+    let offsets = symbol_name_offsets(&our_bytes);
+    assert_eq!(offsets["_array_sum"], offsets["_afs_array_sum"] + 4);
+
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(apple_out);

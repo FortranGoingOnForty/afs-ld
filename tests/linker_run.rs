@@ -4,8 +4,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand};
 use afs_ld::{LinkError, LinkOptions, Linker, OutputKind};
+use common::harness::diff_macho;
 
 fn have_xcrun() -> bool {
     Command::new("xcrun")
@@ -25,6 +28,26 @@ fn sdk_path() -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn sdk_version() -> Option<String> {
+    let out = Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-version"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn have_xcrun_tool(tool: &str) -> bool {
+    Command::new("xcrun")
+        .arg("-f")
+        .arg(tool)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn assemble(src: &str, out: &PathBuf) -> Result<(), String> {
@@ -75,6 +98,42 @@ fn output_section(bytes: &[u8], segname: &str, sectname: &str) -> Option<(u64, V
         }
     }
     None
+}
+
+fn apple_link(
+    obj: &PathBuf,
+    out: &PathBuf,
+    entry: &str,
+    syslibroot: &str,
+    platform_version: &str,
+) -> Result<(), String> {
+    let output = Command::new("xcrun")
+        .args([
+            "ld",
+            "-arch",
+            "arm64",
+            "-platform_version",
+            "macos",
+            platform_version,
+            platform_version,
+            "-syslibroot",
+            syslibroot,
+            "-lSystem",
+            "-e",
+            entry,
+            "-o",
+        ])
+        .arg(out)
+        .arg(obj)
+        .output()
+        .map_err(|e| format!("spawn xcrun ld: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "xcrun ld failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
 }
 
 #[test]
@@ -590,6 +649,142 @@ fn sign_extend_21(value: i64) -> i64 {
 }
 
 #[test]
+fn linker_run_applies_scaled_pageoff12_for_ldr_x() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("scaled-ldr.o");
+    let out = scratch("scaled-ldr.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            adrp x0, _target@PAGE
+            ldr x1, [x0, _target@PAGEOFF]
+            ret
+
+        .section __DATA,__data
+        .space 0x3f8
+        .p2align 3
+        .globl _target
+        _target:
+            .quad 0x1122334455667788
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").expect("text section");
+    let (data_addr, data) = output_section(&bytes, "__DATA", "__data").expect("data section");
+
+    let adrp = u32::from_le_bytes(text[0..4].try_into().unwrap());
+    let ldr = u32::from_le_bytes(text[4..8].try_into().unwrap());
+    let adrp_immlo = ((adrp >> 29) & 0x3) as i64;
+    let adrp_immhi = ((adrp >> 5) & 0x7ffff) as i64;
+    let adrp_pages = sign_extend_21((adrp_immhi << 2) | adrp_immlo);
+    let adrp_base = ((text_addr as i64) & !0xfff) + (adrp_pages << 12);
+    let ldr_shift = ((ldr >> 30) & 0b11) as u64;
+    let ldr_imm = ((ldr >> 10) & 0xfff) as u64;
+    let reconstructed_target = (adrp_base as u64) + (ldr_imm << ldr_shift);
+
+    assert_eq!(ldr_shift, 3, "expected 64-bit LDR scale");
+    assert_eq!(ldr_imm, 0x7f, "scaled imm12 should store 0x3f8 >> 3");
+    assert_eq!(reconstructed_target, data_addr + 0x3f8);
+    assert_eq!(
+        u64::from_le_bytes(data[0x3f8..0x400].try_into().unwrap()),
+        0x1122334455667788
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn relocated_text_matches_apple_ld_for_local_relocs() {
+    if !have_xcrun() || !have_xcrun_tool("ld") {
+        eprintln!("skipping: xcrun as/ld unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+
+    let obj = scratch("ld-diff.o");
+    let our_out = scratch("ld-diff-ours.out");
+    let apple_out = scratch("ld-diff-apple.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        .globl _helper
+        _main:
+            adrp x0, _target@PAGE
+            add x0, x0, _target@PAGEOFF
+            bl _helper
+            ret
+        _helper:
+            ret
+
+        .section __DATA,__data
+        .p2align 3
+        _target:
+            .quad _helper
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    if let Err(e) = apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver) {
+        eprintln!("skipping: {e}");
+        let _ = fs::remove_file(obj);
+        let _ = fs::remove_file(our_out);
+        return;
+    }
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let (_, our_text) = output_section(&our_bytes, "__TEXT", "__text").expect("our __text");
+    let (_, apple_text) = output_section(&apple_bytes, "__TEXT", "__text").expect("apple __text");
+
+    let diff = diff_macho(&our_text, &apple_text);
+    assert!(
+        diff.is_clean(),
+        "relocated __text diverged from Apple ld: {:#?}",
+        diff.critical
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
 fn linker_run_rejects_out_of_range_branch26() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun as unavailable");
@@ -681,6 +876,56 @@ fn linker_run_rejects_got_relocations_until_sprint_12() {
             assert!(msg.contains("not yet implemented"), "{msg}");
             assert!(msg.contains("Sprint 12/13"), "{msg}");
             assert!(msg.contains("_target"), "{msg}");
+        }
+        other => panic!("expected Reloc error, got {other:?}"),
+    }
+
+    let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn linker_run_rejects_tlvp_relocations_until_sprint_13() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+
+    let obj = scratch("tlvp-reloc.o");
+    let out = scratch("tlvp-reloc.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            adrp x0, _tlsvar@TLVPPAGE
+            ldr x0, [x0, _tlsvar@TLVPPAGEOFF]
+            ret
+
+        .section __DATA,__thread_data,thread_local_regular
+        .globl _tlsvar
+        .p2align 3
+        _tlsvar:
+            .quad 0
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    let err = Linker::run(&opts).unwrap_err();
+    match err {
+        LinkError::Reloc(err) => {
+            let msg = err.to_string();
+            assert!(msg.contains("TlvpLoadPage21") || msg.contains("TlvpLoadPageOff12"), "{msg}");
+            assert!(msg.contains("not yet implemented"), "{msg}");
+            assert!(msg.contains("Sprint 12/13"), "{msg}");
+            assert!(msg.contains("_tlsvar"), "{msg}");
         }
         other => panic!("expected Reloc error, got {other:?}"),
     }

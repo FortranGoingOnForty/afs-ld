@@ -118,8 +118,11 @@ fn libsystem_tbd_materializes_into_dylib_file() {
 
     // Common expected sub-dylibs we re-export — matches what `otool -L
     // libSystem.B.dylib` shows on a real macOS.
-    let install_names: Vec<&str> =
-        dy.dependencies.iter().map(|d| d.install_name.as_str()).collect();
+    let install_names: Vec<&str> = dy
+        .dependencies
+        .iter()
+        .map(|d| d.install_name.as_str())
+        .collect();
     for sub in [
         "/usr/lib/system/libsystem_c.dylib",
         "/usr/lib/system/libsystem_kernel.dylib",

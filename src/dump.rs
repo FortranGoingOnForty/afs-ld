@@ -9,14 +9,14 @@ use std::path::Path;
 
 use crate::archive::{Archive, Flavor, SpecialMember};
 use crate::input::ObjectFile;
+use crate::macho::constants::*;
 use crate::macho::dylib::{DylibFile, DylibLoadKind};
 use crate::macho::exports::ExportKind;
-use crate::macho::tbd::parse_tbd;
-use crate::macho::constants::*;
 use crate::macho::reader::{
     BuildVersionCmd, DyldInfoCmd, DylibCmd, DysymtabCmd, LinkEditDataCmd, LoadCommand,
     MachHeader64, RpathCmd, Section64Header, Segment64, SymtabCmd,
 };
+use crate::macho::tbd::parse_tbd;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind};
 use crate::section::InputSection;
 use crate::symbol::{InputSymbol, SymKind};
@@ -58,7 +58,11 @@ pub fn dump_archive_file(path: &Path) -> io::Result<()> {
     if let Some(idx) = ar.symbol_index() {
         writeln!(h, "Symbols ({}):", idx.len())?;
         for (i, e) in idx.entries.iter().enumerate().take(16) {
-            writeln!(h, "  [{i}] {} -> member@0x{:x}", e.name, e.member_header_offset)?;
+            writeln!(
+                h,
+                "  [{i}] {} -> member@0x{:x}",
+                e.name, e.member_header_offset
+            )?;
         }
         if idx.len() > 16 {
             writeln!(h, "  ... ({} more)", idx.len() - 16)?;
@@ -69,8 +73,8 @@ pub fn dump_archive_file(path: &Path) -> io::Result<()> {
 
 pub fn dump_tbd_file(path: &Path) -> io::Result<()> {
     let src = std::fs::read_to_string(path)?;
-    let docs = parse_tbd(&src)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let docs =
+        parse_tbd(&src).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let out = io::stdout();
     let mut h = out.lock();
     writeln!(h, "{}:", path.display())?;
@@ -86,18 +90,10 @@ pub fn dump_tbd_file(path: &Path) -> io::Result<()> {
             tbd.compatibility_version.as_deref().unwrap_or("-")
         )?;
         if !tbd.reexported_libraries.is_empty() {
-            let total: usize = tbd
-                .reexported_libraries
-                .iter()
-                .map(|s| s.value.len())
-                .sum();
+            let total: usize = tbd.reexported_libraries.iter().map(|s| s.value.len()).sum();
             writeln!(h, "      reexported-libraries: {total}")?;
         }
-        let export_syms: usize = tbd
-            .exports
-            .iter()
-            .map(|s| s.value.total())
-            .sum();
+        let export_syms: usize = tbd.exports.iter().map(|s| s.value.total()).sum();
         if export_syms > 0 {
             writeln!(h, "      exports: {export_syms} symbols total")?;
         }
@@ -222,12 +218,7 @@ fn write_command(w: &mut impl Write, idx: usize, cmd: &LoadCommand) -> io::Resul
         LoadCommand::DyldExportsTrie(l) => write_linkedit_data(w, l, "EXPORTS_TRIE"),
         LoadCommand::DyldChainedFixups(l) => write_linkedit_data(w, l, "CHAINED_FIXUPS"),
         LoadCommand::Raw { cmd, data, .. } => {
-            writeln!(
-                w,
-                "  (raw — cmd=0x{:x}, payload {} bytes)",
-                cmd,
-                data.len()
-            )
+            writeln!(w, "  (raw — cmd=0x{:x}, payload {} bytes)", cmd, data.len())
         }
     }
 }
@@ -340,11 +331,7 @@ fn write_build_version(w: &mut impl Write, b: &BuildVersionCmd) -> io::Result<()
 }
 
 fn write_linkedit_data(w: &mut impl Write, l: &LinkEditDataCmd, kind: &str) -> io::Result<()> {
-    writeln!(
-        w,
-        "  {kind} dataoff={} datasize={}",
-        l.dataoff, l.datasize
-    )
+    writeln!(w, "  {kind} dataoff={} datasize={}", l.dataoff, l.datasize)
 }
 
 fn write_sections(w: &mut impl Write, secs: &[InputSection]) -> io::Result<()> {
@@ -356,22 +343,14 @@ fn write_sections(w: &mut impl Write, secs: &[InputSection]) -> io::Result<()> {
         writeln!(
             w,
             "  [{i}] {},{:<16} {:?} addr=0x{:x} size=0x{:x} align=2^{} offset={} flags=0x{:08x}",
-            s.segname,
-            s.sectname,
-            s.kind,
-            s.addr,
-            s.size,
-            s.align_pow2,
-            s.offset,
-            s.flags
+            s.segname, s.sectname, s.kind, s.addr, s.size, s.align_pow2, s.offset, s.flags
         )?;
         if !s.data.is_empty() {
             writeln!(w, "      data: {}", hex_preview(&s.data, 16))?;
         }
         if s.nreloc > 0 {
             writeln!(w, "      relocs ({}):", s.nreloc)?;
-            match parse_raw_relocs(&s.raw_relocs, 0, s.nreloc)
-                .and_then(|raws| parse_relocs(&raws))
+            match parse_raw_relocs(&s.raw_relocs, 0, s.nreloc).and_then(|raws| parse_relocs(&raws))
             {
                 Ok(fused) => {
                     for (ri, r) in fused.iter().enumerate() {
@@ -399,7 +378,11 @@ fn write_symbols(w: &mut impl Write, obj: &ObjectFile) -> io::Result<()> {
 
 fn describe_symbol(sym: &InputSymbol) -> String {
     if let Some(stab) = sym.stab_kind() {
-        return format!("STAB kind=0x{stab:02x} sect={} value=0x{:x}", sym.sect_idx(), sym.value());
+        return format!(
+            "STAB kind=0x{stab:02x} sect={} value=0x{:x}",
+            sym.sect_idx(),
+            sym.value()
+        );
     }
     let mut parts: Vec<String> = Vec::new();
     parts.push(

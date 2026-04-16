@@ -29,6 +29,8 @@ use self::stubs::{
 };
 use self::tlv::{ThreadPointerSection, THREAD_POINTER_SIZE};
 
+const COMPACT_UNWIND_PERSONALITY_FIELD_OFFSET: u32 = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntheticPlan {
     pub got: GotSection,
@@ -131,6 +133,17 @@ impl SyntheticPlan {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             for reloc in relocs_for_atom(relocs, atom) {
+                if atom.section == AtomSection::CompactUnwind
+                    && reloc.kind == RelocKind::Unsigned
+                    && reloc.offset
+                        == atom.input_offset + COMPACT_UNWIND_PERSONALITY_FIELD_OFFSET
+                {
+                    if let Some(symbol_id) = dylib_import_referent(obj, reloc.referent, sym_table)
+                    {
+                        got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
+                    }
+                    continue;
+                }
                 match reloc.kind {
                     RelocKind::Unsigned => {
                         // `__thread_vars` descriptors carry their own dedicated
@@ -992,6 +1005,68 @@ mod tests {
         assert_eq!(plan.direct_binds[0].symbol, import);
     }
 
+    #[test]
+    fn synthetic_plan_collects_got_for_compact_unwind_personality_import() {
+        let mut sym_table = SymbolTable::new();
+        let name = sym_table.intern("___gxx_personality_v0");
+        let input_id = InputId(0);
+        let import = match sym_table
+            .insert(Symbol::DylibImport {
+                name,
+                dylib: DylibId(0),
+                ordinal: 2,
+                weak_import: false,
+            })
+            .unwrap()
+        {
+            crate::resolve::InsertOutcome::Inserted(id) => id,
+            other => panic!("unexpected insert outcome: {other:?}"),
+        };
+
+        let relocs = vec![Reloc {
+            offset: 16,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(0),
+            addend: 0,
+            subtrahend: None,
+        }];
+        let object = compact_unwind_object("___gxx_personality_v0", encode_raw_relocs(&relocs));
+
+        let mut atoms = AtomTable::new();
+        atoms.push(Atom {
+            id: crate::resolve::AtomId(0),
+            origin: input_id,
+            input_section: 1,
+            section: AtomSection::CompactUnwind,
+            input_offset: 0,
+            size: 32,
+            align_pow2: 3,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 32],
+            flags: AtomFlags::default(),
+            parent_of: None,
+        });
+
+        let plan = SyntheticPlan::build(
+            &[LayoutInput {
+                id: input_id,
+                object: &object,
+            }],
+            &atoms,
+            &mut sym_table,
+            &[libsystem_input()],
+        )
+        .unwrap();
+
+        assert_eq!(plan.got.entries.len(), 1);
+        assert_eq!(plan.got.entries[0].symbol, import);
+        assert!(plan.stubs.entries.is_empty());
+        assert!(plan.lazy_pointers.entries.is_empty());
+    }
+
     fn libsystem_input() -> DylibInput {
         DylibInput {
             path: PathBuf::from("/tmp/libSystem.tbd"),
@@ -1154,6 +1229,55 @@ mod tests {
                 strx,
                 n_type: N_EXT | crate::macho::constants::N_SECT,
                 n_sect: 2,
+                n_desc: 0,
+                n_value: 0,
+            })],
+            strings: StringTable::from_bytes(strings),
+            symtab: None,
+            dysymtab: None,
+            data_in_code: Vec::new(),
+        }
+    }
+
+    fn compact_unwind_object(symbol_name: &str, raw_relocs: Vec<u8>) -> ObjectFile {
+        let mut strings = vec![0];
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(symbol_name.as_bytes());
+        strings.push(0);
+        ObjectFile {
+            path: PathBuf::from("/tmp/synth-compact-unwind.o"),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections: vec![InputSection {
+                segname: "__LD".into(),
+                sectname: "__compact_unwind".into(),
+                kind: SectionKind::CompactUnwind,
+                addr: 0,
+                size: 32,
+                align_pow2: 3,
+                flags: crate::macho::constants::S_REGULAR,
+                offset: 0,
+                reloff: 0,
+                nreloc: (raw_relocs.len() / 8) as u32,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                data: vec![0; 32],
+                raw_relocs,
+            }],
+            symbols: vec![InputSymbol::from_raw(RawNlist {
+                strx,
+                n_type: N_UNDF | N_EXT,
+                n_sect: 0,
                 n_desc: 0,
                 n_value: 0,
             })],

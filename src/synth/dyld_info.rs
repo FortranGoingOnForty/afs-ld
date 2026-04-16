@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 
 use crate::leb::{write_sleb, write_uleb};
 use crate::macho::constants::{
-    BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND, BIND_OPCODE_SET_ADDEND_SLEB,
-    BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
-    BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
-    BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
-    BIND_SYMBOL_FLAGS_WEAK_IMPORT, BIND_TYPE_POINTER, REBASE_IMMEDIATE_MASK,
-    REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
+    BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND,
+    BIND_OPCODE_SET_ADDEND_SLEB, BIND_OPCODE_SET_DYLIB_ORDINAL_IMM,
+    BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB, BIND_OPCODE_SET_DYLIB_SPECIAL_IMM,
+    BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
+    BIND_OPCODE_SET_TYPE_IMM, BIND_SYMBOL_FLAGS_WEAK_IMPORT, BIND_TYPE_POINTER,
+    REBASE_IMMEDIATE_MASK, REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
 };
 use crate::macho::exports::{ExportEntry, ExportKind};
 
@@ -195,7 +195,8 @@ fn emit_trie_node(node: &FlatTrieNode, offsets: &[usize], out: &mut Vec<u8>) {
     let mut stream = OpcodeStream::new();
     stream.uleb(terminal.len() as u64);
     stream.bytes(&terminal);
-    stream.byte(u8::try_from(node.children.len()).expect("export trie node fanout should fit in u8"));
+    stream
+        .byte(u8::try_from(node.children.len()).expect("export trie node fanout should fit in u8"));
     for (edge, child) in &node.children {
         stream.string(edge);
         stream.uleb(offsets[*child] as u64);
@@ -258,8 +259,12 @@ pub fn emit_bind_records(specs: &[BindRecordSpec<'_>]) -> Vec<u8> {
             state.ordinal = Some(spec.ordinal);
         }
 
-        if current_symbol.as_deref() != Some(spec.name) || state.weak_import != Some(spec.weak_import) {
-            out.byte(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | bind_symbol_flags(spec.weak_import));
+        if current_symbol.as_deref() != Some(spec.name)
+            || state.weak_import != Some(spec.weak_import)
+        {
+            out.byte(
+                BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | bind_symbol_flags(spec.weak_import),
+            );
             out.string(spec.name);
             current_symbol = Some(spec.name.to_string());
             state.weak_import = Some(spec.weak_import);
@@ -278,9 +283,11 @@ pub fn emit_bind_records(specs: &[BindRecordSpec<'_>]) -> Vec<u8> {
 
         match (state.segment_index, state.next_segment_offset) {
             (Some(segment_index), Some(next_segment_offset))
-                if segment_index == spec.segment_index && next_segment_offset == spec.segment_offset => {}
+                if segment_index == spec.segment_index
+                    && next_segment_offset == spec.segment_offset => {}
             (Some(segment_index), Some(next_segment_offset))
-                if segment_index == spec.segment_index && next_segment_offset < spec.segment_offset =>
+                if segment_index == spec.segment_index
+                    && next_segment_offset < spec.segment_offset =>
             {
                 out.byte(BIND_OPCODE_ADD_ADDR_ULEB);
                 out.uleb(spec.segment_offset - next_segment_offset);
@@ -350,9 +357,8 @@ mod tests {
     use crate::macho::constants::{
         BIND_OPCODE_DO_BIND, BIND_OPCODE_SET_ADDEND_SLEB, BIND_OPCODE_SET_DYLIB_ORDINAL_IMM,
         BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
-        BIND_OPCODE_SET_TYPE_IMM, BIND_TYPE_POINTER,
-        EXPORT_SYMBOL_FLAGS_KIND_REGULAR, EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL,
-        EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION,
+        BIND_OPCODE_SET_TYPE_IMM, BIND_TYPE_POINTER, EXPORT_SYMBOL_FLAGS_KIND_REGULAR,
+        EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL, EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION,
     };
     use crate::macho::exports::Exports;
 
@@ -469,13 +475,24 @@ mod tests {
             vec![
                 BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | 1,
                 BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
-                b'_', b'a', b'l', b'p', b'h', b'a', 0,
+                b'_',
+                b'a',
+                b'l',
+                b'p',
+                b'h',
+                b'a',
+                0,
                 BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER,
                 BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | 2,
                 0,
                 BIND_OPCODE_DO_BIND,
                 BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
-                b'_', b'b', b'e', b't', b'a', 0,
+                b'_',
+                b'b',
+                b'e',
+                b't',
+                b'a',
+                0,
                 BIND_OPCODE_DO_BIND,
                 0,
             ]

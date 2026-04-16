@@ -11,7 +11,9 @@ use std::path::PathBuf;
 
 use super::constants::*;
 use super::exports::{ExportEntry, ExportKind, Exports};
-use super::reader::{parse_commands, parse_header, LoadCommand, MachHeader64, ReadError, SymtabCmd};
+use super::reader::{
+    parse_commands, parse_header, LoadCommand, MachHeader64, ReadError, SymtabCmd,
+};
 use super::tbd::{parse_version, SymbolLists, Target, Tbd};
 
 /// How a consumer loaded this dylib. The filetype of the dylib itself is
@@ -132,10 +134,7 @@ impl DylibFile {
 /// `LC_DYLD_EXPORTS_TRIE` (chained-fixups era). Dylibs built by older
 /// toolchains may have no export trie; in that case return an empty
 /// `Exports::Flat(vec![])` so downstream `entries()` works uniformly.
-fn locate_exports(
-    commands: &[LoadCommand],
-    file_bytes: &[u8],
-) -> Result<Exports, ReadError> {
+fn locate_exports(commands: &[LoadCommand], file_bytes: &[u8]) -> Result<Exports, ReadError> {
     for cmd in commands {
         match cmd {
             LoadCommand::DyldInfoOnly(d) if d.export_size != 0 => {
@@ -315,9 +314,7 @@ pub fn dependency_ordinal(deps: &[DylibDependency], install_name: &str) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macho::reader::{
-        write_commands, write_header, DylibCmd, RpathCmd,
-    };
+    use crate::macho::reader::{write_commands, write_header, DylibCmd, RpathCmd};
 
     fn make_dylib_image(commands: Vec<LoadCommand>) -> Vec<u8> {
         let sizeofcmds: u32 = commands.iter().map(|c| c.cmdsize()).sum();
@@ -404,10 +401,7 @@ mod tests {
             }),
         ]);
         let dy = DylibFile::parse("/tmp/x.dylib", &image).unwrap();
-        assert_eq!(
-            dy.rpaths,
-            vec!["@executable_path/../lib", "/opt/local/lib"]
-        );
+        assert_eq!(dy.rpaths, vec!["@executable_path/../lib", "/opt/local/lib"]);
     }
 
     // ----- DylibFile::from_tbd tests -----

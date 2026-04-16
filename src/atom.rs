@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use crate::input::ObjectFile;
 use crate::macho::constants::MH_SUBSECTIONS_VIA_SYMBOLS;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent};
-use crate::resolve::{AtomId, InputId, SymbolTable, SymbolId};
+use crate::resolve::{AtomId, InputId, SymbolId, SymbolTable};
 use crate::section::{InputSection, SectionKind};
 use crate::symbol::{InputSymbol, SymKind};
 
@@ -81,10 +81,7 @@ impl AtomSection {
     }
 
     pub fn is_zerofill(self) -> bool {
-        matches!(
-            self,
-            AtomSection::ZeroFill | AtomSection::ThreadLocalBss
-        )
+        matches!(self, AtomSection::ZeroFill | AtomSection::ThreadLocalBss)
     }
 
     pub fn is_literal(self) -> bool {
@@ -224,7 +221,9 @@ impl AtomTable {
     pub fn by_input_section(&self) -> HashMap<(InputId, u8), Vec<AtomId>> {
         let mut out: HashMap<(InputId, u8), Vec<AtomId>> = HashMap::new();
         for (id, atom) in self.iter() {
-            out.entry((atom.origin, atom.input_section)).or_default().push(id);
+            out.entry((atom.origin, atom.input_section))
+                .or_default()
+                .push(id);
         }
         out
     }
@@ -582,15 +581,36 @@ fn atomize_literal_section(
         AtomSection::CStringLiterals => {
             atomize_cstring(input_id, section_idx, sect, syms, atom_section, table, out)
         }
-        AtomSection::Literal4 => {
-            atomize_fixed_literal(input_id, section_idx, sect, syms, 4, atom_section, table, out)
-        }
-        AtomSection::Literal8 => {
-            atomize_fixed_literal(input_id, section_idx, sect, syms, 8, atom_section, table, out)
-        }
-        AtomSection::Literal16 => {
-            atomize_fixed_literal(input_id, section_idx, sect, syms, 16, atom_section, table, out)
-        }
+        AtomSection::Literal4 => atomize_fixed_literal(
+            input_id,
+            section_idx,
+            sect,
+            syms,
+            4,
+            atom_section,
+            table,
+            out,
+        ),
+        AtomSection::Literal8 => atomize_fixed_literal(
+            input_id,
+            section_idx,
+            sect,
+            syms,
+            8,
+            atom_section,
+            table,
+            out,
+        ),
+        AtomSection::Literal16 => atomize_fixed_literal(
+            input_id,
+            section_idx,
+            sect,
+            syms,
+            16,
+            atom_section,
+            table,
+            out,
+        ),
         _ => unreachable!("atomize_literal_section called with non-literal kind"),
     }
 }
@@ -615,9 +635,7 @@ fn atomize_cstring(
         let data = sect.data[offset..end].to_vec();
         let size = (end - offset) as u32;
 
-        let owner_entry = syms
-            .iter()
-            .find(|(_, _, off)| *off as usize == offset);
+        let owner_entry = syms.iter().find(|(_, _, off)| *off as usize == offset);
         let owner_idx = owner_entry.map(|(i, _, _)| *i);
 
         let mut flags = AtomFlags::default().with(AtomFlags::LITERAL);
@@ -671,9 +689,7 @@ fn atomize_fixed_literal(
         };
         let size = (end - offset) as u32;
 
-        let owner_entry = syms
-            .iter()
-            .find(|(_, _, off)| *off as usize == offset);
+        let owner_entry = syms.iter().find(|(_, _, off)| *off as usize == offset);
         let owner_idx = owner_entry.map(|(i, _, _)| *i);
 
         let mut flags = AtomFlags::default().with(AtomFlags::LITERAL);

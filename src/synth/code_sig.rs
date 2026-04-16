@@ -34,13 +34,15 @@ impl CodeSignaturePlan {
         code_limit: u64,
         executable: bool,
     ) -> Result<Self, &'static str> {
-        let code_limit = u32::try_from(code_limit).map_err(|_| "code-signature offset exceeds 32-bit Mach-O field width")?;
+        let code_limit = u32::try_from(code_limit)
+            .map_err(|_| "code-signature offset exceeds 32-bit Mach-O field width")?;
         let identifier = output_identifier(opts);
         let (exec_seg_base, exec_seg_limit, exec_seg_flags) = exec_segment_info(layout, executable);
         let blob_len = blob_len(code_limit as usize, &identifier);
         Ok(Self {
             dataoff: code_limit,
-            datasize: u32::try_from(blob_len).map_err(|_| "code-signature blob exceeds 32-bit Mach-O field width")?,
+            datasize: u32::try_from(blob_len)
+                .map_err(|_| "code-signature blob exceeds 32-bit Mach-O field width")?,
             code_limit,
             identifier,
             exec_seg_base,
@@ -114,9 +116,9 @@ fn exec_segment_info(layout: &Layout, executable: bool) -> (u64, u64, u64) {
         if !is_executable(section.kind) || section.is_zerofill() {
             continue;
         }
-        min_off = Some(
-            min_off.map_or(section.file_off, |min_off: u64| min_off.min(section.file_off)),
-        );
+        min_off = Some(min_off.map_or(section.file_off, |min_off: u64| {
+            min_off.min(section.file_off)
+        }));
         max_end = max_end.max(section.file_off + section.size);
     }
     let exec_seg_limit = min_off.map_or(0, |min_off| max_end.saturating_sub(min_off));
@@ -132,7 +134,10 @@ fn exec_segment_info(layout: &Layout, executable: bool) -> (u64, u64, u64) {
 }
 
 fn blob_len(code_limit: usize, identifier: &str) -> usize {
-    let cd_len = CODEDIRECTORY_HEADER_SIZE + identifier.len() + 1 + code_slots(code_limit) * CS_SHA256_LEN as usize;
+    let cd_len = CODEDIRECTORY_HEADER_SIZE
+        + identifier.len()
+        + 1
+        + code_slots(code_limit) * CS_SHA256_LEN as usize;
     align_up((SUPERBLOB_HEADER_SIZE + cd_len) as u64, 8) as usize
 }
 
@@ -162,13 +167,7 @@ fn align_up(value: u64, align: u64) -> u64 {
 
 fn sha256(data: &[u8]) -> [u8; 32] {
     const INIT: [u32; 8] = [
-        0x6a09e667,
-        0xbb67ae85,
-        0x3c6ef372,
-        0xa54ff53a,
-        0x510e527f,
-        0x9b05688c,
-        0x1f83d9ab,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
     ];
     const K: [u32; 64] = [
@@ -188,7 +187,11 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     let mut block = [0u8; 128];
     let full_blocks = data.len() / 64;
     for idx in 0..full_blocks {
-        compress(&mut state, (&data[idx * 64..idx * 64 + 64]).try_into().unwrap(), &K);
+        compress(
+            &mut state,
+            (&data[idx * 64..idx * 64 + 64]).try_into().unwrap(),
+            &K,
+        );
     }
 
     let rem = &data[full_blocks * 64..];
@@ -288,17 +291,17 @@ mod tests {
         assert_eq!(
             sha256(b""),
             [
-                0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99,
-                0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95,
-                0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+                0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+                0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+                0x78, 0x52, 0xb8, 0x55,
             ]
         );
         assert_eq!(
             sha256(b"abc"),
             [
-                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d,
-                0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10,
-                0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad,
             ]
         );
     }
@@ -309,7 +312,13 @@ mod tests {
             output: Some("apple".into()),
             ..LinkOptions::default()
         };
-        let plan = CodeSignaturePlan::new(&Layout::empty(crate::OutputKind::Executable, 0), &opts, 16_512, true).unwrap();
+        let plan = CodeSignaturePlan::new(
+            &Layout::empty(crate::OutputKind::Executable, 0),
+            &opts,
+            16_512,
+            true,
+        )
+        .unwrap();
         let blob = plan.build(&vec![0; 16_512]);
 
         assert_eq!(plan.dataoff, 16_512);

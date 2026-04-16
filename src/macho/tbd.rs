@@ -152,11 +152,7 @@ fn decode_document(doc: &Document) -> Result<Tbd, TbdError> {
             "exports" => tbd.exports = decode_scoped_symbols(v)?,
             "reexports" => tbd.reexports = decode_scoped_symbols(v)?,
             // Known-but-ignored keys (grow this list as TAPI adds them).
-            "uuids"
-            | "flags"
-            | "swift-abi-version"
-            | "rpaths"
-            | "objc-constraint"
+            "uuids" | "flags" | "swift-abi-version" | "rpaths" | "objc-constraint"
             | "parent-libraries" => {}
             _ => {
                 // Silently accept unknown keys — TAPI can add new ones in
@@ -180,7 +176,9 @@ fn decode_target_list(v: &Value) -> Result<Vec<Target>, TbdError> {
         .ok_or_else(|| schema("'targets' must be a sequence"))?;
     let mut out = Vec::with_capacity(seq.len());
     for item in seq {
-        let s = item.as_str().ok_or_else(|| schema("target must be a scalar"))?;
+        let s = item
+            .as_str()
+            .ok_or_else(|| schema("target must be a scalar"))?;
         out.push(parse_target(s)?);
     }
     Ok(out)
@@ -189,9 +187,9 @@ fn decode_target_list(v: &Value) -> Result<Vec<Target>, TbdError> {
 fn parse_target(s: &str) -> Result<Target, TbdError> {
     // `arch-platform`. Arch may contain a hyphen (none today, but armv7k
     // in the wild) — split on the *last* `-`.
-    let hyphen = s.rfind('-').ok_or_else(|| schema(&format!(
-        "target {s:?} is not `arch-platform`"
-    )))?;
+    let hyphen = s
+        .rfind('-')
+        .ok_or_else(|| schema(&format!("target {s:?} is not `arch-platform`")))?;
     let arch = match &s[..hyphen] {
         "arm64" => Arch::Arm64,
         "arm64e" => Arch::Arm64e,
@@ -220,8 +218,7 @@ fn decode_scoped_umbrella(v: &Value) -> Result<Vec<Scoped<String>>, TbdError> {
             .as_mapping()
             .ok_or_else(|| schema("parent-umbrella entry must be a mapping"))?;
         let targets = lookup_required(m, "targets").and_then(decode_target_list)?;
-        let umbrella = lookup_required(m, "umbrella")
-            .and_then(|v| scalar_string(v, "umbrella"))?;
+        let umbrella = lookup_required(m, "umbrella").and_then(|v| scalar_string(v, "umbrella"))?;
         out.push(Scoped {
             targets,
             value: umbrella,
@@ -322,7 +319,9 @@ fn scalar_string(v: &Value, context: &str) -> Result<String, TbdError> {
 }
 
 fn schema(msg: &str) -> TbdError {
-    TbdError::Schema { msg: msg.to_string() }
+    TbdError::Schema {
+        msg: msg.to_string(),
+    }
 }
 
 /// Pack a `"X.Y.Z"` / `"X.Y"` / `"X"` / `"1351"` version string to
@@ -435,7 +434,10 @@ mod tests {
         assert_eq!(tbd.reexported_libraries.len(), 1);
         assert_eq!(
             tbd.reexported_libraries[0].value,
-            vec!["/usr/lib/system/libcache.dylib", "/usr/lib/system/libxpc.dylib"]
+            vec![
+                "/usr/lib/system/libcache.dylib",
+                "/usr/lib/system/libxpc.dylib"
+            ]
         );
     }
 

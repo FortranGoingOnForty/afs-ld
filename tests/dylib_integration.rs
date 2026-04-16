@@ -17,15 +17,7 @@ use afs_ld::macho::exports::ExportKind;
 fn build_test_dylib(src: &str, out: &PathBuf) -> Result<(), String> {
     let mut child = Command::new("xcrun")
         .args([
-            "--sdk",
-            "macosx",
-            "clang",
-            "-x",
-            "c",
-            "-arch",
-            "arm64",
-            "-shared",
-            "-o",
+            "--sdk", "macosx", "clang", "-x", "c", "-arch", "arm64", "-shared", "-o",
         ])
         .arg(out)
         .arg("-install_name")

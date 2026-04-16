@@ -74,11 +74,13 @@ pub fn parse_raw_relocs(
     nreloc: u32,
 ) -> Result<Vec<RawRelocation>, ReadError> {
     let start = reloff as usize;
-    let total = (nreloc as usize).checked_mul(RAW_RELOC_SIZE).ok_or(ReadError::Truncated {
-        need: usize::MAX,
-        have: file_bytes.len(),
-        context: "reloc table (nreloc × 8 overflows)",
-    })?;
+    let total = (nreloc as usize)
+        .checked_mul(RAW_RELOC_SIZE)
+        .ok_or(ReadError::Truncated {
+            need: usize::MAX,
+            have: file_bytes.len(),
+            context: "reloc table (nreloc × 8 overflows)",
+        })?;
     let end = start.checked_add(total).ok_or(ReadError::Truncated {
         need: usize::MAX,
         have: file_bytes.len(),
@@ -94,7 +96,9 @@ pub fn parse_raw_relocs(
     let mut out = Vec::with_capacity(nreloc as usize);
     for i in 0..nreloc as usize {
         let off = start + i * RAW_RELOC_SIZE;
-        out.push(RawRelocation::parse(&file_bytes[off..off + RAW_RELOC_SIZE])?);
+        out.push(RawRelocation::parse(
+            &file_bytes[off..off + RAW_RELOC_SIZE],
+        )?);
     }
     Ok(out)
 }
@@ -259,10 +263,11 @@ pub fn parse_relocs(raws: &[RawRelocation]) -> Result<Vec<Reloc>, ReadError> {
                     at_offset: raw.r_address as u32,
                     reason: "unknown ARM64_RELOC_* type",
                 })?;
-                let length = RelocLength::from_bits(raw.r_length).ok_or(ReadError::BadRelocation {
-                    at_offset: raw.r_address as u32,
-                    reason: "invalid r_length (must be 0..=3)",
-                })?;
+                let length =
+                    RelocLength::from_bits(raw.r_length).ok_or(ReadError::BadRelocation {
+                        at_offset: raw.r_address as u32,
+                        reason: "invalid r_length (must be 0..=3)",
+                    })?;
                 let addend = pending_addend.take().map(|v| v as i64).unwrap_or(0);
                 let referent = referent_from(raw)?;
 
@@ -580,7 +585,7 @@ mod tests {
     fn raw_reloc_preserves_all_bit_fields() {
         // Cover every extreme value to catch shift/mask bugs.
         let raw = RawRelocation {
-            r_address: -1, // signed negative round-trips
+            r_address: -1,            // signed negative round-trips
             r_symbolnum: 0x00FF_FFFF, // max 24-bit value
             r_pcrel: true,
             r_length: 0b11,
@@ -615,7 +620,14 @@ mod tests {
     #[test]
     fn raw_reloc_truncated_errors() {
         let err = RawRelocation::parse(&[0u8; 4]).unwrap_err();
-        assert!(matches!(err, ReadError::Truncated { need: RAW_RELOC_SIZE, have: 4, .. }));
+        assert!(matches!(
+            err,
+            ReadError::Truncated {
+                need: RAW_RELOC_SIZE,
+                have: 4,
+                ..
+            }
+        ));
     }
 
     #[test]

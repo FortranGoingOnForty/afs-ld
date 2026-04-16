@@ -128,6 +128,30 @@ fn compile_c(src: &str, out: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+fn compile_cxx(src: &str, out: &PathBuf) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "afs-ld-linker-run-{}-{}.cc",
+        std::process::id(),
+        out.file_stem().and_then(|s| s.to_str()).unwrap_or("t")
+    ));
+    fs::write(&tmp, src).map_err(|e| format!("write: {e}"))?;
+    let output = Command::new("xcrun")
+        .args(["--sdk", "macosx", "clang++", "-arch", "arm64", "-c"])
+        .arg(&tmp)
+        .arg("-o")
+        .arg(out)
+        .output()
+        .map_err(|e| format!("spawn xcrun clang++: {e}"))?;
+    let _ = fs::remove_file(&tmp);
+    if !output.status.success() {
+        return Err(format!(
+            "xcrun clang++ failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
 fn compile_dylib_c(src: &str, out: &PathBuf) -> Result<(), String> {
     let tmp = std::env::temp_dir().join(format!(
         "afs-ld-linker-run-{}-{}.c",
@@ -695,6 +719,30 @@ fn apple_link_dylib_classic(
     if !output.status.success() {
         return Err(format!(
             "xcrun ld -dylib failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn apple_link_cxx_classic(obj: &PathBuf, out: &PathBuf) -> Result<(), String> {
+    let output = Command::new("xcrun")
+        .args([
+            "--sdk",
+            "macosx",
+            "clang++",
+            "-arch",
+            "arm64",
+            "-Wl,-no_fixup_chains",
+            "-o",
+        ])
+        .arg(out)
+        .arg(obj)
+        .output()
+        .map_err(|e| format!("spawn xcrun clang++ link: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "xcrun clang++ link failed: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
@@ -3738,6 +3786,73 @@ fn linker_run_preserves_eh_frame_like_ld() {
     )
     .unwrap();
     assert_eq!(our_dump, apple_dump);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_preserves_exception_unwind_metadata_like_apple_ld() {
+    if !have_xcrun() || !have_xcrun_tool("clang++") || !have_tool("codesign") {
+        eprintln!("skipping: xcrun clang++ or codesign unavailable");
+        return;
+    }
+
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let libsystem = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    let libcxx = PathBuf::from(format!("{sdk}/usr/lib/libc++.tbd"));
+    if !libsystem.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", libsystem.display());
+        return;
+    }
+    if !libcxx.exists() {
+        eprintln!("skipping: no libc++.tbd at {}", libcxx.display());
+        return;
+    }
+
+    let obj = scratch("cxx-exc.o");
+    let our_out = scratch("cxx-exc-ours.out");
+    let apple_out = scratch("cxx-exc-apple.out");
+    let src = r#"
+        int helper() { throw 7; }
+        int main() {
+            try { return helper(); }
+            catch (...) { return 42; }
+        }
+    "#;
+    if let Err(e) = compile_cxx(src, &obj) {
+        eprintln!("skipping: clang++ compile failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), libcxx.clone(), libsystem.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_cxx_classic(&obj, &apple_out).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let (_, our_unwind) = output_section(&our_bytes, "__TEXT", "__unwind_info").unwrap();
+    let (_, apple_unwind) = output_section(&apple_bytes, "__TEXT", "__unwind_info").unwrap();
+    let our_decoded = decode_unwind_info(&our_unwind).unwrap();
+    let apple_decoded = decode_unwind_info(&apple_unwind).unwrap();
+    assert_eq!(our_decoded, apple_decoded);
+    assert_eq!(our_decoded.personalities.len(), 1);
+    assert_eq!(our_decoded.lsdas.len(), 1);
+    assert!(output_section(&our_bytes, "__TEXT", "__gcc_except_tab").is_some());
+
+    let our_status = Command::new(&our_out).status().unwrap();
+    let apple_status = Command::new(&apple_out).status().unwrap();
+    assert_eq!(our_status.code(), Some(42));
+    assert_eq!(apple_status.code(), Some(42));
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);

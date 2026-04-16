@@ -224,7 +224,13 @@ mod tests {
     use super::*;
 
     fn nlist(strx: u32, n_type: u8, n_sect: u8, n_desc: u16, n_value: u64) -> RawNlist {
-        RawNlist { strx, n_type, n_sect, n_desc, n_value }
+        RawNlist {
+            strx,
+            n_type,
+            n_sect,
+            n_desc,
+            n_value,
+        }
     }
 
     #[test]

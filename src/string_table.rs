@@ -24,11 +24,13 @@ impl StringTable {
     /// from `LC_SYMTAB`.
     pub fn from_file(file_bytes: &[u8], stroff: u32, strsize: u32) -> Result<Self, ReadError> {
         let start = stroff as usize;
-        let end = start.checked_add(strsize as usize).ok_or(ReadError::Truncated {
-            need: usize::MAX,
-            have: file_bytes.len(),
-            context: "string table (stroff + strsize overflows)",
-        })?;
+        let end = start
+            .checked_add(strsize as usize)
+            .ok_or(ReadError::Truncated {
+                need: usize::MAX,
+                have: file_bytes.len(),
+                context: "string table (stroff + strsize overflows)",
+            })?;
         if end > file_bytes.len() {
             return Err(ReadError::Truncated {
                 need: end,
@@ -75,15 +77,16 @@ impl StringTable {
                 reason: "strx out of bounds",
             });
         }
-        let end = start + self.raw[start..]
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or(ReadError::BadCmdsize {
-                cmd: 0,
-                cmdsize: 0,
-                at_offset: start,
-                reason: "unterminated string (no null byte before end)",
-            })?;
+        let end = start
+            + self.raw[start..]
+                .iter()
+                .position(|&b| b == 0)
+                .ok_or(ReadError::BadCmdsize {
+                    cmd: 0,
+                    cmdsize: 0,
+                    at_offset: start,
+                    reason: "unterminated string (no null byte before end)",
+                })?;
         std::str::from_utf8(&self.raw[start..end]).map_err(|_| ReadError::BadCmdsize {
             cmd: 0,
             cmdsize: 0,
@@ -196,14 +199,18 @@ mod tests {
     fn out_of_bounds_strx_errors() {
         let t = tbl(b"\0a\0");
         let err = t.get(100).unwrap_err();
-        assert!(matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("out of bounds")));
+        assert!(
+            matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("out of bounds"))
+        );
     }
 
     #[test]
     fn unterminated_string_errors() {
         let t = tbl(b"\0abcdef"); // no trailing null
         let err = t.get(1).unwrap_err();
-        assert!(matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("unterminated")));
+        assert!(
+            matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("unterminated"))
+        );
     }
 
     #[test]

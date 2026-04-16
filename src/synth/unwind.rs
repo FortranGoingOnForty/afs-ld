@@ -8,6 +8,7 @@ use crate::macho::constants::S_REGULAR;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc};
 use crate::resolve::{AtomId, InputId, Symbol, SymbolTable};
 use crate::section::{OutputSection, SectionKind};
+use crate::synth::SyntheticPlan;
 
 const PAGE_SIZE: usize = 4096;
 const UNWIND_INFO_VERSION: u32 = 1;
@@ -15,6 +16,15 @@ const UNWIND_SECOND_LEVEL_REGULAR: u32 = 2;
 const UNWIND_SECOND_LEVEL_COMPRESSED: u32 = 3;
 const FIRST_LEVEL_ENTRY_SIZE: usize = 12;
 const COMPRESSED_PAGE_HEADER_SIZE: usize = 12;
+const UNWIND_HAS_LSDA: u32 = 0x4000_0000;
+const UNWIND_PERSONALITY_MASK: u32 = 0x3000_0000;
+const UNWIND_PERSONALITY_SHIFT: u32 = 28;
+const UNWIND_ARM64_MODE_MASK: u32 = 0x0f00_0000;
+const UNWIND_ARM64_MODE_DWARF: u32 = 0x0300_0000;
+const UNWIND_ARM64_DWARF_SECTION_OFFSET_MASK: u32 = 0x00ff_ffff;
+const COMPACT_UNWIND_FUNCTION_OFFSET: usize = 0;
+const COMPACT_UNWIND_PERSONALITY_OFFSET: usize = 16;
+const COMPACT_UNWIND_LSDA_OFFSET: usize = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnwindError {
@@ -44,6 +54,7 @@ pub enum UnwindReadError {
     UnsupportedSecondLevelPageKind(u32),
     BadFirstLevelIndexOrder { previous: u32, next: u32 },
     BadEncodingIndex { index: u32, max: u32 },
+    TooManyPersonalities(usize),
 }
 
 impl fmt::Display for UnwindReadError {
@@ -66,6 +77,9 @@ impl fmt::Display for UnwindReadError {
                     "encoding index {index} exceeds decoded encoding table size {max}"
                 )
             }
+            UnwindReadError::TooManyPersonalities(count) => {
+                write!(f, "unwind info needs {count} personalities but only 3 are encodable")
+            }
         }
     }
 }
@@ -81,6 +95,8 @@ pub struct DecodedUnwindRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedUnwindInfo {
     pub version: u32,
+    pub personalities: Vec<u32>,
+    pub lsdas: Vec<DecodedLsdaRecord>,
     pub records: Vec<DecodedUnwindRecord>,
 }
 
@@ -89,6 +105,20 @@ struct UnwindRecord {
     function_offset: u32,
     code_len: u32,
     encoding: u32,
+    personality_offset: Option<u32>,
+    lsda_offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedLsdaRecord {
+    pub function_offset: u32,
+    pub lsda_offset: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LsdaRecord {
+    function_offset: u32,
+    lsda_offset: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,9 +133,10 @@ pub fn synthesize(
     inputs: &[LayoutInput<'_>],
     atoms: &AtomTable,
     sym_table: &SymbolTable,
+    synthetic_plan: &SyntheticPlan,
 ) -> Result<bool, UnwindError> {
     let mut changed = remove_compact_unwind_sections(layout);
-    let records = collect_records(layout, inputs, atoms, sym_table)?;
+    let records = collect_records(layout, inputs, atoms, sym_table, synthetic_plan)?;
     if records.is_empty() {
         changed |= remove_unwind_info_section(layout);
         if changed {
@@ -114,7 +145,11 @@ pub fn synthesize(
         return Ok(changed);
     }
 
-    let bytes = serialize_unwind_info(&records);
+    let bytes = serialize_unwind_info(&records).map_err(|err| UnwindError {
+        input: PathBuf::from("<synthetic unwind>"),
+        atom: AtomId(0),
+        detail: err.to_string(),
+    })?;
     validate_serialized_unwind_info(&bytes, &records).map_err(|err| UnwindError {
         input: PathBuf::from("<synthetic unwind>"),
         atom: AtomId(0),
@@ -132,6 +167,7 @@ fn collect_records(
     inputs: &[LayoutInput<'_>],
     atoms: &AtomTable,
     sym_table: &SymbolTable,
+    synthetic_plan: &SyntheticPlan,
 ) -> Result<Vec<UnwindRecord>, UnwindError> {
     let text_base = layout
         .segment("__TEXT")
@@ -191,20 +227,48 @@ fn collect_records(
             .unwrap_or(&[]);
         let function_addr =
             resolve_function_address(atom_id, atom, obj, relocs, atoms, sym_table, layout)?;
-        if has_nonzero_u64(atom, 16) || has_reloc_at(relocs, atom.input_offset + 16) {
-            return Err(UnwindError {
+        let personality_offset = resolve_metadata_offset(
+            atom_id,
+            atom,
+            obj,
+            relocs,
+            atoms,
+            sym_table,
+            layout,
+            synthetic_plan,
+            COMPACT_UNWIND_PERSONALITY_OFFSET,
+            true,
+            "personality",
+        )?
+        .map(|addr| {
+            u32::try_from(addr.saturating_sub(text_base)).map_err(|_| UnwindError {
                 input: obj.path.clone(),
                 atom: atom_id,
-                detail: "personality records are not implemented yet".to_string(),
-            });
-        }
-        if has_nonzero_u64(atom, 24) || has_reloc_at(relocs, atom.input_offset + 24) {
-            return Err(UnwindError {
+                detail: "personality target exceeds 32-bit unwind offset range".to_string(),
+            })
+        })
+        .transpose()?;
+        let lsda_offset = resolve_metadata_offset(
+            atom_id,
+            atom,
+            obj,
+            relocs,
+            atoms,
+            sym_table,
+            layout,
+            synthetic_plan,
+            COMPACT_UNWIND_LSDA_OFFSET,
+            false,
+            "LSDA",
+        )?
+        .map(|addr| {
+            u32::try_from(addr.saturating_sub(text_base)).map_err(|_| UnwindError {
                 input: obj.path.clone(),
                 atom: atom_id,
-                detail: "LSDA records are not implemented yet".to_string(),
-            });
-        }
+                detail: "LSDA target exceeds 32-bit unwind offset range".to_string(),
+            })
+        })
+        .transpose()?;
 
         let function_offset =
             u32::try_from(function_addr.saturating_sub(text_base)).map_err(|_| UnwindError {
@@ -216,6 +280,8 @@ fn collect_records(
             function_offset,
             code_len: u32::from_le_bytes(atom.data[8..12].try_into().unwrap()),
             encoding: u32::from_le_bytes(atom.data[12..16].try_into().unwrap()),
+            personality_offset,
+            lsda_offset,
         });
     }
 
@@ -249,20 +315,100 @@ fn resolve_function_address(
             detail: "function_start reloc is missing".to_string(),
         });
     };
-    match reloc.referent {
+    resolve_reference_address(
+        atom_id,
+        atom,
+        obj,
+        atoms,
+        sym_table,
+        layout,
+        None,
+        reloc.referent,
+        read_u64(atom, COMPACT_UNWIND_FUNCTION_OFFSET)? as u32,
+        "function_start",
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_metadata_offset(
+    atom_id: AtomId,
+    atom: &Atom,
+    obj: &crate::input::ObjectFile,
+    relocs: &[Reloc],
+    atoms: &AtomTable,
+    sym_table: &SymbolTable,
+    layout: &Layout,
+    synthetic_plan: &SyntheticPlan,
+    field_offset: usize,
+    allow_import_got: bool,
+    label: &str,
+) -> Result<Option<u64>, UnwindError> {
+    let raw_value = read_u64(atom, field_offset)?;
+    let reloc = relocs
+        .iter()
+        .find(|reloc| reloc.offset == atom.input_offset + field_offset as u32);
+    if raw_value == 0 && reloc.is_none() {
+        return Ok(None);
+    }
+    let Some(reloc) = reloc else {
+        return Err(UnwindError {
+            input: obj.path.clone(),
+            atom: atom_id,
+            detail: format!("{label} field has inline value but no relocation"),
+        });
+    };
+    Ok(Some(resolve_reference_address(
+        atom_id,
+        atom,
+        obj,
+        atoms,
+        sym_table,
+        layout,
+        Some(synthetic_plan),
+        reloc.referent,
+        raw_value as u32,
+        label,
+        allow_import_got,
+    )?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_reference_address(
+    atom_id: AtomId,
+    atom: &Atom,
+    obj: &crate::input::ObjectFile,
+    atoms: &AtomTable,
+    sym_table: &SymbolTable,
+    layout: &Layout,
+    synthetic_plan: Option<&SyntheticPlan>,
+    referent: Referent,
+    target_offset: u32,
+    label: &str,
+    allow_import_got: bool,
+) -> Result<u64, UnwindError> {
+    match referent {
         Referent::Section(section_idx) => {
-            let target_offset = read_u64(atom, 0)? as u32;
+            let input_section = obj
+                .sections
+                .get((section_idx as usize).saturating_sub(1))
+                .ok_or_else(|| UnwindError {
+                    input: obj.path.clone(),
+                    atom: atom_id,
+                    detail: format!("{label} section {} is out of range", section_idx),
+                })?;
             let Some((candidate_id, candidate)) = atoms.iter().find(|(_, candidate)| {
                 candidate.origin == atom.origin
                     && candidate.input_section == section_idx
-                    && candidate.input_offset <= target_offset
-                    && target_offset < candidate.input_offset + candidate.size
+                    && input_section.addr + candidate.input_offset as u64 <= target_offset as u64
+                    && (target_offset as u64)
+                        < input_section.addr + candidate.input_offset as u64 + candidate.size as u64
             }) else {
                 return Err(UnwindError {
                     input: obj.path.clone(),
                     atom: atom_id,
                     detail: format!(
-                        "function_start points at missing input atom section {} offset 0x{:x}",
+                        "{label} points at missing input atom section {} offset 0x{:x}",
                         section_idx, target_offset
                     ),
                 });
@@ -271,10 +417,11 @@ fn resolve_function_address(
                 return Err(UnwindError {
                     input: obj.path.clone(),
                     atom: atom_id,
-                    detail: format!("function atom {:?} missing from final layout", candidate_id),
+                    detail: format!("{label} atom {:?} missing from final layout", candidate_id),
                 });
             };
-            Ok(base_addr + (target_offset - candidate.input_offset) as u64)
+            let atom_input_addr = input_section.addr + candidate.input_offset as u64;
+            Ok(base_addr + (target_offset as u64 - atom_input_addr))
         }
         Referent::Symbol(sym_idx) => {
             let input_symbol = obj
@@ -283,45 +430,91 @@ fn resolve_function_address(
                 .ok_or_else(|| UnwindError {
                     input: obj.path.clone(),
                     atom: atom_id,
-                    detail: format!("function_start symbol {} is out of range", sym_idx),
+                    detail: format!("{label} symbol {} is out of range", sym_idx),
                 })?;
             let name = obj.symbol_name(input_symbol).map_err(|err| UnwindError {
                 input: obj.path.clone(),
                 atom: atom_id,
                 detail: err.to_string(),
             })?;
-            let Some((_, symbol)) = sym_table
+            let Some((symbol_id, symbol)) = sym_table
                 .iter()
                 .find(|(_, symbol)| sym_table.interner.resolve(symbol.name()) == name)
             else {
                 return Err(UnwindError {
                     input: obj.path.clone(),
                     atom: atom_id,
-                    detail: format!("function_start symbol `{name}` was not resolved"),
+                    detail: format!("{label} symbol `{name}` was not resolved"),
                 });
             };
             match symbol {
-                Symbol::Defined { atom, value, .. } => {
-                    let Some(base_addr) = layout.atom_addr(*atom) else {
+                Symbol::Defined {
+                    atom: target_atom,
+                    value,
+                    ..
+                } => {
+                    let Some(base_addr) = layout.atom_addr(*target_atom) else {
                         return Err(UnwindError {
                             input: obj.path.clone(),
                             atom: atom_id,
-                            detail: format!("function atom {:?} missing from final layout", atom),
+                            detail: format!(
+                                "{label} atom {:?} missing from final layout",
+                                target_atom
+                            ),
                         });
                     };
                     Ok(base_addr + *value)
+                }
+                Symbol::DylibImport { .. } if allow_import_got => {
+                    personality_got_addr(layout, synthetic_plan, symbol_id, atom_id, obj, label)
                 }
                 other => Err(UnwindError {
                     input: obj.path.clone(),
                     atom: atom_id,
                     detail: format!(
-                        "function_start symbol `{name}` resolved to unsupported kind {:?}",
+                        "{label} symbol `{name}` resolved to unsupported kind {:?}",
                         other.kind()
                     ),
                 }),
             }
         }
     }
+}
+
+fn personality_got_addr(
+    layout: &Layout,
+    synthetic_plan: Option<&SyntheticPlan>,
+    symbol_id: crate::resolve::SymbolId,
+    atom_id: AtomId,
+    obj: &crate::input::ObjectFile,
+    label: &str,
+) -> Result<u64, UnwindError> {
+    let Some(plan) = synthetic_plan else {
+        return Err(UnwindError {
+            input: obj.path.clone(),
+            atom: atom_id,
+            detail: format!("{label} import needs a synthetic GOT slot"),
+        });
+    };
+    let Some((idx, _)) = plan.got.get(symbol_id) else {
+        return Err(UnwindError {
+            input: obj.path.clone(),
+            atom: atom_id,
+            detail: format!("{label} import is missing synthetic GOT planning"),
+        });
+    };
+    let Some(section) = layout
+        .sections
+        .iter()
+        .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
+    else {
+        return Err(UnwindError {
+            input: obj.path.clone(),
+            atom: atom_id,
+            detail: format!("{label} import is missing the output __got section"),
+        });
+    };
+    Ok(section.addr + (idx as u64) * 8)
 }
 
 fn read_u64(atom: &Atom, offset: usize) -> Result<u64, UnwindError> {
@@ -338,26 +531,17 @@ fn read_u64(atom: &Atom, offset: usize) -> Result<u64, UnwindError> {
     ))
 }
 
-fn has_nonzero_u64(atom: &Atom, offset: usize) -> bool {
-    read_u64(atom, offset)
-        .map(|value| value != 0)
-        .unwrap_or(false)
-}
-
-fn has_reloc_at(relocs: &[Reloc], offset: u32) -> bool {
-    relocs.iter().any(|reloc| reloc.offset == offset)
-}
-
-fn serialize_unwind_info(records: &[UnwindRecord]) -> Vec<u8> {
-    let pages = build_pages(records);
-    let indices_offset = 7 * 4;
+fn serialize_unwind_info(records: &[UnwindRecord]) -> Result<Vec<u8>, UnwindReadError> {
+    let (records, personalities, lsdas) = finalize_unwind_records(records)?;
+    let pages = build_pages(&records);
+    let common_encodings_offset = 7 * 4;
+    let common_encodings_count = 0u32;
+    let personalities_offset = common_encodings_offset + common_encodings_count as usize * 4;
+    let indices_offset = personalities_offset + personalities.len() * 4;
     let indices_count = (pages.len() + 1) as u32;
-    let second_level_start = align_up(
-        (indices_offset + indices_count as usize * FIRST_LEVEL_ENTRY_SIZE) as u32,
-        16,
-    ) as usize;
+    let lsdas_offset = indices_offset + indices_count as usize * FIRST_LEVEL_ENTRY_SIZE;
+    let second_level_start = align_up((lsdas_offset + lsdas.len() * 8) as u32, 16) as usize;
     let page_blobs: Vec<Vec<u8>> = pages.iter().map(serialize_compressed_page).collect();
-    let lsda_offset = second_level_start as u32;
     let sentinel = records
         .last()
         .map(|record| record.function_offset + record.code_len)
@@ -365,23 +549,49 @@ fn serialize_unwind_info(records: &[UnwindRecord]) -> Vec<u8> {
 
     let mut out = Vec::new();
     out.extend_from_slice(&UNWIND_INFO_VERSION.to_le_bytes());
-    out.extend_from_slice(&(indices_offset as u32).to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&(indices_offset as u32).to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(common_encodings_offset as u32).to_le_bytes());
+    out.extend_from_slice(&common_encodings_count.to_le_bytes());
+    out.extend_from_slice(&(personalities_offset as u32).to_le_bytes());
+    out.extend_from_slice(&(personalities.len() as u32).to_le_bytes());
     out.extend_from_slice(&(indices_offset as u32).to_le_bytes());
     out.extend_from_slice(&indices_count.to_le_bytes());
 
+    for personality in &personalities {
+        out.extend_from_slice(&personality.to_le_bytes());
+    }
+
+    let mut page_lsda_index = 0usize;
     let mut page_offset = second_level_start as u32;
-    for page in &pages {
+    for (page_idx, page) in pages.iter().enumerate() {
+        let next_page_start = pages
+            .get(page_idx + 1)
+            .map(|page| page.start_function_offset)
+            .unwrap_or(sentinel);
+        while page_lsda_index < lsdas.len()
+            && lsdas[page_lsda_index].function_offset < page.start_function_offset
+        {
+            page_lsda_index += 1;
+        }
+        let lsda_index_offset = lsdas_offset as u32 + (page_lsda_index as u32) * 8;
         out.extend_from_slice(&page.start_function_offset.to_le_bytes());
         out.extend_from_slice(&page_offset.to_le_bytes());
-        out.extend_from_slice(&lsda_offset.to_le_bytes());
+        out.extend_from_slice(&lsda_index_offset.to_le_bytes());
+        while page_lsda_index < lsdas.len()
+            && lsdas[page_lsda_index].function_offset < next_page_start
+        {
+            page_lsda_index += 1;
+        }
         page_offset += serialize_compressed_page(page).len() as u32;
     }
     out.extend_from_slice(&sentinel.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&lsda_offset.to_le_bytes());
+    out.extend_from_slice(&(lsdas_offset as u32 + (lsdas.len() as u32) * 8).to_le_bytes());
+
+    for lsda in &lsdas {
+        out.extend_from_slice(&lsda.function_offset.to_le_bytes());
+        out.extend_from_slice(&lsda.lsda_offset.to_le_bytes());
+    }
+
     while out.len() < second_level_start {
         out.push(0);
     }
@@ -393,7 +603,7 @@ fn serialize_unwind_info(records: &[UnwindRecord]) -> Vec<u8> {
     while !out.len().is_multiple_of(8) {
         out.push(0);
     }
-    out
+    Ok(out)
 }
 
 pub fn decode_unwind_info(bytes: &[u8]) -> Result<DecodedUnwindInfo, UnwindReadError> {
@@ -406,8 +616,8 @@ pub fn decode_unwind_info(bytes: &[u8]) -> Result<DecodedUnwindInfo, UnwindReadE
     }
     let common_encodings_offset = read_u32(bytes, 4, "common encodings offset")? as usize;
     let common_encodings_count = read_u32(bytes, 8, "common encodings count")? as usize;
-    let _personalities_offset = read_u32(bytes, 12, "personalities offset")? as usize;
-    let _personalities_count = read_u32(bytes, 16, "personalities count")? as usize;
+    let personalities_offset = read_u32(bytes, 12, "personalities offset")? as usize;
+    let personalities_count = read_u32(bytes, 16, "personalities count")? as usize;
     let indices_offset = read_u32(bytes, 20, "indices offset")? as usize;
     let indices_count = read_u32(bytes, 24, "indices count")? as usize;
 
@@ -417,13 +627,21 @@ pub fn decode_unwind_info(bytes: &[u8]) -> Result<DecodedUnwindInfo, UnwindReadE
         common_encodings_count,
         "common encodings",
     )?;
+    let personalities = read_u32_array(
+        bytes,
+        personalities_offset,
+        personalities_count,
+        "personality array",
+    )?;
     let mut index_starts = Vec::new();
+    let mut index_lsda_offsets = Vec::new();
     for idx in 0..indices_count {
         let entry_off = indices_offset + idx * FIRST_LEVEL_ENTRY_SIZE;
         if entry_off + FIRST_LEVEL_ENTRY_SIZE > bytes.len() {
             return Err(UnwindReadError::Truncated("first-level index"));
         }
         index_starts.push(read_u32(bytes, entry_off, "first-level function offset")?);
+        index_lsda_offsets.push(read_u32(bytes, entry_off + 8, "first-level lsda offset")?);
     }
     for pair in index_starts.windows(2) {
         if pair[0] > pair[1] {
@@ -431,6 +649,27 @@ pub fn decode_unwind_info(bytes: &[u8]) -> Result<DecodedUnwindInfo, UnwindReadE
                 previous: pair[0],
                 next: pair[1],
             });
+        }
+    }
+
+    let mut lsdas = Vec::new();
+    if let (Some(&lsda_start), Some(&lsda_end)) = (index_lsda_offsets.first(), index_lsda_offsets.last())
+    {
+        let start = lsda_start as usize;
+        let end = lsda_end as usize;
+        if end < start {
+            return Err(UnwindReadError::Truncated("lsda index array"));
+        }
+        let mut entry_off = start;
+        while entry_off < end {
+            if entry_off + 8 > bytes.len() {
+                return Err(UnwindReadError::Truncated("lsda index entry"));
+            }
+            lsdas.push(DecodedLsdaRecord {
+                function_offset: read_u32(bytes, entry_off, "lsda function offset")?,
+                lsda_offset: read_u32(bytes, entry_off + 4, "lsda target offset")?,
+            });
+            entry_off += 8;
         }
     }
 
@@ -481,7 +720,12 @@ pub fn decode_unwind_info(bytes: &[u8]) -> Result<DecodedUnwindInfo, UnwindReadE
         }
     }
 
-    Ok(DecodedUnwindInfo { version, records })
+    Ok(DecodedUnwindInfo {
+        version,
+        personalities,
+        lsdas,
+        records,
+    })
 }
 
 fn validate_serialized_unwind_info(
@@ -489,6 +733,7 @@ fn validate_serialized_unwind_info(
     records: &[UnwindRecord],
 ) -> Result<(), UnwindReadError> {
     let decoded = decode_unwind_info(bytes)?;
+    let (records, personalities, lsdas) = finalize_unwind_records(records)?;
     let expected: Vec<DecodedUnwindRecord> = records
         .iter()
         .map(|record| DecodedUnwindRecord {
@@ -501,7 +746,69 @@ fn validate_serialized_unwind_info(
             "decoded unwind records do not round-trip",
         ));
     }
+    if decoded.personalities != personalities {
+        return Err(UnwindReadError::Truncated(
+            "decoded personality table does not round-trip",
+        ));
+    }
+    let expected_lsdas: Vec<DecodedLsdaRecord> = lsdas
+        .iter()
+        .map(|lsda| DecodedLsdaRecord {
+            function_offset: lsda.function_offset,
+            lsda_offset: lsda.lsda_offset,
+        })
+        .collect();
+    if decoded.lsdas != expected_lsdas {
+        return Err(UnwindReadError::Truncated(
+            "decoded lsda table does not round-trip",
+        ));
+    }
     Ok(())
+}
+
+fn finalize_unwind_records(
+    records: &[UnwindRecord],
+) -> Result<(Vec<UnwindRecord>, Vec<u32>, Vec<LsdaRecord>), UnwindReadError> {
+    let mut personalities = Vec::new();
+    let mut finalized = Vec::with_capacity(records.len());
+    let mut lsdas = Vec::new();
+    let mut personality_index = HashMap::new();
+
+    for record in records {
+        let mut encoding = record.encoding & !UNWIND_PERSONALITY_MASK;
+        if let Some(personality_offset) = record.personality_offset {
+            let idx = if let Some(&idx) = personality_index.get(&personality_offset) {
+                idx
+            } else {
+                if personalities.len() == 3 {
+                    return Err(UnwindReadError::TooManyPersonalities(personalities.len() + 1));
+                }
+                personalities.push(personality_offset);
+                let idx = personalities.len() as u32;
+                personality_index.insert(personality_offset, idx);
+                idx
+            };
+            encoding |= idx << UNWIND_PERSONALITY_SHIFT;
+        }
+        if let Some(lsda_offset) = record.lsda_offset {
+            encoding |= UNWIND_HAS_LSDA;
+            lsdas.push(LsdaRecord {
+                function_offset: record.function_offset,
+                lsda_offset,
+            });
+        } else {
+            encoding &= !UNWIND_HAS_LSDA;
+        }
+        if encoding & UNWIND_ARM64_MODE_MASK == UNWIND_ARM64_MODE_DWARF {
+            encoding &= !UNWIND_ARM64_DWARF_SECTION_OFFSET_MASK;
+        }
+        finalized.push(UnwindRecord {
+            encoding,
+            ..*record
+        });
+    }
+
+    Ok((finalized, personalities, lsdas))
 }
 
 fn build_pages(records: &[UnwindRecord]) -> Vec<CompressedPage> {
@@ -722,7 +1029,10 @@ mod tests {
             function_offset: 0x348,
             code_len: 0x14,
             encoding: 0x0200_1000,
-        }]);
+            personality_offset: None,
+            lsda_offset: None,
+        }])
+        .unwrap();
         let words: Vec<u32> = bytes
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
@@ -739,10 +1049,10 @@ mod tests {
                 2,
                 0x348,
                 0x40,
-                0x40,
+                0x34,
                 0x35c,
                 0,
-                0x40,
+                0x34,
                 0,
                 0,
                 0,
@@ -755,6 +1065,8 @@ mod tests {
             ]
         );
         let decoded = decode_unwind_info(&bytes).unwrap();
+        assert!(decoded.personalities.is_empty());
+        assert!(decoded.lsdas.is_empty());
         assert_eq!(
             decoded.records,
             vec![DecodedUnwindRecord {
@@ -771,13 +1083,18 @@ mod tests {
                 function_offset: 0x348,
                 code_len: 0x8,
                 encoding: 0x0200_0000,
+                personality_offset: None,
+                lsda_offset: None,
             },
             UnwindRecord {
                 function_offset: 0x350,
                 code_len: 0x20,
                 encoding: 0x0400_0000,
+                personality_offset: None,
+                lsda_offset: None,
             },
-        ]);
+        ])
+        .unwrap();
         let words: Vec<u32> = bytes
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
@@ -794,10 +1111,10 @@ mod tests {
                 2,
                 0x348,
                 0x40,
-                0x40,
+                0x34,
                 0x370,
                 0,
-                0x40,
+                0x34,
                 0,
                 0,
                 0,
@@ -812,6 +1129,8 @@ mod tests {
             ]
         );
         let decoded = decode_unwind_info(&bytes).unwrap();
+        assert!(decoded.personalities.is_empty());
+        assert!(decoded.lsdas.is_empty());
         assert_eq!(
             decoded.records,
             vec![
@@ -833,7 +1152,10 @@ mod tests {
             function_offset: 0x348,
             code_len: 0x14,
             encoding: 0x0200_1000,
-        }]);
+            personality_offset: None,
+            lsda_offset: None,
+        }])
+        .unwrap();
         let second_level_offset =
             u32::from_le_bytes(bytes[28 + 4..28 + 8].try_into().unwrap()) as usize;
         let entries_offset = second_level_offset

@@ -158,11 +158,13 @@ impl InputSection {
             Vec::new()
         } else {
             let start = hdr.offset as usize;
-            let end = start.checked_add(hdr.size as usize).ok_or(ReadError::Truncated {
-                need: usize::MAX,
-                have: file_bytes.len(),
-                context: "section content (offset + size overflows)",
-            })?;
+            let end = start
+                .checked_add(hdr.size as usize)
+                .ok_or(ReadError::Truncated {
+                    need: usize::MAX,
+                    have: file_bytes.len(),
+                    context: "section content (offset + size overflows)",
+                })?;
             if end > file_bytes.len() {
                 return Err(ReadError::Truncated {
                     need: end,
@@ -177,11 +179,13 @@ impl InputSection {
             Vec::new()
         } else {
             let start = hdr.reloff as usize;
-            let total = (hdr.nreloc as usize).checked_mul(8).ok_or(ReadError::Truncated {
-                need: usize::MAX,
-                have: file_bytes.len(),
-                context: "section relocs (nreloc × 8 overflows)",
-            })?;
+            let total = (hdr.nreloc as usize)
+                .checked_mul(8)
+                .ok_or(ReadError::Truncated {
+                    need: usize::MAX,
+                    have: file_bytes.len(),
+                    context: "section relocs (nreloc × 8 overflows)",
+                })?;
             let end = start.checked_add(total).ok_or(ReadError::Truncated {
                 need: usize::MAX,
                 have: file_bytes.len(),

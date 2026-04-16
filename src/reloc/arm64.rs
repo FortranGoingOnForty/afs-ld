@@ -957,8 +957,22 @@ fn read_implicit_addend(
     referent: Referent,
 ) -> Result<i64, RelocError> {
     match length {
-        RelocLength::Word => Ok(read_u32(bytes, local_offset, atom, obj, kind, &describe_referent(obj, referent))? as i32 as i64),
-        RelocLength::Quad => Ok(read_u64(bytes, local_offset, atom, obj, kind, &describe_referent(obj, referent))? as i64),
+        RelocLength::Word => Ok(read_u32(
+            bytes,
+            local_offset,
+            atom,
+            obj,
+            kind,
+            &describe_referent(obj, referent),
+        )? as i32 as i64),
+        RelocLength::Quad => Ok(read_u64(
+            bytes,
+            local_offset,
+            atom,
+            obj,
+            kind,
+            &describe_referent(obj, referent),
+        )? as i64),
         other => Err(reloc_error(
             atom,
             &obj.path,

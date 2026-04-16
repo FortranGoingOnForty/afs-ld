@@ -9,14 +9,22 @@ use crate::atom::AtomTable;
 use crate::input::ObjectFile;
 use crate::macho::constants::SG_READ_ONLY;
 use crate::resolve::InputId;
-use crate::section::{is_zerofill, OutputAtom, OutputSection, OutputSectionId, OutputSegment, Prot};
+use crate::section::{
+    is_zerofill, OutputAtom, OutputSection, OutputSectionId, OutputSegment, Prot,
+};
 use crate::synth::SyntheticPlan;
 use crate::OutputKind;
 
 pub const PAGE_SIZE: u64 = 0x4000;
 pub const EXECUTABLE_TEXT_BASE: u64 = 0x1_0000_0000;
 
-const EXEC_SEGMENTS: [&str; 5] = ["__PAGEZERO", "__TEXT", "__DATA_CONST", "__DATA", "__LINKEDIT"];
+const EXEC_SEGMENTS: [&str; 5] = [
+    "__PAGEZERO",
+    "__TEXT",
+    "__DATA_CONST",
+    "__DATA",
+    "__LINKEDIT",
+];
 const DYLIB_SEGMENTS: [&str; 4] = ["__TEXT", "__DATA_CONST", "__DATA", "__LINKEDIT"];
 
 #[derive(Debug, Clone, Copy)]
@@ -59,8 +67,10 @@ impl Layout {
         header_size: u64,
         synthetic_plan: Option<&SyntheticPlan>,
     ) -> Self {
-        let input_map: HashMap<InputId, &ObjectFile> =
-            inputs.iter().map(|input| (input.id, input.object)).collect();
+        let input_map: HashMap<InputId, &ObjectFile> = inputs
+            .iter()
+            .map(|input| (input.id, input.object))
+            .collect();
 
         let mut sections: Vec<OutputSection> = Vec::new();
         let mut section_index: HashMap<SectionKey, usize> = HashMap::new();
@@ -122,10 +132,9 @@ impl Layout {
 
         if let Some(plan) = synthetic_plan {
             for synthetic in plan.output_sections() {
-                if let Some(existing) = sections
-                    .iter_mut()
-                    .find(|section| section.segment == synthetic.segment && section.name == synthetic.name)
-                {
+                if let Some(existing) = sections.iter_mut().find(|section| {
+                    section.segment == synthetic.segment && section.name == synthetic.name
+                }) {
                     merge_synthetic_section(existing, synthetic);
                 } else {
                     sections.push(synthetic);
@@ -136,7 +145,9 @@ impl Layout {
         sections.sort_by(|a, b| {
             segment_rank(kind, &a.segment)
                 .cmp(&segment_rank(kind, &b.segment))
-                .then_with(|| section_rank(&a.segment, &a.name).cmp(&section_rank(&b.segment, &b.name)))
+                .then_with(|| {
+                    section_rank(&a.segment, &a.name).cmp(&section_rank(&b.segment, &b.name))
+                })
                 .then_with(|| a.segment.cmp(&b.segment))
                 .then_with(|| a.name.cmp(&b.name))
         });
@@ -159,12 +170,13 @@ impl Layout {
                 placed.offset = size;
                 size += placed.size;
             }
-            section.synthetic_offset = if section.synthetic_data.is_empty() || section.atoms.is_empty() {
-                0
-            } else {
-                let align = 1u64 << section.align_pow2.min(63);
-                align_up(size, align)
-            };
+            section.synthetic_offset =
+                if section.synthetic_data.is_empty() || section.atoms.is_empty() {
+                    0
+                } else {
+                    let align = 1u64 << section.align_pow2.min(63);
+                    align_up(size, align)
+                };
             section.size = if section.synthetic_data.is_empty() {
                 size
             } else {
@@ -278,11 +290,7 @@ impl Layout {
             } else {
                 seg_start_vm
             };
-            let mut file_cursor = if is_text {
-                header_size
-            } else {
-                seg_start_file
-            };
+            let mut file_cursor = if is_text { header_size } else { seg_start_file };
             let mut seg_vm_end = if is_text {
                 seg_start_vm + header_size
             } else {
@@ -323,13 +331,25 @@ impl Layout {
                 align_up(raw_vm_size, PAGE_SIZE)
             };
             segment.file_size = if is_linkedit || raw_file_size == 0 {
-                if is_linkedit { 0 } else { raw_file_size }
+                if is_linkedit {
+                    0
+                } else {
+                    raw_file_size
+                }
             } else {
                 align_up(raw_file_size, PAGE_SIZE)
             };
 
-            next_vm = if is_linkedit { seg_start_vm } else { seg_vm_end };
-            next_file = if is_linkedit { seg_start_file } else { seg_file_end };
+            next_vm = if is_linkedit {
+                seg_start_vm
+            } else {
+                seg_vm_end
+            };
+            next_file = if is_linkedit {
+                seg_start_file
+            } else {
+                seg_file_end
+            };
         }
     }
 }
@@ -343,7 +363,9 @@ fn merge_synthetic_section(existing: &mut OutputSection, synthetic: OutputSectio
     existing.reserved2 = synthetic.reserved2;
     existing.reserved3 = synthetic.reserved3;
     if !synthetic.synthetic_data.is_empty() {
-        existing.synthetic_data.extend_from_slice(&synthetic.synthetic_data);
+        existing
+            .synthetic_data
+            .extend_from_slice(&synthetic.synthetic_data);
     }
 }
 
@@ -412,7 +434,10 @@ fn segment_rank(kind: OutputKind, segment: &str) -> usize {
         OutputKind::Executable => &EXEC_SEGMENTS,
         OutputKind::Dylib => &DYLIB_SEGMENTS,
     };
-    order.iter().position(|name| *name == segment).unwrap_or(order.len())
+    order
+        .iter()
+        .position(|name| *name == segment)
+        .unwrap_or(order.len())
 }
 
 fn section_rank(segment: &str, section: &str) -> usize {
@@ -440,7 +465,10 @@ fn section_rank(segment: &str, section: &str) -> usize {
         "__LINKEDIT" => &[],
         _ => &[],
     };
-    order.iter().position(|name| *name == section).unwrap_or(order.len())
+    order
+        .iter()
+        .position(|name| *name == section)
+        .unwrap_or(order.len())
 }
 
 fn segment_init_prot(name: &str) -> Prot {
@@ -529,11 +557,18 @@ mod tests {
 
     use crate::atom::{Atom, AtomFlags, AtomSection, AtomTable};
     use crate::input::ObjectFile;
-    use crate::macho::constants::{CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_CSTRING_LITERALS, S_REGULAR, S_ZEROFILL};
+    use crate::macho::constants::{
+        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, S_ATTR_PURE_INSTRUCTIONS,
+        S_ATTR_SOME_INSTRUCTIONS, S_CSTRING_LITERALS, S_REGULAR, S_ZEROFILL,
+    };
     use crate::macho::reader::MachHeader64;
     use crate::resolve::{DylibId, InputId, SymbolId};
     use crate::section::{InputSection, SectionKind};
-    use crate::synth::{got::GotSection, stubs::{LazyPointerSection, StubsSection, StubEntry, LazyPointerEntry}, SyntheticPlan};
+    use crate::synth::{
+        got::GotSection,
+        stubs::{LazyPointerEntry, LazyPointerSection, StubEntry, StubsSection},
+        SyntheticPlan,
+    };
 
     use super::*;
 
@@ -553,7 +588,13 @@ mod tests {
             },
             commands: Vec::new(),
             sections: vec![
-                input_section("__TEXT", "__cstring", SectionKind::CStringLiterals, 0, S_CSTRING_LITERALS),
+                input_section(
+                    "__TEXT",
+                    "__cstring",
+                    SectionKind::CStringLiterals,
+                    0,
+                    S_CSTRING_LITERALS,
+                ),
                 input_section(
                     "__TEXT",
                     "__text",
@@ -582,8 +623,24 @@ mod tests {
             0,
             b"hello\0".to_vec(),
         ));
-        atoms.push(atom(InputId(0), 3, AtomSection::ConstData, 0, 16, 3, vec![1; 16]));
-        atoms.push(atom(InputId(0), 4, AtomSection::ZeroFill, 0, 32, 3, Vec::new()));
+        atoms.push(atom(
+            InputId(0),
+            3,
+            AtomSection::ConstData,
+            0,
+            16,
+            3,
+            vec![1; 16],
+        ));
+        atoms.push(atom(
+            InputId(0),
+            4,
+            AtomSection::ZeroFill,
+            0,
+            32,
+            3,
+            Vec::new(),
+        ));
 
         let layout = Layout::build(
             OutputKind::Executable,
@@ -626,7 +683,13 @@ mod tests {
                 reserved: 0,
             },
             commands: Vec::new(),
-            sections: vec![input_section("__DATA", "__bss", SectionKind::ZeroFill, 4, S_ZEROFILL)],
+            sections: vec![input_section(
+                "__DATA",
+                "__bss",
+                SectionKind::ZeroFill,
+                4,
+                S_ZEROFILL,
+            )],
             symbols: Vec::new(),
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
@@ -635,7 +698,15 @@ mod tests {
         };
 
         let mut atoms = AtomTable::new();
-        atoms.push(atom(InputId(0), 1, AtomSection::ZeroFill, 0, 64, 4, Vec::new()));
+        atoms.push(atom(
+            InputId(0),
+            1,
+            AtomSection::ZeroFill,
+            0,
+            64,
+            4,
+            Vec::new(),
+        ));
 
         let layout = Layout::build(
             OutputKind::Executable,
@@ -689,7 +760,15 @@ mod tests {
         };
 
         let mut atoms = AtomTable::new();
-        atoms.push(atom(InputId(0), 1, AtomSection::Text, 0, 16, 2, vec![0; 16]));
+        atoms.push(atom(
+            InputId(0),
+            1,
+            AtomSection::Text,
+            0,
+            16,
+            2,
+            vec![0; 16],
+        ));
         atoms.push(atom(InputId(0), 2, AtomSection::Data, 0, 8, 3, vec![0; 8]));
 
         let layout = Layout::build(
@@ -858,7 +937,13 @@ mod tests {
                 reserved: 0,
             },
             commands: Vec::new(),
-            sections: vec![input_section("__DATA", "__data", SectionKind::Data, 3, S_REGULAR)],
+            sections: vec![input_section(
+                "__DATA",
+                "__data",
+                SectionKind::Data,
+                3,
+                S_REGULAR,
+            )],
             symbols: Vec::new(),
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
@@ -867,7 +952,15 @@ mod tests {
         };
 
         let mut atoms = AtomTable::new();
-        atoms.push(atom(InputId(0), 1, AtomSection::Data, 0, 16, 3, vec![0xaa; 16]));
+        atoms.push(atom(
+            InputId(0),
+            1,
+            AtomSection::Data,
+            0,
+            16,
+            3,
+            vec![0xaa; 16],
+        ));
 
         let plan = SyntheticPlan {
             got: GotSection {
@@ -929,7 +1022,13 @@ mod tests {
                 reserved: 0,
             },
             commands: Vec::new(),
-            sections: vec![input_section("__FOO", "__bar", SectionKind::Data, 3, S_REGULAR)],
+            sections: vec![input_section(
+                "__FOO",
+                "__bar",
+                SectionKind::Data,
+                3,
+                S_REGULAR,
+            )],
             symbols: Vec::new(),
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,

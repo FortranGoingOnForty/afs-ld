@@ -55,7 +55,10 @@ fn minimal_outputs_pass_otool_and_file() {
 
     for (path, expected) in [
         (&exe, "Mach-O 64-bit executable arm64"),
-        (&dylib, "Mach-O 64-bit dynamically linked shared library arm64"),
+        (
+            &dylib,
+            "Mach-O 64-bit dynamically linked shared library arm64",
+        ),
     ] {
         let otool = Command::new("xcrun")
             .args(["otool", "-lV"])

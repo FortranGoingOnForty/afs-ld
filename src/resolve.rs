@@ -277,11 +277,7 @@ impl Inputs {
             compatibility_version: file.compatibility_version,
             ordinal,
         };
-        self.add_dylib_from_file_with_meta(
-            path,
-            file,
-            load,
-        )
+        self.add_dylib_from_file_with_meta(path, file, load)
     }
 
     pub fn add_dylib_from_file_with_meta(
@@ -303,7 +299,12 @@ impl Inputs {
     }
 
     pub fn next_dylib_ordinal(&self) -> u16 {
-        self.dylibs.iter().map(|dylib| dylib.ordinal).max().unwrap_or(0) + 1
+        self.dylibs
+            .iter()
+            .map(|dylib| dylib.ordinal)
+            .max()
+            .unwrap_or(0)
+            + 1
     }
 
     // ---- accessors ----
@@ -671,9 +672,9 @@ impl SymbolTable {
                 first: existing_id,
                 second: Box::new(new.clone()),
             }),
-            (false, true) => Ok(Action::Replace),     // strong over weak
-            (true, false) => Ok(Action::Keep),        // strong keeps its seat
-            (false, false) => Ok(Action::Keep),       // first weak wins
+            (false, true) => Ok(Action::Replace), // strong over weak
+            (true, false) => Ok(Action::Keep),    // strong keeps its seat
+            (false, false) => Ok(Action::Keep),   // first weak wins
         }
     }
 
@@ -708,7 +709,9 @@ impl SymbolTable {
                 InsertOutcome::CommonCoalesced { id }
             }
             Action::PendingArchiveFetch => {
-                let Symbol::LazyArchive { archive, member, .. } = self.symbols[id.0 as usize]
+                let Symbol::LazyArchive {
+                    archive, member, ..
+                } = self.symbols[id.0 as usize]
                 else {
                     unreachable!("PendingArchiveFetch requires LazyArchive in slot")
                 };
@@ -719,8 +722,7 @@ impl SymbolTable {
                 }
             }
             Action::PendingObjectLoad => {
-                let Symbol::LazyObject { origin, .. } = self.symbols[id.0 as usize]
-                else {
+                let Symbol::LazyObject { origin, .. } = self.symbols[id.0 as usize] else {
                     unreachable!("PendingObjectLoad requires LazyObject in slot")
                 };
                 InsertOutcome::PendingObjectLoad { id, origin }
@@ -746,9 +748,7 @@ impl SymbolTable {
             unreachable!("coalesce_common requires two Common entries");
         };
         if let Symbol::Common {
-            size,
-            align_pow2,
-            ..
+            size, align_pow2, ..
         } = slot
         {
             *size = a_size.max(b_size);
@@ -892,10 +892,7 @@ impl ReferrerLog {
     }
 
     pub fn get(&self, name: Istr) -> &[InputId] {
-        self.entries
-            .get(&name)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        self.entries.get(&name).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     pub fn extend_from(&mut self, other: &ReferrerLog) {
@@ -1037,11 +1034,7 @@ pub fn seed_dylib(
     report: &mut SeedReport,
 ) -> Result<(), SeedError> {
     let di = inputs.dylib(dylib_id);
-    let entries = di
-        .file
-        .exports
-        .entries()
-        .map_err(SeedError::Read)?;
+    let entries = di.file.exports.entries().map_err(SeedError::Read)?;
     for entry in entries {
         let name = table.intern(&entry.name);
         let sym = Symbol::DylibImport {
@@ -1149,13 +1142,12 @@ fn ingest_member_bytes(
     // Extract owned data before mutating the registry.
     let (logical_path, member_bytes) = {
         let archive = Archive::open(&ai.path, &ai.bytes)?;
-        let member =
-            archive
-                .member_at_offset(member_id.0)
-                .ok_or(FetchError::MemberNotFound {
-                    archive: archive_id,
-                    member: member_id,
-                })?;
+        let member = archive
+            .member_at_offset(member_id.0)
+            .ok_or(FetchError::MemberNotFound {
+                archive: archive_id,
+                member: member_id,
+            })?;
         let logical = format!("{}({})", ai.path.display(), member.name);
         (logical, member.body.to_vec())
     };
@@ -1212,13 +1204,7 @@ pub fn force_load_archive(
     };
     let mut queue: Vec<PendingFetch> = Vec::new();
     for offset in member_offsets {
-        let new = ingest_member_bytes(
-            inputs,
-            table,
-            archive_id,
-            MemberId(offset),
-            report,
-        )?;
+        let new = ingest_member_bytes(inputs, table, archive_id, MemberId(offset), report)?;
         queue.extend(new);
     }
     while let Some(p) = queue.pop() {
@@ -1325,9 +1311,7 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
         row[0] = i + 1;
         for (j, cb) in b.iter().enumerate() {
             let cost = if ca == cb { 0 } else { 1 };
-            let new_val = (row[j + 1] + 1)
-                .min(row[j] + 1)
-                .min(prev + cost);
+            let new_val = (row[j + 1] + 1).min(row[j] + 1).min(prev + cost);
             prev = row[j + 1];
             row[j + 1] = new_val;
         }
@@ -1440,9 +1424,7 @@ pub fn classify_unresolved(
     let undefs: Vec<(SymbolId, Istr, bool)> = table
         .iter()
         .filter_map(|(id, s)| match s {
-            Symbol::Undefined {
-                name, weak_ref, ..
-            } => Some((id, *name, *weak_ref)),
+            Symbol::Undefined { name, weak_ref, .. } => Some((id, *name, *weak_ref)),
             _ => None,
         })
         .collect();
@@ -2018,7 +2000,9 @@ mod tests {
         t.insert(lazy).unwrap();
         let want = undef(&mut t, "_hidden");
         match t.insert(want).unwrap() {
-            InsertOutcome::PendingArchiveFetch { archive, member, .. } => {
+            InsertOutcome::PendingArchiveFetch {
+                archive, member, ..
+            } => {
                 assert_eq!(archive, ArchiveId(7));
                 assert_eq!(member, MemberId(42));
             }

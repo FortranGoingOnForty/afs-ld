@@ -23,7 +23,10 @@ impl std::fmt::Display for ArgsError {
                 write!(f, "flag `{flag}` requires a value")
             }
             ArgsError::UnknownFlag(flag) => {
-                write!(f, "unknown flag `{flag}` (Sprint 19 adds the full `ld` surface)")
+                write!(
+                    f,
+                    "unknown flag `{flag}` (Sprint 19 adds the full `ld` surface)"
+                )
             }
         }
     }
@@ -36,7 +39,8 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
         match arg.as_str() {
             "-o" => {
                 opts.output = Some(PathBuf::from(
-                    it.next().ok_or_else(|| ArgsError::MissingValue("-o".into()))?,
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("-o".into()))?,
                 ));
             }
             "-e" => {
@@ -66,22 +70,22 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                 ));
             }
             "--dump-archive" => {
-                opts.dump_archive = Some(PathBuf::from(
-                    it.next()
-                        .ok_or_else(|| ArgsError::MissingValue("--dump-archive".into()))?,
-                ));
+                opts.dump_archive =
+                    Some(PathBuf::from(it.next().ok_or_else(|| {
+                        ArgsError::MissingValue("--dump-archive".into())
+                    })?));
             }
             "--dump-dylib" => {
-                opts.dump_dylib = Some(PathBuf::from(
-                    it.next()
-                        .ok_or_else(|| ArgsError::MissingValue("--dump-dylib".into()))?,
-                ));
+                opts.dump_dylib =
+                    Some(PathBuf::from(it.next().ok_or_else(|| {
+                        ArgsError::MissingValue("--dump-dylib".into())
+                    })?));
             }
             "--dump-tbd" => {
-                opts.dump_tbd = Some(PathBuf::from(
-                    it.next()
-                        .ok_or_else(|| ArgsError::MissingValue("--dump-tbd".into()))?,
-                ));
+                opts.dump_tbd =
+                    Some(PathBuf::from(it.next().ok_or_else(|| {
+                        ArgsError::MissingValue("--dump-tbd".into())
+                    })?));
             }
             s if s.starts_with('-') => {
                 return Err(ArgsError::UnknownFlag(s.to_string()));

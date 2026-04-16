@@ -305,8 +305,13 @@ impl Linker {
             )?;
             layout = next_layout;
             linkedit = Some(next_linkedit);
-            let changed =
-                synth::unwind::synthesize(&mut layout, &layout_inputs, &atom_table, &sym_table)?;
+            let changed = synth::unwind::synthesize(
+                &mut layout,
+                &layout_inputs,
+                &atom_table,
+                &sym_table,
+                &synthetic_plan,
+            )?;
             if !changed {
                 break;
             }

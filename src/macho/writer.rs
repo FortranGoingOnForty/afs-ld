@@ -2217,6 +2217,9 @@ mod tests {
         };
 
         let blob = build_function_starts(&layout, &atoms).unwrap();
-        assert_eq!(decode_function_starts_blob(&blob), vec![0x1000, 0x1008, 0x1040]);
+        assert_eq!(
+            decode_function_starts_blob(&blob),
+            vec![0x1000, 0x1008, 0x1040]
+        );
     }
 }

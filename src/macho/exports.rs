@@ -275,7 +275,12 @@ fn lookup(
         child_cursor += off_len;
         let edge_bytes = edge.as_bytes();
         if remaining.len() >= edge_bytes.len() && &remaining[..edge_bytes.len()] == edge_bytes {
-            return lookup(trie, child_off as usize, &remaining[edge_bytes.len()..], depth + 1);
+            return lookup(
+                trie,
+                child_off as usize,
+                &remaining[edge_bytes.len()..],
+                depth + 1,
+            );
         }
     }
     Ok(None)

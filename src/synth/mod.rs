@@ -8,8 +8,13 @@ use std::path::PathBuf;
 use crate::atom::{Atom, AtomTable};
 use crate::input::ObjectFile;
 use crate::layout::LayoutInput;
+use crate::macho::constants::{
+    S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_LAZY_SYMBOL_POINTERS,
+    S_NON_LAZY_SYMBOL_POINTERS, S_SYMBOL_STUBS,
+};
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind};
 use crate::resolve::{InputId, Symbol, SymbolId, SymbolTable};
+use crate::section::{OutputSection, SectionKind};
 
 use self::got::GotSection;
 use self::stubs::{LazyPointerSection, StubsSection};
@@ -128,6 +133,62 @@ impl SyntheticPlan {
             stubs,
             lazy_pointers,
         })
+    }
+
+    pub fn output_sections(&self) -> Vec<OutputSection> {
+        let mut out = Vec::new();
+        if !self.stubs.entries.is_empty() {
+            out.push(OutputSection {
+                segment: "__TEXT".into(),
+                name: "__stubs".into(),
+                kind: SectionKind::SymbolStubs,
+                align_pow2: 2,
+                flags: S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                reserved1: 0,
+                reserved2: stubs::STUB_SIZE,
+                reserved3: 0,
+                atoms: Vec::new(),
+                synthetic_data: vec![0; self.stubs.entries.len() * stubs::STUB_SIZE as usize],
+                addr: 0,
+                size: (self.stubs.entries.len() as u64) * stubs::STUB_SIZE as u64,
+                file_off: 0,
+            });
+        }
+        if !self.got.entries.is_empty() {
+            out.push(OutputSection {
+                segment: "__DATA_CONST".into(),
+                name: "__got".into(),
+                kind: SectionKind::NonLazySymbolPointers,
+                align_pow2: 3,
+                flags: S_NON_LAZY_SYMBOL_POINTERS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                atoms: Vec::new(),
+                synthetic_data: vec![0; self.got.entries.len() * 8],
+                addr: 0,
+                size: (self.got.entries.len() as u64) * 8,
+                file_off: 0,
+            });
+        }
+        if !self.lazy_pointers.entries.is_empty() {
+            out.push(OutputSection {
+                segment: "__DATA".into(),
+                name: "__la_symbol_ptr".into(),
+                kind: SectionKind::LazySymbolPointers,
+                align_pow2: 3,
+                flags: S_LAZY_SYMBOL_POINTERS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                atoms: Vec::new(),
+                synthetic_data: vec![0; self.lazy_pointers.entries.len() * 8],
+                addr: 0,
+                size: (self.lazy_pointers.entries.len() as u64) * 8,
+                file_off: 0,
+            });
+        }
+        out
     }
 }
 

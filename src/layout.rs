@@ -9,6 +9,7 @@ use crate::atom::AtomTable;
 use crate::input::ObjectFile;
 use crate::resolve::InputId;
 use crate::section::{is_zerofill, OutputAtom, OutputSection, OutputSectionId, OutputSegment, Prot};
+use crate::synth::SyntheticPlan;
 use crate::OutputKind;
 
 pub const PAGE_SIZE: u64 = 0x4000;
@@ -46,6 +47,16 @@ impl Layout {
         inputs: &[LayoutInput<'_>],
         atoms: &AtomTable,
         header_size: u64,
+    ) -> Self {
+        Self::build_with_synthetics(kind, inputs, atoms, header_size, None)
+    }
+
+    pub fn build_with_synthetics(
+        kind: OutputKind,
+        inputs: &[LayoutInput<'_>],
+        atoms: &AtomTable,
+        header_size: u64,
+        synthetic_plan: Option<&SyntheticPlan>,
     ) -> Self {
         let input_map: HashMap<InputId, &ObjectFile> =
             inputs.iter().map(|input| (input.id, input.object)).collect();
@@ -87,6 +98,7 @@ impl Layout {
                         reserved2: input_section.reserved2,
                         reserved3: input_section.reserved3,
                         atoms: Vec::new(),
+                        synthetic_data: Vec::new(),
                         addr: 0,
                         size: 0,
                         file_off: 0,
@@ -104,6 +116,10 @@ impl Layout {
                 size: atom.size as u64,
                 data: atom.data.clone(),
             });
+        }
+
+        if let Some(plan) = synthetic_plan {
+            sections.extend(plan.output_sections());
         }
 
         sections.sort_by(|a, b| {
@@ -132,7 +148,11 @@ impl Layout {
                 placed.offset = size;
                 size += placed.size;
             }
-            section.size = size;
+            if section.atoms.is_empty() {
+                section.size = section.synthetic_data.len() as u64;
+            } else {
+                section.size = size.max(section.synthetic_data.len() as u64);
+            }
         }
 
         let mut layout = Layout {
@@ -466,8 +486,9 @@ mod tests {
     use crate::input::ObjectFile;
     use crate::macho::constants::{CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_CSTRING_LITERALS, S_REGULAR, S_ZEROFILL};
     use crate::macho::reader::MachHeader64;
-    use crate::resolve::InputId;
+    use crate::resolve::{DylibId, InputId, SymbolId};
     use crate::section::{InputSection, SectionKind};
+    use crate::synth::{got::GotSection, stubs::{LazyPointerSection, StubsSection, StubEntry, LazyPointerEntry}, SyntheticPlan};
 
     use super::*;
 
@@ -586,6 +607,110 @@ mod tests {
         let bss = layout.sections.iter().find(|s| s.name == "__bss").unwrap();
         assert_eq!(bss.file_off, 0);
         assert!(bss.addr >= EXECUTABLE_TEXT_BASE + PAGE_SIZE);
+    }
+
+    #[test]
+    fn layout_places_synthetic_import_sections_in_expected_order() {
+        let object = ObjectFile {
+            path: PathBuf::from("/tmp/layout-synth.o"),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections: vec![input_section(
+                "__TEXT",
+                "__text",
+                SectionKind::Text,
+                2,
+                S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            )],
+            symbols: Vec::new(),
+            strings: crate::string_table::StringTable::from_bytes(vec![0]),
+            symtab: None,
+            dysymtab: None,
+        };
+
+        let mut atoms = AtomTable::new();
+        atoms.push(atom(InputId(0), 1, AtomSection::Text, 0, 8, 2, vec![0; 8]));
+
+        let plan = SyntheticPlan {
+            got: GotSection {
+                entries: vec![crate::synth::got::GotEntry {
+                    symbol: SymbolId(1),
+                    weak_import: false,
+                }],
+                index: [(SymbolId(1), 0)].into_iter().collect(),
+            },
+            stubs: StubsSection {
+                entries: vec![StubEntry {
+                    symbol: SymbolId(1),
+                    dylib: DylibId(0),
+                    weak_import: false,
+                }],
+                index: [(SymbolId(1), 0)].into_iter().collect(),
+            },
+            lazy_pointers: LazyPointerSection {
+                entries: vec![LazyPointerEntry {
+                    symbol: SymbolId(1),
+                    dylib: DylibId(0),
+                    weak_import: false,
+                }],
+                index: [(SymbolId(1), 0)].into_iter().collect(),
+            },
+        };
+
+        let layout = Layout::build_with_synthetics(
+            OutputKind::Executable,
+            &[LayoutInput {
+                id: InputId(0),
+                object: &object,
+            }],
+            &atoms,
+            0x200,
+            Some(&plan),
+        );
+
+        let names: Vec<(&str, &str)> = layout
+            .sections
+            .iter()
+            .map(|section| (section.segment.as_str(), section.name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("__TEXT", "__text"),
+                ("__TEXT", "__stubs"),
+                ("__DATA_CONST", "__got"),
+                ("__DATA", "__la_symbol_ptr"),
+            ]
+        );
+
+        let stubs = layout
+            .sections
+            .iter()
+            .find(|section| section.name == "__stubs")
+            .unwrap();
+        assert_eq!(stubs.size, 12);
+        assert_eq!(stubs.reserved2, 12);
+        let got = layout
+            .sections
+            .iter()
+            .find(|section| section.name == "__got")
+            .unwrap();
+        assert_eq!(got.size, 8);
+        let lazy = layout
+            .sections
+            .iter()
+            .find(|section| section.name == "__la_symbol_ptr")
+            .unwrap();
+        assert_eq!(lazy.size, 8);
     }
 
     #[test]

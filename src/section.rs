@@ -257,6 +257,7 @@ pub struct OutputSection {
     pub reserved2: u32,
     pub reserved3: u32,
     pub atoms: Vec<OutputAtom>,
+    pub synthetic_data: Vec<u8>,
     pub addr: u64,
     pub size: u64,
     pub file_off: u64,

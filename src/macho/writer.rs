@@ -152,6 +152,11 @@ pub fn write_finalized_with_dylibs(
         if section.is_zerofill() {
             continue;
         }
+        if !section.synthetic_data.is_empty() {
+            let start = section.file_off as usize;
+            let end = start + section.synthetic_data.len();
+            out[start..end].copy_from_slice(&section.synthetic_data);
+        }
         for placed in &section.atoms {
             let start = (section.file_off + placed.offset) as usize;
             let end = start + placed.data.len();

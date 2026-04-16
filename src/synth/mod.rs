@@ -186,6 +186,31 @@ impl SyntheticPlan {
             }
         }
 
+        sort_symbol_indexed_entries(
+            &mut got.entries,
+            &mut got.index,
+            |entry| entry.symbol,
+            sym_table,
+        );
+        sort_symbol_indexed_entries(
+            &mut stubs.entries,
+            &mut stubs.index,
+            |entry| entry.symbol,
+            sym_table,
+        );
+        sort_symbol_indexed_entries(
+            &mut lazy_pointers.entries,
+            &mut lazy_pointers.index,
+            |entry| entry.symbol,
+            sym_table,
+        );
+        sort_symbol_indexed_entries(
+            &mut thread_pointers.entries,
+            &mut thread_pointers.index,
+            |entry| entry.symbol,
+            sym_table,
+        );
+
         let mut binder_symbol = None;
         let mut tlv_bootstrap_symbol = None;
         let mut needs_dyld_private = false;
@@ -326,6 +351,25 @@ impl SyntheticPlan {
             });
         }
         out
+    }
+}
+
+fn sort_symbol_indexed_entries<T, F>(
+    entries: &mut [T],
+    index: &mut HashMap<SymbolId, usize>,
+    symbol_of: F,
+    sym_table: &SymbolTable,
+) where
+    F: Fn(&T) -> SymbolId,
+{
+    entries.sort_by(|lhs, rhs| {
+        let lhs_name = sym_table.interner.resolve(sym_table.get(symbol_of(lhs)).name());
+        let rhs_name = sym_table.interner.resolve(sym_table.get(symbol_of(rhs)).name());
+        lhs_name.cmp(rhs_name)
+    });
+    index.clear();
+    for (idx, entry) in entries.iter().enumerate() {
+        index.insert(symbol_of(entry), idx);
     }
 }
 

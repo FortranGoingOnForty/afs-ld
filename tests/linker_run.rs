@@ -970,6 +970,11 @@ struct ExportParityCase {
     src: &'static str,
 }
 
+struct ClassicLazyParityCase {
+    name: &'static str,
+    src: &'static str,
+}
+
 fn assert_case_matches_apple_ld(
     case: &ParityCase,
     sdk: &str,
@@ -1094,6 +1099,101 @@ fn assert_dylib_export_case_matches_apple_ld(
         .is_empty()
     {
         return Err(format!("{}: expected non-empty export trie", case.name));
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+    Ok(())
+}
+
+fn assert_classic_lazy_case_matches_apple_ld(
+    case: &ClassicLazyParityCase,
+    sdk: &str,
+    sdk_ver: &str,
+) -> Result<(), String> {
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        return Err(format!("no libSystem.tbd at {}", tbd.display()));
+    }
+
+    let obj = scratch(&format!("classic-lazy-{}.o", case.name));
+    let our_out = scratch(&format!("classic-lazy-{}-ours.out", case.name));
+    let apple_out = scratch(&format!("classic-lazy-{}-apple.out", case.name));
+
+    assemble(case.src, &obj)?;
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts)
+        .map_err(|e| format!("afs-ld classic-lazy link failed for {}: {e}", case.name))?;
+    apple_link_classic_lazy(&obj, &apple_out, "_main", sdk, sdk_ver)?;
+
+    let our_bytes = fs::read(&our_out).map_err(|e| format!("read our output: {e}"))?;
+    let apple_bytes = fs::read(&apple_out).map_err(|e| format!("read apple output: {e}"))?;
+
+    for (segname, sectname) in [("__TEXT", "__stubs"), ("__TEXT", "__stub_helper")] {
+        let (_, ours) = output_section(&our_bytes, segname, sectname)
+            .ok_or_else(|| format!("{}: missing our section {segname},{sectname}", case.name))?;
+        let (_, theirs) = output_section(&apple_bytes, segname, sectname).ok_or_else(|| {
+            format!("{}: missing apple section {segname},{sectname}", case.name)
+        })?;
+        let diff = diff_macho(&ours, &theirs);
+        if !diff.is_clean() {
+            return Err(format!(
+                "{}: section {},{} diverged from Apple ld: {:#?}",
+                case.name, segname, sectname, diff.critical
+            ));
+        }
+    }
+
+    if load_dylib_names(&our_bytes).map_err(|e| format!("our dylibs: {e}"))?
+        != load_dylib_names(&apple_bytes).map_err(|e| format!("apple dylibs: {e}"))?
+    {
+        return Err(format!("{}: LC_LOAD_DYLIB set diverged from Apple ld", case.name));
+    }
+    if segment_flags(&our_bytes, "__DATA_CONST") != segment_flags(&apple_bytes, "__DATA_CONST") {
+        return Err(format!("{}: __DATA_CONST flags diverged from Apple ld", case.name));
+    }
+    if decode_rebase_records(&our_bytes).map_err(|e| format!("our rebases: {e}"))?
+        != decode_rebase_records(&apple_bytes).map_err(|e| format!("apple rebases: {e}"))?
+    {
+        return Err(format!("{}: rebase records diverged from Apple ld", case.name));
+    }
+    if decode_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?
+        != decode_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?
+    {
+        return Err(format!("{}: bind records diverged from Apple ld", case.name));
+    }
+    if dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind)
+        != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::WeakBind)
+    {
+        return Err(format!("{}: weak-bind stream diverged from Apple ld", case.name));
+    }
+    if decode_bind_records(&our_bytes, true).map_err(|e| format!("our lazy binds: {e}"))?
+        != decode_bind_records(&apple_bytes, true).map_err(|e| format!("apple lazy binds: {e}"))?
+    {
+        return Err(format!("{}: lazy bind records diverged from Apple ld", case.name));
+    }
+    if canonical_lazy_bind_stream(&our_bytes)
+        .map_err(|e| format!("our lazy stream: {e}"))?
+        != canonical_lazy_bind_stream(&apple_bytes)
+            .map_err(|e| format!("apple lazy stream: {e}"))?
+    {
+        return Err(format!(
+            "{}: canonical lazy-bind stream diverged from Apple ld",
+            case.name
+        ));
+    }
+    if indirect_symbol_table(&our_bytes) != indirect_symbol_table(&apple_bytes) {
+        return Err(format!(
+            "{}: indirect symbol table diverged from Apple ld",
+            case.name
+        ));
     }
 
     let _ = fs::remove_file(obj);
@@ -2532,6 +2632,100 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
     let _ = fs::remove_file(apple_out);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn classic_lazy_surfaces_match_apple_ld_across_fixture_matrix() {
+    if !have_xcrun() || !have_xcrun_tool("ld") {
+        eprintln!("skipping: xcrun as/ld unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+
+    let cases = [
+        ClassicLazyParityCase {
+            name: "single-got-and-call",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _main
+                _main:
+                    adrp x0, _write@GOTPAGE
+                    ldr x0, [x0, _write@GOTPAGEOFF]
+                    bl _write
+                    ret
+                .subsections_via_symbols
+            "#,
+        },
+        ClassicLazyParityCase {
+            name: "batched-got-and-calls",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _main
+                _main:
+                    adrp x0, _write@GOTPAGE
+                    ldr x0, [x0, _write@GOTPAGEOFF]
+                    bl _write
+                    adrp x1, _close@GOTPAGE
+                    ldr x1, [x1, _close@GOTPAGEOFF]
+                    bl _close
+                    adrp x2, _read@GOTPAGE
+                    ldr x2, [x2, _read@GOTPAGEOFF]
+                    bl _read
+                    ret
+                .subsections_via_symbols
+            "#,
+        },
+        ClassicLazyParityCase {
+            name: "branch-only-calls",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _main
+                _main:
+                    bl _write
+                    bl _close
+                    bl _read
+                    ret
+                .subsections_via_symbols
+            "#,
+        },
+        ClassicLazyParityCase {
+            name: "deduped-import",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _main
+                _main:
+                    adrp x0, _write@GOTPAGE
+                    ldr x0, [x0, _write@GOTPAGEOFF]
+                    bl _write
+                    bl _write
+                    adrp x1, _write@GOTPAGE
+                    ldr x1, [x1, _write@GOTPAGEOFF]
+                    ret
+                .subsections_via_symbols
+            "#,
+        },
+    ];
+
+    let mut failures = Vec::new();
+    for case in &cases {
+        if let Err(err) = assert_classic_lazy_case_matches_apple_ld(case, &sdk, &sdk_ver) {
+            failures.push(err);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Apple ld classic-lazy parity failures ({} cases):\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
 }
 
 #[test]

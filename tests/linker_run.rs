@@ -1673,7 +1673,7 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     let (helper_addr, helper) = output_section(&bytes, "__TEXT", "__stub_helper").unwrap();
     let (got_addr, got) = output_section(&bytes, "__DATA_CONST", "__got").unwrap();
     let (lazy_addr, lazy) = output_section(&bytes, "__DATA", "__la_symbol_ptr").unwrap();
-    let (dyld_private_addr, _) = output_section(&bytes, "__DATA", "__dyld_private").unwrap();
+    let (dyld_private_addr, _) = output_section(&bytes, "__DATA", "__data").unwrap();
     let stubs_hdr = output_section_header(&bytes, "__TEXT", "__stubs").unwrap();
     let got_hdr = output_section_header(&bytes, "__DATA_CONST", "__got").unwrap();
     let lazy_hdr = output_section_header(&bytes, "__DATA", "__la_symbol_ptr").unwrap();

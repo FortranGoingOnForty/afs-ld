@@ -98,6 +98,7 @@ impl Layout {
                         reserved2: input_section.reserved2,
                         reserved3: input_section.reserved3,
                         atoms: Vec::new(),
+                        synthetic_offset: 0,
                         synthetic_data: Vec::new(),
                         addr: 0,
                         size: 0,
@@ -119,7 +120,16 @@ impl Layout {
         }
 
         if let Some(plan) = synthetic_plan {
-            sections.extend(plan.output_sections());
+            for synthetic in plan.output_sections() {
+                if let Some(existing) = sections
+                    .iter_mut()
+                    .find(|section| section.segment == synthetic.segment && section.name == synthetic.name)
+                {
+                    merge_synthetic_section(existing, synthetic);
+                } else {
+                    sections.push(synthetic);
+                }
+            }
         }
 
         sections.sort_by(|a, b| {
@@ -148,11 +158,17 @@ impl Layout {
                 placed.offset = size;
                 size += placed.size;
             }
-            if section.atoms.is_empty() {
-                section.size = section.synthetic_data.len() as u64;
+            section.synthetic_offset = if section.synthetic_data.is_empty() || section.atoms.is_empty() {
+                0
             } else {
-                section.size = size.max(section.synthetic_data.len() as u64);
-            }
+                let align = 1u64 << section.align_pow2.min(63);
+                align_up(size, align)
+            };
+            section.size = if section.synthetic_data.is_empty() {
+                size
+            } else {
+                section.synthetic_offset + section.synthetic_data.len() as u64
+            };
         }
 
         let mut layout = Layout {
@@ -311,6 +327,19 @@ impl Layout {
     }
 }
 
+fn merge_synthetic_section(existing: &mut OutputSection, synthetic: OutputSection) {
+    debug_assert_eq!(existing.segment, synthetic.segment);
+    debug_assert_eq!(existing.name, synthetic.name);
+    existing.align_pow2 = existing.align_pow2.max(synthetic.align_pow2);
+    existing.flags = synthetic.flags;
+    existing.reserved1 = synthetic.reserved1;
+    existing.reserved2 = synthetic.reserved2;
+    existing.reserved3 = synthetic.reserved3;
+    if !synthetic.synthetic_data.is_empty() {
+        existing.synthetic_data.extend_from_slice(&synthetic.synthetic_data);
+    }
+}
+
 fn build_segments(kind: OutputKind, sections: &[OutputSection]) -> Vec<OutputSegment> {
     let names: &[&str] = match kind {
         OutputKind::Executable => &EXEC_SEGMENTS,
@@ -392,7 +421,6 @@ fn section_rank(segment: &str, section: &str) -> usize {
         "__DATA_CONST" => &["__got", "__const"],
         "__DATA" => &[
             "__la_symbol_ptr",
-            "__dyld_private",
             "__data",
             "__thread_vars",
             "__thread_ptrs",
@@ -699,7 +727,7 @@ mod tests {
                 ("__TEXT", "__stub_helper"),
                 ("__DATA_CONST", "__got"),
                 ("__DATA", "__la_symbol_ptr"),
-                ("__DATA", "__dyld_private"),
+                ("__DATA", "__data"),
             ]
         );
 
@@ -731,9 +759,73 @@ mod tests {
         let dyld_private = layout
             .sections
             .iter()
-            .find(|section| section.name == "__dyld_private")
+            .find(|section| section.name == "__data")
             .unwrap();
         assert_eq!(dyld_private.size, 8);
+    }
+
+    #[test]
+    fn synthetic_dyld_private_merges_into_existing_data_section() {
+        let object = ObjectFile {
+            path: PathBuf::from("/tmp/layout-data.o"),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections: vec![input_section("__DATA", "__data", SectionKind::Data, 3, S_REGULAR)],
+            symbols: Vec::new(),
+            strings: crate::string_table::StringTable::from_bytes(vec![0]),
+            symtab: None,
+            dysymtab: None,
+        };
+
+        let mut atoms = AtomTable::new();
+        atoms.push(atom(InputId(0), 1, AtomSection::Data, 0, 16, 3, vec![0xaa; 16]));
+
+        let plan = SyntheticPlan {
+            got: GotSection {
+                entries: Vec::new(),
+                index: HashMap::new(),
+            },
+            stubs: StubsSection {
+                entries: Vec::new(),
+                index: HashMap::new(),
+            },
+            lazy_pointers: LazyPointerSection {
+                entries: Vec::new(),
+                index: HashMap::new(),
+            },
+            binder_symbol: None,
+            needs_dyld_private: true,
+        };
+
+        let layout = Layout::build_with_synthetics(
+            OutputKind::Executable,
+            &[LayoutInput {
+                id: InputId(0),
+                object: &object,
+            }],
+            &atoms,
+            0x200,
+            Some(&plan),
+        );
+
+        let data = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__DATA" && section.name == "__data")
+            .unwrap();
+        assert_eq!(data.atoms.len(), 1);
+        assert_eq!(data.synthetic_offset, 16);
+        assert_eq!(data.synthetic_data.len(), 8);
+        assert_eq!(data.size, 24);
     }
 
     #[test]

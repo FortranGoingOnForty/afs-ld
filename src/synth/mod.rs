@@ -164,6 +164,7 @@ impl SyntheticPlan {
                 reserved2: stubs::STUB_SIZE,
                 reserved3: 0,
                 atoms: Vec::new(),
+                synthetic_offset: 0,
                 synthetic_data: vec![0; self.stubs.entries.len() * stubs::STUB_SIZE as usize],
                 addr: 0,
                 size: (self.stubs.entries.len() as u64) * stubs::STUB_SIZE as u64,
@@ -181,6 +182,7 @@ impl SyntheticPlan {
                 reserved2: 0,
                 reserved3: 0,
                 atoms: Vec::new(),
+                synthetic_offset: 0,
                 synthetic_data: vec![
                     0;
                     STUB_HELPER_HEADER_SIZE as usize
@@ -203,6 +205,7 @@ impl SyntheticPlan {
                 reserved2: 0,
                 reserved3: 0,
                 atoms: Vec::new(),
+                synthetic_offset: 0,
                 synthetic_data: vec![0; self.got.entries.len() * 8],
                 addr: 0,
                 size: (self.got.entries.len() as u64) * 8,
@@ -212,7 +215,7 @@ impl SyntheticPlan {
         if self.needs_dyld_private {
             out.push(OutputSection {
                 segment: "__DATA".into(),
-                name: "__dyld_private".into(),
+                name: "__data".into(),
                 kind: SectionKind::Data,
                 align_pow2: 3,
                 flags: S_REGULAR,
@@ -220,6 +223,7 @@ impl SyntheticPlan {
                 reserved2: 0,
                 reserved3: 0,
                 atoms: Vec::new(),
+                synthetic_offset: 0,
                 synthetic_data: vec![0; DYLD_PRIVATE_SIZE as usize],
                 addr: 0,
                 size: DYLD_PRIVATE_SIZE as u64,
@@ -237,6 +241,7 @@ impl SyntheticPlan {
                 reserved2: 0,
                 reserved3: 0,
                 atoms: Vec::new(),
+                synthetic_offset: 0,
                 synthetic_data: vec![0; self.lazy_pointers.entries.len() * 8],
                 addr: 0,
                 size: (self.lazy_pointers.entries.len() as u64) * 8,

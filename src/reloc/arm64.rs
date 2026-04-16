@@ -252,8 +252,12 @@ fn synthetic_address_maps(
     let dyld_private_addr = layout
         .sections
         .iter()
-        .find(|section| section.segment == "__DATA" && section.name == "__dyld_private")
-        .map(|section| section.addr);
+        .find(|section| {
+            section.segment == "__DATA"
+                && section.name == "__data"
+                && section.synthetic_data.len() >= crate::synth::stubs::DYLD_PRIVATE_SIZE as usize
+        })
+        .map(|section| section.addr + section.synthetic_offset);
 
     SyntheticAddressMaps {
         stub_addrs,

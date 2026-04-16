@@ -55,6 +55,16 @@ pub fn write_with_dylibs(
     dylibs: &[DylibDependency],
     out: &mut Vec<u8>,
 ) -> Result<(), WriteError> {
+    let layout = finalize_layout(layout, kind, opts, dylibs)?;
+    write_finalized_with_dylibs(&layout, kind, opts, entry_point, dylibs, out)
+}
+
+pub fn finalize_layout(
+    layout: &Layout,
+    kind: OutputKind,
+    opts: &LinkOptions,
+    dylibs: &[DylibDependency],
+) -> Result<Layout, WriteError> {
     let mut layout = layout.clone();
     let header_size = estimate_header_size(&layout, kind, opts, dylibs);
     layout.relayout(header_size);
@@ -71,17 +81,10 @@ pub fn write_with_dylibs(
         strsize: 1,
     };
     let dysymtab = DysymtabCmd::default();
-
-    let mut commands = build_commands(
-        &layout,
-        kind,
-        opts,
-        entry_point,
-        dylibs,
-        symtab,
-        dysymtab,
-    )?;
-    let sizeofcmds: u32 = commands.iter().map(LoadCommand::cmdsize).sum();
+    let sizeofcmds: u32 = build_commands(&layout, kind, opts, None, dylibs, symtab, dysymtab)?
+        .iter()
+        .map(LoadCommand::cmdsize)
+        .sum();
     let header_size = HEADER_SIZE as u64 + sizeofcmds as u64;
     layout.relayout(header_size);
 
@@ -90,7 +93,21 @@ pub fn write_with_dylibs(
         .ok_or(WriteError::MissingSegment("__LINKEDIT"))?;
     linkedit.file_size = 1;
     linkedit.vm_size = 1;
+    Ok(layout)
+}
 
+pub fn write_finalized_with_dylibs(
+    layout: &Layout,
+    kind: OutputKind,
+    opts: &LinkOptions,
+    entry_point: Option<EntryPoint>,
+    dylibs: &[DylibDependency],
+    out: &mut Vec<u8>,
+) -> Result<(), WriteError> {
+    let linkedit = layout
+        .segment("__LINKEDIT")
+        .cloned()
+        .ok_or(WriteError::MissingSegment("__LINKEDIT"))?;
     let strtab_off = u32_fit(linkedit.file_off, "string table offset")?;
     let symtab = SymtabCmd {
         symoff: strtab_off,
@@ -99,8 +116,8 @@ pub fn write_with_dylibs(
         strsize: 1,
     };
     let dysymtab = DysymtabCmd::default();
-    commands = build_commands(
-        &layout,
+    let commands = build_commands(
+        layout,
         kind,
         opts,
         entry_point,
@@ -124,7 +141,7 @@ pub fn write_with_dylibs(
         reserved: 0,
     };
 
-    let final_size = final_file_size(&layout);
+    let final_size = final_file_size(layout);
     out.clear();
     out.reserve(final_size as usize);
     write_header(&header, out);

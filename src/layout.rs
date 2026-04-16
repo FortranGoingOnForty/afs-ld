@@ -167,6 +167,17 @@ impl Layout {
         None
     }
 
+    pub fn atom_addr(&self, atom_id: crate::resolve::AtomId) -> Option<u64> {
+        for section in &self.sections {
+            for placed in &section.atoms {
+                if placed.atom == atom_id {
+                    return Some(section.addr + placed.offset);
+                }
+            }
+        }
+        None
+    }
+
     fn assign_addresses(&mut self, header_size: u64) {
         for seg in &mut self.segments {
             seg.sections.clear();

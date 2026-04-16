@@ -15,6 +15,8 @@
 //! fused `Reloc` form. Later passes (Sprint 11, Sprint 23's dead-strip) reason
 //! about `Reloc` and never touch `RawRelocation` again.
 
+pub mod arm64;
+
 use crate::macho::constants::*;
 use crate::macho::reader::{u32_le, ReadError};
 

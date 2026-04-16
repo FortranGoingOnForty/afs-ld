@@ -27,6 +27,7 @@ use layout::{Layout, LayoutInput};
 use macho::reader::ReadError;
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
 use macho::tbd::{parse_tbd, Arch, Platform, Target};
+use reloc::arm64::RelocError;
 use resolve::{
     classify_unresolved, drain_fetches, format_duplicate_diagnostic, format_undefined_diagnostic,
     seed_all, InputAddError, Inputs, Symbol, SymbolTable, UndefinedTreatment,
@@ -84,6 +85,7 @@ pub enum LinkError {
     Fetch(resolve::FetchError),
     Write(macho::writer::WriteError),
     Tbd(macho::tbd::TbdError),
+    Reloc(RelocError),
     DuplicateSymbols(String),
     UndefinedSymbols(String),
     UnsupportedArch(String),
@@ -101,6 +103,7 @@ impl std::fmt::Display for LinkError {
             LinkError::Fetch(e) => write!(f, "{e}"),
             LinkError::Write(e) => write!(f, "{e}"),
             LinkError::Tbd(e) => write!(f, "{e}"),
+            LinkError::Reloc(e) => write!(f, "{e}"),
             LinkError::DuplicateSymbols(msg) | LinkError::UndefinedSymbols(msg) => {
                 write!(f, "{msg}")
             }
@@ -160,6 +163,12 @@ impl From<macho::writer::WriteError> for LinkError {
 impl From<macho::tbd::TbdError> for LinkError {
     fn from(value: macho::tbd::TbdError) -> Self {
         LinkError::Tbd(value)
+    }
+}
+
+impl From<RelocError> for LinkError {
+    fn from(value: RelocError) -> Self {
+        LinkError::Reloc(value)
     }
 }
 
@@ -231,9 +240,6 @@ impl Linker {
                 object,
             })
             .collect();
-        let layout = Layout::build(opts.kind, &layout_inputs, &atom_table, 0);
-
-        let mut image = Vec::new();
         let dylib_loads: Vec<DylibDependency> = inputs
             .dylibs
             .iter()
@@ -245,8 +251,13 @@ impl Linker {
                 ordinal: dylib.ordinal,
             })
             .collect();
+        let base_layout = Layout::build(opts.kind, &layout_inputs, &atom_table, 0);
+        let mut layout = macho::writer::finalize_layout(&base_layout, opts.kind, opts, &dylib_loads)?;
+        reloc::arm64::apply_layout(&mut layout, &layout_inputs, &atom_table, &sym_table)?;
+
+        let mut image = Vec::new();
         let entry_point = resolve_entry_point(opts, &sym_table)?;
-        macho::writer::write_with_dylibs(
+        macho::writer::write_finalized_with_dylibs(
             &layout,
             opts.kind,
             opts,

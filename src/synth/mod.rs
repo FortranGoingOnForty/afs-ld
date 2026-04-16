@@ -143,7 +143,9 @@ impl SyntheticPlan {
                     RelocKind::TlvpLoadPage21 | RelocKind::TlvpLoadPageOff12 => {
                         if let Some(symbol_id) = symbol_referent_id(obj, reloc.referent, sym_table)
                         {
-                            if tlv_symbol_needs_thread_pointer(sym_table, symbol_id) {
+                            if tlv_symbol_needs_got(sym_table, symbol_id) {
+                                got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
+                            } else if tlv_symbol_needs_thread_pointer(sym_table, symbol_id) {
                                 thread_pointers.intern(symbol_id);
                             }
                         }
@@ -358,6 +360,10 @@ fn dylib_import_is_weak(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
 }
 
 fn tlv_symbol_needs_thread_pointer(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
+    matches!(sym_table.get(symbol_id), Symbol::LazyArchive { .. } | Symbol::LazyObject { .. })
+}
+
+fn tlv_symbol_needs_got(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
     matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. })
 }
 
@@ -746,6 +752,75 @@ mod tests {
         assert!(sections
             .iter()
             .all(|section| !(section.segment == "__DATA" && section.name == "__thread_ptrs")));
+    }
+
+    #[test]
+    fn synthetic_plan_routes_imported_tlvp_through_got() {
+        let mut sym_table = SymbolTable::new();
+        let name = sym_table.intern("_ext_tls");
+        let input_id = InputId(0);
+        sym_table
+            .insert(Symbol::DylibImport {
+                name,
+                dylib: DylibId(0),
+                ordinal: 2,
+                weak_import: false,
+            })
+            .unwrap();
+
+        let relocs = vec![
+            Reloc {
+                offset: 0,
+                kind: RelocKind::TlvpLoadPage21,
+                length: RelocLength::Word,
+                pcrel: true,
+                referent: Referent::Symbol(0),
+                addend: 0,
+                subtrahend: None,
+            },
+            Reloc {
+                offset: 4,
+                kind: RelocKind::TlvpLoadPageOff12,
+                length: RelocLength::Word,
+                pcrel: false,
+                referent: Referent::Symbol(0),
+                addend: 0,
+                subtrahend: None,
+            },
+        ];
+        let object = synth_object("_ext_tls", encode_raw_relocs(&relocs));
+
+        let mut atoms = AtomTable::new();
+        atoms.push(Atom {
+            id: crate::resolve::AtomId(0),
+            origin: input_id,
+            input_section: 1,
+            section: AtomSection::Text,
+            input_offset: 0,
+            size: 12,
+            align_pow2: 2,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 12],
+            flags: AtomFlags::default().with(AtomFlags::PURE_INSTRUCTIONS),
+            parent_of: None,
+        });
+
+        let plan = SyntheticPlan::build(
+            &[LayoutInput {
+                id: input_id,
+                object: &object,
+            }],
+            &atoms,
+            &mut sym_table,
+            &[libsystem_input()],
+        )
+        .unwrap();
+
+        assert_eq!(plan.got.entries.len(), 1);
+        assert_eq!(plan.got.entries[0].symbol, SymbolId(0));
+        assert!(plan.thread_pointers.entries.is_empty());
+        assert!(plan.tlv_bootstrap_symbol.is_none());
     }
 
     fn libsystem_input() -> DylibInput {

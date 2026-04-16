@@ -46,7 +46,6 @@ struct ResolveView<'a> {
     section_addrs: &'a HashMap<(InputId, u8), u64>,
     stub_addrs: &'a HashMap<SymbolId, u64>,
     got_addrs: &'a HashMap<SymbolId, u64>,
-    thread_pointer_addrs: &'a HashMap<SymbolId, u64>,
     lazy_pointer_addrs: &'a HashMap<SymbolId, u64>,
     stub_helper_entry_addrs: &'a HashMap<SymbolId, u64>,
     stub_helper_header_addr: Option<u64>,
@@ -56,7 +55,6 @@ struct ResolveView<'a> {
 struct SyntheticAddressMaps {
     stub_addrs: HashMap<SymbolId, u64>,
     got_addrs: HashMap<SymbolId, u64>,
-    thread_pointer_addrs: HashMap<SymbolId, u64>,
     lazy_pointer_addrs: HashMap<SymbolId, u64>,
     stub_helper_entry_addrs: HashMap<SymbolId, u64>,
     stub_helper_header_addr: Option<u64>,
@@ -112,7 +110,6 @@ pub fn apply_layout(
         section_addrs: &section_addrs,
         stub_addrs: &synth_addrs.stub_addrs,
         got_addrs: &synth_addrs.got_addrs,
-        thread_pointer_addrs: &synth_addrs.thread_pointer_addrs,
         lazy_pointer_addrs: &synth_addrs.lazy_pointer_addrs,
         stub_helper_entry_addrs: &synth_addrs.stub_helper_entry_addrs,
         stub_helper_header_addr: synth_addrs.stub_helper_header_addr,
@@ -196,7 +193,6 @@ fn synthetic_address_maps(
         return SyntheticAddressMaps {
             stub_addrs: HashMap::new(),
             got_addrs: HashMap::new(),
-            thread_pointer_addrs: HashMap::new(),
             lazy_pointer_addrs: HashMap::new(),
             stub_helper_entry_addrs: HashMap::new(),
             stub_helper_header_addr: None,
@@ -223,17 +219,6 @@ fn synthetic_address_maps(
     {
         for (idx, entry) in plan.got.entries.iter().enumerate() {
             got_addrs.insert(entry.symbol, section.addr + (idx as u64) * 8);
-        }
-    }
-
-    let mut thread_pointer_addrs = HashMap::new();
-    if let Some(section) = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__DATA" && section.name == "__thread_ptrs")
-    {
-        for (idx, entry) in plan.thread_pointers.entries.iter().enumerate() {
-            thread_pointer_addrs.insert(entry.symbol, section.addr + (idx as u64) * 8);
         }
     }
 
@@ -279,7 +264,6 @@ fn synthetic_address_maps(
     SyntheticAddressMaps {
         stub_addrs,
         got_addrs,
-        thread_pointer_addrs,
         lazy_pointer_addrs,
         stub_helper_entry_addrs,
         stub_helper_header_addr,
@@ -382,14 +366,14 @@ fn apply_one(
             place,
             resolve_tlvp_target(obj, atom, reloc, resolve)?,
         ),
-        RelocKind::TlvpLoadPageOff12 => patch_tlvp_pageoff12(
-            bytes,
-            atom,
-            obj,
-            local_offset,
-            reloc,
-            resolve_tlvp_pageoff_target(obj, atom, reloc, resolve)?,
-        ),
+        RelocKind::TlvpLoadPageOff12 => {
+            let target = resolve_tlvp_pageoff_target(obj, atom, reloc, resolve)?;
+            if dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table).is_some() {
+                patch_pageoff12(bytes, atom, obj, local_offset, reloc, target)
+            } else {
+                patch_tlvp_pageoff12(bytes, atom, obj, local_offset, reloc, target)
+            }
+        }
     }
 }
 
@@ -448,21 +432,8 @@ fn resolve_tlvp_target(
     reloc: Reloc,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
-    if let Some(symbol_id) = dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table) {
-        return resolve
-            .thread_pointer_addrs
-            .get(&symbol_id)
-            .copied()
-            .ok_or_else(|| {
-                reloc_error(
-                    atom,
-                    &obj.path,
-                    reloc.offset.saturating_sub(atom.input_offset),
-                    reloc.kind,
-                    &describe_referent(obj, reloc.referent),
-                    "dylib TLVP targets are not yet implemented".to_string(),
-                )
-            });
+    if dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table).is_some() {
+        return resolve_got_target(obj, atom, reloc, resolve);
     }
     resolve_referent(obj, atom, reloc.referent, resolve)
 }
@@ -474,7 +445,7 @@ fn resolve_tlvp_pageoff_target(
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
     if dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table).is_some() {
-        return resolve_tlvp_target(obj, atom, reloc, resolve);
+        return resolve_got_target(obj, atom, reloc, resolve);
     }
     resolve_referent(obj, atom, reloc.referent, resolve)
 }

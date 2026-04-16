@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::leb::{write_sleb, write_uleb};
 use crate::macho::constants::{
-    BIND_IMMEDIATE_MASK, BIND_OPCODE_DO_BIND, BIND_OPCODE_SET_ADDEND_SLEB,
+    BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND, BIND_OPCODE_SET_ADDEND_SLEB,
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
@@ -68,6 +68,16 @@ pub struct BindRecordSpec<'a> {
     pub weak_import: bool,
     pub addend: i64,
     pub terminate: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BindState {
+    ordinal: Option<u16>,
+    weak_import: Option<bool>,
+    addend: i64,
+    segment_index: Option<u8>,
+    next_segment_offset: Option<u64>,
+    pointer_type_set: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -237,21 +247,63 @@ pub fn emit_rebase_run(out: &mut OpcodeStream, count: usize) {
     }
 }
 
-pub fn emit_bind_record(out: &mut OpcodeStream, spec: BindRecordSpec<'_>) {
-    emit_bind_ordinal(out, spec.ordinal);
-    out.byte(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | bind_symbol_flags(spec.weak_import));
-    out.string(spec.name);
-    if spec.addend != 0 {
-        out.byte(BIND_OPCODE_SET_ADDEND_SLEB);
-        out.sleb(spec.addend);
+pub fn emit_bind_records(specs: &[BindRecordSpec<'_>]) -> Vec<u8> {
+    let mut out = OpcodeStream::new();
+    let mut state = BindState::default();
+    let mut current_symbol: Option<String> = None;
+
+    for spec in specs {
+        if state.ordinal != Some(spec.ordinal) {
+            emit_bind_ordinal(&mut out, spec.ordinal);
+            state.ordinal = Some(spec.ordinal);
+        }
+
+        if current_symbol.as_deref() != Some(spec.name) || state.weak_import != Some(spec.weak_import) {
+            out.byte(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | bind_symbol_flags(spec.weak_import));
+            out.string(spec.name);
+            current_symbol = Some(spec.name.to_string());
+            state.weak_import = Some(spec.weak_import);
+        }
+
+        if state.addend != spec.addend {
+            out.byte(BIND_OPCODE_SET_ADDEND_SLEB);
+            out.sleb(spec.addend);
+            state.addend = spec.addend;
+        }
+
+        if !state.pointer_type_set {
+            out.byte(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
+            state.pointer_type_set = true;
+        }
+
+        match (state.segment_index, state.next_segment_offset) {
+            (Some(segment_index), Some(next_segment_offset))
+                if segment_index == spec.segment_index && next_segment_offset == spec.segment_offset => {}
+            (Some(segment_index), Some(next_segment_offset))
+                if segment_index == spec.segment_index && next_segment_offset < spec.segment_offset =>
+            {
+                out.byte(BIND_OPCODE_ADD_ADDR_ULEB);
+                out.uleb(spec.segment_offset - next_segment_offset);
+            }
+            _ => {
+                out.byte(
+                    BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
+                        | (spec.segment_index & BIND_IMMEDIATE_MASK),
+                );
+                out.uleb(spec.segment_offset);
+            }
+        }
+
+        out.byte(BIND_OPCODE_DO_BIND);
+        state.segment_index = Some(spec.segment_index);
+        state.next_segment_offset = Some(spec.segment_offset + 8);
     }
-    out.byte(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
-    out.byte(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (spec.segment_index & BIND_IMMEDIATE_MASK));
-    out.uleb(spec.segment_offset);
-    out.byte(BIND_OPCODE_DO_BIND);
-    if spec.terminate {
+
+    if specs.last().is_some_and(|spec| spec.terminate) {
         out.done();
     }
+
+    out.into_vec()
 }
 
 pub fn emit_lazy_bind_record(
@@ -296,6 +348,9 @@ fn bind_symbol_flags(weak_import: bool) -> u8 {
 mod tests {
     use crate::leb::{read_sleb, read_uleb};
     use crate::macho::constants::{
+        BIND_OPCODE_DO_BIND, BIND_OPCODE_SET_ADDEND_SLEB, BIND_OPCODE_SET_DYLIB_ORDINAL_IMM,
+        BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
+        BIND_OPCODE_SET_TYPE_IMM, BIND_TYPE_POINTER,
         EXPORT_SYMBOL_FLAGS_KIND_REGULAR, EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL,
         EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION,
     };
@@ -384,5 +439,76 @@ mod tests {
             .map(|idx| idx + 2)
             .expect("root edge should be null-terminated");
         assert_eq!(std::str::from_utf8(&trie[2..edge_end]).unwrap(), "_alpha");
+    }
+
+    #[test]
+    fn bind_encoder_reuses_state_for_adjacent_binds() {
+        let stream = emit_bind_records(&[
+            BindRecordSpec {
+                segment_index: 2,
+                segment_offset: 0,
+                ordinal: 1,
+                name: "_alpha",
+                weak_import: false,
+                addend: 0,
+                terminate: false,
+            },
+            BindRecordSpec {
+                segment_index: 2,
+                segment_offset: 8,
+                ordinal: 1,
+                name: "_beta",
+                weak_import: false,
+                addend: 0,
+                terminate: true,
+            },
+        ]);
+
+        assert_eq!(
+            stream,
+            vec![
+                BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | 1,
+                BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
+                b'_', b'a', b'l', b'p', b'h', b'a', 0,
+                BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER,
+                BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | 2,
+                0,
+                BIND_OPCODE_DO_BIND,
+                BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
+                b'_', b'b', b'e', b't', b'a', 0,
+                BIND_OPCODE_DO_BIND,
+                0,
+            ]
+        );
+    }
+
+    #[test]
+    fn bind_encoder_emits_zero_addend_only_after_nonzero_state() {
+        let stream = emit_bind_records(&[
+            BindRecordSpec {
+                segment_index: 2,
+                segment_offset: 0,
+                ordinal: 1,
+                name: "_alpha",
+                weak_import: false,
+                addend: 4,
+                terminate: false,
+            },
+            BindRecordSpec {
+                segment_index: 2,
+                segment_offset: 8,
+                ordinal: 1,
+                name: "_beta",
+                weak_import: false,
+                addend: 0,
+                terminate: true,
+            },
+        ]);
+
+        assert!(stream.contains(&BIND_OPCODE_SET_ADDEND_SLEB));
+        let zero_reset = stream
+            .windows(2)
+            .any(|window| window == [BIND_OPCODE_SET_ADDEND_SLEB, 0]);
+        assert!(zero_reset, "expected explicit addend reset back to zero");
     }
 }

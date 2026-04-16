@@ -26,7 +26,7 @@ use crate::synth::stubs::{STUB_HELPER_ENTRY_SIZE, STUB_HELPER_HEADER_SIZE, STUB_
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::{
     code_sig::CodeSignaturePlan,
-    dyld_info::{build_export_trie, emit_bind_record, emit_lazy_bind_record, emit_rebase_run, BindRecordSpec, OpcodeStream},
+    dyld_info::{build_export_trie, emit_bind_records, emit_lazy_bind_record, emit_rebase_run, BindRecordSpec, OpcodeStream},
     SyntheticPlan,
 };
 use crate::{LinkOptions, OutputKind};
@@ -671,23 +671,25 @@ fn build_linkedit_plan(
     }
 
     let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
-    let rebase_bytes = build_rebase_stream(layout, synthetic_plan)?;
-    let export_bytes = build_export_trie(&symbol_plan.exports);
+    let rebase_bytes = pad_dyld_info_stream(build_rebase_stream(layout, synthetic_plan)?);
+    let bind_bytes = pad_dyld_info_stream(bind_streams.bind);
+    let weak_bind_bytes = pad_dyld_info_stream(bind_streams.weak_bind);
+    let lazy_bind_bytes = pad_dyld_info_stream(bind_streams.lazy_bind);
+    let export_bytes = pad_dyld_info_stream(build_export_trie(&symbol_plan.exports));
     let function_starts_bytes = build_function_starts(layout)?;
     let data_in_code_bytes = Vec::new();
 
     let mut cursor = base_off as u64;
     let rebase_off = place_optional_block(&mut cursor, rebase_bytes.len(), "rebase stream offset")?;
-    let bindoff =
-        place_optional_block(&mut cursor, bind_streams.bind.len(), "bind stream offset")?;
+    let bindoff = place_optional_block(&mut cursor, bind_bytes.len(), "bind stream offset")?;
     let weak_bind_off = place_optional_block(
         &mut cursor,
-        bind_streams.weak_bind.len(),
+        weak_bind_bytes.len(),
         "weak bind stream offset",
     )?;
     let lazy_bind_off = place_optional_block(
         &mut cursor,
-        bind_streams.lazy_bind.len(),
+        lazy_bind_bytes.len(),
         "lazy bind stream offset",
     )?;
     let export_off = place_optional_block(&mut cursor, export_bytes.len(), "export trie offset")?;
@@ -727,11 +729,11 @@ fn build_linkedit_plan(
             rebase_off,
             rebase_size: rebase_bytes.len() as u32,
             bind_off: bindoff,
-            bind_size: bind_streams.bind.len() as u32,
+            bind_size: bind_bytes.len() as u32,
             weak_bind_off,
-            weak_bind_size: bind_streams.weak_bind.len() as u32,
+            weak_bind_size: weak_bind_bytes.len() as u32,
             lazy_bind_off,
-            lazy_bind_size: bind_streams.lazy_bind.len() as u32,
+            lazy_bind_size: lazy_bind_bytes.len() as u32,
             export_off,
             export_size: export_bytes.len() as u32,
         },
@@ -740,9 +742,9 @@ fn build_linkedit_plan(
         symtab_bytes,
         indirect_bytes,
         rebase_bytes,
-        bind_bytes: bind_streams.bind,
-        weak_bind_bytes: bind_streams.weak_bind,
-        lazy_bind_bytes: bind_streams.lazy_bind,
+        bind_bytes,
+        weak_bind_bytes,
+        lazy_bind_bytes,
         export_bytes,
         function_starts_bytes,
         data_in_code_bytes,
@@ -762,6 +764,15 @@ fn build_code_signature(
     let code_limit = align_up(regular_end, 16);
     CodeSignaturePlan::new(layout, opts, code_limit, kind == OutputKind::Executable)
         .map_err(WriteError::OffsetTooLarge)
+}
+
+fn pad_dyld_info_stream(mut bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.is_empty() {
+        return bytes;
+    }
+    let padded_len = align_up(bytes.len() as u64, 8) as usize;
+    bytes.resize(padded_len, 0);
+    bytes
 }
 
 #[derive(Debug, Clone)]
@@ -1393,7 +1404,7 @@ fn build_bind_streams(
     synthetic_plan: &SyntheticPlan,
     imports: &HashMap<SymbolId, &ImportSymbolRecord>,
 ) -> Result<BindStreams, WriteError> {
-    let mut bind = OpcodeStream::new();
+    let mut bind_specs = Vec::new();
     let weak_bind = Vec::new();
     let mut lazy_bind = OpcodeStream::new();
     let mut lazy_offsets = HashMap::new();
@@ -1414,18 +1425,15 @@ fn build_bind_streams(
                 .copied()
                 .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
             let slot_addr = section.addr + (idx as u64) * 8;
-            emit_bind_record(
-                &mut bind,
-                BindRecordSpec {
-                    segment_index,
-                    segment_offset: slot_addr - segment.vm_addr,
-                    ordinal: import.ordinal,
-                    name: &import.name,
-                    weak_import: import.weak_import,
-                    addend: 0,
-                    terminate: false,
-                },
-            );
+            bind_specs.push(BindRecordSpec {
+                segment_index,
+                segment_offset: slot_addr - segment.vm_addr,
+                ordinal: import.ordinal,
+                name: &import.name,
+                weak_import: import.weak_import,
+                addend: 0,
+                terminate: false,
+            });
         }
     }
 
@@ -1448,18 +1456,15 @@ fn build_bind_streams(
                     (0..placed.size).step_by(THREAD_VARIABLE_DESCRIPTOR_SIZE as usize)
                 {
                     let slot_addr = section.addr + placed.offset + descriptor_offset;
-                    emit_bind_record(
-                        &mut bind,
-                        BindRecordSpec {
-                            segment_index,
-                            segment_offset: slot_addr - segment.vm_addr,
-                            ordinal: import.ordinal,
-                            name: &import.name,
-                            weak_import: import.weak_import,
-                            addend: 0,
-                            terminate: false,
-                        },
-                    );
+                    bind_specs.push(BindRecordSpec {
+                        segment_index,
+                        segment_offset: slot_addr - segment.vm_addr,
+                        ordinal: import.ordinal,
+                        name: &import.name,
+                        weak_import: import.weak_import,
+                        addend: 0,
+                        terminate: false,
+                    });
                 }
             }
         }
@@ -1483,22 +1488,19 @@ fn build_bind_streams(
             .segment(&section.segment)
             .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
         let slot_addr = atom_addr + entry.atom_offset as u64;
-        emit_bind_record(
-            &mut bind,
-            BindRecordSpec {
-                segment_index,
-                segment_offset: slot_addr - segment.vm_addr,
-                ordinal: import.ordinal,
-                name: &import.name,
-                weak_import: import.weak_import,
-                addend: entry.addend,
-                terminate: false,
-            },
-        );
+        bind_specs.push(BindRecordSpec {
+            segment_index,
+            segment_offset: slot_addr - segment.vm_addr,
+            ordinal: import.ordinal,
+            name: &import.name,
+            weak_import: import.weak_import,
+            addend: entry.addend,
+            terminate: false,
+        });
     }
 
-    if !bind.is_empty() {
-        bind.done();
+    if let Some(last) = bind_specs.last_mut() {
+        last.terminate = true;
     }
 
     if !synthetic_plan.lazy_pointers.entries.is_empty() {
@@ -1530,7 +1532,7 @@ fn build_bind_streams(
     }
 
     Ok(BindStreams {
-        bind: bind.into_vec(),
+        bind: emit_bind_records(&bind_specs),
         weak_bind,
         lazy_bind: lazy_bind.into_vec(),
         lazy_offsets,

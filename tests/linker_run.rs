@@ -586,6 +586,8 @@ fn dyld_info_command(bytes: &[u8]) -> Result<afs_ld::macho::reader::DyldInfoCmd,
 
 #[derive(Clone, Copy)]
 enum DyldInfoStreamKind {
+    Rebase,
+    Bind,
     WeakBind,
     LazyBind,
     Export,
@@ -594,6 +596,8 @@ enum DyldInfoStreamKind {
 fn dyld_info_stream(bytes: &[u8], kind: DyldInfoStreamKind) -> Result<Vec<u8>, String> {
     let dyld_info = dyld_info_command(bytes)?;
     let (off, size) = match kind {
+        DyldInfoStreamKind::Rebase => (dyld_info.rebase_off, dyld_info.rebase_size),
+        DyldInfoStreamKind::Bind => (dyld_info.bind_off, dyld_info.bind_size),
         DyldInfoStreamKind::WeakBind => (dyld_info.weak_bind_off, dyld_info.weak_bind_size),
         DyldInfoStreamKind::LazyBind => (dyld_info.lazy_bind_off, dyld_info.lazy_bind_size),
         DyldInfoStreamKind::Export => (dyld_info.export_off, dyld_info.export_size),
@@ -975,6 +979,12 @@ struct ClassicLazyParityCase {
     src: &'static str,
 }
 
+struct DirectBindParityCase {
+    name: &'static str,
+    dylib_src: &'static str,
+    main_src: &'static str,
+}
+
 fn assert_case_matches_apple_ld(
     case: &ParityCase,
     sdk: &str,
@@ -1159,10 +1169,20 @@ fn assert_classic_lazy_case_matches_apple_ld(
     if segment_flags(&our_bytes, "__DATA_CONST") != segment_flags(&apple_bytes, "__DATA_CONST") {
         return Err(format!("{}: __DATA_CONST flags diverged from Apple ld", case.name));
     }
+    if dyld_info_stream(&our_bytes, DyldInfoStreamKind::Rebase)
+        != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::Rebase)
+    {
+        return Err(format!("{}: rebase stream diverged from Apple ld", case.name));
+    }
     if decode_rebase_records(&our_bytes).map_err(|e| format!("our rebases: {e}"))?
         != decode_rebase_records(&apple_bytes).map_err(|e| format!("apple rebases: {e}"))?
     {
         return Err(format!("{}: rebase records diverged from Apple ld", case.name));
+    }
+    if dyld_info_stream(&our_bytes, DyldInfoStreamKind::Bind)
+        != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::Bind)
+    {
+        return Err(format!("{}: bind stream diverged from Apple ld", case.name));
     }
     if decode_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?
         != decode_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?
@@ -1196,6 +1216,108 @@ fn assert_classic_lazy_case_matches_apple_ld(
         ));
     }
 
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+    Ok(())
+}
+
+fn assert_direct_bind_case_matches_apple_ld(
+    case: &DirectBindParityCase,
+    sdk: &str,
+    sdk_ver: &str,
+) -> Result<(), String> {
+    let dylib = scratch(&format!("direct-bind-{}.dylib", case.name));
+    let obj = scratch(&format!("direct-bind-{}.o", case.name));
+    let our_out = scratch(&format!("direct-bind-{}-ours.out", case.name));
+    let apple_out = scratch(&format!("direct-bind-{}-apple.out", case.name));
+
+    compile_dylib_c(case.dylib_src, &dylib)?;
+    compile_c(case.main_src, &obj)?;
+
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        return Err(format!("no libSystem.tbd at {}", tbd.display()));
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd, dylib.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts)
+        .map_err(|e| format!("afs-ld direct-bind link failed for {}: {e}", case.name))?;
+    let apple = Command::new("xcrun")
+        .args([
+            "ld",
+            "-arch",
+            "arm64",
+            "-platform_version",
+            "macos",
+            sdk_ver,
+            sdk_ver,
+            "-syslibroot",
+            sdk,
+            "-no_fixup_chains",
+            "-lSystem",
+            "-e",
+            "_main",
+            "-o",
+        ])
+        .arg(&apple_out)
+        .arg(&obj)
+        .arg(&dylib)
+        .output()
+        .map_err(|e| format!("spawn xcrun ld: {e}"))?;
+    if !apple.status.success() {
+        return Err(format!(
+            "xcrun ld failed for {}: {}",
+            case.name,
+            String::from_utf8_lossy(&apple.stderr)
+        ));
+    }
+
+    let our_bytes = fs::read(&our_out).map_err(|e| format!("read our output: {e}"))?;
+    let apple_bytes = fs::read(&apple_out).map_err(|e| format!("read apple output: {e}"))?;
+
+    if load_dylib_names(&our_bytes).map_err(|e| format!("our dylibs: {e}"))?
+        != load_dylib_names(&apple_bytes).map_err(|e| format!("apple dylibs: {e}"))?
+    {
+        return Err(format!("{}: LC_LOAD_DYLIB set diverged from Apple ld", case.name));
+    }
+    if dyld_info_stream(&our_bytes, DyldInfoStreamKind::Rebase)
+        != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::Rebase)
+    {
+        return Err(format!("{}: rebase stream diverged from Apple ld", case.name));
+    }
+    if decode_rebase_records(&our_bytes).map_err(|e| format!("our rebases: {e}"))?
+        != decode_rebase_records(&apple_bytes).map_err(|e| format!("apple rebases: {e}"))?
+    {
+        return Err(format!("{}: rebase records diverged from Apple ld", case.name));
+    }
+    if dyld_info_stream(&our_bytes, DyldInfoStreamKind::Bind)
+        != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::Bind)
+    {
+        return Err(format!("{}: bind stream diverged from Apple ld", case.name));
+    }
+    if decode_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?
+        != decode_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?
+    {
+        return Err(format!("{}: bind records diverged from Apple ld", case.name));
+    }
+    if dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind)
+        != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::WeakBind)
+    {
+        return Err(format!("{}: weak-bind stream diverged from Apple ld", case.name));
+    }
+    if dyld_info_stream(&our_bytes, DyldInfoStreamKind::LazyBind)
+        != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::LazyBind)
+    {
+        return Err(format!("{}: lazy-bind stream diverged from Apple ld", case.name));
+    }
+
+    let _ = fs::remove_file(dylib);
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(apple_out);
@@ -2748,14 +2870,26 @@ fn linker_run_binds_direct_dylib_import_pointers() {
         return;
     }
 
-    let dylib = scratch("direct-data.dylib");
-    let obj = scratch("direct-data.o");
-    let our_out = scratch("direct-data-ours.out");
-    let apple_out = scratch("direct-data-apple.out");
-
     let dylib_src = r#"
         int ext_data = 5;
     "#;
+    let direct_case = DirectBindParityCase {
+        name: "direct-data",
+        dylib_src,
+        main_src: r#"
+            extern int ext_data;
+            int *p = &ext_data;
+            int main(void) { return *p == 5 ? 0 : 1; }
+        "#,
+    };
+    if let Err(e) = assert_direct_bind_case_matches_apple_ld(&direct_case, &sdk, &sdk_ver) {
+        panic!("{e}");
+    }
+
+    let dylib = scratch("direct-data.dylib");
+    let obj = scratch("direct-data.o");
+    let our_out = scratch("direct-data-ours.out");
+
     if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
         eprintln!("skipping: dylib compile failed: {e}");
         return;
@@ -2778,36 +2912,7 @@ fn linker_run_binds_direct_dylib_import_pointers() {
         ..LinkOptions::default()
     };
     Linker::run(&opts).unwrap();
-    let apple = Command::new("xcrun")
-        .args([
-            "ld",
-            "-arch",
-            "arm64",
-            "-platform_version",
-            "macos",
-            &sdk_ver,
-            &sdk_ver,
-            "-syslibroot",
-            &sdk,
-            "-no_fixup_chains",
-            "-lSystem",
-            "-e",
-            "_main",
-            "-o",
-        ])
-        .arg(&apple_out)
-        .arg(&obj)
-        .arg(&dylib)
-        .output()
-        .unwrap();
-    assert!(
-        apple.status.success(),
-        "xcrun ld failed: {}",
-        String::from_utf8_lossy(&apple.stderr)
-    );
-
     let our_bytes = fs::read(&our_out).unwrap();
-    let apple_bytes = fs::read(&apple_out).unwrap();
     let binds = decode_bind_records(&our_bytes, false).unwrap();
     assert!(
         binds.iter().any(|record| {
@@ -2818,11 +2923,6 @@ fn linker_run_binds_direct_dylib_import_pointers() {
         }),
         "missing direct bind for imported data: {binds:#?}"
     );
-    assert_eq!(
-        decode_bind_records(&our_bytes, false).unwrap(),
-        decode_bind_records(&apple_bytes, false).unwrap()
-    );
-
     let verify = Command::new("codesign").arg("-v").arg(&our_out).output().unwrap();
     assert!(
         verify.status.success(),
@@ -2839,7 +2939,78 @@ fn linker_run_binds_direct_dylib_import_pointers() {
     let _ = fs::remove_file(dylib);
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
-    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn direct_bind_surfaces_match_apple_ld_across_fixture_matrix() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun clang or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+
+    let cases = [
+        DirectBindParityCase {
+            name: "direct-multi-data",
+            dylib_src: r#"
+                int ext_data = 5;
+                int more_data = 9;
+            "#,
+            main_src: r#"
+                extern int ext_data;
+                extern int more_data;
+                int *p = &ext_data;
+                int *q = &more_data;
+                int main(void) { return (*p == 5 && *q == 9) ? 0 : 1; }
+            "#,
+        },
+        DirectBindParityCase {
+            name: "direct-and-call-mixed",
+            dylib_src: r#"
+                int ext_data = 5;
+                int ext_fn(void) { return ext_data + 1; }
+            "#,
+            main_src: r#"
+                extern int ext_data;
+                extern int ext_fn(void);
+                int *p = &ext_data;
+                int main(void) { return *p + ext_fn() == 11 ? 0 : 1; }
+            "#,
+        },
+        DirectBindParityCase {
+            name: "direct-deduped",
+            dylib_src: r#"
+                int ext_data = 5;
+            "#,
+            main_src: r#"
+                extern int ext_data;
+                int *p = &ext_data;
+                int *q = &ext_data;
+                int main(void) { return (*p == 5 && *q == 5) ? 0 : 1; }
+            "#,
+        },
+    ];
+
+    let mut failures = Vec::new();
+    for case in &cases {
+        if let Err(err) = assert_direct_bind_case_matches_apple_ld(case, &sdk, &sdk_ver) {
+            failures.push(err);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Apple ld direct-bind parity failures ({} cases):\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
 }
 
 #[test]

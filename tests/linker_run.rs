@@ -588,3 +588,102 @@ fn sign_extend_21(value: i64) -> i64 {
         value
     }
 }
+
+#[test]
+fn linker_run_rejects_out_of_range_branch26() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("branch26-range.o");
+    let out = scratch("branch26-range.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            bl _helper
+            ret
+
+        .zerofill __DATA,__bss,_gap,0x9000000,0
+
+        .section __FAR,__text,regular,pure_instructions
+        .globl _helper
+        _helper:
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    let err = Linker::run(&opts).unwrap_err();
+    match err {
+        LinkError::Reloc(err) => {
+            let msg = err.to_string();
+            assert!(msg.contains("Branch26"), "{msg}");
+            assert!(msg.contains("out of BRANCH26 range"), "{msg}");
+            assert!(msg.contains("_helper"), "{msg}");
+        }
+        other => panic!("expected Reloc error, got {other:?}"),
+    }
+
+    let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn linker_run_rejects_got_relocations_until_sprint_12() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+
+    let obj = scratch("got-reloc.o");
+    let out = scratch("got-reloc.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            adrp x0, _target@GOTPAGE
+            ldr x0, [x0, _target@GOTPAGEOFF]
+            ret
+
+        .section __DATA,__data
+        .globl _target
+        .p2align 3
+        _target:
+            .quad 0
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    let err = Linker::run(&opts).unwrap_err();
+    match err {
+        LinkError::Reloc(err) => {
+            let msg = err.to_string();
+            assert!(msg.contains("GotLoadPage21") || msg.contains("GotLoadPageOff12"), "{msg}");
+            assert!(msg.contains("not yet implemented"), "{msg}");
+            assert!(msg.contains("Sprint 12/13"), "{msg}");
+            assert!(msg.contains("_target"), "{msg}");
+        }
+        other => panic!("expected Reloc error, got {other:?}"),
+    }
+
+    let _ = fs::remove_file(obj);
+}

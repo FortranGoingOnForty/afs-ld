@@ -1995,6 +1995,13 @@ fn build_bind_streams(
             .iter()
             .find(|section| section.atoms.iter().any(|placed| placed.atom == entry.atom))
             .ok_or(WriteError::DirectBindSectionMissing(entry.atom))?;
+        if section.segment == "__DATA" && section.name == "__thread_vars" {
+            // `__thread_vars` starts are emitted through the dedicated
+            // `__tlv_bootstrap` pass above. Descriptor tails are rewritten to
+            // template offsets before write, so any generic direct bind landing
+            // back in this section is stale and would override the TLV bind.
+            continue;
+        }
         let segment_index = segment_index(layout, &section.segment)?;
         let segment = layout
             .segment(&section.segment)

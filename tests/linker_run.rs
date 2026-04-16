@@ -293,6 +293,34 @@ fn dyld_info_command(bytes: &[u8]) -> Result<afs_ld::macho::reader::DyldInfoCmd,
         .ok_or_else(|| "missing LC_DYLD_INFO_ONLY".to_string())
 }
 
+fn dyld_info_stream(bytes: &[u8], lazy: bool) -> Result<Vec<u8>, String> {
+    let dyld_info = dyld_info_command(bytes)?;
+    let (off, size) = if lazy {
+        (dyld_info.lazy_bind_off, dyld_info.lazy_bind_size)
+    } else {
+        (dyld_info.bind_off, dyld_info.bind_size)
+    };
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let start = off as usize;
+    let end = start + size as usize;
+    bytes.get(start..end)
+        .map(|slice| slice.to_vec())
+        .ok_or_else(|| "dyld-info stream out of bounds".to_string())
+}
+
+fn canonical_lazy_bind_stream(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut stream = dyld_info_stream(bytes, true)?;
+    while stream.len() >= 2
+        && stream[stream.len() - 1] == BIND_OPCODE_DONE
+        && stream[stream.len() - 2] == BIND_OPCODE_DONE
+    {
+        stream.pop();
+    }
+    Ok(stream)
+}
+
 fn segment_views(bytes: &[u8]) -> Result<Vec<SegmentView>, String> {
     let header = parse_header(bytes).map_err(|e| e.to_string())?;
     let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
@@ -1911,10 +1939,77 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
         decode_bind_records(&our_bytes, true).unwrap(),
         decode_bind_records(&apple_bytes, true).unwrap()
     );
+    assert_eq!(
+        canonical_lazy_bind_stream(&our_bytes).unwrap(),
+        canonical_lazy_bind_stream(&apple_bytes).unwrap()
+    );
 
     let _ = fs::remove_file(apple_out);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn linker_run_launches_with_classic_lazy_dylib_import() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun clang or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let dylib = scratch("lazy-runtime.dylib");
+    let obj = scratch("lazy-runtime.o");
+    let out = scratch("lazy-runtime.out");
+
+    let dylib_src = r#"
+        int ext_fn(void) { return 7; }
+    "#;
+    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
+        eprintln!("skipping: dylib compile failed: {e}");
+        return;
+    }
+
+    let main_src = r#"
+        int ext_fn(void);
+        int main(void) { return ext_fn() == 7 ? 0 : 1; }
+    "#;
+    if let Err(e) = compile_c(main_src, &obj) {
+        eprintln!("skipping: compile failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd, dylib.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let verify = Command::new("codesign").arg("-v").arg(&out).output().unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let status = Command::new(&out).status().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "expected dylib-import executable to exit 0"
+    );
+
+    let _ = fs::remove_file(dylib);
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
 }
 
 #[test]
@@ -2117,6 +2212,14 @@ fn linker_run_routes_imported_tlv_through_got() {
         decode_bind_records(&apple_bytes, false).unwrap()
     );
     assert_eq!(load_dylib_names(&our_bytes).unwrap(), load_dylib_names(&apple_bytes).unwrap());
+    let verify = Command::new("codesign").arg("-v").arg(&our_out).output().unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let status = Command::new(&our_out).status().unwrap();
+    assert_eq!(status.code(), Some(0), "expected imported TLV executable to exit 0");
 
     let _ = fs::remove_file(dylib);
     let _ = fs::remove_file(obj);

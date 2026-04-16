@@ -15,6 +15,7 @@ const UNWIND_INFO_VERSION: u32 = 1;
 const UNWIND_SECOND_LEVEL_REGULAR: u32 = 2;
 const UNWIND_SECOND_LEVEL_COMPRESSED: u32 = 3;
 const FIRST_LEVEL_ENTRY_SIZE: usize = 12;
+const FIRST_LEVEL_INDEX_GAP_SIZE: usize = FIRST_LEVEL_ENTRY_SIZE;
 const COMPRESSED_PAGE_HEADER_SIZE: usize = 12;
 const UNWIND_HAS_LSDA: u32 = 0x4000_0000;
 const UNWIND_PERSONALITY_MASK: u32 = 0x3000_0000;
@@ -78,7 +79,10 @@ impl fmt::Display for UnwindReadError {
                 )
             }
             UnwindReadError::TooManyPersonalities(count) => {
-                write!(f, "unwind info needs {count} personalities but only 3 are encodable")
+                write!(
+                    f,
+                    "unwind info needs {count} personalities but only 3 are encodable"
+                )
             }
         }
     }
@@ -120,6 +124,8 @@ struct LsdaRecord {
     function_offset: u32,
     lsda_offset: u32,
 }
+
+type FinalizedUnwindTables = (Vec<UnwindRecord>, Vec<u32>, Vec<LsdaRecord>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CompressedPage {
@@ -539,8 +545,10 @@ fn serialize_unwind_info(records: &[UnwindRecord]) -> Result<Vec<u8>, UnwindRead
     let personalities_offset = common_encodings_offset + common_encodings_count as usize * 4;
     let indices_offset = personalities_offset + personalities.len() * 4;
     let indices_count = (pages.len() + 1) as u32;
-    let lsdas_offset = indices_offset + indices_count as usize * FIRST_LEVEL_ENTRY_SIZE;
-    let second_level_start = align_up((lsdas_offset + lsdas.len() * 8) as u32, 16) as usize;
+    let lsdas_offset = indices_offset
+        + indices_count as usize * FIRST_LEVEL_ENTRY_SIZE
+        + FIRST_LEVEL_INDEX_GAP_SIZE;
+    let second_level_start = lsdas_offset + lsdas.len() * 8;
     let page_blobs: Vec<Vec<u8>> = pages.iter().map(serialize_compressed_page).collect();
     let sentinel = records
         .last()
@@ -587,6 +595,9 @@ fn serialize_unwind_info(records: &[UnwindRecord]) -> Result<Vec<u8>, UnwindRead
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&(lsdas_offset as u32 + (lsdas.len() as u32) * 8).to_le_bytes());
 
+    while out.len() < lsdas_offset {
+        out.push(0);
+    }
     for lsda in &lsdas {
         out.extend_from_slice(&lsda.function_offset.to_le_bytes());
         out.extend_from_slice(&lsda.lsda_offset.to_le_bytes());
@@ -653,7 +664,8 @@ pub fn decode_unwind_info(bytes: &[u8]) -> Result<DecodedUnwindInfo, UnwindReadE
     }
 
     let mut lsdas = Vec::new();
-    if let (Some(&lsda_start), Some(&lsda_end)) = (index_lsda_offsets.first(), index_lsda_offsets.last())
+    if let (Some(&lsda_start), Some(&lsda_end)) =
+        (index_lsda_offsets.first(), index_lsda_offsets.last())
     {
         let start = lsda_start as usize;
         let end = lsda_end as usize;
@@ -768,7 +780,7 @@ fn validate_serialized_unwind_info(
 
 fn finalize_unwind_records(
     records: &[UnwindRecord],
-) -> Result<(Vec<UnwindRecord>, Vec<u32>, Vec<LsdaRecord>), UnwindReadError> {
+) -> Result<FinalizedUnwindTables, UnwindReadError> {
     let mut personalities = Vec::new();
     let mut finalized = Vec::with_capacity(records.len());
     let mut lsdas = Vec::new();
@@ -781,7 +793,9 @@ fn finalize_unwind_records(
                 idx
             } else {
                 if personalities.len() == 3 {
-                    return Err(UnwindReadError::TooManyPersonalities(personalities.len() + 1));
+                    return Err(UnwindReadError::TooManyPersonalities(
+                        personalities.len() + 1,
+                    ));
                 }
                 personalities.push(personality_offset);
                 let idx = personalities.len() as u32;
@@ -862,17 +876,6 @@ fn build_pages(records: &[UnwindRecord]) -> Vec<CompressedPage> {
         pages.push(page);
     }
     pages
-}
-
-fn align_up(value: u32, align: u32) -> u32 {
-    if align == 0 {
-        return value;
-    }
-    let mask = align - 1;
-    value
-        .checked_add(mask)
-        .map(|value| value & !mask)
-        .unwrap_or(value)
 }
 
 fn read_u16(bytes: &[u8], offset: usize, what: &'static str) -> Result<u16, UnwindReadError> {
@@ -1049,10 +1052,10 @@ mod tests {
                 2,
                 0x348,
                 0x40,
-                0x34,
+                0x40,
                 0x35c,
                 0,
-                0x34,
+                0x40,
                 0,
                 0,
                 0,
@@ -1111,10 +1114,10 @@ mod tests {
                 2,
                 0x348,
                 0x40,
-                0x34,
+                0x40,
                 0x370,
                 0,
-                0x34,
+                0x40,
                 0,
                 0,
                 0,

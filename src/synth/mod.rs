@@ -135,11 +135,9 @@ impl SyntheticPlan {
             for reloc in relocs_for_atom(relocs, atom) {
                 if atom.section == AtomSection::CompactUnwind
                     && reloc.kind == RelocKind::Unsigned
-                    && reloc.offset
-                        == atom.input_offset + COMPACT_UNWIND_PERSONALITY_FIELD_OFFSET
+                    && reloc.offset == atom.input_offset + COMPACT_UNWIND_PERSONALITY_FIELD_OFFSET
                 {
-                    if let Some(symbol_id) = dylib_import_referent(obj, reloc.referent, sym_table)
-                    {
+                    if let Some(symbol_id) = dylib_import_referent(obj, reloc.referent, sym_table) {
                         got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
                     }
                     continue;

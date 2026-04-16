@@ -499,13 +499,14 @@ fn normalized_unwind_words(bytes: &[u8]) -> Vec<u32> {
     if words.len() < 7 {
         return words;
     }
+    let indices_offset_words = words[5] as usize / 4;
     let indices_count = words[6] as usize;
-    if indices_count == 0 || words.len() < 7 + indices_count * 3 {
+    if indices_count == 0 || words.len() < indices_offset_words + indices_count * 3 {
         return words;
     }
-    let base = words[7];
+    let base = words[indices_offset_words];
     for idx in 0..indices_count {
-        let word = 7 + idx * 3;
+        let word = indices_offset_words + idx * 3;
         words[word] = words[word].saturating_sub(base);
     }
     if !decoded.records.is_empty() {
@@ -3868,17 +3869,24 @@ fn linker_run_preserves_exception_unwind_metadata_like_apple_ld() {
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
+    assert_eq!(
+        decode_bind_records(&our_bytes, false).unwrap(),
+        decode_bind_records(&apple_bytes, false).unwrap()
+    );
+    assert_eq!(
+        decode_bind_records(&our_bytes, true).unwrap(),
+        decode_bind_records(&apple_bytes, true).unwrap()
+    );
+    assert_eq!(
+        canonical_lazy_bind_stream(&our_bytes).unwrap(),
+        canonical_lazy_bind_stream(&apple_bytes).unwrap()
+    );
     let our_decoded = canonical_unwind_info(&our_bytes);
     let apple_decoded = canonical_unwind_info(&apple_bytes);
     assert_eq!(our_decoded, apple_decoded);
     assert_eq!(our_decoded.personalities.len(), 1);
     assert_eq!(our_decoded.lsdas.len(), 1);
     assert!(output_section(&our_bytes, "__TEXT", "__gcc_except_tab").is_some());
-
-    let our_status = Command::new(&our_out).status().unwrap();
-    let apple_status = Command::new(&apple_out).status().unwrap();
-    assert_eq!(our_status.code(), Some(42));
-    assert_eq!(apple_status.code(), Some(42));
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);

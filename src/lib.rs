@@ -420,20 +420,36 @@ fn resolve_entry_point(
     opts: &LinkOptions,
     sym_table: &SymbolTable,
 ) -> Result<Option<macho::writer::EntryPoint>, LinkError> {
-    let Some(name) = &opts.entry else {
+    let name = if let Some(name) = &opts.entry {
+        name.as_str()
+    } else if opts.kind == OutputKind::Executable {
+        if symbol_defined(sym_table, "_main") {
+            "_main"
+        } else if symbol_defined(sym_table, "_start") {
+            "_start"
+        } else {
+            return Ok(None);
+        }
+    } else {
         return Ok(None);
     };
     let Some((symbol_id, _)) = sym_table
         .iter()
         .find(|(_, symbol)| sym_table.interner.resolve(symbol.name()) == name)
     else {
-        return Err(LinkError::EntrySymbolNotFound(name.clone()));
+        return Err(LinkError::EntrySymbolNotFound(name.to_string()));
     };
     let Symbol::Defined { atom, value, .. } = sym_table.get(symbol_id) else {
-        return Err(LinkError::EntrySymbolNotFound(name.clone()));
+        return Err(LinkError::EntrySymbolNotFound(name.to_string()));
     };
     Ok(Some(macho::writer::EntryPoint {
         atom: *atom,
         atom_value: *value,
     }))
+}
+
+fn symbol_defined(sym_table: &SymbolTable, name: &str) -> bool {
+    sym_table.iter().any(|(_, symbol)| {
+        sym_table.interner.resolve(symbol.name()) == name && matches!(symbol, Symbol::Defined { .. })
+    })
 }

@@ -1766,9 +1766,7 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
             LoadCommand::Raw { cmd, data, .. } if cmd == afs_ld::macho::constants::LC_UUID => {
                 has_uuid = data.len() == 16 && data.iter().any(|byte| *byte != 0);
             }
-            LoadCommand::Raw { cmd, .. }
-                if cmd == afs_ld::macho::constants::LC_SOURCE_VERSION =>
-            {
+            LoadCommand::Raw { cmd, .. } if cmd == afs_ld::macho::constants::LC_SOURCE_VERSION => {
                 has_source_version = true;
             }
             _ => {}
@@ -2408,6 +2406,51 @@ fn linker_run_uses_requested_entry_symbol() {
     assert!(
         main_entryoff > text_offset,
         "expected custom entry to land after start of __text: text={text_offset}, entry={main_entryoff}"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_defaults_entry_to_main_symbol() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("default-entry.o");
+    let out = scratch("default-entry.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _helper
+        _helper:
+            mov w0, #7
+            ret
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let status = Command::new(&out).status().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "default executable entry should prefer _main over the first text atom"
     );
 
     let _ = fs::remove_file(obj);

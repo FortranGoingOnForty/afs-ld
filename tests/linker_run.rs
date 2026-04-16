@@ -67,6 +67,14 @@ fn have_xcrun_tool(tool: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn have_tool(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success() || !o.stderr.is_empty())
+        .unwrap_or(false)
+}
+
 fn assemble(src: &str, out: &PathBuf) -> Result<(), String> {
     let tmp = std::env::temp_dir().join(format!(
         "afs-ld-linker-run-{}-{}.s",
@@ -708,8 +716,8 @@ fn sign_extend_26(value: i64) -> i64 {
 
 #[test]
 fn linker_run_emits_non_empty_executable_from_real_object() {
-    if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun as or codesign unavailable");
         return;
     }
 
@@ -766,6 +774,14 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
         fs::metadata(&out).unwrap().permissions().mode() & 0o111 != 0,
         "expected executable output mode"
     );
+    let verify = Command::new("codesign").arg("-v").arg(&out).output().unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let status = Command::new(&out).status().unwrap();
+    assert_eq!(status.code(), Some(0), "expected executable to exit 0");
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);

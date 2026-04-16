@@ -128,6 +128,21 @@ pub const EXPORT_SYMBOL_FLAGS_REEXPORT: u64 = 0x08;
 pub const EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER: u64 = 0x10;
 
 // Classic dyld bind opcodes / flags (<mach-o/loader.h>)
+pub const REBASE_TYPE_POINTER: u8 = 1;
+
+pub const REBASE_OPCODE_MASK: u8 = 0xF0;
+pub const REBASE_IMMEDIATE_MASK: u8 = 0x0F;
+pub const REBASE_OPCODE_DONE: u8 = 0x00;
+pub const REBASE_OPCODE_SET_TYPE_IMM: u8 = 0x10;
+pub const REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x20;
+pub const REBASE_OPCODE_ADD_ADDR_ULEB: u8 = 0x30;
+pub const REBASE_OPCODE_ADD_ADDR_IMM_SCALED: u8 = 0x40;
+pub const REBASE_OPCODE_DO_REBASE_IMM_TIMES: u8 = 0x50;
+pub const REBASE_OPCODE_DO_REBASE_ULEB_TIMES: u8 = 0x60;
+pub const REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB: u8 = 0x70;
+pub const REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB: u8 = 0x80;
+
+// Classic dyld bind opcodes / flags (<mach-o/loader.h>)
 pub const BIND_TYPE_POINTER: u8 = 1;
 
 pub const BIND_SYMBOL_FLAGS_WEAK_IMPORT: u8 = 0x1;

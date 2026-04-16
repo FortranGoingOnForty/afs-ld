@@ -198,6 +198,7 @@ pub fn write_finalized_with_linkedit(
 
     let symoff = linkedit_plan.symtab.symoff as usize;
     let indirectoff = linkedit_plan.dysymtab.indirectsymoff as usize;
+    let rebaseoff = linkedit_plan.dyld_info.rebase_off as usize;
     let bindoff = linkedit_plan.dyld_info.bind_off as usize;
     let lazy_bind_off = linkedit_plan.dyld_info.lazy_bind_off as usize;
     let stroff = linkedit_plan.symtab.stroff as usize;
@@ -208,6 +209,10 @@ pub fn write_finalized_with_linkedit(
     if !linkedit_plan.indirect_bytes.is_empty() {
         let end = indirectoff + linkedit_plan.indirect_bytes.len();
         out[indirectoff..end].copy_from_slice(&linkedit_plan.indirect_bytes);
+    }
+    if !linkedit_plan.rebase_bytes.is_empty() {
+        let end = rebaseoff + linkedit_plan.rebase_bytes.len();
+        out[rebaseoff..end].copy_from_slice(&linkedit_plan.rebase_bytes);
     }
     if !linkedit_plan.bind_bytes.is_empty() {
         let end = bindoff + linkedit_plan.bind_bytes.len();
@@ -422,6 +427,7 @@ pub struct LinkEditPlan {
     pub dyld_info: DyldInfoCmd,
     pub symtab_bytes: Vec<u8>,
     pub indirect_bytes: Vec<u8>,
+    rebase_bytes: Vec<u8>,
     bind_bytes: Vec<u8>,
     lazy_bind_bytes: Vec<u8>,
     pub strtab_bytes: Vec<u8>,
@@ -437,6 +443,7 @@ impl LinkEditPlan {
     fn total_size(&self) -> u64 {
         (self.symtab_bytes.len()
             + self.indirect_bytes.len()
+            + self.rebase_bytes.len()
             + self.bind_bytes.len()
             + self.lazy_bind_bytes.len()
             + self.strtab_bytes.len()) as u64
@@ -469,6 +476,7 @@ fn build_linkedit_plan(
             dyld_info: DyldInfoCmd::default(),
             symtab_bytes: Vec::new(),
             indirect_bytes: Vec::new(),
+            rebase_bytes: Vec::new(),
             bind_bytes: Vec::new(),
             lazy_bind_bytes: Vec::new(),
             strtab_bytes: vec![0],
@@ -542,17 +550,26 @@ fn build_linkedit_plan(
     }
 
     let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
+    let rebase_bytes = build_rebase_stream(layout, synthetic_plan)?;
 
     let symoff = base_off;
     let indirectsymoff = u32_fit(
         symoff as u64 + symtab_bytes.len() as u64,
         "indirect symbol table offset",
     )?;
-    let bindoff = if bind_streams.bind.is_empty() {
+    let rebase_off = if rebase_bytes.is_empty() {
         0
     } else {
         u32_fit(
             indirectsymoff as u64 + indirect_bytes.len() as u64,
+            "rebase stream offset",
+        )?
+    };
+    let bindoff = if bind_streams.bind.is_empty() {
+        0
+    } else {
+        u32_fit(
+            indirectsymoff as u64 + indirect_bytes.len() as u64 + rebase_bytes.len() as u64,
             "bind stream offset",
         )?
     };
@@ -562,6 +579,7 @@ fn build_linkedit_plan(
         u32_fit(
             indirectsymoff as u64
                 + indirect_bytes.len() as u64
+                + rebase_bytes.len() as u64
                 + bind_streams.bind.len() as u64,
             "lazy bind stream offset",
         )?
@@ -569,6 +587,7 @@ fn build_linkedit_plan(
     let stroff = u32_fit(
         indirectsymoff as u64
             + indirect_bytes.len() as u64
+            + rebase_bytes.len() as u64
             + bind_streams.bind.len() as u64
             + bind_streams.lazy_bind.len() as u64,
         "string table offset",
@@ -588,6 +607,8 @@ fn build_linkedit_plan(
             ..DysymtabCmd::default()
         },
         dyld_info: DyldInfoCmd {
+            rebase_off,
+            rebase_size: rebase_bytes.len() as u32,
             bind_off: bindoff,
             bind_size: bind_streams.bind.len() as u32,
             lazy_bind_off,
@@ -596,6 +617,7 @@ fn build_linkedit_plan(
         },
         symtab_bytes,
         indirect_bytes,
+        rebase_bytes,
         bind_bytes: bind_streams.bind,
         lazy_bind_bytes: bind_streams.lazy_bind,
         strtab_bytes,
@@ -616,6 +638,42 @@ struct BindStreams {
     bind: Vec<u8>,
     lazy_bind: Vec<u8>,
     lazy_offsets: HashMap<SymbolId, u32>,
+}
+
+fn build_rebase_stream(
+    layout: &Layout,
+    synthetic_plan: &SyntheticPlan,
+) -> Result<Vec<u8>, WriteError> {
+    if synthetic_plan.lazy_pointers.entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let segment_index = segment_index(layout, "__DATA")?;
+    let segment = layout
+        .segment("__DATA")
+        .ok_or(WriteError::MissingSegment("__DATA"))?;
+    let section = layout
+        .sections
+        .iter()
+        .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
+        .ok_or(WriteError::MissingSegment("__DATA"))?;
+
+    let mut out = Vec::new();
+    out.push(REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER);
+    out.push(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segment_index & REBASE_IMMEDIATE_MASK));
+    write_uleb(section.addr - segment.vm_addr, &mut out);
+    emit_rebase_run(&mut out, synthetic_plan.lazy_pointers.entries.len());
+    out.push(REBASE_OPCODE_DONE);
+    Ok(out)
+}
+
+fn emit_rebase_run(out: &mut Vec<u8>, count: usize) {
+    if count <= REBASE_IMMEDIATE_MASK as usize {
+        out.push(REBASE_OPCODE_DO_REBASE_IMM_TIMES | count as u8);
+    } else {
+        out.push(REBASE_OPCODE_DO_REBASE_ULEB_TIMES);
+        write_uleb(count as u64, out);
+    }
 }
 
 fn collect_imports(

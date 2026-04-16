@@ -1227,6 +1227,7 @@ fn build_data_in_code(
         kind: u16,
     }
 
+    let atoms_by_input_section = atom_table.by_input_section();
     let mut remapped = Vec::new();
     for (input_order, input) in inputs.iter().enumerate() {
         for (input_entry_index, entry) in input.object.data_in_code.iter().copied().enumerate() {
@@ -1234,6 +1235,7 @@ fn build_data_in_code(
                 remap_data_in_code_to_section(input.object, entry)?;
             let (atom_id, atom_delta) = find_containing_atom_range(
                 atom_table,
+                &atoms_by_input_section,
                 input.id,
                 section_index,
                 section_relative,
@@ -1395,6 +1397,7 @@ fn build_output_symbols(
 ) -> Result<SymbolTablePlan, WriteError> {
     let sym_table = inputs.0.sym_table;
     let atom_sections = atom_section_ordinals(layout);
+    let atoms_by_input_section = inputs.0.atom_table.by_input_section();
     let image_base = layout.segment("__TEXT").map(|seg| seg.vm_addr).unwrap_or(0);
     let mut locals = Vec::new();
     let mut external_defineds = Vec::new();
@@ -1420,6 +1423,7 @@ fn build_output_symbols(
         collect_local_symbols(
             layout,
             inputs.0.atom_table,
+            &atoms_by_input_section,
             &atom_sections,
             input.id,
             input.object,
@@ -1606,6 +1610,7 @@ fn collect_synthetic_local_symbols(
 fn collect_local_symbols(
     layout: &Layout,
     atom_table: &AtomTable,
+    atoms_by_input_section: &HashMap<(InputId, u8), Vec<crate::resolve::AtomId>>,
     atom_sections: &HashMap<crate::resolve::AtomId, u8>,
     input_id: InputId,
     object: &ObjectFile,
@@ -1628,9 +1633,14 @@ fn collect_local_symbols(
                     .section_for_symbol(input_sym)
                     .expect("section symbol without section");
                 let offset = input_sym.value().saturating_sub(section.addr) as u32;
-                let (atom_id, delta) =
-                    find_containing_atom(atom_table, input_id, input_sym.sect_idx(), offset)
-                        .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
+                let (atom_id, delta) = find_containing_atom(
+                    atom_table,
+                    atoms_by_input_section,
+                    input_id,
+                    input_sym.sect_idx(),
+                    offset,
+                )
+                .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
                 let addr =
                     layout
                         .atom_addr(atom_id)
@@ -1679,22 +1689,30 @@ fn is_assembler_temporary_symbol(name: &str) -> bool {
 
 fn find_containing_atom(
     atom_table: &AtomTable,
+    atoms_by_input_section: &HashMap<(InputId, u8), Vec<crate::resolve::AtomId>>,
     input_id: InputId,
     input_section: u8,
     offset: u32,
 ) -> Option<(crate::resolve::AtomId, u32)> {
-    find_containing_atom_range(atom_table, input_id, input_section, offset, 1)
+    find_containing_atom_range(
+        atom_table,
+        atoms_by_input_section,
+        input_id,
+        input_section,
+        offset,
+        1,
+    )
 }
 
 fn find_containing_atom_range(
     atom_table: &AtomTable,
+    atoms_by_input_section: &HashMap<(InputId, u8), Vec<crate::resolve::AtomId>>,
     input_id: InputId,
     input_section: u8,
     offset: u32,
     len: u32,
 ) -> Option<(crate::resolve::AtomId, u32)> {
-    let atoms = atom_table.by_input_section();
-    atoms.get(&(input_id, input_section)).and_then(|ids| {
+    atoms_by_input_section.get(&(input_id, input_section)).and_then(|ids| {
         ids.iter().find_map(|atom_id| {
             let atom = atom_table.get(*atom_id);
             let start = atom.input_offset;
@@ -2340,6 +2358,49 @@ mod tests {
         assert_eq!(
             decode_function_starts_blob(&blob),
             vec![0x1000, 0x1008, 0x1040]
+        );
+    }
+
+    #[test]
+    fn containing_atom_lookup_reuses_precomputed_section_index() {
+        let mut atoms = AtomTable::new();
+        let first = atoms.push(Atom {
+            id: AtomId(0),
+            origin: InputId(7),
+            input_section: 3,
+            section: AtomSection::Text,
+            input_offset: 0,
+            size: 8,
+            align_pow2: 2,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 8],
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        });
+        let second = atoms.push(Atom {
+            id: AtomId(0),
+            origin: InputId(7),
+            input_section: 3,
+            section: AtomSection::Text,
+            input_offset: 8,
+            size: 12,
+            align_pow2: 2,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 12],
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        });
+
+        let by_input_section = atoms.by_input_section();
+        assert_eq!(
+            find_containing_atom(&atoms, &by_input_section, InputId(7), 3, 4),
+            Some((first, 4))
+        );
+        assert_eq!(
+            find_containing_atom_range(&atoms, &by_input_section, InputId(7), 3, 10, 2),
+            Some((second, 2))
         );
     }
 }

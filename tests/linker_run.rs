@@ -965,6 +965,11 @@ struct ParityCase {
     check: ParityCheck,
 }
 
+struct ExportParityCase {
+    name: &'static str,
+    src: &'static str,
+}
+
 fn assert_case_matches_apple_ld(
     case: &ParityCase,
     sdk: &str,
@@ -1035,6 +1040,60 @@ fn assert_case_matches_apple_ld(
                 ));
             }
         }
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+    Ok(())
+}
+
+fn assert_dylib_export_case_matches_apple_ld(
+    case: &ExportParityCase,
+    sdk: &str,
+    sdk_ver: &str,
+) -> Result<(), String> {
+    let obj = scratch(&format!("export-parity-{}.o", case.name));
+    let our_out = scratch(&format!("export-parity-{}-ours.dylib", case.name));
+    let apple_out = scratch(&format!("export-parity-{}-apple.dylib", case.name));
+
+    assemble(case.src, &obj)?;
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).map_err(|e| format!("afs-ld dylib link failed for {}: {e}", case.name))?;
+    apple_link_dylib_classic(
+        &obj,
+        &apple_out,
+        &format!("@rpath/{}.dylib", case.name),
+        sdk,
+        sdk_ver,
+    )?;
+
+    let our_bytes = fs::read(&our_out).map_err(|e| format!("read our output: {e}"))?;
+    let apple_bytes = fs::read(&apple_out).map_err(|e| format!("read apple output: {e}"))?;
+    if canonical_export_records(&our_bytes) != canonical_export_records(&apple_bytes) {
+        return Err(format!(
+            "{}: canonical export records diverged:\nours={:#?}\napple={:#?}",
+            case.name,
+            canonical_export_records(&our_bytes),
+            canonical_export_records(&apple_bytes)
+        ));
+    }
+    if dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind)
+        != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::WeakBind)
+    {
+        return Err(format!("{}: weak-bind stream diverged from Apple ld", case.name));
+    }
+    if dyld_info_stream(&our_bytes, DyldInfoStreamKind::Export)
+        .map_err(|e| format!("read our export stream: {e}"))?
+        .is_empty()
+    {
+        return Err(format!("{}: expected non-empty export trie", case.name));
     }
 
     let _ = fs::remove_file(obj);
@@ -1239,57 +1298,17 @@ fn dylib_export_surfaces_match_apple_ld() {
         return;
     };
 
-    let obj = scratch("export-parity.o");
-    let our_out = scratch("export-parity-ours.dylib");
-    let apple_out = scratch("export-parity-apple.dylib");
-    let src = r#"
-        .section __TEXT,__text,regular,pure_instructions
-        .globl _exported
-        _exported:
-            ret
-        .subsections_via_symbols
-    "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-
-    let opts = LinkOptions {
-        inputs: vec![obj.clone()],
-        output: Some(our_out.clone()),
-        kind: OutputKind::Dylib,
-        ..LinkOptions::default()
+    let case = ExportParityCase {
+        name: "export-parity",
+        src: r#"
+            .section __TEXT,__text,regular,pure_instructions
+            .globl _exported
+            _exported:
+                ret
+            .subsections_via_symbols
+        "#,
     };
-    Linker::run(&opts).unwrap();
-    apple_link_dylib_classic(
-        &obj,
-        &apple_out,
-        "@rpath/export-parity.dylib",
-        &sdk,
-        &sdk_ver,
-    )
-    .unwrap();
-
-    let our_bytes = fs::read(&our_out).unwrap();
-    let apple_bytes = fs::read(&apple_out).unwrap();
-    assert_eq!(
-        canonical_export_records(&our_bytes),
-        canonical_export_records(&apple_bytes)
-    );
-    assert!(
-        !dyld_info_stream(&our_bytes, DyldInfoStreamKind::Export)
-            .unwrap()
-            .is_empty(),
-        "expected non-empty export trie"
-    );
-    assert_eq!(
-        dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind).unwrap(),
-        dyld_info_stream(&apple_bytes, DyldInfoStreamKind::WeakBind).unwrap()
-    );
-
-    let _ = fs::remove_file(apple_out);
-    let _ = fs::remove_file(our_out);
-    let _ = fs::remove_file(obj);
+    assert_dylib_export_case_matches_apple_ld(&case, &sdk, &sdk_ver).unwrap();
 }
 
 #[test]
@@ -1307,59 +1326,152 @@ fn dylib_export_surfaces_match_apple_ld_with_shared_prefixes() {
         return;
     };
 
-    let obj = scratch("export-prefix-parity.o");
-    let our_out = scratch("export-prefix-parity-ours.dylib");
-    let apple_out = scratch("export-prefix-parity-apple.dylib");
-    let src = r#"
-        .section __TEXT,__text,regular,pure_instructions
-        .globl _alpha
-        _alpha:
-            ret
-        .globl _alphabet
-        _alphabet:
-            ret
-        .globl _alphanumeric
-        _alphanumeric:
-            ret
-        .subsections_via_symbols
-    "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
+    let case = ExportParityCase {
+        name: "export-prefix-parity",
+        src: r#"
+            .section __TEXT,__text,regular,pure_instructions
+            .globl _alpha
+            _alpha:
+                ret
+            .globl _alphabet
+            _alphabet:
+                ret
+            .globl _alphanumeric
+            _alphanumeric:
+                ret
+            .subsections_via_symbols
+        "#,
+    };
+    assert_dylib_export_case_matches_apple_ld(&case, &sdk, &sdk_ver).unwrap();
+}
+
+#[test]
+fn dylib_export_surfaces_match_apple_ld_across_fixture_matrix() {
+    if !have_xcrun() || !have_xcrun_tool("ld") {
+        eprintln!("skipping: xcrun as/ld unavailable");
         return;
     }
-
-    let opts = LinkOptions {
-        inputs: vec![obj.clone()],
-        output: Some(our_out.clone()),
-        kind: OutputKind::Dylib,
-        ..LinkOptions::default()
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
     };
-    Linker::run(&opts).unwrap();
-    apple_link_dylib_classic(
-        &obj,
-        &apple_out,
-        "@rpath/export-prefix-parity.dylib",
-        &sdk,
-        &sdk_ver,
-    )
-    .unwrap();
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
 
-    let our_bytes = fs::read(&our_out).unwrap();
-    let apple_bytes = fs::read(&apple_out).unwrap();
-    assert_eq!(
-        canonical_export_records(&our_bytes),
-        canonical_export_records(&apple_bytes)
-    );
+    let cases = [
+        ExportParityCase {
+            name: "export-ordering",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _zeta
+                _zeta:
+                    ret
+                .globl _alpha
+                _alpha:
+                    ret
+                .globl _middle
+                _middle:
+                    ret
+                .subsections_via_symbols
+            "#,
+        },
+        ExportParityCase {
+            name: "export-text-data",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _code_symbol
+                _code_symbol:
+                    ret
+                .section __DATA,__data
+                .p2align 3
+                .globl _data_symbol
+                _data_symbol:
+                    .quad 0x1234
+                .globl _more_data
+                _more_data:
+                    .long 7
+                .subsections_via_symbols
+            "#,
+        },
+        ExportParityCase {
+            name: "export-text-const",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _entry
+                _entry:
+                    ret
+                .section __TEXT,__const
+                .p2align 3
+                .globl _ro_value
+                _ro_value:
+                    .quad 0xfeedface
+                .subsections_via_symbols
+            "#,
+        },
+        ExportParityCase {
+            name: "export-bss",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _touch
+                _touch:
+                    ret
+                .zerofill __DATA,__bss,_global_bss,16,3
+                .subsections_via_symbols
+            "#,
+        },
+        ExportParityCase {
+            name: "export-prefix-fanout",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _pre
+                _pre:
+                    ret
+                .globl _prefix
+                _prefix:
+                    ret
+                .globl _prefix_long
+                _prefix_long:
+                    ret
+                .globl _prefix_lone
+                _prefix_lone:
+                    ret
+                .subsections_via_symbols
+            "#,
+        },
+        ExportParityCase {
+            name: "export-shared-data-prefix",
+            src: r#"
+                .section __DATA,__data
+                .p2align 3
+                .globl _alpha_data
+                _alpha_data:
+                    .quad 1
+                .globl _alphabet_data
+                _alphabet_data:
+                    .quad 2
+                .globl _alphanumeric_data
+                _alphanumeric_data:
+                    .quad 3
+                .subsections_via_symbols
+            "#,
+        },
+    ];
+
+    let mut failures = Vec::new();
+    for case in &cases {
+        if let Err(err) = assert_dylib_export_case_matches_apple_ld(case, &sdk, &sdk_ver) {
+            failures.push(err);
+        }
+    }
+
     assert!(
-        !dyld_info_stream(&our_bytes, DyldInfoStreamKind::Export)
-            .unwrap()
-            .is_empty(),
-        "expected non-empty export trie"
+        failures.is_empty(),
+        "Apple ld dylib export parity failures ({} cases):\n{}",
+        failures.len(),
+        failures.join("\n\n")
     );
-
-    let _ = fs::remove_file(apple_out);
-    let _ = fs::remove_file(our_out);
-    let _ = fs::remove_file(obj);
 }
 
 #[test]

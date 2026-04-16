@@ -55,6 +55,28 @@ fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-linker-run-{}-{name}", std::process::id()))
 }
 
+fn output_section(bytes: &[u8], segname: &str, sectname: &str) -> Option<(u64, Vec<u8>)> {
+    let header = parse_header(bytes).ok()?;
+    let commands = parse_commands(&header, bytes).ok()?;
+    for cmd in commands {
+        if let LoadCommand::Segment64(seg) = cmd {
+            for section in seg.sections {
+                if section.segname_str() == segname && section.sectname_str() == sectname {
+                    let data = if section.offset == 0 {
+                        Vec::new()
+                    } else {
+                        let start = section.offset as usize;
+                        let end = start + section.size as usize;
+                        bytes.get(start..end)?.to_vec()
+                    };
+                    return Some((section.addr, data));
+                }
+            }
+        }
+    }
+    None
+}
+
 #[test]
 fn linker_run_emits_non_empty_executable_from_real_object() {
     if !have_xcrun() {
@@ -485,4 +507,84 @@ fn linker_run_uses_requested_entry_symbol() {
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_applies_core_arm64_relocations() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("relocs.o");
+    let out = scratch("relocs.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        .globl _helper
+        _main:
+            adrp x0, _target@PAGE
+            add x0, x0, _target@PAGEOFF
+            bl _helper
+            ret
+        _helper:
+            ret
+
+        .section __DATA,__data
+        .p2align 3
+        _target:
+            .quad _helper
+
+        .section __TEXT,__const
+        .p2align 3
+        _delta:
+            .quad _helper - _main
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").expect("text section");
+    let (data_addr, data) = output_section(&bytes, "__DATA", "__data").expect("data section");
+    let (_, cdata) = output_section(&bytes, "__TEXT", "__const").expect("const section");
+
+    let adrp = u32::from_le_bytes(text[0..4].try_into().unwrap());
+    let add = u32::from_le_bytes(text[4..8].try_into().unwrap());
+    let branch = u32::from_le_bytes(text[8..12].try_into().unwrap());
+    let data_ptr = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let delta = u64::from_le_bytes(cdata[0..8].try_into().unwrap());
+
+    let adrp_immlo = ((adrp >> 29) & 0x3) as i64;
+    let adrp_immhi = ((adrp >> 5) & 0x7ffff) as i64;
+    let adrp_pages = sign_extend_21((adrp_immhi << 2) | adrp_immlo);
+    let adrp_base = ((text_addr as i64) & !0xfff) + (adrp_pages << 12);
+    let add_imm = ((add >> 10) & 0xfff) as u64;
+    let reconstructed_target = (adrp_base as u64) + add_imm;
+
+    assert_eq!(reconstructed_target, data_addr, "ADRP+ADD should resolve _target");
+    assert_eq!(branch & 0x03ff_ffff, 0x2, "BL should branch forward 8 bytes");
+    assert_eq!(data_ptr, text_addr + 16, ".quad _helper should point at helper");
+    assert_eq!(delta, 16, "_helper - _main should fold through SUBTRACTOR");
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+fn sign_extend_21(value: i64) -> i64 {
+    if value & (1 << 20) != 0 {
+        value | !0x1f_ffff
+    } else {
+        value
+    }
 }

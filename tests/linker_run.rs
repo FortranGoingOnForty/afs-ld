@@ -266,12 +266,27 @@ fn decode_page_reference(
     Ok((adrp_base as u64) + low)
 }
 
+fn decode_branch_target(bytes: &[u8], section_addr: u64, site_offset: u64) -> Result<u64, String> {
+    let insn = read_insn(bytes, site_offset as usize)?;
+    let imm26 = (insn & 0x03ff_ffff) as i64;
+    let imm = sign_extend_26(imm26) << 2;
+    Ok(section_addr.wrapping_add(site_offset).wrapping_add_signed(imm))
+}
+
 fn read_insn(bytes: &[u8], start: usize) -> Result<u32, String> {
     let end = start + 4;
     let slice = bytes
         .get(start..end)
         .ok_or_else(|| format!("instruction read OOB at 0x{start:x}"))?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn sign_extend_26(value: i64) -> i64 {
+    if value & (1 << 25) != 0 {
+        value | !0x03ff_ffff
+    } else {
+        value
+    }
 }
 
 #[test]
@@ -1177,27 +1192,31 @@ fn linker_run_rejects_out_of_range_branch26() {
 }
 
 #[test]
-fn linker_run_rejects_got_relocations_until_sprint_12() {
+fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");
         return;
     }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
 
-    let obj = scratch("got-reloc.o");
-    let out = scratch("got-reloc.out");
+    let obj = scratch("import-reloc.o");
+    let out = scratch("import-reloc.out");
     let src = r#"
         .section __TEXT,__text,regular,pure_instructions
         .globl _main
         _main:
-            adrp x0, _target@GOTPAGE
-            ldr x0, [x0, _target@GOTPAGEOFF]
+            adrp x0, _write@GOTPAGE
+            ldr x0, [x0, _write@GOTPAGEOFF]
+            bl _write
             ret
-
-        .section __DATA,__data
-        .globl _target
-        .p2align 3
-        _target:
-            .quad 0
         .subsections_via_symbols
     "#;
     if let Err(e) = assemble(src, &obj) {
@@ -1206,23 +1225,34 @@ fn linker_run_rejects_got_relocations_until_sprint_12() {
     }
 
     let opts = LinkOptions {
-        inputs: vec![obj.clone()],
-        output: Some(out),
+        inputs: vec![obj.clone(), tbd.clone()],
+        output: Some(out.clone()),
         kind: OutputKind::Executable,
         ..LinkOptions::default()
     };
-    let err = Linker::run(&opts).unwrap_err();
-    match err {
-        LinkError::Reloc(err) => {
-            let msg = err.to_string();
-            assert!(msg.contains("GotLoadPage21") || msg.contains("GotLoadPageOff12"), "{msg}");
-            assert!(msg.contains("not yet implemented"), "{msg}");
-            assert!(msg.contains("Sprint 12/13"), "{msg}");
-            assert!(msg.contains("_target"), "{msg}");
-        }
-        other => panic!("expected Reloc error, got {other:?}"),
-    }
+    Linker::run(&opts).unwrap();
 
+    let bytes = fs::read(&out).unwrap();
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let (stubs_addr, stubs) = output_section(&bytes, "__TEXT", "__stubs").unwrap();
+    let (got_addr, got) = output_section(&bytes, "__DATA_CONST", "__got").unwrap();
+    let (lazy_addr, lazy) = output_section(&bytes, "__DATA", "__la_symbol_ptr").unwrap();
+
+    assert_eq!(got.len(), 8);
+    assert_eq!(stubs.len(), 12);
+    assert_eq!(lazy.len(), 8);
+    assert_eq!(
+        decode_page_reference(&text, text_addr, 0, &PageRefKind::Load).unwrap(),
+        got_addr
+    );
+    assert_eq!(decode_branch_target(&text, text_addr, 8).unwrap(), stubs_addr);
+    assert_eq!(
+        decode_page_reference(&stubs, stubs_addr, 0, &PageRefKind::Load).unwrap(),
+        lazy_addr
+    );
+    assert_eq!(read_insn(&stubs, 8).unwrap(), 0xd61f0200);
+
+    let _ = fs::remove_file(out);
     let _ = fs::remove_file(obj);
 }
 

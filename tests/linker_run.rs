@@ -1276,11 +1276,85 @@ fn dylib_export_surfaces_match_apple_ld() {
         canonical_export_records(&our_bytes),
         canonical_export_records(&apple_bytes)
     );
-    let our_export_stream = dyld_info_stream(&our_bytes, DyldInfoStreamKind::Export).unwrap();
-    assert!(!our_export_stream.is_empty(), "expected non-empty export trie");
+    assert!(
+        !dyld_info_stream(&our_bytes, DyldInfoStreamKind::Export)
+            .unwrap()
+            .is_empty(),
+        "expected non-empty export trie"
+    );
     assert_eq!(
         dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind).unwrap(),
         dyld_info_stream(&apple_bytes, DyldInfoStreamKind::WeakBind).unwrap()
+    );
+
+    let _ = fs::remove_file(apple_out);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn dylib_export_surfaces_match_apple_ld_with_shared_prefixes() {
+    if !have_xcrun() || !have_xcrun_tool("ld") {
+        eprintln!("skipping: xcrun as/ld unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+
+    let obj = scratch("export-prefix-parity.o");
+    let our_out = scratch("export-prefix-parity-ours.dylib");
+    let apple_out = scratch("export-prefix-parity-apple.dylib");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _alpha
+        _alpha:
+            ret
+        .globl _alphabet
+        _alphabet:
+            ret
+        .globl _alphanumeric
+        _alphanumeric:
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_dylib_classic(
+        &obj,
+        &apple_out,
+        "@rpath/export-prefix-parity.dylib",
+        &sdk,
+        &sdk_ver,
+    )
+    .unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert_eq!(
+        canonical_export_records(&our_bytes),
+        canonical_export_records(&apple_bytes)
+    );
+    assert!(
+        !dyld_info_stream(&our_bytes, DyldInfoStreamKind::Export)
+            .unwrap()
+            .is_empty(),
+        "expected non-empty export trie"
     );
 
     let _ = fs::remove_file(apple_out);

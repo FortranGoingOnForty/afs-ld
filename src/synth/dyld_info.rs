@@ -73,15 +73,14 @@ pub struct BindRecordSpec<'a> {
 #[derive(Debug, Clone, Default)]
 struct TrieNode {
     terminal: Option<ExportEntry>,
-    children: BTreeMap<String, TrieNode>,
+    children: BTreeMap<u8, TrieNode>,
 }
 
 impl TrieNode {
     fn insert(&mut self, name: &str, entry: ExportEntry) {
         let mut node = self;
         for byte in name.bytes() {
-            let edge = char::from(byte).to_string();
-            node = node.children.entry(edge).or_default();
+            node = node.children.entry(byte).or_default();
         }
         node.terminal = Some(entry);
     }
@@ -147,12 +146,29 @@ fn flatten_trie(node: &TrieNode, flat: &mut Vec<FlatTrieNode>) -> usize {
     });
 
     let mut children = Vec::with_capacity(node.children.len());
-    for (edge, child) in &node.children {
-        let child_id = flatten_trie(child, flat);
-        children.push((edge.clone(), child_id));
+    for (&edge, child) in &node.children {
+        let (label, child_id) = flatten_edge(edge, child, flat);
+        children.push((label, child_id));
     }
     flat[id].children = children;
     id
+}
+
+fn flatten_edge(first: u8, child: &TrieNode, flat: &mut Vec<FlatTrieNode>) -> (String, usize) {
+    let mut label = vec![first];
+    let mut node = child;
+    while node.terminal.is_none() && node.children.len() == 1 {
+        let (&next, next_child) = node
+            .children
+            .iter()
+            .next()
+            .expect("single-child trie node should expose one edge");
+        label.push(next);
+        node = next_child;
+    }
+    let label = String::from_utf8(label).expect("export labels should stay UTF-8");
+    let child_id = flatten_trie(node, flat);
+    (label, child_id)
 }
 
 fn trie_node_size(node: &FlatTrieNode, offsets: &[usize]) -> usize {
@@ -350,5 +366,23 @@ mod tests {
         ];
         let reverse = forward.iter().rev().cloned().collect::<Vec<_>>();
         assert_eq!(build_export_trie(&forward), build_export_trie(&reverse));
+    }
+
+    #[test]
+    fn export_trie_compresses_single_child_paths() {
+        let trie = build_export_trie(&[ExportEntry {
+            name: "_alpha".into(),
+            flags: EXPORT_SYMBOL_FLAGS_KIND_REGULAR,
+            kind: ExportKind::Regular { address: 0x40 },
+        }]);
+
+        let child_count = *trie.get(1).expect("root child count should exist");
+        assert_eq!(child_count, 1);
+        let edge_end = trie[2..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|idx| idx + 2)
+            .expect("root edge should be null-terminated");
+        assert_eq!(std::str::from_utf8(&trie[2..edge_end]).unwrap(), "_alpha");
     }
 }

@@ -136,6 +136,144 @@ fn apple_link(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct SectionCase {
+    segname: &'static str,
+    sectname: &'static str,
+}
+
+#[derive(Clone, Copy)]
+enum PageRefKind {
+    Add,
+    Load,
+}
+
+enum ParityCheck {
+    ExactSections(&'static [SectionCase]),
+    PageRef {
+        section: SectionCase,
+        site_offset: u64,
+        target_offset: u64,
+        kind: PageRefKind,
+    },
+}
+
+struct ParityCase {
+    name: &'static str,
+    src: &'static str,
+    check: ParityCheck,
+}
+
+fn assert_case_matches_apple_ld(
+    case: &ParityCase,
+    sdk: &str,
+    sdk_ver: &str,
+) -> Result<(), String> {
+    let obj = scratch(&format!("parity-{}.o", case.name));
+    let our_out = scratch(&format!("parity-{}-ours.out", case.name));
+    let apple_out = scratch(&format!("parity-{}-apple.out", case.name));
+
+    assemble(case.src, &obj)?;
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).map_err(|e| format!("afs-ld link failed for {}: {e}", case.name))?;
+    apple_link(&obj, &apple_out, "_main", sdk, sdk_ver)?;
+
+    let our_bytes = fs::read(&our_out).map_err(|e| format!("read our output: {e}"))?;
+    let apple_bytes = fs::read(&apple_out).map_err(|e| format!("read apple output: {e}"))?;
+
+    match case.check {
+        ParityCheck::ExactSections(sections) => {
+            for section in sections {
+                let (_, ours) = output_section(&our_bytes, section.segname, section.sectname)
+                    .ok_or_else(|| {
+                        format!("missing our section {},{}", section.segname, section.sectname)
+                    })?;
+                let (_, theirs) = output_section(&apple_bytes, section.segname, section.sectname)
+                    .ok_or_else(|| {
+                        format!(
+                            "missing apple section {},{}",
+                            section.segname, section.sectname
+                        )
+                    })?;
+                let diff = diff_macho(&ours, &theirs);
+                if !diff.is_clean() {
+                    return Err(format!(
+                        "{}: section {},{} diverged from Apple ld: {:#?}",
+                        case.name, section.segname, section.sectname, diff.critical
+                    ));
+                }
+            }
+        }
+        ParityCheck::PageRef {
+            section,
+            site_offset,
+            target_offset,
+            kind,
+        } => {
+            let (our_addr, our_bytes_sec) = output_section(&our_bytes, section.segname, section.sectname)
+                .ok_or_else(|| format!("missing our section {},{}", section.segname, section.sectname))?;
+            let (apple_addr, apple_bytes_sec) =
+                output_section(&apple_bytes, section.segname, section.sectname).ok_or_else(|| {
+                    format!("missing apple section {},{}", section.segname, section.sectname)
+                })?;
+            let our_target = decode_page_reference(&our_bytes_sec, our_addr, site_offset, &kind)?;
+            let apple_target =
+                decode_page_reference(&apple_bytes_sec, apple_addr, site_offset, &kind)?;
+            let our_offset = our_target - our_addr;
+            let apple_offset = apple_target - apple_addr;
+            if our_offset != target_offset || apple_offset != target_offset {
+                return Err(format!(
+                    "{}: decoded target offset mismatch (ours={our_offset:#x}, apple={apple_offset:#x}, expected={target_offset:#x})",
+                    case.name,
+                ));
+            }
+        }
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+    Ok(())
+}
+
+fn decode_page_reference(
+    bytes: &[u8],
+    section_addr: u64,
+    site_offset: u64,
+    kind: &PageRefKind,
+) -> Result<u64, String> {
+    let start = site_offset as usize;
+    let adrp = read_insn(bytes, start)?;
+    let second = read_insn(bytes, start + 4)?;
+    let place = section_addr + site_offset;
+    let adrp_immlo = ((adrp >> 29) & 0x3) as i64;
+    let adrp_immhi = ((adrp >> 5) & 0x7ffff) as i64;
+    let adrp_pages = sign_extend_21((adrp_immhi << 2) | adrp_immlo);
+    let adrp_base = ((place as i64) & !0xfff) + (adrp_pages << 12);
+    let low = match kind {
+        PageRefKind::Add => ((second >> 10) & 0xfff) as u64,
+        PageRefKind::Load => {
+            let shift = ((second >> 30) & 0b11) as u64;
+            (((second >> 10) & 0xfff) as u64) << shift
+        }
+    };
+    Ok((adrp_base as u64) + low)
+}
+
+fn read_insn(bytes: &[u8], start: usize) -> Result<u32, String> {
+    let end = start + 4;
+    let slice = bytes
+        .get(start..end)
+        .ok_or_else(|| format!("instruction read OOB at 0x{start:x}"))?;
+    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
 #[test]
 fn linker_run_emits_non_empty_executable_from_real_object() {
     if !have_xcrun() {
@@ -713,7 +851,7 @@ fn linker_run_applies_scaled_pageoff12_for_ldr_x() {
 }
 
 #[test]
-fn relocated_text_matches_apple_ld_for_local_relocs() {
+fn relocated_sections_match_apple_ld_across_fixture_matrix() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
         eprintln!("skipping: xcrun as/ld unavailable");
         return;
@@ -726,62 +864,267 @@ fn relocated_text_matches_apple_ld_for_local_relocs() {
         eprintln!("skipping: xcrun --show-sdk-version unavailable");
         return;
     };
-
-    let obj = scratch("ld-diff.o");
-    let our_out = scratch("ld-diff-ours.out");
-    let apple_out = scratch("ld-diff-apple.out");
-    let src = r#"
-        .section __TEXT,__text,regular,pure_instructions
-        .globl _main
-        .globl _helper
-        _main:
-            adrp x0, _target@PAGE
-            add x0, x0, _target@PAGEOFF
-            bl _helper
-            ret
-        _helper:
-            ret
-
-        .section __DATA,__data
-        .p2align 3
-        _target:
-            .quad _helper
-        .subsections_via_symbols
-    "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-
-    let opts = LinkOptions {
-        inputs: vec![obj.clone()],
-        output: Some(our_out.clone()),
-        kind: OutputKind::Executable,
-        ..LinkOptions::default()
+    const TEXT: SectionCase = SectionCase {
+        segname: "__TEXT",
+        sectname: "__text",
     };
-    Linker::run(&opts).unwrap();
-    if let Err(e) = apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver) {
-        eprintln!("skipping: {e}");
-        let _ = fs::remove_file(obj);
-        let _ = fs::remove_file(our_out);
-        return;
+    const CONST: SectionCase = SectionCase {
+        segname: "__TEXT",
+        sectname: "__const",
+    };
+
+    let cases = [
+        ParityCase {
+            name: "branch-forward",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _main
+                _main:
+                    bl _helper
+                    ret
+                _helper:
+                    ret
+                .subsections_via_symbols
+            "#,
+            check: ParityCheck::ExactSections(&[TEXT]),
+        },
+        ParityCase {
+            name: "branch-backward",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _helper
+                _helper:
+                    ret
+                .globl _main
+                _main:
+                    bl _helper
+                    ret
+                .subsections_via_symbols
+            "#,
+            check: ParityCheck::ExactSections(&[TEXT]),
+        },
+        ParityCase {
+            name: "adrp-add-intra-text-forward",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _main
+                _main:
+                    adrp x0, _target@PAGE
+                    add x0, x0, _target@PAGEOFF
+                    ret
+                .space 0x4ff4
+                _target:
+                    .quad 0
+                .subsections_via_symbols
+            "#,
+            check: ParityCheck::PageRef {
+                section: TEXT,
+                site_offset: 0,
+                target_offset: 0x5000,
+                kind: PageRefKind::Add,
+            },
+        },
+        ParityCase {
+            name: "adrp-add-intra-text-backward",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                _target:
+                    .quad 0x55
+                .space 0x4ff8
+                .globl _main
+                _main:
+                    adrp x0, _target@PAGE
+                    add x0, x0, _target@PAGEOFF
+                    ret
+                .subsections_via_symbols
+            "#,
+            check: ParityCheck::PageRef {
+                section: TEXT,
+                site_offset: 0x5000,
+                target_offset: 0,
+                kind: PageRefKind::Add,
+            },
+        },
+        ParityCase {
+            name: "adrp-ldr-x-intra-text",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _main
+                _main:
+                    adrp x0, _target@PAGE
+                    ldr x1, [x0, _target@PAGEOFF]
+                    ret
+                .space 0x3f4
+                _target:
+                    .quad 0x1122334455667788
+                .subsections_via_symbols
+            "#,
+            check: ParityCheck::PageRef {
+                section: TEXT,
+                site_offset: 0,
+                target_offset: 0x400,
+                kind: PageRefKind::Load,
+            },
+        },
+        ParityCase {
+            name: "adrp-ldr-w-intra-text",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _main
+                _main:
+                    adrp x0, _target@PAGE
+                    ldr w1, [x0, _target@PAGEOFF]
+                    ret
+                .space 0x2f4
+                _target:
+                    .long 0x11223344
+                .subsections_via_symbols
+            "#,
+            check: ParityCheck::PageRef {
+                section: TEXT,
+                site_offset: 0,
+                target_offset: 0x300,
+                kind: PageRefKind::Load,
+            },
+        },
+        ParityCase {
+            name: "adrp-ldrh-intra-text",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _main
+                _main:
+                    adrp x0, _target@PAGE
+                    ldrh w1, [x0, _target@PAGEOFF]
+                    ret
+                .space 0x1f4
+                _target:
+                    .hword 0x3344
+                .subsections_via_symbols
+            "#,
+            check: ParityCheck::PageRef {
+                section: TEXT,
+                site_offset: 0,
+                target_offset: 0x200,
+                kind: PageRefKind::Load,
+            },
+        },
+        ParityCase {
+            name: "adrp-ldrb-intra-text",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _main
+                _main:
+                    adrp x0, _target@PAGE
+                    ldrb w1, [x0, _target@PAGEOFF]
+                    ret
+                .space 0xf4
+                _target:
+                    .byte 0x44
+                .subsections_via_symbols
+            "#,
+            check: ParityCheck::PageRef {
+                section: TEXT,
+                site_offset: 0,
+                target_offset: 0x100,
+                kind: PageRefKind::Load,
+            },
+        },
+        ParityCase {
+            name: "mixed-branch-adrp-text",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _main
+                .globl _helper
+                _main:
+                    adrp x0, _target@PAGE
+                    add x0, x0, _target@PAGEOFF
+                    bl _helper
+                    ret
+                _helper:
+                    ret
+                .space 0xff0
+                _target:
+                    .quad 0x99
+                .subsections_via_symbols
+            "#,
+            check: ParityCheck::PageRef {
+                section: TEXT,
+                site_offset: 0,
+                target_offset: 0x1004,
+                kind: PageRefKind::Add,
+            },
+        },
+        ParityCase {
+            name: "subtractor-positive",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _helper
+                _helper:
+                    ret
+                .globl _main
+                _main:
+                    bl _helper
+                    ret
+                .section __TEXT,__const
+                .p2align 3
+                _delta:
+                    .quad _helper - _main
+                .subsections_via_symbols
+            "#,
+            check: ParityCheck::ExactSections(&[CONST]),
+        },
+        ParityCase {
+            name: "subtractor-negative",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _helper
+                _helper:
+                    ret
+                .globl _main
+                _main:
+                    ret
+                .section __TEXT,__const
+                .p2align 3
+                _delta:
+                    .quad _main - _helper
+                .subsections_via_symbols
+            "#,
+            check: ParityCheck::ExactSections(&[CONST]),
+        },
+        ParityCase {
+            name: "branch-and-subtractor",
+            src: r#"
+                .section __TEXT,__text,regular,pure_instructions
+                .globl _helper
+                _helper:
+                    ret
+                .globl _main
+                _main:
+                    bl _helper
+                    ret
+                .section __TEXT,__const
+                .p2align 3
+                _delta:
+                    .quad _main - _helper
+                .subsections_via_symbols
+            "#,
+            check: ParityCheck::ExactSections(&[TEXT, CONST]),
+        },
+    ];
+
+    let mut failures = Vec::new();
+    for case in &cases {
+        if let Err(err) = assert_case_matches_apple_ld(case, &sdk, &sdk_ver) {
+            failures.push(err);
+        }
     }
 
-    let our_bytes = fs::read(&our_out).unwrap();
-    let apple_bytes = fs::read(&apple_out).unwrap();
-    let (_, our_text) = output_section(&our_bytes, "__TEXT", "__text").expect("our __text");
-    let (_, apple_text) = output_section(&apple_bytes, "__TEXT", "__text").expect("apple __text");
-
-    let diff = diff_macho(&our_text, &apple_text);
     assert!(
-        diff.is_clean(),
-        "relocated __text diverged from Apple ld: {:#?}",
-        diff.critical
+        failures.is_empty(),
+        "Apple ld parity failures ({} cases):\n{}",
+        failures.len(),
+        failures.join("\n\n")
     );
-
-    let _ = fs::remove_file(obj);
-    let _ = fs::remove_file(our_out);
-    let _ = fs::remove_file(apple_out);
 }
 
 #[test]

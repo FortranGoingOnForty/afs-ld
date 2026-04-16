@@ -1,3 +1,4 @@
+pub mod code_sig;
 pub mod got;
 pub mod stubs;
 

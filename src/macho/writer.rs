@@ -15,7 +15,7 @@ use crate::macho::reader::{
 };
 use crate::resolve::{Symbol, SymbolId, SymbolTable};
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist};
-use crate::synth::SyntheticPlan;
+use crate::synth::{code_sig::CodeSignaturePlan, SyntheticPlan};
 use crate::{LinkOptions, OutputKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,12 +100,12 @@ fn finalize_with_linkedit(
     imports: Option<(&SymbolTable, &SyntheticPlan)>,
 ) -> Result<(Layout, LinkEditPlan), WriteError> {
     let mut layout = layout.clone();
-    let mut linkedit = build_linkedit_plan(&layout, imports)?;
+    let mut linkedit = build_linkedit_plan(&layout, kind, opts, imports)?;
     apply_indirect_starts(&mut layout, &linkedit);
     let header_size = estimate_header_size(&layout, kind, opts, dylibs, &linkedit);
     layout.relayout(header_size);
 
-    linkedit = build_linkedit_plan(&layout, imports)?;
+    linkedit = build_linkedit_plan(&layout, kind, opts, imports)?;
     apply_indirect_starts(&mut layout, &linkedit);
     let sizeofcmds: u32 = build_commands(&layout, kind, opts, None, dylibs, &linkedit)?
         .iter()
@@ -113,7 +113,7 @@ fn finalize_with_linkedit(
         .sum();
     let header_size = HEADER_SIZE as u64 + sizeofcmds as u64;
     layout.relayout(header_size);
-    linkedit = build_linkedit_plan(&layout, imports)?;
+    linkedit = build_linkedit_plan(&layout, kind, opts, imports)?;
     apply_indirect_starts(&mut layout, &linkedit);
 
     let linkedit_seg = layout
@@ -132,7 +132,7 @@ pub fn write_finalized_with_dylibs(
     dylibs: &[DylibDependency],
     out: &mut Vec<u8>,
 ) -> Result<(), WriteError> {
-    let linkedit = LinkEditPlan::minimal(layout)?;
+    let linkedit = LinkEditPlan::minimal(layout, kind, opts)?;
     write_finalized_with_linkedit(layout, kind, opts, entry_point, dylibs, &linkedit, out)
 }
 
@@ -224,6 +224,12 @@ pub fn write_finalized_with_linkedit(
     }
     let end = stroff + linkedit_plan.strtab_bytes.len();
     out[stroff..end].copy_from_slice(&linkedit_plan.strtab_bytes);
+    if let Some(code_signature) = &linkedit_plan.code_signature {
+        let start = code_signature.dataoff as usize;
+        let bytes = code_signature.build(&out[..start]);
+        let end = start + bytes.len();
+        out[start..end].copy_from_slice(&bytes);
+    }
 
     Ok(())
 }
@@ -279,7 +285,15 @@ fn build_commands(
     commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
     commands.push(raw_linkedit_command(LC_FUNCTION_STARTS, 0, 0));
     commands.push(raw_linkedit_command(LC_DATA_IN_CODE, 0, 0));
-    commands.push(raw_linkedit_command(LC_CODE_SIGNATURE, 0, 0));
+    if let Some(code_signature) = &linkedit.code_signature {
+        commands.push(raw_linkedit_command(
+            LC_CODE_SIGNATURE,
+            code_signature.dataoff,
+            code_signature.datasize,
+        ));
+    } else {
+        commands.push(raw_linkedit_command(LC_CODE_SIGNATURE, 0, 0));
+    }
     commands.push(LoadCommand::DyldInfoOnly(linkedit.dyld_info));
 
     Ok(commands)
@@ -447,22 +461,25 @@ pub struct LinkEditPlan {
     bind_bytes: Vec<u8>,
     lazy_bind_bytes: Vec<u8>,
     pub strtab_bytes: Vec<u8>,
+    code_signature: Option<CodeSignaturePlan>,
     indirect_starts: HashMap<(String, String), u32>,
     lazy_bind_offsets: HashMap<SymbolId, u32>,
 }
 
 impl LinkEditPlan {
-    fn minimal(layout: &Layout) -> Result<Self, WriteError> {
-        build_linkedit_plan(layout, None)
+    fn minimal(layout: &Layout, kind: OutputKind, opts: &LinkOptions) -> Result<Self, WriteError> {
+        build_linkedit_plan(layout, kind, opts, None)
     }
 
     fn total_size(&self) -> u64 {
-        (self.symtab_bytes.len()
-            + self.indirect_bytes.len()
-            + self.rebase_bytes.len()
-            + self.bind_bytes.len()
-            + self.lazy_bind_bytes.len()
-            + self.strtab_bytes.len()) as u64
+        let base_off = self.symtab.symoff as u64;
+        let regular_end = self.symtab.stroff as u64 + self.strtab_bytes.len() as u64;
+        let regular_size = regular_end.saturating_sub(base_off);
+        if let Some(code_signature) = &self.code_signature {
+            (code_signature.dataoff as u64 - base_off) + code_signature.datasize as u64
+        } else {
+            regular_size
+        }
     }
 
     pub fn lazy_bind_offset(&self, symbol: SymbolId) -> Option<u32> {
@@ -472,6 +489,8 @@ impl LinkEditPlan {
 
 fn build_linkedit_plan(
     layout: &Layout,
+    kind: OutputKind,
+    opts: &LinkOptions,
     imports: Option<(&SymbolTable, &SyntheticPlan)>,
 ) -> Result<LinkEditPlan, WriteError> {
     let linkedit = layout
@@ -496,6 +515,7 @@ fn build_linkedit_plan(
             bind_bytes: Vec::new(),
             lazy_bind_bytes: Vec::new(),
             strtab_bytes: vec![0],
+            code_signature: Some(build_code_signature(layout, kind, opts, base_off as u64 + 1)?),
             indirect_starts: HashMap::new(),
             lazy_bind_offsets: HashMap::new(),
         });
@@ -608,6 +628,7 @@ fn build_linkedit_plan(
             + bind_streams.lazy_bind.len() as u64,
         "string table offset",
     )?;
+    let regular_end = stroff as u64 + strtab_bytes.len() as u64;
     Ok(LinkEditPlan {
         symtab: SymtabCmd {
             symoff,
@@ -637,9 +658,21 @@ fn build_linkedit_plan(
         bind_bytes: bind_streams.bind,
         lazy_bind_bytes: bind_streams.lazy_bind,
         strtab_bytes,
+        code_signature: Some(build_code_signature(layout, kind, opts, regular_end)?),
         indirect_starts,
         lazy_bind_offsets: bind_streams.lazy_offsets,
     })
+}
+
+fn build_code_signature(
+    layout: &Layout,
+    kind: OutputKind,
+    opts: &LinkOptions,
+    regular_end: u64,
+) -> Result<CodeSignaturePlan, WriteError> {
+    let code_limit = align_up(regular_end, 16);
+    CodeSignaturePlan::new(layout, opts, code_limit, kind == OutputKind::Executable)
+        .map_err(WriteError::OffsetTooLarge)
 }
 
 #[derive(Debug, Clone)]

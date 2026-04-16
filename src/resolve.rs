@@ -157,8 +157,27 @@ pub struct DylibInput {
     /// Parsed `DylibFile`. `DylibFile` owns its data (no borrow into
     /// `bytes`), so we keep it pre-parsed for O(1) export-trie walks.
     pub file: DylibFile,
-    /// 1-based two-level-namespace ordinal. Matches command-line order
-    /// of `LC_LOAD_DYLIB`-style entries.
+    /// Install name surfaced in the output's `LC_LOAD_DYLIB` list.
+    ///
+    /// Multi-document TBD inputs may seed exports from several sibling
+    /// documents while still canonicalizing them back to one umbrella load
+    /// command (e.g. `libSystem.tbd`).
+    pub load_install_name: String,
+    /// Current-version field surfaced in the output `LC_LOAD_DYLIB`.
+    pub load_current_version: u32,
+    /// Compatibility-version field surfaced in the output `LC_LOAD_DYLIB`.
+    pub load_compatibility_version: u32,
+    /// 1-based two-level-namespace ordinal encoded into undefined symbols and
+    /// bind opcodes. Matches the output's `LC_LOAD_DYLIB` ordering, so several
+    /// parsed TBD documents from one umbrella input may legitimately share it.
+    pub ordinal: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct DylibLoadMeta {
+    pub install_name: String,
+    pub current_version: u32,
+    pub compatibility_version: u32,
     pub ordinal: u16,
 }
 
@@ -234,10 +253,13 @@ impl Inputs {
     /// [`Inputs::add_dylib_from_tbd`].
     pub fn add_dylib(&mut self, path: PathBuf, bytes: Vec<u8>) -> Result<DylibId, InputAddError> {
         let file = DylibFile::parse(&path, &bytes)?;
-        let ordinal = (self.dylibs.len() + 1) as u16;
+        let ordinal = self.next_dylib_ordinal();
         let id = DylibId(self.dylibs.len() as u32);
         self.dylibs.push(DylibInput {
             path,
+            load_install_name: file.install_name.clone(),
+            load_current_version: file.current_version,
+            load_compatibility_version: file.compatibility_version,
             file,
             ordinal,
         });
@@ -248,14 +270,40 @@ impl Inputs {
     /// via `DylibFile::from_tbd(path, tbd, target)` so the target filter
     /// is explicit.
     pub fn add_dylib_from_file(&mut self, path: PathBuf, file: DylibFile) -> DylibId {
-        let ordinal = (self.dylibs.len() + 1) as u16;
+        let ordinal = self.next_dylib_ordinal();
+        let load = DylibLoadMeta {
+            install_name: file.install_name.clone(),
+            current_version: file.current_version,
+            compatibility_version: file.compatibility_version,
+            ordinal,
+        };
+        self.add_dylib_from_file_with_meta(
+            path,
+            file,
+            load,
+        )
+    }
+
+    pub fn add_dylib_from_file_with_meta(
+        &mut self,
+        path: PathBuf,
+        file: DylibFile,
+        load: DylibLoadMeta,
+    ) -> DylibId {
         let id = DylibId(self.dylibs.len() as u32);
         self.dylibs.push(DylibInput {
             path,
+            load_install_name: load.install_name,
+            load_current_version: load.current_version,
+            load_compatibility_version: load.compatibility_version,
             file,
-            ordinal,
+            ordinal: load.ordinal,
         });
         id
+    }
+
+    pub fn next_dylib_ordinal(&self) -> u16 {
+        self.dylibs.iter().map(|dylib| dylib.ordinal).max().unwrap_or(0) + 1
     }
 
     // ---- accessors ----

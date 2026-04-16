@@ -308,12 +308,12 @@ fn ensure_stub_helper_support(
     let (libsystem_id, libsystem) = dylibs
         .iter()
         .enumerate()
-        .find(|(_, dylib)| dylib.file.install_name == "/usr/lib/libSystem.B.dylib")
+        .find(|(_, dylib)| dylib.load_install_name == "/usr/lib/libSystem.B.dylib")
         .or_else(|| {
             dylibs
                 .iter()
                 .enumerate()
-                .find(|(_, dylib)| dylib.file.install_name.contains("libSystem"))
+                .find(|(_, dylib)| dylib.load_install_name.contains("libSystem"))
         })
         .or_else(|| {
             dylibs
@@ -326,11 +326,11 @@ fn ensure_stub_helper_support(
             atom: crate::resolve::AtomId(0),
             reloc_offset: 0,
             kind: RelocKind::Branch26,
-            detail: "stub helper requires a libSystem dylib/TBD input for `_dyld_stub_binder`"
+            detail: "stub helper requires a libSystem dylib/TBD input for `dyld_stub_binder`"
                 .to_string(),
         })?;
 
-    let name = sym_table.intern("_dyld_stub_binder");
+    let name = sym_table.intern("dyld_stub_binder");
     let symbol_id = if let Some(id) = sym_table.lookup(name) {
         match sym_table.get(id) {
             Symbol::DylibImport { .. } => id,
@@ -341,7 +341,7 @@ fn ensure_stub_helper_support(
                     reloc_offset: 0,
                     kind: RelocKind::Branch26,
                     detail: format!(
-                        "`_dyld_stub_binder` already exists as unsupported symbol kind {:?}",
+                        "`dyld_stub_binder` already exists as unsupported symbol kind {:?}",
                         other.kind()
                     ),
                 });
@@ -544,6 +544,9 @@ mod tests {
     fn libsystem_input() -> DylibInput {
         DylibInput {
             path: PathBuf::from("/tmp/libSystem.tbd"),
+            load_install_name: "/usr/lib/libSystem.B.dylib".into(),
+            load_current_version: 0,
+            load_compatibility_version: 0,
             file: DylibFile {
                 path: PathBuf::from("/tmp/libSystem.tbd"),
                 header: MachHeader64 {

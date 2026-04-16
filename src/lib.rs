@@ -27,11 +27,11 @@ use atom::{atomize_object, backpatch_symbol_atoms, AtomTable};
 use layout::{Layout, LayoutInput};
 use macho::reader::ReadError;
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
-use macho::tbd::{parse_tbd, Arch, Platform, Target};
+use macho::tbd::{parse_tbd, parse_version, Arch, Platform, Target};
 use reloc::arm64::RelocError;
 use resolve::{
     classify_unresolved, drain_fetches, format_duplicate_diagnostic, format_undefined_diagnostic,
-    seed_all, InputAddError, Inputs, Symbol, SymbolTable, UndefinedTreatment,
+    seed_all, DylibLoadMeta, InputAddError, Inputs, Symbol, SymbolTable, UndefinedTreatment,
 };
 
 /// What kind of Mach-O file the linker is producing.
@@ -249,17 +249,20 @@ impl Linker {
                 object,
             })
             .collect();
-        let dylib_loads: Vec<DylibDependency> = inputs
-            .dylibs
-            .iter()
-            .map(|dylib| DylibDependency {
+        let mut dylib_loads = Vec::new();
+        let mut seen_ordinals = std::collections::BTreeSet::new();
+        for dylib in &inputs.dylibs {
+            if !seen_ordinals.insert(dylib.ordinal) {
+                continue;
+            }
+            dylib_loads.push(DylibDependency {
                 kind: DylibLoadKind::Normal,
-                install_name: dylib.file.install_name.clone(),
-                current_version: dylib.file.current_version,
-                compatibility_version: dylib.file.compatibility_version,
+                install_name: dylib.load_install_name.clone(),
+                current_version: dylib.load_current_version,
+                compatibility_version: dylib.load_compatibility_version,
                 ordinal: dylib.ordinal,
-            })
-            .collect();
+            });
+        }
         let synthetic_plan = synth::SyntheticPlan::build(
             &layout_inputs,
             &atom_table,
@@ -331,13 +334,32 @@ fn register_input(inputs: &mut Inputs, path: &std::path::Path) -> Result<(), Lin
                 arch: Arch::Arm64,
                 platform: Platform::MacOs,
             };
+            let canonical = docs
+                .iter()
+                .find(|doc| doc.parent_umbrella.is_empty())
+                .unwrap_or_else(|| &docs[0]);
+            let load = DylibLoadMeta {
+                install_name: canonical.install_name.clone(),
+                current_version: canonical
+                    .current_version
+                    .as_deref()
+                    .map(parse_version)
+                    .unwrap_or(0),
+                compatibility_version: canonical
+                    .compatibility_version
+                    .as_deref()
+                    .map(parse_version)
+                    .unwrap_or(0),
+                ordinal: inputs.next_dylib_ordinal(),
+            };
             let mut loaded = false;
             for doc in docs
                 .iter()
                 .filter(|doc| doc.targets.iter().any(|t| t == &target))
             {
                 let file = DylibFile::from_tbd(path, doc, &target);
-                let _ = inputs.add_dylib_from_file(path.to_path_buf(), file);
+                let _ =
+                    inputs.add_dylib_from_file_with_meta(path.to_path_buf(), file, load.clone());
                 loaded = true;
             }
             if !loaded {

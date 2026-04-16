@@ -916,7 +916,7 @@ fn synthesize_stub_helper_section(
             atom: crate::resolve::AtomId(0),
             atom_offset: 0,
             kind: RelocKind::GotLoadPage21,
-            referent: "_dyld_stub_binder".to_string(),
+            referent: "dyld_stub_binder".to_string(),
             detail: "binder GOT slot missing final address".to_string(),
         })?;
 
@@ -976,8 +976,8 @@ fn encode_stub_helper_header(
         encode_adrp_reg(17, header_addr, dyld_private_addr, "__dyld_private")?,
         encode_add_x_reg_pageoff(17, dyld_private_addr, "__dyld_private")?,
         encode_stp_x16_x17_sp_preindex(),
-        encode_adrp_reg(16, header_addr + 12, binder_got_addr, "_dyld_stub_binder@GOT")?,
-        encode_ldr_x_reg_pageoff(16, binder_got_addr, "_dyld_stub_binder@GOT")?,
+        encode_adrp_reg(16, header_addr + 12, binder_got_addr, "dyld_stub_binder@GOT")?,
+        encode_ldr_x_reg_pageoff(16, binder_got_addr, "dyld_stub_binder@GOT")?,
         0xd61f0200u32,
     ];
     for (idx, word) in words.iter().enumerate() {

@@ -1,4 +1,5 @@
 pub mod code_sig;
+pub mod dyld_info;
 pub mod got;
 pub mod stubs;
 pub mod tlv;

@@ -24,6 +24,7 @@ use afs_ld::macho::constants::{
     REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM, REBASE_TYPE_POINTER,
     SG_READ_ONLY,
 };
+use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::reader::{parse_commands, parse_header, u32_le, LoadCommand, Section64Header};
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, SymKind};
@@ -1088,11 +1089,29 @@ fn linker_run_emits_minimal_dylib_from_real_object() {
     let bytes = fs::read(&out).unwrap();
     let header = parse_header(&bytes).unwrap();
     let commands = parse_commands(&header, &bytes).unwrap();
+    let dyld_info = commands.iter().find_map(|cmd| match cmd {
+        LoadCommand::DyldInfoOnly(cmd) => Some(*cmd),
+        _ => None,
+    });
     assert_eq!(header.filetype, afs_ld::macho::constants::MH_DYLIB);
     assert!(
         commands
             .iter()
             .any(|cmd| matches!(cmd, LoadCommand::Dylib(d) if d.cmd == afs_ld::macho::constants::LC_ID_DYLIB))
+    );
+    let dyld_info = dyld_info.expect("expected LC_DYLD_INFO_ONLY in dylib output");
+    assert!(dyld_info.export_size > 0, "expected non-empty export trie");
+
+    let dylib = DylibFile::parse(&out, &bytes).unwrap();
+    let mut exports = dylib.exports.entries().unwrap();
+    exports.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+    assert!(
+        exports.iter().any(|entry| entry.name == "_exported"),
+        "expected _exported in export trie, got {:?}",
+        exports
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>()
     );
 
     let _ = fs::remove_file(obj);

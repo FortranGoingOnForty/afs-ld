@@ -10,6 +10,7 @@ use crate::input::ObjectFile;
 use crate::leb::{write_sleb, write_uleb};
 use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
 use crate::macho::constants::*;
+use crate::macho::exports::{ExportEntry, ExportKind};
 use crate::macho::dylib::DylibDependency;
 use crate::macho::reader::{
     write_commands, write_header, BuildVersionCmd, BuildTool, DyldInfoCmd, DysymtabCmd,
@@ -23,7 +24,7 @@ use crate::string_table::StringTableBuilder;
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind};
 use crate::synth::stubs::{STUB_HELPER_ENTRY_SIZE, STUB_HELPER_HEADER_SIZE, STUB_SIZE};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
-use crate::synth::{code_sig::CodeSignaturePlan, SyntheticPlan};
+use crate::synth::{code_sig::CodeSignaturePlan, dyld_info::build_export_trie, SyntheticPlan};
 use crate::{LinkOptions, OutputKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +243,7 @@ pub fn write_finalized_with_linkedit(
     let rebaseoff = linkedit_plan.dyld_info.rebase_off as usize;
     let bindoff = linkedit_plan.dyld_info.bind_off as usize;
     let lazy_bind_off = linkedit_plan.dyld_info.lazy_bind_off as usize;
+    let export_off = linkedit_plan.dyld_info.export_off as usize;
     let function_starts_off = linkedit_plan.function_starts.dataoff as usize;
     let data_in_code_off = linkedit_plan.data_in_code.dataoff as usize;
     let stroff = linkedit_plan.symtab.stroff as usize;
@@ -264,6 +266,10 @@ pub fn write_finalized_with_linkedit(
     if !linkedit_plan.lazy_bind_bytes.is_empty() {
         let end = lazy_bind_off + linkedit_plan.lazy_bind_bytes.len();
         out[lazy_bind_off..end].copy_from_slice(&linkedit_plan.lazy_bind_bytes);
+    }
+    if !linkedit_plan.export_bytes.is_empty() {
+        let end = export_off + linkedit_plan.export_bytes.len();
+        out[export_off..end].copy_from_slice(&linkedit_plan.export_bytes);
     }
     if !linkedit_plan.function_starts_bytes.is_empty() {
         let end = function_starts_off + linkedit_plan.function_starts_bytes.len();
@@ -530,6 +536,7 @@ pub struct LinkEditPlan {
     rebase_bytes: Vec<u8>,
     bind_bytes: Vec<u8>,
     lazy_bind_bytes: Vec<u8>,
+    export_bytes: Vec<u8>,
     function_starts_bytes: Vec<u8>,
     data_in_code_bytes: Vec<u8>,
     pub strtab_bytes: Vec<u8>,
@@ -595,6 +602,7 @@ fn build_linkedit_plan(
             rebase_bytes: Vec::new(),
             bind_bytes: Vec::new(),
             lazy_bind_bytes: Vec::new(),
+            export_bytes: Vec::new(),
             function_starts_bytes: Vec::new(),
             data_in_code_bytes: Vec::new(),
             strtab_bytes: vec![0; 8],
@@ -653,6 +661,7 @@ fn build_linkedit_plan(
 
     let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
     let rebase_bytes = build_rebase_stream(layout, synthetic_plan)?;
+    let export_bytes = build_export_trie(&symbol_plan.exports);
     let function_starts_bytes = build_function_starts(layout)?;
     let data_in_code_bytes = Vec::new();
 
@@ -665,6 +674,7 @@ fn build_linkedit_plan(
         bind_streams.lazy_bind.len(),
         "lazy bind stream offset",
     )?;
+    let export_off = place_optional_block(&mut cursor, export_bytes.len(), "export trie offset")?;
     let function_starts = place_linkedit_data_block(
         &mut cursor,
         function_starts_bytes.len(),
@@ -704,6 +714,8 @@ fn build_linkedit_plan(
             bind_size: bind_streams.bind.len() as u32,
             lazy_bind_off,
             lazy_bind_size: bind_streams.lazy_bind.len() as u32,
+            export_off,
+            export_size: export_bytes.len() as u32,
             ..DyldInfoCmd::default()
         },
         function_starts,
@@ -713,6 +725,7 @@ fn build_linkedit_plan(
         rebase_bytes,
         bind_bytes: bind_streams.bind,
         lazy_bind_bytes: bind_streams.lazy_bind,
+        export_bytes,
         function_starts_bytes,
         data_in_code_bytes,
         strtab_bytes: symbol_plan.strtab_bytes,
@@ -767,6 +780,7 @@ struct SymbolTablePlan {
     symbols: Vec<InputSymbol>,
     strtab_bytes: Vec<u8>,
     symbol_indices: HashMap<SymbolId, u32>,
+    exports: Vec<ExportEntry>,
     dysymtab: DysymtabCmd,
 }
 
@@ -947,6 +961,7 @@ fn build_output_symbols(
 ) -> Result<SymbolTablePlan, WriteError> {
     let sym_table = inputs.0.sym_table;
     let atom_sections = atom_section_ordinals(layout);
+    let image_base = layout.segment("__TEXT").map(|seg| seg.vm_addr).unwrap_or(0);
     let mut locals = Vec::new();
     let mut external_defineds = Vec::new();
     let mut undefineds = Vec::with_capacity(imports.len());
@@ -1043,6 +1058,19 @@ fn build_output_symbols(
     }
     undefineds.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
 
+    let exports = if kind == OutputKind::Dylib {
+        external_defineds
+            .iter()
+            .map(|spec| ExportEntry {
+                name: spec.name.clone(),
+                flags: export_symbol_flags(layout, spec.n_desc, spec.n_type, spec.n_sect),
+                kind: export_symbol_kind(layout, image_base, spec.n_type, spec.n_sect, spec.n_value),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let local_count = if strip_locals { 0 } else { locals.len() };
     let mut specs = Vec::with_capacity(local_count + external_defineds.len() + undefineds.len());
     if !strip_locals {
@@ -1092,6 +1120,7 @@ fn build_output_symbols(
         symbols,
         strtab_bytes,
         symbol_indices,
+        exports,
         dysymtab: DysymtabCmd {
             ilocalsym: 0,
             nlocalsym,
@@ -1238,6 +1267,55 @@ fn atom_section_ordinals(layout: &Layout) -> HashMap<crate::resolve::AtomId, u8>
         }
     }
     out
+}
+
+fn export_symbol_flags(layout: &Layout, n_desc: u16, n_type: u8, n_sect: u8) -> u64 {
+    let mut flags = 0u64;
+    if n_desc & N_WEAK_DEF != 0 {
+        flags |= EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION;
+    }
+    match n_type & N_TYPE {
+        N_ABS => flags | EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE,
+        _ if section_is_thread_local(layout, n_sect) => {
+            flags | EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL
+        }
+        _ => flags,
+    }
+}
+
+fn export_symbol_kind(
+    layout: &Layout,
+    image_base: u64,
+    n_type: u8,
+    n_sect: u8,
+    n_value: u64,
+) -> ExportKind {
+    match n_type & N_TYPE {
+        N_ABS => ExportKind::Absolute { address: n_value },
+        _ if section_is_thread_local(layout, n_sect) => ExportKind::ThreadLocal {
+            address: n_value.saturating_sub(image_base),
+        },
+        _ => ExportKind::Regular {
+            address: n_value.saturating_sub(image_base),
+        },
+    }
+}
+
+fn section_is_thread_local(layout: &Layout, n_sect: u8) -> bool {
+    if n_sect == 0 {
+        return false;
+    }
+    layout
+        .sections
+        .get(n_sect as usize - 1)
+        .map(|section| {
+            matches!(
+                section.kind,
+                crate::section::SectionKind::ThreadLocalRegular
+                    | crate::section::SectionKind::ThreadLocalZeroFill
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn defined_symbol_type(private_extern: bool) -> u8 {

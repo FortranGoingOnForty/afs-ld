@@ -308,3 +308,44 @@ fn linker_run_carries_tbd_inputs_into_load_commands() {
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
 }
+
+#[test]
+fn linker_run_handles_non_standard_segment_without_panicking() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("custom-segment.o");
+    let out = scratch("custom-segment.out");
+    let src = r#"
+        .section __FOO,__bar
+        .globl _custom
+        _custom:
+            .quad 1
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
+    assert!(commands.iter().any(|cmd| match cmd {
+        LoadCommand::Segment64(seg) => seg.segname_str() == "__FOO",
+        _ => false,
+    }));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}

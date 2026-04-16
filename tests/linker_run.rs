@@ -2148,6 +2148,8 @@ fn linker_run_partitions_symtab_like_ld() {
         .globl _visible
         .globl _main
         .p2align 2
+    _local:
+        ret
     _hidden:
         ret
     _visible:

@@ -5,17 +5,20 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::atom::AtomTable;
+use crate::input::ObjectFile;
 use crate::leb::{write_sleb, write_uleb};
-use crate::layout::{Layout, PAGE_SIZE};
+use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
 use crate::macho::constants::*;
 use crate::macho::dylib::DylibDependency;
 use crate::macho::reader::{
     write_commands, write_header, BuildVersionCmd, BuildTool, DyldInfoCmd, DysymtabCmd,
     DylibCmd, LoadCommand, MachHeader64, Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
 };
+use crate::resolve::InputId;
 use crate::resolve::{Symbol, SymbolId, SymbolTable};
 use crate::string_table::StringTableBuilder;
-use crate::symbol::{write_nlist_table, InputSymbol, RawNlist};
+use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::{code_sig::CodeSignaturePlan, SyntheticPlan};
 use crate::{LinkOptions, OutputKind};
@@ -24,6 +27,14 @@ use crate::{LinkOptions, OutputKind};
 pub struct EntryPoint {
     pub atom: crate::resolve::AtomId,
     pub atom_value: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct LinkEditContext<'a> {
+    pub layout_inputs: &'a [LayoutInput<'a>],
+    pub atom_table: &'a AtomTable,
+    pub sym_table: &'a SymbolTable,
+    pub synthetic_plan: &'a SyntheticPlan,
 }
 
 #[derive(Debug)]
@@ -108,10 +119,15 @@ pub fn finalize_layout_with_linkedit(
     kind: OutputKind,
     opts: &LinkOptions,
     dylibs: &[DylibDependency],
-    sym_table: &SymbolTable,
-    synthetic_plan: &SyntheticPlan,
+    context: LinkEditContext<'_>,
 ) -> Result<(Layout, LinkEditPlan), WriteError> {
-    finalize_with_linkedit(layout, kind, opts, dylibs, Some((sym_table, synthetic_plan)))
+    finalize_with_linkedit(
+        layout,
+        kind,
+        opts,
+        dylibs,
+        Some(LinkEditInputs(context)),
+    )
 }
 
 fn finalize_with_linkedit(
@@ -119,15 +135,15 @@ fn finalize_with_linkedit(
     kind: OutputKind,
     opts: &LinkOptions,
     dylibs: &[DylibDependency],
-    imports: Option<(&SymbolTable, &SyntheticPlan)>,
+    inputs: Option<LinkEditInputs<'_>>,
 ) -> Result<(Layout, LinkEditPlan), WriteError> {
     let mut layout = layout.clone();
-    let mut linkedit = build_linkedit_plan(&layout, kind, opts, imports)?;
+    let mut linkedit = build_linkedit_plan(&layout, kind, opts, inputs)?;
     apply_indirect_starts(&mut layout, &linkedit);
     let header_size = estimate_header_size(&layout, kind, opts, dylibs, &linkedit);
     layout.relayout(header_size);
 
-    linkedit = build_linkedit_plan(&layout, kind, opts, imports)?;
+    linkedit = build_linkedit_plan(&layout, kind, opts, inputs)?;
     apply_indirect_starts(&mut layout, &linkedit);
     let sizeofcmds: u32 = build_commands(&layout, kind, opts, None, dylibs, &linkedit)?
         .iter()
@@ -135,7 +151,7 @@ fn finalize_with_linkedit(
         .sum();
     let header_size = HEADER_SIZE as u64 + sizeofcmds as u64;
     layout.relayout(header_size);
-    linkedit = build_linkedit_plan(&layout, kind, opts, imports)?;
+    linkedit = build_linkedit_plan(&layout, kind, opts, inputs)?;
     apply_indirect_starts(&mut layout, &linkedit);
 
     let linkedit_seg = layout
@@ -522,7 +538,7 @@ fn build_linkedit_plan(
     layout: &Layout,
     kind: OutputKind,
     opts: &LinkOptions,
-    imports: Option<(&SymbolTable, &SyntheticPlan)>,
+    inputs: Option<LinkEditInputs<'_>>,
 ) -> Result<LinkEditPlan, WriteError> {
     let linkedit = layout
         .segment("__LINKEDIT")
@@ -530,7 +546,7 @@ fn build_linkedit_plan(
         .ok_or(WriteError::MissingSegment("__LINKEDIT"))?;
     let base_off = u32_fit(linkedit.file_off, "linkedit file offset")?;
 
-    let Some((sym_table, synthetic_plan)) = imports else {
+    let Some(inputs) = inputs else {
         return Ok(LinkEditPlan {
             base_off,
             symtab: SymtabCmd {
@@ -552,11 +568,13 @@ fn build_linkedit_plan(
             lazy_bind_offsets: HashMap::new(),
         });
     };
+    let sym_table = inputs.0.sym_table;
+    let synthetic_plan = inputs.0.synthetic_plan;
 
     let imports = collect_imports(sym_table, synthetic_plan)?;
     let import_lookup: HashMap<SymbolId, &ImportSymbolRecord> =
         imports.iter().map(|record| (record.symbol, record)).collect();
-    let symbol_plan = build_output_symbols(layout, kind, sym_table, &imports)?;
+    let symbol_plan = build_output_symbols(layout, kind, inputs, &imports)?;
 
     let mut symtab_bytes = Vec::new();
     write_nlist_table(&symbol_plan.symbols, &mut symtab_bytes);
@@ -674,6 +692,9 @@ struct ImportSymbolRecord {
     ordinal: u16,
     weak_import: bool,
 }
+
+#[derive(Clone, Copy)]
+struct LinkEditInputs<'a>(LinkEditContext<'a>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputSymbolPartition {
@@ -811,9 +832,10 @@ fn collect_imports(
 fn build_output_symbols(
     layout: &Layout,
     kind: OutputKind,
-    sym_table: &SymbolTable,
+    inputs: LinkEditInputs<'_>,
     imports: &[ImportSymbolRecord],
 ) -> Result<SymbolTablePlan, WriteError> {
+    let sym_table = inputs.0.sym_table;
     let atom_sections = atom_section_ordinals(layout);
     let mut locals = Vec::new();
     let mut external_defineds = Vec::new();
@@ -835,6 +857,17 @@ fn build_output_symbols(
         });
     }
 
+    for input in inputs.0.layout_inputs {
+        collect_local_symbols(
+            layout,
+            inputs.0.atom_table,
+            &atom_sections,
+            input.id,
+            input.object,
+            &mut locals,
+        )?;
+    }
+
     for (symbol_id, symbol) in sym_table.iter() {
         let Symbol::Defined {
             name,
@@ -848,6 +881,9 @@ fn build_output_symbols(
         else {
             continue;
         };
+        if *private_extern {
+            continue;
+        }
         let name = sym_table.interner.resolve(*name).to_string();
         let (n_type, n_sect, n_value) = if atom.0 == 0 {
             (absolute_symbol_type(*private_extern), NO_SECT, *value)
@@ -867,24 +903,15 @@ fn build_output_symbols(
         if *no_dead_strip {
             n_desc |= N_NO_DEAD_STRIP;
         }
-        let spec = OutputSymbolSpec {
+        external_defineds.push(OutputSymbolSpec {
             symbol: Some(symbol_id),
             name,
-            partition: if *private_extern {
-                OutputSymbolPartition::Local
-            } else {
-                OutputSymbolPartition::ExternalDefined
-            },
+            partition: OutputSymbolPartition::ExternalDefined,
             n_type,
             n_sect,
             n_desc,
             n_value,
-        };
-        if *private_extern {
-            locals.push(spec);
-        } else {
-            external_defineds.push(spec);
-        }
+        });
     }
 
     external_defineds.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
@@ -961,6 +988,102 @@ fn build_output_symbols(
             ..DysymtabCmd::default()
         },
     })
+}
+
+fn collect_local_symbols(
+    layout: &Layout,
+    atom_table: &AtomTable,
+    atom_sections: &HashMap<crate::resolve::AtomId, u8>,
+    input_id: InputId,
+    object: &ObjectFile,
+    out: &mut Vec<OutputSymbolSpec>,
+) -> Result<(), WriteError> {
+    for input_sym in &object.symbols {
+        if input_sym.stab_kind().is_some() {
+            continue;
+        }
+        if input_sym.is_ext() && !input_sym.is_private_ext() {
+            continue;
+        }
+        let name = object.symbol_name(input_sym).unwrap_or("").to_string();
+        if is_assembler_temporary_symbol(&name) {
+            continue;
+        }
+        match input_sym.kind() {
+            SymKind::Sect => {
+                let section = object.section_for_symbol(input_sym).expect("section symbol without section");
+                let offset = input_sym.value().saturating_sub(section.addr) as u32;
+                let (atom_id, delta) = find_containing_atom(atom_table, input_id, input_sym.sect_idx(), offset)
+                    .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
+                let addr = layout
+                    .atom_addr(atom_id)
+                    .ok_or(WriteError::DefinedSymbolAtomMissing(SymbolId(u32::MAX), atom_id))?
+                    + delta as u64;
+                let n_sect = *atom_sections
+                    .get(&atom_id)
+                    .ok_or(WriteError::DefinedSymbolSectionMissing(SymbolId(u32::MAX), atom_id))?;
+                out.push(OutputSymbolSpec {
+                    symbol: None,
+                    name,
+                    partition: OutputSymbolPartition::Local,
+                    n_type: input_symbol_type(input_sym),
+                    n_sect,
+                    n_desc: input_sym.raw.n_desc,
+                    n_value: addr,
+                });
+            }
+            SymKind::Abs => {
+                out.push(OutputSymbolSpec {
+                    symbol: None,
+                    name,
+                    partition: OutputSymbolPartition::Local,
+                    n_type: input_symbol_type(input_sym),
+                    n_sect: NO_SECT,
+                    n_desc: input_sym.raw.n_desc,
+                    n_value: input_sym.value(),
+                });
+            }
+            SymKind::Undef | SymKind::Indirect => {}
+        }
+    }
+    Ok(())
+}
+
+fn is_assembler_temporary_symbol(name: &str) -> bool {
+    name.starts_with('L') || name.starts_with("ltmp")
+}
+
+fn find_containing_atom(
+    atom_table: &AtomTable,
+    input_id: InputId,
+    input_section: u8,
+    offset: u32,
+) -> Option<(crate::resolve::AtomId, u32)> {
+    let atoms = atom_table.by_input_section();
+    atoms.get(&(input_id, input_section)).and_then(|ids| {
+        ids.iter().find_map(|atom_id| {
+            let atom = atom_table.get(*atom_id);
+            let start = atom.input_offset;
+            let end = atom.input_offset.saturating_add(atom.size);
+            (start <= offset && offset < end).then_some((*atom_id, offset - start))
+        })
+    })
+}
+
+fn input_symbol_type(input_sym: &InputSymbol) -> u8 {
+    let mut n_type = match input_sym.kind() {
+        SymKind::Sect => N_SECT,
+        SymKind::Abs => N_ABS,
+        SymKind::Undef => N_UNDF,
+        SymKind::Indirect => N_INDR,
+    };
+    if input_sym.is_private_ext() {
+        n_type |= N_PEXT;
+    }
+    if input_sym.is_ext() {
+        n_type |= N_EXT;
+    }
+    n_type
 }
 
 fn atom_section_ordinals(layout: &Layout) -> HashMap<crate::resolve::AtomId, u8> {

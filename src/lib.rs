@@ -282,8 +282,12 @@ impl Linker {
             opts.kind,
             opts,
             &dylib_loads,
-            &sym_table,
-            &synthetic_plan,
+            macho::writer::LinkEditContext {
+                layout_inputs: &layout_inputs,
+                atom_table: &atom_table,
+                sym_table: &sym_table,
+                synthetic_plan: &synthetic_plan,
+            },
         )?;
         reloc::arm64::apply_layout(
             &mut layout,

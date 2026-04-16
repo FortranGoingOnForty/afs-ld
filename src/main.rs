@@ -59,6 +59,10 @@ fn main() -> ExitCode {
             diag::error("no input files");
             ExitCode::from(2)
         }
+        Err(LinkError::DuplicateSymbols(msg)) | Err(LinkError::UndefinedSymbols(msg)) => {
+            diag::error_verbatim(&msg);
+            ExitCode::from(1)
+        }
         Err(e) => {
             diag::error(&e.to_string());
             ExitCode::from(1)

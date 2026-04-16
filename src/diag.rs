@@ -10,3 +10,9 @@ pub fn error(msg: &str) {
     let mut h = stderr.lock();
     let _ = writeln!(h, "afs-ld: error: {msg}");
 }
+
+pub fn error_verbatim(msg: &str) {
+    let stderr = std::io::stderr();
+    let mut h = stderr.lock();
+    let _ = writeln!(h, "{msg}");
+}

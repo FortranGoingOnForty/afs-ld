@@ -1,6 +1,14 @@
 use std::collections::BTreeMap;
 
 use crate::leb::{write_sleb, write_uleb};
+use crate::macho::constants::{
+    BIND_IMMEDIATE_MASK, BIND_OPCODE_DO_BIND, BIND_OPCODE_SET_ADDEND_SLEB,
+    BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
+    BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
+    BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, BIND_TYPE_POINTER, REBASE_IMMEDIATE_MASK,
+    REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
+};
 use crate::macho::exports::{ExportEntry, ExportKind};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -38,9 +46,28 @@ impl OpcodeStream {
         self.buf.push(0);
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
     pub fn into_vec(self) -> Vec<u8> {
         self.buf
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindRecordSpec<'a> {
+    pub segment_index: u8,
+    pub segment_offset: u64,
+    pub ordinal: u16,
+    pub name: &'a str,
+    pub weak_import: bool,
+    pub addend: i64,
+    pub terminate: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -183,6 +210,70 @@ fn uleb_size(mut value: u64) -> usize {
         size += 1;
     }
     size
+}
+
+pub fn emit_rebase_run(out: &mut OpcodeStream, count: usize) {
+    if count <= REBASE_IMMEDIATE_MASK as usize {
+        out.byte(REBASE_OPCODE_DO_REBASE_IMM_TIMES | count as u8);
+    } else {
+        out.byte(REBASE_OPCODE_DO_REBASE_ULEB_TIMES);
+        out.uleb(count as u64);
+    }
+}
+
+pub fn emit_bind_record(out: &mut OpcodeStream, spec: BindRecordSpec<'_>) {
+    emit_bind_ordinal(out, spec.ordinal);
+    out.byte(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | bind_symbol_flags(spec.weak_import));
+    out.string(spec.name);
+    if spec.addend != 0 {
+        out.byte(BIND_OPCODE_SET_ADDEND_SLEB);
+        out.sleb(spec.addend);
+    }
+    out.byte(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
+    out.byte(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (spec.segment_index & BIND_IMMEDIATE_MASK));
+    out.uleb(spec.segment_offset);
+    out.byte(BIND_OPCODE_DO_BIND);
+    if spec.terminate {
+        out.done();
+    }
+}
+
+pub fn emit_lazy_bind_record(
+    out: &mut OpcodeStream,
+    segment_index: u8,
+    segment_offset: u64,
+    ordinal: u16,
+    name: &str,
+    weak_import: bool,
+) {
+    // dyld's lazy-bind stream only accepts the classic lazy subset; pointer type is implicit.
+    out.byte(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segment_index & BIND_IMMEDIATE_MASK));
+    out.uleb(segment_offset);
+    emit_bind_ordinal(out, ordinal);
+    out.byte(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | bind_symbol_flags(weak_import));
+    out.string(name);
+    out.byte(BIND_OPCODE_DO_BIND);
+    out.done();
+}
+
+fn emit_bind_ordinal(out: &mut OpcodeStream, ordinal: u16) {
+    let signed = ordinal as i16;
+    if (-8..=-1).contains(&signed) {
+        out.byte(BIND_OPCODE_SET_DYLIB_SPECIAL_IMM | ((signed as u8) & BIND_IMMEDIATE_MASK));
+    } else if ordinal <= BIND_IMMEDIATE_MASK as u16 {
+        out.byte(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | ordinal as u8);
+    } else {
+        out.byte(BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB);
+        out.uleb(ordinal as u64);
+    }
+}
+
+fn bind_symbol_flags(weak_import: bool) -> u8 {
+    if weak_import {
+        BIND_SYMBOL_FLAGS_WEAK_IMPORT
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]

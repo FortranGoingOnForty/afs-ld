@@ -25,6 +25,7 @@ use afs_ld::macho::constants::{
     SG_READ_ONLY,
 };
 use afs_ld::macho::dylib::DylibFile;
+use afs_ld::macho::exports::ExportKind;
 use afs_ld::macho::reader::{parse_commands, parse_header, u32_le, LoadCommand, Section64Header};
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, SymKind};
@@ -304,6 +305,66 @@ fn canonical_symbol_records(bytes: &[u8]) -> Vec<CanonicalSymbolRecord> {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CanonicalExportKind {
+    Regular(u64),
+    ThreadLocal(u64),
+    Absolute(u64),
+    Reexport { ordinal: u32, imported_name: String },
+    StubAndResolver { stub: u64, resolver: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalExportRecord {
+    name: String,
+    flags: u64,
+    kind: CanonicalExportKind,
+}
+
+fn canonical_export_records(bytes: &[u8]) -> Vec<CanonicalExportRecord> {
+    let dylib = DylibFile::parse("/tmp/canonical.dylib", bytes).unwrap();
+    let symbol_values: HashMap<String, u64> = canonical_symbol_records(bytes)
+        .into_iter()
+        .map(|record| (record.name, record.value))
+        .collect();
+    let mut out = dylib
+        .exports
+        .entries()
+        .unwrap()
+        .into_iter()
+        .map(|entry| {
+            let kind = match entry.kind {
+                ExportKind::Regular { .. } => {
+                    CanonicalExportKind::Regular(*symbol_values.get(&entry.name).unwrap())
+                }
+                ExportKind::ThreadLocal { .. } => {
+                    CanonicalExportKind::ThreadLocal(*symbol_values.get(&entry.name).unwrap())
+                }
+                ExportKind::Absolute { .. } => {
+                    CanonicalExportKind::Absolute(*symbol_values.get(&entry.name).unwrap())
+                }
+                ExportKind::Reexport {
+                    ordinal,
+                    imported_name,
+                } => CanonicalExportKind::Reexport {
+                    ordinal,
+                    imported_name,
+                },
+                ExportKind::StubAndResolver { stub, resolver } => {
+                    CanonicalExportKind::StubAndResolver { stub, resolver }
+                }
+            };
+            CanonicalExportRecord {
+                name: entry.name,
+                flags: entry.flags,
+                kind,
+            }
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+    out
+}
+
 fn raw_string_table(bytes: &[u8]) -> Vec<u8> {
     let (symtab, _) = symtab_and_dysymtab(bytes);
     let start = symtab.stroff as usize;
@@ -447,6 +508,44 @@ fn apple_link_classic_lazy(
     )
 }
 
+fn apple_link_dylib_classic(
+    obj: &PathBuf,
+    out: &PathBuf,
+    install_name: &str,
+    syslibroot: &str,
+    platform_version: &str,
+) -> Result<(), String> {
+    let output = Command::new("xcrun")
+        .args([
+            "ld",
+            "-dylib",
+            "-arch",
+            "arm64",
+            "-platform_version",
+            "macos",
+            platform_version,
+            platform_version,
+            "-syslibroot",
+            syslibroot,
+            "-lSystem",
+            "-install_name",
+            install_name,
+            "-no_fixup_chains",
+        ])
+        .arg("-o")
+        .arg(out)
+        .arg(obj)
+        .output()
+        .map_err(|e| format!("spawn xcrun ld -dylib: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "xcrun ld -dylib failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RebaseRecord {
     segment: String,
@@ -485,12 +584,19 @@ fn dyld_info_command(bytes: &[u8]) -> Result<afs_ld::macho::reader::DyldInfoCmd,
         .ok_or_else(|| "missing LC_DYLD_INFO_ONLY".to_string())
 }
 
-fn dyld_info_stream(bytes: &[u8], lazy: bool) -> Result<Vec<u8>, String> {
+#[derive(Clone, Copy)]
+enum DyldInfoStreamKind {
+    WeakBind,
+    LazyBind,
+    Export,
+}
+
+fn dyld_info_stream(bytes: &[u8], kind: DyldInfoStreamKind) -> Result<Vec<u8>, String> {
     let dyld_info = dyld_info_command(bytes)?;
-    let (off, size) = if lazy {
-        (dyld_info.lazy_bind_off, dyld_info.lazy_bind_size)
-    } else {
-        (dyld_info.bind_off, dyld_info.bind_size)
+    let (off, size) = match kind {
+        DyldInfoStreamKind::WeakBind => (dyld_info.weak_bind_off, dyld_info.weak_bind_size),
+        DyldInfoStreamKind::LazyBind => (dyld_info.lazy_bind_off, dyld_info.lazy_bind_size),
+        DyldInfoStreamKind::Export => (dyld_info.export_off, dyld_info.export_size),
     };
     if size == 0 {
         return Ok(Vec::new());
@@ -503,7 +609,7 @@ fn dyld_info_stream(bytes: &[u8], lazy: bool) -> Result<Vec<u8>, String> {
 }
 
 fn canonical_lazy_bind_stream(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let mut stream = dyld_info_stream(bytes, true)?;
+    let mut stream = dyld_info_stream(bytes, DyldInfoStreamKind::LazyBind)?;
     while stream.len() >= 2
         && stream[stream.len() - 1] == BIND_OPCODE_DONE
         && stream[stream.len() - 2] == BIND_OPCODE_DONE
@@ -1116,6 +1222,70 @@ fn linker_run_emits_minimal_dylib_from_real_object() {
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
+}
+
+#[test]
+fn dylib_export_surfaces_match_apple_ld() {
+    if !have_xcrun() || !have_xcrun_tool("ld") {
+        eprintln!("skipping: xcrun as/ld unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+
+    let obj = scratch("export-parity.o");
+    let our_out = scratch("export-parity-ours.dylib");
+    let apple_out = scratch("export-parity-apple.dylib");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _exported
+        _exported:
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_dylib_classic(
+        &obj,
+        &apple_out,
+        "@rpath/export-parity.dylib",
+        &sdk,
+        &sdk_ver,
+    )
+    .unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert_eq!(
+        canonical_export_records(&our_bytes),
+        canonical_export_records(&apple_bytes)
+    );
+    let our_export_stream = dyld_info_stream(&our_bytes, DyldInfoStreamKind::Export).unwrap();
+    assert!(!our_export_stream.is_empty(), "expected non-empty export trie");
+    assert_eq!(
+        dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind).unwrap(),
+        dyld_info_stream(&apple_bytes, DyldInfoStreamKind::WeakBind).unwrap()
+    );
+
+    let _ = fs::remove_file(apple_out);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(obj);
 }
 
 #[test]
@@ -2158,6 +2328,10 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
     assert_eq!(
         decode_bind_records(&our_bytes, false).unwrap(),
         decode_bind_records(&apple_bytes, false).unwrap()
+    );
+    assert_eq!(
+        dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind).unwrap(),
+        dyld_info_stream(&apple_bytes, DyldInfoStreamKind::WeakBind).unwrap()
     );
     assert_eq!(
         decode_bind_records(&our_bytes, true).unwrap(),

@@ -7,7 +7,7 @@ use std::fmt;
 
 use crate::atom::AtomTable;
 use crate::input::ObjectFile;
-use crate::leb::{write_sleb, write_uleb};
+use crate::leb::write_uleb;
 use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
 use crate::macho::constants::*;
 use crate::macho::exports::{ExportEntry, ExportKind};
@@ -24,7 +24,11 @@ use crate::string_table::StringTableBuilder;
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind};
 use crate::synth::stubs::{STUB_HELPER_ENTRY_SIZE, STUB_HELPER_HEADER_SIZE, STUB_SIZE};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
-use crate::synth::{code_sig::CodeSignaturePlan, dyld_info::build_export_trie, SyntheticPlan};
+use crate::synth::{
+    code_sig::CodeSignaturePlan,
+    dyld_info::{build_export_trie, emit_bind_record, emit_lazy_bind_record, emit_rebase_run, BindRecordSpec, OpcodeStream},
+    SyntheticPlan,
+};
 use crate::{LinkOptions, OutputKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +246,7 @@ pub fn write_finalized_with_linkedit(
     let indirectoff = linkedit_plan.dysymtab.indirectsymoff as usize;
     let rebaseoff = linkedit_plan.dyld_info.rebase_off as usize;
     let bindoff = linkedit_plan.dyld_info.bind_off as usize;
+    let weak_bind_off = linkedit_plan.dyld_info.weak_bind_off as usize;
     let lazy_bind_off = linkedit_plan.dyld_info.lazy_bind_off as usize;
     let export_off = linkedit_plan.dyld_info.export_off as usize;
     let function_starts_off = linkedit_plan.function_starts.dataoff as usize;
@@ -262,6 +267,10 @@ pub fn write_finalized_with_linkedit(
     if !linkedit_plan.bind_bytes.is_empty() {
         let end = bindoff + linkedit_plan.bind_bytes.len();
         out[bindoff..end].copy_from_slice(&linkedit_plan.bind_bytes);
+    }
+    if !linkedit_plan.weak_bind_bytes.is_empty() {
+        let end = weak_bind_off + linkedit_plan.weak_bind_bytes.len();
+        out[weak_bind_off..end].copy_from_slice(&linkedit_plan.weak_bind_bytes);
     }
     if !linkedit_plan.lazy_bind_bytes.is_empty() {
         let end = lazy_bind_off + linkedit_plan.lazy_bind_bytes.len();
@@ -535,6 +544,7 @@ pub struct LinkEditPlan {
     pub indirect_bytes: Vec<u8>,
     rebase_bytes: Vec<u8>,
     bind_bytes: Vec<u8>,
+    weak_bind_bytes: Vec<u8>,
     lazy_bind_bytes: Vec<u8>,
     export_bytes: Vec<u8>,
     function_starts_bytes: Vec<u8>,
@@ -601,6 +611,7 @@ fn build_linkedit_plan(
             indirect_bytes: Vec::new(),
             rebase_bytes: Vec::new(),
             bind_bytes: Vec::new(),
+            weak_bind_bytes: Vec::new(),
             lazy_bind_bytes: Vec::new(),
             export_bytes: Vec::new(),
             function_starts_bytes: Vec::new(),
@@ -669,6 +680,11 @@ fn build_linkedit_plan(
     let rebase_off = place_optional_block(&mut cursor, rebase_bytes.len(), "rebase stream offset")?;
     let bindoff =
         place_optional_block(&mut cursor, bind_streams.bind.len(), "bind stream offset")?;
+    let weak_bind_off = place_optional_block(
+        &mut cursor,
+        bind_streams.weak_bind.len(),
+        "weak bind stream offset",
+    )?;
     let lazy_bind_off = place_optional_block(
         &mut cursor,
         bind_streams.lazy_bind.len(),
@@ -712,11 +728,12 @@ fn build_linkedit_plan(
             rebase_size: rebase_bytes.len() as u32,
             bind_off: bindoff,
             bind_size: bind_streams.bind.len() as u32,
+            weak_bind_off,
+            weak_bind_size: bind_streams.weak_bind.len() as u32,
             lazy_bind_off,
             lazy_bind_size: bind_streams.lazy_bind.len() as u32,
             export_off,
             export_size: export_bytes.len() as u32,
-            ..DyldInfoCmd::default()
         },
         function_starts,
         data_in_code,
@@ -724,6 +741,7 @@ fn build_linkedit_plan(
         indirect_bytes,
         rebase_bytes,
         bind_bytes: bind_streams.bind,
+        weak_bind_bytes: bind_streams.weak_bind,
         lazy_bind_bytes: bind_streams.lazy_bind,
         export_bytes,
         function_starts_bytes,
@@ -786,18 +804,9 @@ struct SymbolTablePlan {
 
 struct BindStreams {
     bind: Vec<u8>,
+    weak_bind: Vec<u8>,
     lazy_bind: Vec<u8>,
     lazy_offsets: HashMap<SymbolId, u32>,
-}
-
-struct BindRecordSpec<'a> {
-    segment_index: u8,
-    segment_offset: u64,
-    ordinal: u16,
-    name: &'a str,
-    weak_import: bool,
-    addend: i64,
-    terminate: bool,
 }
 
 fn build_rebase_stream(
@@ -818,22 +827,13 @@ fn build_rebase_stream(
         .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
         .ok_or(WriteError::MissingSegment("__DATA"))?;
 
-    let mut out = Vec::new();
-    out.push(REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER);
-    out.push(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segment_index & REBASE_IMMEDIATE_MASK));
-    write_uleb(section.addr - segment.vm_addr, &mut out);
+    let mut out = OpcodeStream::new();
+    out.byte(REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER);
+    out.byte(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segment_index & REBASE_IMMEDIATE_MASK));
+    out.uleb(section.addr - segment.vm_addr);
     emit_rebase_run(&mut out, synthetic_plan.lazy_pointers.entries.len());
-    out.push(REBASE_OPCODE_DONE);
-    Ok(out)
-}
-
-fn emit_rebase_run(out: &mut Vec<u8>, count: usize) {
-    if count <= REBASE_IMMEDIATE_MASK as usize {
-        out.push(REBASE_OPCODE_DO_REBASE_IMM_TIMES | count as u8);
-    } else {
-        out.push(REBASE_OPCODE_DO_REBASE_ULEB_TIMES);
-        write_uleb(count as u64, out);
-    }
+    out.done();
+    Ok(out.into_vec())
 }
 
 fn build_function_starts(layout: &Layout) -> Result<Vec<u8>, WriteError> {
@@ -1393,8 +1393,9 @@ fn build_bind_streams(
     synthetic_plan: &SyntheticPlan,
     imports: &HashMap<SymbolId, &ImportSymbolRecord>,
 ) -> Result<BindStreams, WriteError> {
-    let mut bind = Vec::new();
-    let mut lazy_bind = Vec::new();
+    let mut bind = OpcodeStream::new();
+    let weak_bind = Vec::new();
+    let mut lazy_bind = OpcodeStream::new();
     let mut lazy_offsets = HashMap::new();
 
     if !synthetic_plan.got.entries.is_empty() {
@@ -1497,7 +1498,7 @@ fn build_bind_streams(
     }
 
     if !bind.is_empty() {
-        bind.push(BIND_OPCODE_DONE);
+        bind.done();
     }
 
     if !synthetic_plan.lazy_pointers.entries.is_empty() {
@@ -1529,67 +1530,11 @@ fn build_bind_streams(
     }
 
     Ok(BindStreams {
-        bind,
-        lazy_bind,
+        bind: bind.into_vec(),
+        weak_bind,
+        lazy_bind: lazy_bind.into_vec(),
         lazy_offsets,
     })
-}
-
-fn emit_bind_record(out: &mut Vec<u8>, spec: BindRecordSpec<'_>) {
-    emit_bind_ordinal(out, spec.ordinal);
-    out.push(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | bind_symbol_flags(spec.weak_import));
-    out.extend_from_slice(spec.name.as_bytes());
-    out.push(0);
-    if spec.addend != 0 {
-        out.push(BIND_OPCODE_SET_ADDEND_SLEB);
-        write_sleb(spec.addend, out);
-    }
-    out.push(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
-    out.push(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (spec.segment_index & BIND_IMMEDIATE_MASK));
-    write_uleb(spec.segment_offset, out);
-    out.push(BIND_OPCODE_DO_BIND);
-    if spec.terminate {
-        out.push(BIND_OPCODE_DONE);
-    }
-}
-
-fn emit_lazy_bind_record(
-    out: &mut Vec<u8>,
-    segment_index: u8,
-    segment_offset: u64,
-    ordinal: u16,
-    name: &str,
-    weak_import: bool,
-) {
-    // dyld's lazy-bind stream only accepts the classic lazy subset; pointer type is implicit.
-    out.push(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segment_index & BIND_IMMEDIATE_MASK));
-    write_uleb(segment_offset, out);
-    emit_bind_ordinal(out, ordinal);
-    out.push(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | bind_symbol_flags(weak_import));
-    out.extend_from_slice(name.as_bytes());
-    out.push(0);
-    out.push(BIND_OPCODE_DO_BIND);
-    out.push(BIND_OPCODE_DONE);
-}
-
-fn emit_bind_ordinal(out: &mut Vec<u8>, ordinal: u16) {
-    let signed = ordinal as i16;
-    if (-8..=-1).contains(&signed) {
-        out.push(BIND_OPCODE_SET_DYLIB_SPECIAL_IMM | ((signed as u8) & BIND_IMMEDIATE_MASK));
-    } else if ordinal <= BIND_IMMEDIATE_MASK as u16 {
-        out.push(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | ordinal as u8);
-    } else {
-        out.push(BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB);
-        write_uleb(ordinal as u64, out);
-    }
-}
-
-fn bind_symbol_flags(weak_import: bool) -> u8 {
-    if weak_import {
-        BIND_SYMBOL_FLAGS_WEAK_IMPORT
-    } else {
-        0
-    }
 }
 
 fn segment_index(layout: &Layout, name: &str) -> Result<u8, WriteError> {

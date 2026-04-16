@@ -4079,6 +4079,96 @@ fn linker_run_preserves_exception_unwind_metadata_like_apple_ld() {
     assert_eq!(our_decoded.personalities.len(), 1);
     assert_eq!(our_decoded.lsdas.len(), 1);
     assert!(output_section(&our_bytes, "__TEXT", "__gcc_except_tab").is_some());
+    let our_status = Command::new(&our_out).status().unwrap();
+    let apple_status = Command::new(&apple_out).status().unwrap();
+    assert_eq!(our_status.code(), Some(42));
+    assert_eq!(apple_status.code(), Some(42));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_resolves_backtrace_symbols_at_runtime() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("execinfo-backtrace.o");
+    let our_out = scratch("execinfo-backtrace-ours.out");
+    let apple_out = scratch("execinfo-backtrace-apple.out");
+    let src = r#"
+        #include <execinfo.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+
+        __attribute__((noinline)) int helper(void) {
+            void *frames[8];
+            int n = backtrace(frames, 8);
+            char **syms = backtrace_symbols(frames, n);
+            int saw_helper = 0;
+            int saw_main = 0;
+            if (!syms) return 2;
+            for (int i = 0; i < n; i++) {
+                puts(syms[i]);
+                saw_helper |= strstr(syms[i], "helper") != NULL;
+                saw_main |= strstr(syms[i], "main") != NULL;
+            }
+            free(syms);
+            return (saw_helper && saw_main) ? 0 : 1;
+        }
+
+        int main(void) {
+            return helper();
+        }
+    "#;
+    if let Err(e) = compile_c(src, &obj) {
+        eprintln!("skipping: clang compile failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_classic_lazy(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_output = Command::new(&our_out).output().unwrap();
+    let apple_output = Command::new(&apple_out).output().unwrap();
+    let our_stdout = String::from_utf8_lossy(&our_output.stdout);
+    let apple_stdout = String::from_utf8_lossy(&apple_output.stdout);
+
+    assert_eq!(our_output.status.code(), Some(0));
+    assert_eq!(apple_output.status.code(), Some(0));
+    assert!(our_stdout.contains("helper"), "expected helper in output: {our_stdout}");
+    assert!(our_stdout.contains("main"), "expected main in output: {our_stdout}");
+    assert!(
+        apple_stdout.contains("helper"),
+        "expected helper in apple output: {apple_stdout}"
+    );
+    assert!(
+        apple_stdout.contains("main"),
+        "expected main in apple output: {apple_stdout}"
+    );
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);

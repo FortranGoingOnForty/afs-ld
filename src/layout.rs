@@ -287,6 +287,7 @@ fn build_segments(kind: OutputKind, sections: &[OutputSection]) -> Vec<OutputSeg
     };
     let mut segments: Vec<OutputSegment> = names
         .iter()
+        .filter(|name| standard_segment_required(kind, name, sections))
         .map(|name| OutputSegment {
             name: (*name).to_string(),
             sections: Vec::new(),
@@ -328,6 +329,13 @@ fn build_segments(kind: OutputKind, sections: &[OutputSection]) -> Vec<OutputSeg
         );
     }
     segments
+}
+
+fn standard_segment_required(kind: OutputKind, name: &&str, sections: &[OutputSection]) -> bool {
+    match (kind, *name) {
+        (OutputKind::Executable, "__PAGEZERO") | (_, "__TEXT") | (_, "__LINKEDIT") => true,
+        _ => sections.iter().any(|section| section.segment == *name),
+    }
 }
 
 fn segment_rank(kind: OutputKind, segment: &str) -> usize {

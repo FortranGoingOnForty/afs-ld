@@ -471,4 +471,26 @@ mod tests {
         assert_eq!(linkedit.fileoff % PAGE_SIZE, 0);
         assert!(linkedit.fileoff >= text.filesize);
     }
+
+    #[test]
+    fn text_only_executable_omits_empty_data_segments() {
+        let layout = Layout::empty(OutputKind::Executable, 0);
+        let mut bytes = Vec::new();
+        write(&layout, OutputKind::Executable, &LinkOptions::default(), &mut bytes).unwrap();
+
+        let header = crate::macho::reader::parse_header(&bytes).unwrap();
+        let commands = crate::macho::reader::parse_commands(&header, &bytes).unwrap();
+        let segment_names: Vec<String> = commands
+            .into_iter()
+            .filter_map(|cmd| match cmd {
+                LoadCommand::Segment64(seg) => Some(seg.segname_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(segment_names.iter().any(|name| name == "__TEXT"));
+        assert!(segment_names.iter().any(|name| name == "__LINKEDIT"));
+        assert!(!segment_names.iter().any(|name| name == "__DATA_CONST"));
+        assert!(!segment_names.iter().any(|name| name == "__DATA"));
+    }
 }

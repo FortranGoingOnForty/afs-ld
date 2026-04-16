@@ -346,6 +346,7 @@ fn build_commands(
             version: pack_version(0, 1, 0),
         }],
     }));
+    commands.push(raw_uuid_command(stable_uuid(layout, kind)));
 
     match kind {
         OutputKind::Executable => {
@@ -418,6 +419,7 @@ fn estimate_header_size(
         }],
     }
     .wire_size() as u64;
+    size += 24;
     size += match kind {
         OutputKind::Executable => raw_dylinker_command("/usr/lib/dyld").cmdsize() as u64 + 24,
         OutputKind::Dylib => DylibCmd {
@@ -520,6 +522,14 @@ fn raw_dylinker_command(path: &str) -> LoadCommand {
     }
 }
 
+fn raw_uuid_command(uuid: [u8; 16]) -> LoadCommand {
+    LoadCommand::Raw {
+        cmd: LC_UUID,
+        cmdsize: 24,
+        data: uuid.to_vec(),
+    }
+}
+
 fn raw_linkedit_command(cmd: u32, dataoff: u32, datasize: u32) -> LoadCommand {
     let mut data = Vec::with_capacity(8);
     data.extend_from_slice(&dataoff.to_le_bytes());
@@ -529,6 +539,47 @@ fn raw_linkedit_command(cmd: u32, dataoff: u32, datasize: u32) -> LoadCommand {
         cmdsize: 16,
         data,
     }
+}
+
+fn stable_uuid(layout: &Layout, kind: OutputKind) -> [u8; 16] {
+    fn mix(state: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *state ^= u64::from(*byte);
+            *state = state.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    let mut lo = 0xcbf29ce484222325u64;
+    let mut hi = 0x84222325cbf29ce4u64;
+    mix(
+        &mut lo,
+        &[match kind {
+            OutputKind::Executable => 1,
+            OutputKind::Dylib => 2,
+        }],
+    );
+    for segment in &layout.segments {
+        mix(&mut lo, segment.name.as_bytes());
+        mix(&mut lo, &segment.vm_addr.to_le_bytes());
+        mix(&mut lo, &segment.vm_size.to_le_bytes());
+        mix(&mut hi, &segment.file_off.to_le_bytes());
+        mix(&mut hi, &segment.file_size.to_le_bytes());
+        mix(&mut hi, &segment.flags.to_le_bytes());
+    }
+    for section in &layout.sections {
+        mix(&mut lo, section.segment.as_bytes());
+        mix(&mut lo, section.name.as_bytes());
+        mix(&mut lo, &section.addr.to_le_bytes());
+        mix(&mut hi, &section.size.to_le_bytes());
+        mix(&mut hi, &section.file_off.to_le_bytes());
+        mix(&mut hi, &section.flags.to_le_bytes());
+    }
+    let mut uuid = [0u8; 16];
+    uuid[..8].copy_from_slice(&lo.to_be_bytes());
+    uuid[8..].copy_from_slice(&hi.to_be_bytes());
+    uuid[6] = (uuid[6] & 0x0f) | 0x40;
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;
+    uuid
 }
 
 fn header_flags(layout: &Layout, kind: OutputKind) -> u32 {

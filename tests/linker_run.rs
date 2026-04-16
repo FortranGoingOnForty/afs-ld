@@ -1708,6 +1708,7 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
     let commands = parse_commands(&header, &bytes).unwrap();
     let mut text_size = 0u64;
     let mut has_dylinker = false;
+    let mut has_uuid = false;
     for cmd in commands {
         match cmd {
             LoadCommand::Segment64(seg) => {
@@ -1724,6 +1725,9 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
                     .windows(b"/usr/lib/dyld\0".len())
                     .any(|window| window == b"/usr/lib/dyld\0");
             }
+            LoadCommand::Raw { cmd, data, .. } if cmd == afs_ld::macho::constants::LC_UUID => {
+                has_uuid = data.len() == 16 && data.iter().any(|byte| *byte != 0);
+            }
             _ => {}
         }
     }
@@ -1732,6 +1736,7 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
         has_dylinker,
         "expected LC_LOAD_DYLINKER in executable output"
     );
+    assert!(has_uuid, "expected LC_UUID in executable output");
     assert!(
         fs::metadata(&out).unwrap().permissions().mode() & 0o111 != 0,
         "expected executable output mode"

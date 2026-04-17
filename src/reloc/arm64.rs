@@ -1000,7 +1000,7 @@ fn patch_pageoff12(
     let imm = if is_add_immediate(insn) {
         pageoff
     } else {
-        let shift = ((insn >> 30) & 0b11) as u64;
+        let shift = pageoff_load_store_shift(insn);
         let scale = 1u64 << shift;
         if !pageoff.is_multiple_of(scale) {
             return Err(reloc_error(
@@ -1034,6 +1034,28 @@ fn patch_pageoff12(
         reloc.kind,
         &describe_referent(obj, reloc.referent),
     )
+}
+
+fn pageoff_load_store_shift(insn: u32) -> u64 {
+    if is_simd_fp_pageoff(insn) {
+        simd_fp_pageoff_shift(insn)
+    } else {
+        ((insn >> 30) & 0b11) as u64
+    }
+}
+
+fn is_simd_fp_pageoff(insn: u32) -> bool {
+    ((insn >> 24) & 0b111) == 0b101
+}
+
+fn simd_fp_pageoff_shift(insn: u32) -> u64 {
+    let size = ((insn >> 30) & 0b11) as u64;
+    let opc = ((insn >> 22) & 0b11) as u64;
+    if size == 0 && (opc & 0b10) != 0 {
+        4
+    } else {
+        size
+    }
 }
 
 fn read_implicit_addend(
@@ -1872,12 +1894,26 @@ mod tests {
     fn load_store_pageoff_uses_size_scaling() {
         let insn = 0xf940_0000u32;
         assert!(!is_add_immediate(insn));
-        let shift = (insn >> 30) & 0b11;
+        let shift = pageoff_load_store_shift(insn);
         assert_eq!(shift, 0b11);
         let pageoff = 0x3f8u64;
         let imm = pageoff >> shift;
         let patched = (insn & !(0xfff << 10)) | ((imm as u32) << 10);
         assert_eq!((patched >> 10) & 0xfff, 0x7f);
+    }
+
+    #[test]
+    fn simd_q_pageoff_uses_16_byte_scaling() {
+        let insn = 0x3dc0_0100u32;
+        assert!(!is_add_immediate(insn));
+        assert!(is_simd_fp_pageoff(insn));
+        let shift = pageoff_load_store_shift(insn);
+        assert_eq!(shift, 4);
+        let pageoff = 0x690u64;
+        let imm = pageoff >> shift;
+        let patched = (insn & !(0xfff << 10)) | ((imm as u32) << 10);
+        assert_eq!((patched >> 10) & 0xfff, 0x69);
+        assert_eq!(patched, 0x3dc1_a500);
     }
 
     #[test]

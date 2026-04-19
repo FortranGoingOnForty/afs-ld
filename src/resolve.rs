@@ -134,6 +134,8 @@ opaque_id!(
 #[derive(Debug)]
 pub struct ObjectInput {
     pub path: PathBuf,
+    pub load_order: usize,
+    pub archive_member_offset: Option<u32>,
     /// Raw bytes; `ObjectFile::parse` re-runs cheaply against this on
     /// demand. We don't cache a parsed view because `ObjectFile` copies
     /// the fields it needs on construction, so re-parse is idempotent.
@@ -143,6 +145,7 @@ pub struct ObjectInput {
 #[derive(Debug)]
 pub struct ArchiveInput {
     pub path: PathBuf,
+    pub load_order: usize,
     pub bytes: Vec<u8>,
     /// Members we've already fetched (keyed by `ar_hdr` offset). Prevents
     /// the fixed-point loop from re-ingesting the same object twice —
@@ -225,11 +228,21 @@ impl Inputs {
     /// Register an `.o` file. Validates the Mach-O header by parsing once,
     /// then keeps only the raw bytes (re-parsing on demand is cheap and
     /// sidesteps borrow-lifetime headaches).
-    pub fn add_object(&mut self, path: PathBuf, bytes: Vec<u8>) -> Result<InputId, InputAddError> {
+    pub fn add_object(
+        &mut self,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        load_order: usize,
+    ) -> Result<InputId, InputAddError> {
         // Validate now — we'd rather catch a bad object at the add site.
         ObjectFile::parse(&path, &bytes)?;
         let id = InputId(self.objects.len() as u32);
-        self.objects.push(ObjectInput { path, bytes });
+        self.objects.push(ObjectInput {
+            path,
+            load_order,
+            archive_member_offset: None,
+            bytes,
+        });
         Ok(id)
     }
 
@@ -238,11 +251,13 @@ impl Inputs {
         &mut self,
         path: PathBuf,
         bytes: Vec<u8>,
+        load_order: usize,
     ) -> Result<ArchiveId, InputAddError> {
         Archive::open(&path, &bytes)?; // validate
         let id = ArchiveId(self.archives.len() as u32);
         self.archives.push(ArchiveInput {
             path,
+            load_order,
             bytes,
             fetched: std::collections::HashSet::new(),
         });
@@ -1134,6 +1149,7 @@ fn ingest_member_bytes(
     member_id: MemberId,
     report: &mut DrainReport,
 ) -> Result<Vec<PendingFetch>, FetchError> {
+    let archive_load_order = inputs.archives[archive_id.0 as usize].load_order;
     let ai = &inputs.archives[archive_id.0 as usize];
     if ai.fetched.contains(&member_id.0) {
         return Ok(Vec::new());
@@ -1158,6 +1174,8 @@ fn ingest_member_bytes(
     let input_id = InputId(inputs.objects.len() as u32);
     inputs.objects.push(ObjectInput {
         path: PathBuf::from(logical_path),
+        load_order: archive_load_order,
+        archive_member_offset: Some(member_id.0),
         bytes: member_bytes,
     });
     report.fetched_members += 1;

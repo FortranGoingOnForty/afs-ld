@@ -166,10 +166,28 @@ impl SyntheticPlan {
                     RelocKind::GotLoadPage21
                     | RelocKind::GotLoadPageOff12
                     | RelocKind::PointerToGot => {
+                        if matches!(
+                            reloc.kind,
+                            RelocKind::GotLoadPage21 | RelocKind::GotLoadPageOff12
+                        ) {
+                            let Some(symbol_id) =
+                                dylib_import_referent(obj, reloc.referent, sym_table)
+                            else {
+                                continue;
+                            };
+                            got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
+                            continue;
+                        }
                         let Some(symbol_id) = symbol_referent_id(obj, reloc.referent, sym_table)
                         else {
                             continue;
                         };
+                        if matches!(reloc.kind, RelocKind::PointerToGot)
+                            && matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. })
+                        {
+                            got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
+                            continue;
+                        }
                         got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
                     }
                     RelocKind::Branch26 => {
@@ -705,6 +723,8 @@ mod tests {
             &[LayoutInput {
                 id: input_id,
                 object: &object,
+                load_order: 0,
+                archive_member_offset: None,
             }],
             &atoms,
             &mut sym_table,
@@ -775,6 +795,8 @@ mod tests {
             &[LayoutInput {
                 id: input_id,
                 object: &object,
+                load_order: 0,
+                archive_member_offset: None,
             }],
             &atoms,
             &mut sym_table,
@@ -849,6 +871,8 @@ mod tests {
             &[LayoutInput {
                 id: input_id,
                 object: &object,
+                load_order: 0,
+                archive_member_offset: None,
             }],
             &atoms,
             &mut sym_table,
@@ -926,6 +950,8 @@ mod tests {
             &[LayoutInput {
                 id: input_id,
                 object: &object,
+                load_order: 0,
+                archive_member_offset: None,
             }],
             &atoms,
             &mut sym_table,
@@ -989,6 +1015,8 @@ mod tests {
             &[LayoutInput {
                 id: input_id,
                 object: &object,
+                load_order: 0,
+                archive_member_offset: None,
             }],
             &atoms,
             &mut sym_table,
@@ -1052,6 +1080,8 @@ mod tests {
             &[LayoutInput {
                 id: input_id,
                 object: &object,
+                load_order: 0,
+                archive_member_offset: None,
             }],
             &atoms,
             &mut sym_table,

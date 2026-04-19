@@ -97,7 +97,7 @@ fn atomize_splits_text_at_symbol_boundaries_and_backpatches_symbols() {
 
     let bytes = fs::read(&obj_path).unwrap();
     let mut inputs = Inputs::new();
-    let input_id = inputs.add_object(obj_path.clone(), bytes).unwrap();
+    let input_id = inputs.add_object(obj_path.clone(), bytes, 0).unwrap();
 
     // Seed the symbol table (produces Defined entries with AtomId(0)
     // placeholders).
@@ -204,7 +204,7 @@ fn atomize_cstring_splits_at_null_terminators() {
 
     let bytes = fs::read(&obj_path).unwrap();
     let mut inputs = Inputs::new();
-    let input_id = inputs.add_object(obj_path.clone(), bytes).unwrap();
+    let input_id = inputs.add_object(obj_path.clone(), bytes, 0).unwrap();
     let mut sym_table = SymbolTable::new();
     let _ = seed_all(&inputs, &mut sym_table).expect("seed_all");
     let obj = inputs.object_file(input_id).unwrap();

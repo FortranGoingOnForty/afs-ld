@@ -10,7 +10,7 @@ use crate::input::ObjectFile;
 use crate::macho::constants::SG_READ_ONLY;
 use crate::resolve::InputId;
 use crate::section::{
-    is_zerofill, OutputAtom, OutputSection, OutputSectionId, OutputSegment, Prot,
+    is_zerofill, InputSection, OutputAtom, OutputSection, OutputSectionId, OutputSegment, Prot,
 };
 use crate::synth::SyntheticPlan;
 use crate::OutputKind;
@@ -31,6 +31,8 @@ const DYLIB_SEGMENTS: [&str; 4] = ["__TEXT", "__DATA_CONST", "__DATA", "__LINKED
 pub struct LayoutInput<'a> {
     pub id: InputId,
     pub object: &'a ObjectFile,
+    pub load_order: usize,
+    pub archive_member_offset: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +46,22 @@ pub struct Layout {
 struct SectionKey {
     segment: String,
     name: String,
+}
+
+fn output_section_key(input_section: &InputSection) -> SectionKey {
+    match (
+        input_section.segname.as_str(),
+        input_section.sectname.as_str(),
+    ) {
+        ("__DATA", "__const") => SectionKey {
+            segment: "__DATA_CONST".to_string(),
+            name: "__const".to_string(),
+        },
+        _ => SectionKey {
+            segment: input_section.segname.clone(),
+            name: input_section.sectname.clone(),
+        },
+    }
 }
 
 impl Layout {
@@ -67,34 +85,30 @@ impl Layout {
         header_size: u64,
         synthetic_plan: Option<&SyntheticPlan>,
     ) -> Self {
-        let input_map: HashMap<InputId, &ObjectFile> = inputs
-            .iter()
-            .map(|input| (input.id, input.object))
-            .collect();
+        let input_map: HashMap<InputId, LayoutInput<'_>> =
+            inputs.iter().map(|input| (input.id, *input)).collect();
 
         let mut sections: Vec<OutputSection> = Vec::new();
         let mut section_index: HashMap<SectionKey, usize> = HashMap::new();
 
         for (atom_id, atom) in atoms.iter() {
-            let obj = input_map
+            let input = input_map
                 .get(&atom.origin)
                 .unwrap_or_else(|| panic!("missing object for input {:?}", atom.origin));
-            let input_section = obj
+            let input_section = input
+                .object
                 .sections
                 .get((atom.input_section as usize).saturating_sub(1))
                 .unwrap_or_else(|| {
                     panic!(
                         "input {} section {} missing for atom {:?}",
-                        obj.path.display(),
+                        input.object.path.display(),
                         atom.input_section,
                         atom_id
                     )
                 });
 
-            let key = SectionKey {
-                segment: input_section.segname.clone(),
-                name: input_section.sectname.clone(),
-            };
+            let key = output_section_key(input_section);
             let idx = match section_index.get(&key) {
                 Some(&idx) => idx,
                 None => {
@@ -124,10 +138,8 @@ impl Layout {
             };
 
             let out = &mut sections[idx];
-            out.align_pow2 = normalize_output_alignment(
-                out.kind,
-                out.align_pow2.max(atom.align_pow2),
-            );
+            out.align_pow2 =
+                normalize_output_alignment(out.kind, out.align_pow2.max(atom.align_pow2));
             out.atoms.push(OutputAtom {
                 atom: atom_id,
                 offset: 0,
@@ -162,8 +174,22 @@ impl Layout {
             section.atoms.sort_by(|a, b| {
                 let lhs = atoms.get(a.atom);
                 let rhs = atoms.get(b.atom);
-                lhs.origin
-                    .cmp(&rhs.origin)
+                let lhs_input = input_map
+                    .get(&lhs.origin)
+                    .unwrap_or_else(|| panic!("missing object for input {:?}", lhs.origin));
+                let rhs_input = input_map
+                    .get(&rhs.origin)
+                    .unwrap_or_else(|| panic!("missing object for input {:?}", rhs.origin));
+                lhs_input
+                    .load_order
+                    .cmp(&rhs_input.load_order)
+                    .then_with(|| {
+                        lhs_input
+                            .archive_member_offset
+                            .unwrap_or(0)
+                            .cmp(&rhs_input.archive_member_offset.unwrap_or(0))
+                    })
+                    .then_with(|| lhs.origin.cmp(&rhs.origin))
                     .then_with(|| lhs.input_offset.cmp(&rhs.input_offset))
                     .then_with(|| a.atom.cmp(&b.atom))
             });
@@ -363,10 +389,8 @@ impl Layout {
 fn merge_synthetic_section(existing: &mut OutputSection, synthetic: OutputSection) {
     debug_assert_eq!(existing.segment, synthetic.segment);
     debug_assert_eq!(existing.name, synthetic.name);
-    existing.align_pow2 = normalize_output_alignment(
-        existing.kind,
-        existing.align_pow2.max(synthetic.align_pow2),
-    );
+    existing.align_pow2 =
+        normalize_output_alignment(existing.kind, existing.align_pow2.max(synthetic.align_pow2));
     existing.flags = synthetic.flags;
     existing.reserved1 = synthetic.reserved1;
     existing.reserved2 = synthetic.reserved2;
@@ -378,10 +402,7 @@ fn merge_synthetic_section(existing: &mut OutputSection, synthetic: OutputSectio
     }
 }
 
-fn normalize_output_alignment(
-    kind: crate::section::SectionKind,
-    align_pow2: u8,
-) -> u8 {
+fn normalize_output_alignment(kind: crate::section::SectionKind, align_pow2: u8) -> u8 {
     match kind {
         crate::section::SectionKind::ThreadLocalRegular
         | crate::section::SectionKind::ThreadLocalZeroFill
@@ -483,6 +504,7 @@ fn section_rank(segment: &str, section: &str) -> usize {
             "__thread_ptrs",
             "__thread_data",
             "__thread_bss",
+            "__common",
             "__bss",
         ],
         "__LINKEDIT" => &[],
@@ -670,6 +692,8 @@ mod tests {
             &[LayoutInput {
                 id: InputId(0),
                 object: &object,
+                load_order: 0,
+                archive_member_offset: None,
             }],
             &atoms,
             0x200,
@@ -689,6 +713,68 @@ mod tests {
                 ("__DATA", "__bss"),
             ]
         );
+    }
+
+    #[test]
+    fn layout_promotes_data_const_into_data_const_segment() {
+        let object = ObjectFile {
+            path: PathBuf::from("/tmp/layout-const.o"),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections: vec![input_section(
+                "__DATA",
+                "__const",
+                SectionKind::ConstData,
+                3,
+                S_REGULAR,
+            )],
+            symbols: Vec::new(),
+            strings: crate::string_table::StringTable::from_bytes(vec![0]),
+            symtab: None,
+            dysymtab: None,
+            data_in_code: Vec::new(),
+        };
+
+        let mut atoms = AtomTable::new();
+        atoms.push(atom(
+            InputId(0),
+            1,
+            AtomSection::ConstData,
+            0,
+            16,
+            3,
+            vec![1; 16],
+        ));
+
+        let layout = Layout::build(
+            OutputKind::Executable,
+            &[LayoutInput {
+                id: InputId(0),
+                object: &object,
+                load_order: 0,
+                archive_member_offset: None,
+            }],
+            &atoms,
+            0x200,
+        );
+
+        assert!(layout
+            .sections
+            .iter()
+            .any(|section| section.segment == "__DATA_CONST" && section.name == "__const"));
+        assert!(!layout
+            .sections
+            .iter()
+            .any(|section| section.segment == "__DATA" && section.name == "__const"));
     }
 
     #[test]
@@ -736,6 +822,8 @@ mod tests {
             &[LayoutInput {
                 id: InputId(0),
                 object: &object,
+                load_order: 0,
+                archive_member_offset: None,
             }],
             &atoms,
             0x300,
@@ -748,6 +836,72 @@ mod tests {
         let bss = layout.sections.iter().find(|s| s.name == "__bss").unwrap();
         assert_eq!(bss.file_off, 0);
         assert!(bss.addr >= EXECUTABLE_TEXT_BASE + PAGE_SIZE);
+    }
+
+    #[test]
+    fn layout_orders_common_before_bss() {
+        let object = ObjectFile {
+            path: PathBuf::from("/tmp/layout-common-bss.o"),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections: vec![
+                input_section("__DATA", "__common", SectionKind::ZeroFill, 3, S_ZEROFILL),
+                input_section("__DATA", "__bss", SectionKind::ZeroFill, 3, S_ZEROFILL),
+            ],
+            symbols: Vec::new(),
+            strings: crate::string_table::StringTable::from_bytes(vec![0]),
+            symtab: None,
+            dysymtab: None,
+            data_in_code: Vec::new(),
+        };
+
+        let mut atoms = AtomTable::new();
+        atoms.push(atom(
+            InputId(0),
+            1,
+            AtomSection::ZeroFill,
+            0,
+            16,
+            3,
+            Vec::new(),
+        ));
+        atoms.push(atom(
+            InputId(0),
+            2,
+            AtomSection::ZeroFill,
+            0,
+            32,
+            3,
+            Vec::new(),
+        ));
+
+        let layout = Layout::build(
+            OutputKind::Executable,
+            &[LayoutInput {
+                id: InputId(0),
+                object: &object,
+                load_order: 0,
+                archive_member_offset: None,
+            }],
+            &atoms,
+            0x200,
+        );
+
+        let names: Vec<(&str, &str)> = layout
+            .sections
+            .iter()
+            .map(|section| (section.segment.as_str(), section.name.as_str()))
+            .collect();
+        assert_eq!(names, vec![("__DATA", "__common"), ("__DATA", "__bss")]);
     }
 
     #[test]
@@ -799,6 +953,8 @@ mod tests {
             &[LayoutInput {
                 id: InputId(0),
                 object: &object,
+                load_order: 0,
+                archive_member_offset: None,
             }],
             &atoms,
             0x200,
@@ -889,6 +1045,8 @@ mod tests {
             &[LayoutInput {
                 id: InputId(0),
                 object: &object,
+                load_order: 0,
+                archive_member_offset: None,
             }],
             &atoms,
             0x200,
@@ -1013,6 +1171,8 @@ mod tests {
             &[LayoutInput {
                 id: InputId(0),
                 object: &object,
+                load_order: 0,
+                archive_member_offset: None,
             }],
             &atoms,
             0x200,
@@ -1067,6 +1227,8 @@ mod tests {
             &[LayoutInput {
                 id: InputId(0),
                 object: &object,
+                load_order: 0,
+                archive_member_offset: None,
             }],
             &atoms,
             0x200,

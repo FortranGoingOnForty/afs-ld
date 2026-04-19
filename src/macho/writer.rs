@@ -740,7 +740,6 @@ fn build_linkedit_plan(
         .map(|record| (record.symbol, record))
         .collect();
     let symbol_plan = build_output_symbols(layout, kind, opts.strip_locals, inputs, &imports)?;
-
     let mut symtab_bytes = Vec::new();
     write_nlist_table(&symbol_plan.symbols, &mut symtab_bytes);
 
@@ -750,30 +749,25 @@ fn build_linkedit_plan(
         &mut indirect_symbols,
         &mut indirect_starts,
         ("__TEXT", "__stubs"),
-        synthetic_plan
-            .stubs
-            .entries
-            .iter()
-            .map(|entry| entry.symbol),
-        &symbol_plan.symbol_indices,
+        synthetic_plan.stubs.entries.iter().map(|entry| {
+            indirect_symbol_index(entry.symbol, &import_lookup, &symbol_plan.symbol_indices)
+        }),
     );
     push_indirect_section(
         &mut indirect_symbols,
         &mut indirect_starts,
         ("__DATA_CONST", "__got"),
-        synthetic_plan.got.entries.iter().map(|entry| entry.symbol),
-        &symbol_plan.symbol_indices,
+        synthetic_plan.got.entries.iter().map(|entry| {
+            indirect_symbol_index(entry.symbol, &import_lookup, &symbol_plan.symbol_indices)
+        }),
     );
     push_indirect_section(
         &mut indirect_symbols,
         &mut indirect_starts,
         ("__DATA", "__la_symbol_ptr"),
-        synthetic_plan
-            .lazy_pointers
-            .entries
-            .iter()
-            .map(|entry| entry.symbol),
-        &symbol_plan.symbol_indices,
+        synthetic_plan.lazy_pointers.entries.iter().map(|entry| {
+            indirect_symbol_index(entry.symbol, &import_lookup, &symbol_plan.symbol_indices)
+        }),
     );
 
     let mut indirect_bytes = Vec::with_capacity(indirect_symbols.len() * 4);
@@ -1142,15 +1136,20 @@ fn reloc_needs_rebase(obj: &ObjectFile, reloc: Reloc, sym_table: &SymbolTable) -
 
     match reloc.referent {
         Referent::Section(_) => true,
-        Referent::Symbol(_) => match symbol_referent_id(obj, reloc.referent, sym_table) {
-            Some(symbol_id) => match sym_table.get(symbol_id) {
-                Symbol::DylibImport { .. } => false,
-                Symbol::Defined { atom, .. } => atom.0 != 0,
-                Symbol::Common { .. } => true,
-                _ => false,
-            },
-            None => false,
-        },
+        Referent::Symbol(sym_idx) => {
+            let Some(input_sym) = obj.symbols.get(sym_idx as usize) else {
+                return false;
+            };
+            match symbol_referent_id(obj, reloc.referent, sym_table) {
+                Some(symbol_id) => match sym_table.get(symbol_id) {
+                    Symbol::DylibImport { .. } => false,
+                    Symbol::Defined { atom, .. } => atom.0 != 0,
+                    Symbol::Common { .. } => true,
+                    _ => false,
+                },
+                None => matches!(input_sym.kind(), SymKind::Sect),
+            }
+        }
     }
 }
 
@@ -1904,22 +1903,31 @@ fn push_indirect_section(
     indirect_symbols: &mut Vec<u32>,
     indirect_starts: &mut HashMap<(String, String), u32>,
     key: (&str, &str),
-    symbols: impl Iterator<Item = SymbolId>,
-    symbol_indices: &HashMap<SymbolId, u32>,
+    symbols: impl Iterator<Item = u32>,
 ) {
     let start = indirect_symbols.len() as u32;
     let mut saw_any = false;
     for symbol in symbols {
         saw_any = true;
-        indirect_symbols.push(
-            symbol_indices
-                .get(&symbol)
-                .copied()
-                .unwrap_or(INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS),
-        );
+        indirect_symbols.push(symbol);
     }
     if saw_any {
         indirect_starts.insert((key.0.to_string(), key.1.to_string()), start);
+    }
+}
+
+fn indirect_symbol_index(
+    symbol: SymbolId,
+    import_lookup: &HashMap<SymbolId, &ImportSymbolRecord>,
+    symbol_indices: &HashMap<SymbolId, u32>,
+) -> u32 {
+    if import_lookup.contains_key(&symbol) {
+        symbol_indices
+            .get(&symbol)
+            .copied()
+            .unwrap_or(INDIRECT_SYMBOL_LOCAL)
+    } else {
+        INDIRECT_SYMBOL_LOCAL
     }
 }
 
@@ -1932,33 +1940,6 @@ fn build_bind_streams(
     let weak_bind = Vec::new();
     let mut lazy_bind = OpcodeStream::new();
     let mut lazy_offsets = HashMap::new();
-
-    if !synthetic_plan.got.entries.is_empty() {
-        let segment_index = segment_index(layout, "__DATA_CONST")?;
-        let segment = layout
-            .segment("__DATA_CONST")
-            .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
-        let section = layout
-            .sections
-            .iter()
-            .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
-            .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
-        for (idx, entry) in synthetic_plan.got.entries.iter().enumerate() {
-            let Some(import) = imports.get(&entry.symbol).copied() else {
-                continue;
-            };
-            let slot_addr = section.addr + (idx as u64) * 8;
-            bind_specs.push(BindRecordSpec {
-                segment_index,
-                segment_offset: slot_addr - segment.vm_addr,
-                ordinal: import.ordinal,
-                name: &import.name,
-                weak_import: import.weak_import,
-                addend: 0,
-                terminate: false,
-            });
-        }
-    }
 
     if let Some(tlv_bootstrap) = synthetic_plan.tlv_bootstrap_symbol {
         let segment_index = segment_index(layout, "__DATA")?;
@@ -1990,6 +1971,33 @@ fn build_bind_streams(
                     });
                 }
             }
+        }
+    }
+
+    if !synthetic_plan.got.entries.is_empty() {
+        let segment_index = segment_index(layout, "__DATA_CONST")?;
+        let segment = layout
+            .segment("__DATA_CONST")
+            .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
+        let section = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
+            .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
+        for (idx, entry) in synthetic_plan.got.entries.iter().enumerate() {
+            let Some(import) = imports.get(&entry.symbol).copied() else {
+                continue;
+            };
+            let slot_addr = section.addr + (idx as u64) * 8;
+            bind_specs.push(BindRecordSpec {
+                segment_index,
+                segment_offset: slot_addr - segment.vm_addr,
+                ordinal: import.ordinal,
+                name: &import.name,
+                weak_import: import.weak_import,
+                addend: 0,
+                terminate: false,
+            });
         }
     }
 

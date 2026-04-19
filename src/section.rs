@@ -18,7 +18,7 @@ pub enum SectionKind {
     Text,
     /// Regular data (`S_REGULAR` with none of the attribute markers).
     Data,
-    /// `__TEXT,__const` — immutable data.
+    /// Immutable data such as `__TEXT,__const` or `__DATA_CONST,__const`.
     ConstData,
     /// `__TEXT,__cstring` (`S_CSTRING_LITERALS`).
     CStringLiterals,
@@ -94,7 +94,7 @@ fn classify_regular(segname: &str, sectname: &str, flags: u32) -> SectionKind {
     if flags & S_ATTR_PURE_INSTRUCTIONS != 0 {
         return SectionKind::Text;
     }
-    if segname == "__TEXT" && sectname == "__const" {
+    if sectname == "__const" && matches!(segname, "__TEXT" | "__DATA" | "__DATA_CONST") {
         return SectionKind::ConstData;
     }
     SectionKind::Data

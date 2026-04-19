@@ -380,16 +380,24 @@ fn apply_one(
             local_offset,
             reloc,
             place,
-            resolve_got_target(obj, atom, reloc, resolve)?,
+            if got_reloc_relaxes_locally(obj, reloc, resolve) {
+                resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)?
+            } else {
+                resolve_got_target(obj, atom, reloc, resolve)?
+            },
         ),
-        RelocKind::GotLoadPageOff12 => patch_pageoff12(
-            bytes,
-            atom,
-            obj,
-            local_offset,
-            reloc,
-            resolve_got_target(obj, atom, reloc, resolve)?,
-        ),
+        RelocKind::GotLoadPageOff12 => {
+            let target = if got_reloc_relaxes_locally(obj, reloc, resolve) {
+                resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)?
+            } else {
+                resolve_got_target(obj, atom, reloc, resolve)?
+            };
+            if got_reloc_relaxes_locally(obj, reloc, resolve) {
+                patch_got_pageoff12_relaxed(bytes, atom, obj, local_offset, reloc, target)
+            } else {
+                patch_pageoff12(bytes, atom, obj, local_offset, reloc, target)
+            }
+        }
         RelocKind::PointerToGot => patch_unsigned(
             bytes,
             atom,
@@ -465,6 +473,12 @@ fn resolve_got_target(
             "symbol is missing synthetic GOT slot".to_string(),
         )
     })
+}
+
+fn got_reloc_relaxes_locally(obj: &ObjectFile, reloc: Reloc, resolve: &ResolveView<'_>) -> bool {
+    symbol_referent_id(obj, reloc.referent, resolve.sym_table)
+        .map(|symbol_id| !matches!(resolve.sym_table.get(symbol_id), Symbol::DylibImport { .. }))
+        .unwrap_or(false)
 }
 
 fn resolve_tlvp_target(
@@ -1096,6 +1110,48 @@ fn read_implicit_addend(
 }
 
 fn patch_tlvp_pageoff12(
+    bytes: &mut [u8],
+    atom: &Atom,
+    obj: &ObjectFile,
+    local_offset: u32,
+    reloc: Reloc,
+    target: u64,
+) -> Result<(), RelocError> {
+    let pageoff = target.wrapping_add_signed(reloc.addend) & 0xfff;
+    if pageoff > 0xfff {
+        return Err(reloc_error(
+            atom,
+            &obj.path,
+            local_offset,
+            reloc.kind,
+            &describe_referent(obj, reloc.referent),
+            format!("pageoff immediate 0x{pageoff:x} exceeds 12 bits"),
+        ));
+    }
+
+    let insn = read_u32(
+        bytes,
+        local_offset,
+        atom,
+        obj,
+        reloc.kind,
+        &describe_referent(obj, reloc.referent),
+    )?;
+    let rd = insn & 0x1f;
+    let rn = (insn >> 5) & 0x1f;
+    let patched = 0x9100_0000 | ((pageoff as u32) << 10) | (rn << 5) | rd;
+    write_u32(
+        bytes,
+        local_offset,
+        patched,
+        atom,
+        obj,
+        reloc.kind,
+        &describe_referent(obj, reloc.referent),
+    )
+}
+
+fn patch_got_pageoff12_relaxed(
     bytes: &mut [u8],
     atom: &Atom,
     obj: &ObjectFile,

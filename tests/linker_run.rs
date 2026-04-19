@@ -16,8 +16,9 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
-    BIND_SYMBOL_FLAGS_WEAK_IMPORT, DICE_KIND_JUMP_TABLE32, LC_BUILD_VERSION, LC_DATA_IN_CODE,
-    LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS, LC_SEGMENT_64, LC_SYMTAB,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, DICE_KIND_JUMP_TABLE32, INDIRECT_SYMBOL_ABS,
+    INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
+    LC_FUNCTION_STARTS, LC_SEGMENT_64, LC_SYMTAB,
     REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB,
     REBASE_OPCODE_DONE, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
@@ -478,6 +479,29 @@ fn indirect_symbol_table(bytes: &[u8]) -> Vec<u32> {
     bytes[start..end]
         .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
+fn indirect_symbol_identities(bytes: &[u8]) -> Vec<String> {
+    let (symtab, _) = symtab_and_dysymtab(bytes);
+    let symbols = parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).unwrap();
+    let strings = StringTable::from_file(bytes, symtab.stroff, symtab.strsize).unwrap();
+    indirect_symbol_table(bytes)
+        .into_iter()
+        .map(|index| {
+            if index & INDIRECT_SYMBOL_LOCAL != 0 {
+                if index & INDIRECT_SYMBOL_ABS != 0 {
+                    "<LOCAL|ABS>".to_string()
+                } else {
+                    "<LOCAL>".to_string()
+                }
+            } else if index & INDIRECT_SYMBOL_ABS != 0 {
+                "<ABS>".to_string()
+            } else {
+                let symbol = &symbols[index as usize];
+                strings.get(symbol.strx()).unwrap().to_string()
+            }
+        })
         .collect()
 }
 
@@ -3718,6 +3742,93 @@ fn linker_run_routes_local_got_loads_through_rebased_slots() {
 }
 
 #[test]
+fn linker_run_relaxes_hidden_got_loads_like_apple_ld() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("hidden-got.o");
+    let our_out = scratch("hidden-got-ours.out");
+    let apple_out = scratch("hidden-got-apple.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            adrp x8, _value@GOTPAGE
+            ldr x8, [x8, _value@GOTPAGEOFF]
+            ldr w0, [x8]
+            ret
+
+        .private_extern _value
+        .section __DATA,__data
+        .p2align 2
+        _value:
+            .long 7
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_classic_lazy(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let (our_text_addr, our_text) = output_section(&our_bytes, "__TEXT", "__text").unwrap();
+    let (apple_text_addr, apple_text) = output_section(&apple_bytes, "__TEXT", "__text").unwrap();
+    assert_eq!(
+        decode_page_reference(&our_text, our_text_addr, 0, &PageRefKind::Add).unwrap(),
+        decode_page_reference(&apple_text, apple_text_addr, 0, &PageRefKind::Add).unwrap()
+    );
+    assert_eq!(our_text, apple_text);
+    assert!(output_section(&our_bytes, "__DATA_CONST", "__got").is_none());
+    assert!(output_section(&apple_bytes, "__DATA_CONST", "__got").is_none());
+
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&our_out)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let status = Command::new(&our_out).status().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(7),
+        "expected hidden GOT executable to exit 7"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
 fn linker_run_partitions_symtab_like_ld() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");
@@ -5204,6 +5315,10 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
         eprintln!("skipping: no macOS SDK path");
         return;
     };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: no macOS SDK version");
+        return;
+    };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
         eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
@@ -5212,16 +5327,17 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
 
     let obj = scratch("runtime-hello.o");
     let out = scratch("runtime-hello.out");
+    let apple_out = scratch("runtime-hello-apple.out");
     let src = r#"
         extern void afs_program_init(void);
         extern void afs_program_finalize(void);
-        extern void afs_write_string(const char *, long);
-        extern void afs_write_newline(void);
+        extern void afs_write_string(int, const char *, long);
+        extern void afs_write_newline(int);
 
         int main(void) {
             afs_program_init();
-            afs_write_string("Hello, World!", 13);
-            afs_write_newline();
+            afs_write_string(6, "Hello, World!", 13);
+            afs_write_newline(6);
             afs_program_finalize();
             return 0;
         }
@@ -5239,6 +5355,34 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
     };
     Linker::run(&opts).unwrap();
 
+    let apple = Command::new("xcrun")
+        .args([
+            "ld",
+            "-arch",
+            "arm64",
+            "-platform_version",
+            "macos",
+            &sdk_ver,
+            &sdk_ver,
+            "-syslibroot",
+            &sdk,
+            "-lSystem",
+            "-e",
+            "_main",
+            "-no_fixup_chains",
+            "-o",
+        ])
+        .arg(&apple_out)
+        .arg(&obj)
+        .arg(&runtime)
+        .output()
+        .unwrap();
+    assert!(
+        apple.status.success(),
+        "xcrun ld failed: {}",
+        String::from_utf8_lossy(&apple.stderr)
+    );
+
     let verify = Command::new("codesign")
         .arg("-v")
         .arg(&out)
@@ -5251,6 +5395,15 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
     );
 
     let bytes = fs::read(&out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert!(
+        output_section(&bytes, "__DATA_CONST", "__const").is_some(),
+        "runtime hello should promote file-backed __const data into __DATA_CONST"
+    );
+    assert!(
+        output_section(&bytes, "__DATA", "__const").is_none(),
+        "runtime hello should not leave file-backed __const data in __DATA"
+    );
     let (thread_vars_addr, thread_vars) =
         output_section(&bytes, "__DATA", "__thread_vars").unwrap();
     let (thread_data_addr, _) = output_section(&bytes, "__DATA", "__thread_data").unwrap();
@@ -5268,6 +5421,27 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
     assert!(tlv_binds
         .iter()
         .all(|record| record.symbol == "__tlv_bootstrap"));
+
+    assert_eq!(
+        decode_bind_records(&bytes, false).unwrap(),
+        decode_bind_records(&apple_bytes, false).unwrap(),
+        "runtime hello bind records diverged from Apple ld"
+    );
+    assert_eq!(
+        decode_bind_records(&bytes, true).unwrap(),
+        decode_bind_records(&apple_bytes, true).unwrap(),
+        "runtime hello lazy-bind records diverged from Apple ld"
+    );
+    assert_eq!(
+        decode_rebase_records(&bytes).unwrap(),
+        decode_rebase_records(&apple_bytes).unwrap(),
+        "runtime hello rebase records diverged from Apple ld"
+    );
+    assert_eq!(
+        indirect_symbol_identities(&bytes),
+        indirect_symbol_identities(&apple_bytes),
+        "runtime hello indirect symbol identities diverged from Apple ld"
+    );
 
     for (name, descriptor_addr) in symbols.iter().filter(|(name, value)| {
         !name.ends_with("$tlv$init")
@@ -5289,14 +5463,138 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
     }
 
     let output = Command::new(&out).output().unwrap();
+    let apple_output = Command::new(&apple_out).output().unwrap();
     assert_eq!(
         output.status.code(),
         Some(0),
         "expected runtime hello executable to exit 0, stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "Hello, World!\n");
+    assert_eq!(
+        apple_output.status.code(),
+        Some(0),
+        "expected Apple-linked runtime hello executable to exit 0, stderr={}",
+        String::from_utf8_lossy(&apple_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&apple_output.stdout)
+    );
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_rebases_runtime_init_metadata_like_apple_ld() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+    let Some(runtime) = find_runtime_archive() else {
+        eprintln!("skipping: libarmfortas_rt.a not built");
+        return;
+    };
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: no macOS SDK path");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: no macOS SDK version");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("runtime-init-only.o");
+    let our_out = scratch("runtime-init-only-ours.out");
+    let apple_out = scratch("runtime-init-only-apple.out");
+    let src = r#"
+        extern void afs_program_init(void);
+
+        int main(void) {
+            afs_program_init();
+            return 0;
+        }
+    "#;
+    if let Err(e) = compile_c(src, &obj) {
+        eprintln!("skipping: compile failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), runtime.clone(), tbd],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let apple = Command::new("xcrun")
+        .args([
+            "ld",
+            "-arch",
+            "arm64",
+            "-platform_version",
+            "macos",
+            &sdk_ver,
+            &sdk_ver,
+            "-syslibroot",
+            &sdk,
+            "-lSystem",
+            "-e",
+            "_main",
+            "-no_fixup_chains",
+            "-o",
+        ])
+        .arg(&apple_out)
+        .arg(&obj)
+        .arg(&runtime)
+        .output()
+        .unwrap();
+    assert!(
+        apple.status.success(),
+        "xcrun ld failed: {}",
+        String::from_utf8_lossy(&apple.stderr)
+    );
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let our_rebases = decode_rebase_records(&our_bytes).unwrap();
+    let apple_rebases = decode_rebase_records(&apple_bytes).unwrap();
+    assert_eq!(
+        our_rebases
+            .iter()
+            .filter(|record| record.section == "__const")
+            .count(),
+        apple_rebases
+            .iter()
+            .filter(|record| record.section == "__const")
+            .count(),
+        "runtime init const rebases diverged from Apple ld"
+    );
+    assert_eq!(
+        our_rebases
+            .iter()
+            .filter(|record| record.section == "__la_symbol_ptr")
+            .count(),
+        apple_rebases
+            .iter()
+            .filter(|record| record.section == "__la_symbol_ptr")
+            .count(),
+        "runtime init lazy-pointer rebases diverged from Apple ld"
+    );
+
+    let our_status = Command::new(&our_out).status().unwrap();
+    let apple_status = Command::new(&apple_out).status().unwrap();
+    assert_eq!(our_status.code(), Some(0));
+    assert_eq!(apple_status.code(), Some(0));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
 }

@@ -3,11 +3,12 @@ use std::collections::BTreeMap;
 use crate::leb::{write_sleb, write_uleb};
 use crate::macho::constants::{
     BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND,
-    BIND_OPCODE_SET_ADDEND_SLEB, BIND_OPCODE_SET_DYLIB_ORDINAL_IMM,
-    BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB, BIND_OPCODE_SET_DYLIB_SPECIAL_IMM,
-    BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
-    BIND_OPCODE_SET_TYPE_IMM, BIND_SYMBOL_FLAGS_WEAK_IMPORT, BIND_TYPE_POINTER,
-    REBASE_IMMEDIATE_MASK, REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
+    BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_SET_ADDEND_SLEB,
+    BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
+    BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
+    BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, BIND_TYPE_POINTER, REBASE_IMMEDIATE_MASK,
+    REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
 };
 use crate::macho::exports::{ExportEntry, ExportKind};
 
@@ -253,7 +254,9 @@ pub fn emit_bind_records(specs: &[BindRecordSpec<'_>]) -> Vec<u8> {
     let mut state = BindState::default();
     let mut current_symbol: Option<String> = None;
 
-    for spec in specs {
+    let mut idx = 0usize;
+    while idx < specs.len() {
+        let spec = specs[idx];
         if state.ordinal != Some(spec.ordinal) {
             emit_bind_ordinal(&mut out, spec.ordinal);
             state.ordinal = Some(spec.ordinal);
@@ -301,9 +304,21 @@ pub fn emit_bind_records(specs: &[BindRecordSpec<'_>]) -> Vec<u8> {
             }
         }
 
-        out.byte(BIND_OPCODE_DO_BIND);
+        let run_len = bind_run_len(specs, idx);
+        if run_len > 1 {
+            let stride = specs[idx + 1].segment_offset - spec.segment_offset;
+            let skip = stride - 8;
+            out.byte(BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB);
+            out.uleb(run_len as u64);
+            out.uleb(skip);
+            state.next_segment_offset = Some(spec.segment_offset + (run_len as u64) * stride);
+            idx += run_len;
+        } else {
+            out.byte(BIND_OPCODE_DO_BIND);
+            state.next_segment_offset = Some(spec.segment_offset + 8);
+            idx += 1;
+        }
         state.segment_index = Some(spec.segment_index);
-        state.next_segment_offset = Some(spec.segment_offset + 8);
     }
 
     if specs.last().is_some_and(|spec| spec.terminate) {
@@ -349,6 +364,41 @@ fn bind_symbol_flags(weak_import: bool) -> u8 {
     } else {
         0
     }
+}
+
+fn bind_run_len(specs: &[BindRecordSpec<'_>], start: usize) -> usize {
+    let Some(next) = specs.get(start + 1) else {
+        return 1;
+    };
+    let first = specs[start];
+    if first.segment_index != next.segment_index
+        || first.ordinal != next.ordinal
+        || first.name != next.name
+        || first.weak_import != next.weak_import
+        || first.addend != next.addend
+    {
+        return 1;
+    }
+    let stride = next.segment_offset.saturating_sub(first.segment_offset);
+    if stride < 8 {
+        return 1;
+    }
+
+    let mut len = 2usize;
+    while let Some(spec) = specs.get(start + len) {
+        let expected_offset = first.segment_offset + (len as u64) * stride;
+        if spec.segment_index != first.segment_index
+            || spec.ordinal != first.ordinal
+            || spec.name != first.name
+            || spec.weak_import != first.weak_import
+            || spec.addend != first.addend
+            || spec.segment_offset != expected_offset
+        {
+            break;
+        }
+        len += 1;
+    }
+    len
 }
 
 #[cfg(test)]
@@ -527,5 +577,47 @@ mod tests {
             .windows(2)
             .any(|window| window == [BIND_OPCODE_SET_ADDEND_SLEB, 0]);
         assert!(zero_reset, "expected explicit addend reset back to zero");
+    }
+
+    #[test]
+    fn bind_encoder_batches_constant_stride_runs() {
+        let stream = emit_bind_records(&[
+            BindRecordSpec {
+                segment_index: 3,
+                segment_offset: 0x98,
+                ordinal: 1,
+                name: "__tlv_bootstrap",
+                weak_import: false,
+                addend: 0,
+                terminate: false,
+            },
+            BindRecordSpec {
+                segment_index: 3,
+                segment_offset: 0xb0,
+                ordinal: 1,
+                name: "__tlv_bootstrap",
+                weak_import: false,
+                addend: 0,
+                terminate: false,
+            },
+            BindRecordSpec {
+                segment_index: 3,
+                segment_offset: 0xc8,
+                ordinal: 1,
+                name: "__tlv_bootstrap",
+                weak_import: false,
+                addend: 0,
+                terminate: true,
+            },
+        ]);
+
+        assert!(stream.contains(&BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB));
+        let idx = stream
+            .iter()
+            .position(|byte| *byte == BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB)
+            .unwrap();
+        assert_eq!(stream[idx + 1], 3);
+        assert_eq!(stream[idx + 2], 0x10);
+        assert_eq!(stream.last().copied(), Some(0));
     }
 }

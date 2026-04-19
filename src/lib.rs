@@ -209,8 +209,8 @@ impl Linker {
         }
 
         let mut inputs = Inputs::new();
-        for path in &opts.inputs {
-            register_input(&mut inputs, path)?;
+        for (load_order, path) in opts.inputs.iter().enumerate() {
+            register_input(&mut inputs, path, load_order)?;
         }
 
         let mut sym_table = SymbolTable::new();
@@ -261,7 +261,15 @@ impl Linker {
 
         let layout_inputs: Vec<LayoutInput<'_>> = objects
             .iter()
-            .map(|(id, object)| LayoutInput { id: *id, object })
+            .map(|(id, object)| {
+                let input = inputs.object(*id);
+                LayoutInput {
+                    id: *id,
+                    object,
+                    load_order: input.load_order,
+                    archive_member_offset: input.archive_member_offset,
+                }
+            })
             .collect();
         let mut dylib_loads = Vec::new();
         let mut seen_ordinals = std::collections::BTreeSet::new();
@@ -357,11 +365,15 @@ fn default_output_path(opts: &LinkOptions) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("a.out"))
 }
 
-fn register_input(inputs: &mut Inputs, path: &std::path::Path) -> Result<(), LinkError> {
+fn register_input(
+    inputs: &mut Inputs,
+    path: &std::path::Path,
+    load_order: usize,
+) -> Result<(), LinkError> {
     let bytes = fs::read(path)?;
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("a") => {
-            let _ = inputs.add_archive(path.to_path_buf(), bytes)?;
+            let _ = inputs.add_archive(path.to_path_buf(), bytes, load_order)?;
         }
         Some("dylib") => {
             let _ = inputs.add_dylib(path.to_path_buf(), bytes)?;
@@ -410,7 +422,7 @@ fn register_input(inputs: &mut Inputs, path: &std::path::Path) -> Result<(), Lin
             }
         }
         _ => {
-            let _ = inputs.add_object(path.to_path_buf(), bytes)?;
+            let _ = inputs.add_object(path.to_path_buf(), bytes, load_order)?;
         }
     }
     Ok(())

@@ -146,13 +146,13 @@ fn resolve_pipeline_pulls_archive_member_and_flags_missing() {
     // Register the inputs with the resolver.
     let mut inputs = Inputs::new();
     let a_id = inputs
-        .add_object(a_o.clone(), fs::read(&a_o).unwrap())
+        .add_object(a_o.clone(), fs::read(&a_o).unwrap(), 0)
         .unwrap();
     inputs
-        .add_object(b_o.clone(), fs::read(&b_o).unwrap())
+        .add_object(b_o.clone(), fs::read(&b_o).unwrap(), 1)
         .unwrap();
     let archive_id = inputs
-        .add_archive(libtest.clone(), fs::read(&libtest).unwrap())
+        .add_archive(libtest.clone(), fs::read(&libtest).unwrap(), 2)
         .unwrap();
     let _ = archive_id;
 

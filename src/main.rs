@@ -19,7 +19,7 @@ Options:
                                   Set LC_BUILD_VERSION payload
   -r                              Relocatable output (deferred; errors)
   -bundle                         Bundle output (deferred; errors)
-  -undefined <error|dynamic_lookup>
+  -undefined <error|warning|suppress|dynamic_lookup>
                                   Control unresolved-symbol treatment
   -rpath <path>                   Add LC_RPATH
   -install_name <path>            Override dylib install name

@@ -34,8 +34,9 @@ use macho::tbd::{parse_tbd, parse_version, Arch, Platform, Target};
 use reloc::arm64::RelocError;
 use resolve::{
     classify_unresolved, drain_fetches, find_archive_by_path, force_load_all, force_load_archive,
-    format_duplicate_diagnostic, format_undefined_diagnostic, seed_all, DrainReport, DylibLoadMeta,
-    InputAddError, Inputs, Symbol, SymbolTable, UndefinedTreatment,
+    format_duplicate_diagnostic, format_undefined_diagnostic,
+    format_undefined_warning_diagnostic, seed_all, DrainReport, DylibLoadMeta, InputAddError,
+    Inputs, Symbol, SymbolTable, UndefinedTreatment,
 };
 
 const DEFAULT_TBD_VERSION: u32 = 1 << 16;
@@ -423,6 +424,14 @@ impl Linker {
                 &referrers,
                 &unresolved.errors,
             )));
+        }
+        if !unresolved.warnings.is_empty() {
+            crate::diag::warning_verbatim(&format_undefined_warning_diagnostic(
+                &sym_table,
+                &inputs,
+                &referrers,
+                &unresolved.warnings,
+            ));
         }
 
         let mut atom_table = AtomTable::new();

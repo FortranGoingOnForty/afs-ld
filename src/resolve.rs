@@ -1296,9 +1296,11 @@ impl DylibId {
 pub struct ClassificationReport {
     /// Strong undefineds that triggered errors under `Error` treatment.
     pub errors: Vec<Unresolved>,
-    /// Strong undefineds that produced warnings under `Warning` treatment.
+    /// Strong undefineds that produced warnings under `Warning` treatment and
+    /// were promoted to flat-lookup imports for final emission.
     pub warnings: Vec<Unresolved>,
-    /// Strong undefineds that were silently accepted under `Suppress`.
+    /// Strong undefineds that were silently accepted under `Suppress` and
+    /// were promoted to flat-lookup imports for final emission.
     pub suppressed: Vec<Unresolved>,
     /// Undefineds promoted to flat-lookup DylibImport entries.
     pub promoted_to_dynamic: Vec<SymbolId>,
@@ -1372,16 +1374,17 @@ pub fn did_you_mean(table: &SymbolTable, query: &str, budget: usize, max: usize)
 /// Format the full undefined-symbol diagnostic block, one entry per
 /// unresolved name: the error line, every referrer, and an optional
 /// did-you-mean hint.
-pub fn format_undefined_diagnostic(
+fn format_undefined_diagnostic_with_level(
     table: &SymbolTable,
     inputs: &Inputs,
     referrers: &ReferrerLog,
     unresolved: &[Unresolved],
+    level: &str,
 ) -> String {
     let mut out = String::new();
     for u in unresolved {
         let name = table.interner.resolve(u.name);
-        out.push_str(&format!("afs-ld: error: undefined symbol: {name}\n"));
+        out.push_str(&format!("afs-ld: {level}: undefined symbol: {name}\n"));
         for origin in referrers.get(u.name) {
             if let Some(oi) = inputs.objects.get(origin.0 as usize) {
                 out.push_str(&format!("      referenced by {}\n", oi.path.display()));
@@ -1400,6 +1403,24 @@ pub fn format_undefined_diagnostic(
         }
     }
     out
+}
+
+pub fn format_undefined_diagnostic(
+    table: &SymbolTable,
+    inputs: &Inputs,
+    referrers: &ReferrerLog,
+    unresolved: &[Unresolved],
+) -> String {
+    format_undefined_diagnostic_with_level(table, inputs, referrers, unresolved, "error")
+}
+
+pub fn format_undefined_warning_diagnostic(
+    table: &SymbolTable,
+    inputs: &Inputs,
+    referrers: &ReferrerLog,
+    unresolved: &[Unresolved],
+) -> String {
+    format_undefined_diagnostic_with_level(table, inputs, referrers, unresolved, "warning")
 }
 
 /// Format a `DuplicateStrong` insertion error for user consumption. Needs
@@ -1442,6 +1463,21 @@ pub fn classify_unresolved(
 ) -> ClassificationReport {
     let mut report = ClassificationReport::default();
 
+    fn promote_to_flat_lookup(table: &mut SymbolTable, id: SymbolId, name: Istr) {
+        table.symbols[id.0 as usize] = Symbol::DylibImport {
+            name,
+            dylib: DylibId::INVALID,
+            ordinal: FLAT_LOOKUP_ORDINAL,
+            weak_import: true,
+        };
+        table.transitions.push(Transition {
+            id,
+            from: SymbolKindTag::Undefined,
+            to: SymbolKindTag::DylibImport,
+            cause: TransitionCause::Replaced,
+        });
+    }
+
     // Collect undefineds before mutating — avoids double-borrow grief.
     let undefs: Vec<(SymbolId, Istr, bool)> = table
         .iter()
@@ -1462,23 +1498,16 @@ pub fn classify_unresolved(
             }
             UndefinedTreatment::Warning => {
                 report.warnings.push(Unresolved { name, id });
+                promote_to_flat_lookup(table, id, name);
+                report.promoted_to_dynamic.push(id);
             }
             UndefinedTreatment::Suppress => {
                 report.suppressed.push(Unresolved { name, id });
+                promote_to_flat_lookup(table, id, name);
+                report.promoted_to_dynamic.push(id);
             }
             UndefinedTreatment::DynamicLookup => {
-                table.symbols[id.0 as usize] = Symbol::DylibImport {
-                    name,
-                    dylib: DylibId::INVALID,
-                    ordinal: FLAT_LOOKUP_ORDINAL,
-                    weak_import: true,
-                };
-                table.transitions.push(Transition {
-                    id,
-                    from: SymbolKindTag::Undefined,
-                    to: SymbolKindTag::DylibImport,
-                    cause: TransitionCause::Replaced,
-                });
+                promote_to_flat_lookup(table, id, name);
                 report.promoted_to_dynamic.push(id);
             }
         }

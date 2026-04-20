@@ -14,6 +14,17 @@ fn have_xcrun() -> bool {
         .unwrap_or(false)
 }
 
+fn sdk_path() -> Option<String> {
+    let out = Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 fn minimal_main_src() -> &'static str {
     r#"
         .section __TEXT,__text,regular,pure_instructions
@@ -120,6 +131,7 @@ fn help_flag_prints_usage_and_exits_successfully() {
     assert!(stdout.contains("-map <path>"));
     assert!(stdout.contains("-no_uuid"));
     assert!(stdout.contains("-dead_strip"));
+    assert!(stdout.contains("-undefined <error|warning|suppress|dynamic_lookup>"));
     assert!(stdout.contains("-t, -trace"));
     assert!(stdout.contains("-v, --version"));
 }
@@ -297,6 +309,118 @@ fn undefined_symbol_diagnostic_is_not_double_prefixed() {
     );
 
     let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn undefined_warning_mode_links_and_warns_once() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = scratch("missing-warning.o");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            bl _missing
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let out_path = scratch("missing-warning.out");
+    let out = Command::new(exe)
+        .arg("-undefined")
+        .arg("warning")
+        .arg("-syslibroot")
+        .arg(&sdk)
+        .arg("-lSystem")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        out.status.success(),
+        "-undefined warning should link successfully:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("afs-ld: warning: undefined symbol: _missing"),
+        "missing expected undefined-symbol warning:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("afs-ld: warning: afs-ld: warning:"),
+        "warning diagnostic was double-prefixed:\n{stderr}"
+    );
+    assert!(out_path.exists(), "expected linked output to be written");
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
+}
+
+#[test]
+fn undefined_suppress_mode_links_silently() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = scratch("missing-suppress.o");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            bl _missing
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let out_path = scratch("missing-suppress.out");
+    let out = Command::new(exe)
+        .arg("-undefined")
+        .arg("suppress")
+        .arg("-syslibroot")
+        .arg(&sdk)
+        .arg("-lSystem")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        out.status.success(),
+        "-undefined suppress should link successfully:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("undefined symbol: _missing"),
+        "expected -undefined suppress to omit undefined diagnostic:\n{stderr}"
+    );
+    assert!(out_path.exists(), "expected linked output to be written");
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
 }
 
 #[test]

@@ -239,21 +239,15 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                     .ok_or_else(|| ArgsError::MissingValue("-undefined".into()))?;
                 opts.undefined_treatment = match value.as_str() {
                     "error" => UndefinedTreatment::Error,
+                    "warning" => UndefinedTreatment::Warning,
+                    "suppress" => UndefinedTreatment::Suppress,
                     "dynamic_lookup" => UndefinedTreatment::DynamicLookup,
-                    "warning" | "suppress" => {
-                        return Err(ArgsError::InvalidValue {
-                            flag: "-undefined".into(),
-                            value: value.clone(),
-                            expected:
-                                "`error` or `dynamic_lookup` (warning/suppress not yet supported)"
-                                    .into(),
-                        });
-                    }
                     _ => {
                         return Err(ArgsError::InvalidValue {
                             flag: "-undefined".into(),
                             value: value.clone(),
-                            expected: "`error` or `dynamic_lookup`".into(),
+                            expected: "`error`, `warning`, `suppress`, or `dynamic_lookup`"
+                                .into(),
                         });
                     }
                 };
@@ -601,15 +595,24 @@ mod tests {
     }
 
     #[test]
-    fn undefined_flag_rejects_unsupported_modes() {
-        let err = parse(&argv(&["-undefined", "warning", "main.o"])).unwrap_err();
+    fn undefined_flag_records_warning_and_suppress() {
+        let warning = parse(&argv(&["-undefined", "warning", "main.o"])).unwrap();
+        assert_eq!(warning.undefined_treatment, UndefinedTreatment::Warning);
+
+        let suppress = parse(&argv(&["-undefined", "suppress", "main.o"])).unwrap();
+        assert_eq!(suppress.undefined_treatment, UndefinedTreatment::Suppress);
+    }
+
+    #[test]
+    fn undefined_flag_rejects_unknown_modes() {
+        let err = parse(&argv(&["-undefined", "bogus", "main.o"])).unwrap_err();
         assert!(matches!(
             err,
             ArgsError::InvalidValue {
                 ref flag,
                 ref value,
                 ..
-            } if flag == "-undefined" && value == "warning"
+            } if flag == "-undefined" && value == "bogus"
         ));
     }
 

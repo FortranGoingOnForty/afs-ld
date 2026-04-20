@@ -25,6 +25,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "-install_name",
     "-current_version",
     "-compatibility_version",
+    "-map",
     "-x",
     "-dylib",
     "-all_load",
@@ -116,8 +117,9 @@ fn parse_version_component(flag: &str, value: &str) -> Result<u32, ArgsError> {
 }
 
 pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
+    let normalized = normalize_wl(argv);
     let mut opts = LinkOptions::default();
-    let mut it = argv.iter();
+    let mut it = normalized.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-o" => {
@@ -257,6 +259,12 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                 opts.compatibility_version =
                     Some(parse_version_component("-compatibility_version", value)?);
             }
+            "-map" => {
+                opts.map = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("-map".into()))?,
+                ));
+            }
             "-x" => {
                 opts.strip_locals = true;
             }
@@ -305,6 +313,22 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
         }
     }
     Ok(opts)
+}
+
+fn normalize_wl(argv: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(argv.len());
+    for arg in argv {
+        if let Some(rest) = arg.strip_prefix("-Wl,") {
+            out.extend(
+                rest.split(',')
+                    .filter(|piece| !piece.is_empty())
+                    .map(ToString::to_string),
+            );
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -466,6 +490,19 @@ mod tests {
         assert_eq!(opts.install_name.as_deref(), Some("@rpath/libdemo.dylib"));
         assert_eq!(opts.current_version, Some((2 << 16) | (3 << 8) | 4));
         assert_eq!(opts.compatibility_version, Some((1 << 16) | (2 << 8)));
+    }
+
+    #[test]
+    fn map_flag_is_recorded() {
+        let opts = parse(&argv(&["-map", "link.map", "main.o"])).unwrap();
+        assert_eq!(opts.map.as_deref(), Some(std::path::Path::new("link.map")));
+    }
+
+    #[test]
+    fn wl_normalizes_map_like_direct_flag() {
+        let opts = parse(&argv(&["-Wl,-map,link.map", "main.o"])).unwrap();
+        assert_eq!(opts.map.as_deref(), Some(std::path::Path::new("link.map")));
+        assert_eq!(opts.inputs, vec![PathBuf::from("main.o")]);
     }
 
     #[test]

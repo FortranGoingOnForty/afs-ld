@@ -2974,6 +2974,55 @@ fn linker_run_emits_rpath_command() {
 }
 
 #[test]
+fn linker_run_emits_map_file() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("map-main.o");
+    let out = scratch("map-main.out");
+    let map = scratch("map-main.map");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        map: Some(map.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let map_text = fs::read_to_string(&map).unwrap();
+    assert!(map_text.contains("# Path:"));
+    assert!(map_text.contains("# Object files:"));
+    assert!(map_text.contains("linker synthesized"));
+    assert!(map_text.contains(&obj.display().to_string()));
+    assert!(map_text.contains("# Sections:"));
+    assert!(map_text.contains("__TEXT"));
+    assert!(map_text.contains("__text"));
+    assert!(map_text.contains("# Symbols:"));
+    assert!(map_text.contains("_main"));
+    assert!(map_text.contains("# Dead stripped:"));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+    let _ = fs::remove_file(map);
+}
+
+#[test]
 fn linker_run_carries_tbd_inputs_into_load_commands() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");

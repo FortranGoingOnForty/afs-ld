@@ -12,6 +12,7 @@ pub mod dump;
 pub mod input;
 pub mod layout;
 pub mod leb;
+pub mod link_map;
 pub mod macho;
 pub mod reloc;
 pub mod resolve;
@@ -71,6 +72,7 @@ pub struct LinkOptions {
     pub install_name: Option<String>,
     pub current_version: Option<u32>,
     pub compatibility_version: Option<u32>,
+    pub map: Option<PathBuf>,
     pub output: Option<PathBuf>,
     pub entry: Option<String>,
     pub arch: Option<String>,
@@ -104,6 +106,7 @@ impl Default for LinkOptions {
             install_name: None,
             current_version: None,
             compatibility_version: None,
+            map: None,
             output: None,
             entry: None,
             arch: None,
@@ -446,6 +449,9 @@ impl Linker {
         )?;
         let output = default_output_path(opts);
         fs::write(&output, image)?;
+        if let Some(map_path) = &opts.map {
+            link_map::write_link_map(map_path, opts, &layout, &layout_inputs, &linkedit)?;
+        }
         if opts.kind == OutputKind::Executable {
             let mut perms = fs::metadata(&output)?.permissions();
             let mode = perms.mode();

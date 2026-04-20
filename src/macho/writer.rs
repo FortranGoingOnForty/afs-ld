@@ -49,6 +49,14 @@ pub struct LinkEditContext<'a> {
     pub synthetic_plan: &'a SyntheticPlan,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkMapSymbol {
+    pub name: String,
+    pub addr: u64,
+    pub size: u64,
+    pub file_index: usize,
+}
+
 #[derive(Debug)]
 pub enum WriteError {
     MissingSegment(&'static str),
@@ -674,6 +682,7 @@ pub struct LinkEditPlan {
     code_signature: Option<CodeSignaturePlan>,
     indirect_starts: HashMap<(String, String), u32>,
     lazy_bind_offsets: HashMap<SymbolId, u32>,
+    pub map_symbols: Vec<LinkMapSymbol>,
 }
 
 impl LinkEditPlan {
@@ -746,6 +755,7 @@ fn build_linkedit_plan(
             )?),
             indirect_starts: HashMap::new(),
             lazy_bind_offsets: HashMap::new(),
+            map_symbols: Vec::new(),
         });
     };
     let sym_table = inputs.0.sym_table;
@@ -876,6 +886,7 @@ fn build_linkedit_plan(
         code_signature: Some(build_code_signature(layout, kind, opts, regular_end)?),
         indirect_starts,
         lazy_bind_offsets: bind_streams.lazy_offsets,
+        map_symbols: symbol_plan.map_symbols,
     })
 }
 
@@ -926,11 +937,14 @@ struct OutputSymbolSpec {
     n_sect: u8,
     n_desc: u16,
     n_value: u64,
+    size: u64,
+    file_index: usize,
 }
 
 #[derive(Debug, Clone)]
 struct SymbolTablePlan {
     symbols: Vec<InputSymbol>,
+    map_symbols: Vec<LinkMapSymbol>,
     strtab_bytes: Vec<u8>,
     symbol_indices: HashMap<SymbolId, u32>,
     exports: Vec<ExportEntry>,
@@ -1451,6 +1465,13 @@ fn build_output_symbols(
     let sym_table = inputs.0.sym_table;
     let atom_sections = atom_section_ordinals(layout);
     let atoms_by_input_section = inputs.0.atom_table.by_input_section();
+    let file_index_by_input: HashMap<InputId, usize> = inputs
+        .0
+        .layout_inputs
+        .iter()
+        .enumerate()
+        .map(|(idx, input)| (input.id, idx + 1))
+        .collect();
     let image_base = layout.segment("__TEXT").map(|seg| seg.vm_addr).unwrap_or(0);
     let mut locals = Vec::new();
     let mut external_defineds = Vec::new();
@@ -1469,16 +1490,22 @@ fn build_output_symbols(
             n_sect: 1,
             n_desc: REFERENCED_DYNAMICALLY,
             n_value: text_vmaddr,
+            size: 0,
+            file_index: 0,
         });
     }
 
     for input in inputs.0.layout_inputs {
+        let ctx = LocalSymbolContext {
+            atom_table: inputs.0.atom_table,
+            atoms_by_input_section: &atoms_by_input_section,
+            atom_sections: &atom_sections,
+            input_id: input.id,
+            file_index: file_index_by_input[&input.id],
+        };
         collect_local_symbols(
             layout,
-            inputs.0.atom_table,
-            &atoms_by_input_section,
-            &atom_sections,
-            input.id,
+            &ctx,
             input.object,
             &mut locals,
         )?;
@@ -1489,6 +1516,7 @@ fn build_output_symbols(
     for (symbol_id, symbol) in sym_table.iter() {
         let Symbol::Defined {
             name,
+            origin,
             atom,
             value,
             weak,
@@ -1514,6 +1542,11 @@ fn build_output_symbols(
                 .ok_or(WriteError::DefinedSymbolSectionMissing(symbol_id, *atom))?;
             (defined_symbol_type(*private_extern), sect, addr + *value)
         };
+        let size = if atom.0 == 0 {
+            0
+        } else {
+            inputs.0.atom_table.get(*atom).size.saturating_sub(*value as u32) as u64
+        };
         let mut n_desc = 0;
         if *weak {
             n_desc |= N_WEAK_DEF;
@@ -1529,6 +1562,8 @@ fn build_output_symbols(
             n_sect,
             n_desc,
             n_value,
+            size,
+            file_index: file_index_by_input.get(origin).copied().unwrap_or(0),
         });
     }
 
@@ -1546,6 +1581,8 @@ fn build_output_symbols(
             n_sect: NO_SECT,
             n_desc,
             n_value: 0,
+            size: 0,
+            file_index: 0,
         });
     }
     undefineds.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
@@ -1598,6 +1635,16 @@ fn build_output_symbols(
 
     let mut symbols = Vec::with_capacity(specs.len());
     let mut symbol_indices = HashMap::new();
+    let map_symbols = specs
+        .iter()
+        .filter(|spec| spec.partition != OutputSymbolPartition::Undefined)
+        .map(|spec| LinkMapSymbol {
+            name: spec.name.clone(),
+            addr: spec.n_value,
+            size: spec.size,
+            file_index: spec.file_index,
+        })
+        .collect();
     for (idx, spec) in specs.into_iter().enumerate() {
         let strx = *strx_by_name
             .get(&spec.name)
@@ -1616,6 +1663,7 @@ fn build_output_symbols(
 
     Ok(SymbolTablePlan {
         symbols,
+        map_symbols,
         strtab_bytes,
         symbol_indices,
         exports,
@@ -1667,16 +1715,15 @@ fn collect_synthetic_local_symbols(
         n_sect: u8::try_from(section_index + 1).expect("section index should fit in n_sect"),
         n_desc: 0,
         n_value: section.addr + section.synthetic_offset,
+        size: 8,
+        file_index: 0,
     });
     Ok(())
 }
 
 fn collect_local_symbols(
     layout: &Layout,
-    atom_table: &AtomTable,
-    atoms_by_input_section: &HashMap<(InputId, u8), Vec<crate::resolve::AtomId>>,
-    atom_sections: &HashMap<crate::resolve::AtomId, u8>,
-    input_id: InputId,
+    ctx: &LocalSymbolContext<'_>,
     object: &ObjectFile,
     out: &mut Vec<OutputSymbolSpec>,
 ) -> Result<(), WriteError> {
@@ -1698,9 +1745,9 @@ fn collect_local_symbols(
                     .expect("section symbol without section");
                 let offset = input_sym.value().saturating_sub(section.addr) as u32;
                 let (atom_id, delta) = find_containing_atom(
-                    atom_table,
-                    atoms_by_input_section,
-                    input_id,
+                    ctx.atom_table,
+                    ctx.atoms_by_input_section,
+                    ctx.input_id,
                     input_sym.sect_idx(),
                     offset,
                 )
@@ -1714,7 +1761,7 @@ fn collect_local_symbols(
                         ))?
                         + delta as u64;
                 let n_sect =
-                    *atom_sections
+                    *ctx.atom_sections
                         .get(&atom_id)
                         .ok_or(WriteError::DefinedSymbolSectionMissing(
                             SymbolId(u32::MAX),
@@ -1728,6 +1775,8 @@ fn collect_local_symbols(
                     n_sect,
                     n_desc: input_sym.raw.n_desc,
                     n_value: addr,
+                    size: ctx.atom_table.get(atom_id).size.saturating_sub(delta) as u64,
+                    file_index: ctx.file_index,
                 });
             }
             SymKind::Abs => {
@@ -1739,12 +1788,22 @@ fn collect_local_symbols(
                     n_sect: NO_SECT,
                     n_desc: input_sym.raw.n_desc,
                     n_value: input_sym.value(),
+                    size: 0,
+                    file_index: ctx.file_index,
                 });
             }
             SymKind::Undef | SymKind::Indirect => {}
         }
     }
     Ok(())
+}
+
+struct LocalSymbolContext<'a> {
+    atom_table: &'a AtomTable,
+    atoms_by_input_section: &'a HashMap<(InputId, u8), Vec<crate::resolve::AtomId>>,
+    atom_sections: &'a HashMap<crate::resolve::AtomId, u8>,
+    input_id: InputId,
+    file_index: usize,
 }
 
 fn is_assembler_temporary_symbol(name: &str) -> bool {

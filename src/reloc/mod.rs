@@ -114,7 +114,7 @@ pub fn write_raw_relocs(relocs: &[RawRelocation], out: &mut Vec<u8>) {
 // Fused Reloc form. Sprint 11's reloc-application pass consumes this.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RelocKind {
     Unsigned,
     Branch26,
@@ -132,7 +132,7 @@ pub enum RelocKind {
     Subtractor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RelocLength {
     Byte = 0,

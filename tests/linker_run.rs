@@ -6991,3 +6991,193 @@ fn linker_run_icf_safe_keeps_address_taken_functions_distinct() {
     let _ = fs::remove_file(baseline_out);
     let _ = fs::remove_file(our_out);
 }
+
+#[test]
+fn linker_run_icf_safe_folds_matching_branch_relocs() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    };
+
+    let obj = scratch("icf-branch-match.o");
+    let baseline_out = scratch("icf-branch-match-baseline.out");
+    let our_out = scratch("icf-branch-match-ours.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            stp x29, x30, [sp, #-32]!
+            mov x29, sp
+            bl _wrapper1
+            str w0, [sp, #16]
+            bl _wrapper2
+            ldr w8, [sp, #16]
+            add w0, w8, w0
+            ldp x29, x30, [sp], #32
+            ret
+
+        .private_extern _wrapper1
+        _wrapper1:
+            b _leaf
+
+        .private_extern _wrapper2
+        _wrapper2:
+            b _leaf
+
+        .private_extern _leaf
+        _leaf:
+            mov w0, #5
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let baseline_opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(baseline_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&baseline_opts).unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        icf_mode: afs_ld::IcfMode::Safe,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let baseline_bytes = fs::read(&baseline_out).unwrap();
+    let our_bytes = fs::read(&our_out).unwrap();
+    let baseline_symbols = symbol_values(&baseline_bytes);
+    let our_symbols = symbol_values(&our_bytes);
+    let baseline_text = output_section(&baseline_bytes, "__TEXT", "__text").unwrap().1;
+    let our_text = output_section(&our_bytes, "__TEXT", "__text").unwrap().1;
+
+    assert_ne!(
+        baseline_symbols.get("_wrapper1"),
+        baseline_symbols.get("_wrapper2"),
+        "baseline link should keep identical wrappers separate"
+    );
+    assert_eq!(
+        our_symbols.get("_wrapper1"),
+        our_symbols.get("_wrapper2"),
+        "matching branch relocations should fold under -icf=safe"
+    );
+    assert_eq!(
+        Command::new(&our_out).status().unwrap().code(),
+        Some(10),
+        "folded branch-reloc executable should preserve runtime behavior"
+    );
+    assert!(
+        our_text.len() < baseline_text.len(),
+        "expected matching branch-reloc wrappers to shrink under -icf=safe"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(baseline_out);
+    let _ = fs::remove_file(our_out);
+}
+
+#[test]
+fn linker_run_icf_safe_keeps_distinct_branch_targets_unfolded() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    };
+
+    let obj = scratch("icf-branch-distinct.o");
+    let baseline_out = scratch("icf-branch-distinct-baseline.out");
+    let our_out = scratch("icf-branch-distinct-ours.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            stp x29, x30, [sp, #-32]!
+            mov x29, sp
+            bl _wrapper1
+            str w0, [sp, #16]
+            bl _wrapper2
+            ldr w8, [sp, #16]
+            add w0, w8, w0
+            ldp x29, x30, [sp], #32
+            ret
+
+        .private_extern _wrapper1
+        _wrapper1:
+            b _leaf1
+
+        .private_extern _wrapper2
+        _wrapper2:
+            b _leaf2
+
+        .private_extern _leaf1
+        _leaf1:
+            mov w0, #3
+            ret
+
+        .private_extern _leaf2
+        _leaf2:
+            mov w0, #5
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let baseline_opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(baseline_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&baseline_opts).unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        icf_mode: afs_ld::IcfMode::Safe,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let baseline_bytes = fs::read(&baseline_out).unwrap();
+    let our_bytes = fs::read(&our_out).unwrap();
+    let baseline_symbols = symbol_values(&baseline_bytes);
+    let our_symbols = symbol_values(&our_bytes);
+    let baseline_text = output_section(&baseline_bytes, "__TEXT", "__text").unwrap().1;
+    let our_text = output_section(&our_bytes, "__TEXT", "__text").unwrap().1;
+
+    assert_ne!(
+        baseline_symbols.get("_wrapper1"),
+        baseline_symbols.get("_wrapper2"),
+        "baseline link should keep distinct wrappers separate"
+    );
+    assert_ne!(
+        our_symbols.get("_wrapper1"),
+        our_symbols.get("_wrapper2"),
+        "wrappers targeting different leaves must not fold under -icf=safe"
+    );
+    assert_eq!(
+        Command::new(&our_out).status().unwrap().code(),
+        Some(8),
+        "distinct branch-target executable should preserve runtime behavior"
+    );
+    assert_eq!(
+        our_text.len(),
+        baseline_text.len(),
+        "distinct branch-target wrappers should not shrink under -icf=safe"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(baseline_out);
+    let _ = fs::remove_file(our_out);
+}

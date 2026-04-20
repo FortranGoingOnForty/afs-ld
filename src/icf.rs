@@ -3,7 +3,9 @@ use std::fmt;
 
 use crate::atom::{Atom, AtomFlags, AtomSection, AtomTable};
 use crate::layout::LayoutInput;
-use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind};
+use crate::reloc::{
+    parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength,
+};
 use crate::resolve::{AtomId, InputId, Symbol, SymbolId, SymbolTable};
 
 #[derive(Debug, Clone, Default)]
@@ -58,46 +60,68 @@ pub fn fold_safe(
     });
     let mut redirects = HashMap::new();
 
-    let mut buckets: HashMap<FoldKey, Vec<AtomId>> = HashMap::new();
-    for (atom_id, atom) in atom_table.iter() {
-        if !kept_atoms.contains(&atom_id) {
-            continue;
-        }
-        if !is_foldable_atom(atom, sym_table) {
-            continue;
-        }
-        let relocs = reloc_cache
-            .get(&(atom.origin, atom.input_section))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        if relocs_for_atom(relocs, atom).next().is_some() {
-            continue;
-        }
-        buckets.entry(FoldKey::from_atom(atom)).or_default().push(atom_id);
-    }
-
     let order_by_input: HashMap<InputId, (usize, Option<u32>)> = layout_inputs
         .iter()
         .map(|input| (input.id, (input.load_order, input.archive_member_offset)))
         .collect();
 
-    for atom_ids in buckets.into_values() {
-        if atom_ids.len() < 2 {
-            continue;
-        }
-        let winner = *atom_ids
-            .iter()
-            .min_by_key(|atom_id| fold_order_key(atom_table.get(**atom_id), &order_by_input, **atom_id))
-            .expect("bucket is non-empty");
-        for loser in atom_ids {
-            if loser == winner {
+    loop {
+        let mut buckets: HashMap<FoldKey, Vec<AtomId>> = HashMap::new();
+        for (atom_id, atom) in atom_table.iter() {
+            if !kept_atoms.contains(&atom_id) {
                 continue;
             }
-            redirects.insert(loser, winner);
-            kept_atoms.remove(&loser);
-            rebind_folded_symbols(sym_table, atom_table.get(loser), winner);
+            if !is_foldable_atom(atom, sym_table) {
+                continue;
+            }
+            let relocs = reloc_cache
+                .get(&(atom.origin, atom.input_section))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let Some(reloc_sig) = reloc_signature_for_atom(
+                atom,
+                relocs,
+                layout_inputs,
+                sym_table,
+                &resolved_by_name,
+                &redirects,
+            ) else {
+                continue;
+            };
+            buckets
+                .entry(FoldKey::from_atom(atom, reloc_sig))
+                .or_default()
+                .push(atom_id);
+        }
+
+        let mut changed = false;
+        for atom_ids in buckets.into_values() {
+            if atom_ids.len() < 2 {
+                continue;
+            }
+            let winner = *atom_ids
+                .iter()
+                .min_by_key(|atom_id| {
+                    fold_order_key(atom_table.get(**atom_id), &order_by_input, **atom_id)
+                })
+                .expect("bucket is non-empty");
+            for loser in atom_ids {
+                if loser == winner {
+                    continue;
+                }
+                redirects.insert(loser, winner);
+                kept_atoms.remove(&loser);
+                rebind_folded_symbols(sym_table, atom_table.get(loser), winner);
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
         }
     }
+
+    rebind_symbols_to_canonical_winners(sym_table, &redirects);
 
     Ok(IcfPlan {
         kept_atoms,
@@ -112,18 +136,38 @@ struct FoldKey {
     align_pow2: u8,
     flags: u32,
     data: Vec<u8>,
+    relocs: Vec<FoldReloc>,
 }
 
 impl FoldKey {
-    fn from_atom(atom: &Atom) -> Self {
+    fn from_atom(atom: &Atom, relocs: Vec<FoldReloc>) -> Self {
         Self {
             section: atom.section,
             size: atom.size,
             align_pow2: atom.align_pow2,
             flags: atom.flags.bits() & !AtomFlags::ADDRESS_TAKEN,
             data: atom.data.clone(),
+            relocs,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FoldReloc {
+    offset: u32,
+    kind: RelocKind,
+    length: RelocLength,
+    pcrel: bool,
+    referent: FoldReferent,
+    addend: i64,
+    subtrahend: Option<FoldReferent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FoldReferent {
+    Atom(AtomId),
+    Symbol(SymbolId),
+    Section(u8),
 }
 
 fn fold_order_key(
@@ -174,6 +218,25 @@ fn rebind_folded_symbols(sym_table: &mut SymbolTable, atom: &Atom, winner: AtomI
             _ => alt.offset_within_atom as u64,
         };
         sym_table.bind_atom(alt.symbol, winner, value);
+    }
+}
+
+fn rebind_symbols_to_canonical_winners(
+    sym_table: &mut SymbolTable,
+    redirects: &HashMap<AtomId, AtomId>,
+) {
+    let updates: Vec<(SymbolId, AtomId, u64)> = sym_table
+        .iter()
+        .filter_map(|(symbol_id, symbol)| match symbol {
+            Symbol::Defined { atom, value, .. } if atom.0 != 0 => {
+                let canonical = canonical_atom(*atom, redirects);
+                (canonical != *atom).then_some((symbol_id, canonical, *value))
+            }
+            _ => None,
+        })
+        .collect();
+    for (symbol_id, atom, value) in updates {
+        sym_table.bind_atom(symbol_id, atom, value);
     }
 }
 
@@ -260,6 +323,83 @@ fn relocs_for_atom<'a>(relocs: &'a [Reloc], atom: &Atom) -> impl Iterator<Item =
         let reloc_end = reloc.offset.saturating_add(reloc.length.byte_width() as u32);
         reloc.offset >= start && reloc_end <= end
     })
+}
+
+fn reloc_signature_for_atom(
+    atom: &Atom,
+    relocs: &[Reloc],
+    layout_inputs: &[LayoutInput<'_>],
+    sym_table: &SymbolTable,
+    resolved_by_name: &HashMap<String, SymbolId>,
+    redirects: &HashMap<AtomId, AtomId>,
+) -> Option<Vec<FoldReloc>> {
+    let objects_by_input: HashMap<InputId, &crate::input::ObjectFile> = layout_inputs
+        .iter()
+        .map(|input| (input.id, input.object))
+        .collect();
+    let object = objects_by_input.get(&atom.origin)?;
+    relocs_for_atom(relocs, atom)
+        .map(|reloc| {
+            Some(FoldReloc {
+                offset: reloc.offset.saturating_sub(atom.input_offset),
+                kind: reloc.kind,
+                length: reloc.length,
+                pcrel: reloc.pcrel,
+                referent: normalize_referent(
+                    object,
+                    reloc.referent,
+                    sym_table,
+                    resolved_by_name,
+                    redirects,
+                )?,
+                addend: reloc.addend,
+                subtrahend: match reloc.subtrahend {
+                    Some(referent) => Some(normalize_referent(
+                        object,
+                        referent,
+                        sym_table,
+                        resolved_by_name,
+                        redirects,
+                    )?),
+                    None => None,
+                },
+            })
+        })
+        .collect()
+}
+
+fn normalize_referent(
+    object: &crate::input::ObjectFile,
+    referent: Referent,
+    sym_table: &SymbolTable,
+    resolved_by_name: &HashMap<String, SymbolId>,
+    redirects: &HashMap<AtomId, AtomId>,
+) -> Option<FoldReferent> {
+    match referent {
+        Referent::Symbol(sym_idx) => {
+            let input_sym = object.symbols.get(sym_idx as usize)?;
+            let name = object.symbol_name(input_sym).ok()?;
+            let &symbol_id = resolved_by_name.get(name)?;
+            match sym_table.get(symbol_id) {
+                Symbol::Defined { atom, .. } if atom.0 != 0 => {
+                    Some(FoldReferent::Atom(canonical_atom(*atom, redirects)))
+                }
+                _ => Some(FoldReferent::Symbol(symbol_id)),
+            }
+        }
+        Referent::Section(section) => Some(FoldReferent::Section(section)),
+    }
+}
+
+fn canonical_atom(atom_id: AtomId, redirects: &HashMap<AtomId, AtomId>) -> AtomId {
+    let mut current = atom_id;
+    while let Some(&next) = redirects.get(&current) {
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
 }
 
 fn target_atoms_for_reloc(

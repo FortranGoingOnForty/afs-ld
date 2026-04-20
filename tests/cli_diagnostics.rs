@@ -473,8 +473,41 @@ fn dead_strip_keeps_no_dead_strip_roots() {
 }
 
 #[test]
-fn icf_safe_flag_errors_loudly() {
-    assert_flag_errors("-icf=safe", "`-icf=safe` is not yet supported", "icf-safe");
+fn icf_safe_flag_links_successfully() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = match assemble_minimal_main("icf-safe-main.o") {
+        Ok(obj) => obj,
+        Err(e) => {
+            eprintln!("skipping: assemble failed: {e}");
+            return;
+        }
+    };
+    let out_path = scratch("icf-safe.out");
+    let out = Command::new(exe)
+        .arg("-icf=safe")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        out.status.success(),
+        "-icf=safe link should succeed:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out_path.is_file(),
+        "expected -icf=safe link to produce {}",
+        out_path.display()
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
 }
 
 #[test]

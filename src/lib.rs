@@ -10,6 +10,7 @@ pub mod atom;
 pub mod diag;
 pub mod dump;
 pub mod input;
+pub mod icf;
 pub mod layout;
 pub mod leb;
 pub mod link_map;
@@ -27,6 +28,7 @@ use std::path::PathBuf;
 use std::{fs, io};
 
 use atom::{atomize_object, backpatch_symbol_atoms, AtomTable};
+use icf::IcfError;
 use layout::{Layout, LayoutInput};
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
 use macho::reader::ReadError;
@@ -174,6 +176,7 @@ pub enum LinkError {
     Reloc(RelocError),
     Synth(synth::SynthError),
     Unwind(synth::unwind::UnwindError),
+    Icf(IcfError),
     DuplicateSymbols(String),
     UndefinedSymbols(String),
     UnsupportedArch(String),
@@ -199,6 +202,7 @@ impl std::fmt::Display for LinkError {
             LinkError::Reloc(e) => write!(f, "{e}"),
             LinkError::Synth(e) => write!(f, "{e}"),
             LinkError::Unwind(e) => write!(f, "{e}"),
+            LinkError::Icf(e) => write!(f, "{e}"),
             LinkError::DuplicateSymbols(msg) | LinkError::UndefinedSymbols(msg) => {
                 write!(f, "{msg}")
             }
@@ -292,6 +296,12 @@ impl From<synth::unwind::UnwindError> for LinkError {
     }
 }
 
+impl From<IcfError> for LinkError {
+    fn from(value: IcfError) -> Self {
+        LinkError::Icf(value)
+    }
+}
+
 /// The linker itself. Sprint 0 only validates that inputs exist; later sprints
 /// grow this into the full pipeline described in `.docs/overview.md`.
 pub struct Linker;
@@ -306,11 +316,6 @@ impl Linker {
         if opts.bundle {
             return Err(LinkError::UnsupportedOption(
                 "`-bundle` output is not yet supported".into(),
-            ));
-        }
-        if opts.icf_mode == IcfMode::Safe {
-            return Err(LinkError::UnsupportedOption(
-                "`-icf=safe` is not yet supported".into(),
             ));
         }
         if opts.fixup_chains {
@@ -489,12 +494,20 @@ impl Linker {
                 entry_symbol,
             )
         });
+        let icf = (opts.icf_mode == IcfMode::Safe)
+            .then(|| icf::fold_safe(&layout_inputs, &mut atom_table, &mut sym_table, dead_strip.as_ref().map(|analysis| analysis.live_atoms())))
+            .transpose()?;
+        let kept_atoms = if let Some(icf) = &icf {
+            Some(icf.kept_atoms())
+        } else {
+            dead_strip.as_ref().map(|analysis| analysis.live_atoms())
+        };
         let synthetic_plan = synth::SyntheticPlan::build_filtered(
             &layout_inputs,
             &atom_table,
             &mut sym_table,
             &inputs.dylibs,
-            dead_strip.as_ref().map(|analysis| analysis.live_atoms()),
+            kept_atoms,
         )?;
         let mut layout = Layout::build_with_synthetics_filtered(
             opts.kind,
@@ -502,13 +515,14 @@ impl Linker {
             &atom_table,
             0,
             Some(&synthetic_plan),
-            dead_strip.as_ref().map(|analysis| analysis.live_atoms()),
+            kept_atoms,
         );
         let linkedit_context = macho::writer::LinkEditContext {
             layout_inputs: &layout_inputs,
             atom_table: &atom_table,
             sym_table: &sym_table,
             synthetic_plan: &synthetic_plan,
+            icf_redirects: icf.as_ref().map(|plan| plan.redirects()),
         };
         let mut linkedit = None;
         for _ in 0..4 {
@@ -540,6 +554,7 @@ impl Linker {
             &sym_table,
             Some(&synthetic_plan),
             &linkedit,
+            icf.as_ref().map(|plan| plan.redirects()),
         )?;
 
         if let Some(report) = why_live::format_explanations(

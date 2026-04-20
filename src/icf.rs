@@ -1,0 +1,289 @@
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+
+use crate::atom::{Atom, AtomFlags, AtomSection, AtomTable};
+use crate::layout::LayoutInput;
+use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind};
+use crate::resolve::{AtomId, InputId, Symbol, SymbolId, SymbolTable};
+
+#[derive(Debug, Clone, Default)]
+pub struct IcfPlan {
+    kept_atoms: HashSet<AtomId>,
+    redirects: HashMap<AtomId, AtomId>,
+}
+
+impl IcfPlan {
+    pub fn kept_atoms(&self) -> &HashSet<AtomId> {
+        &self.kept_atoms
+    }
+
+    pub fn redirects(&self) -> &HashMap<AtomId, AtomId> {
+        &self.redirects
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IcfError(String);
+
+impl fmt::Display for IcfError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ICF error: {}", self.0)
+    }
+}
+
+impl std::error::Error for IcfError {}
+
+pub fn fold_safe(
+    layout_inputs: &[LayoutInput<'_>],
+    atom_table: &mut AtomTable,
+    sym_table: &mut SymbolTable,
+    live_atoms: Option<&HashSet<AtomId>>,
+) -> Result<IcfPlan, IcfError> {
+    let resolved_by_name = resolved_symbol_map(sym_table);
+    let reloc_cache = reloc_cache(layout_inputs)?;
+
+    mark_address_taken(
+        layout_inputs,
+        atom_table,
+        sym_table,
+        &resolved_by_name,
+        &reloc_cache,
+    );
+
+    let mut kept_atoms = live_atoms.cloned().unwrap_or_else(|| {
+        atom_table
+            .iter()
+            .map(|(atom_id, _)| atom_id)
+            .collect::<HashSet<_>>()
+    });
+    let mut redirects = HashMap::new();
+
+    let mut buckets: HashMap<FoldKey, Vec<AtomId>> = HashMap::new();
+    for (atom_id, atom) in atom_table.iter() {
+        if !kept_atoms.contains(&atom_id) {
+            continue;
+        }
+        if !is_foldable_atom(atom, sym_table) {
+            continue;
+        }
+        let relocs = reloc_cache
+            .get(&(atom.origin, atom.input_section))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if relocs_for_atom(relocs, atom).next().is_some() {
+            continue;
+        }
+        buckets.entry(FoldKey::from_atom(atom)).or_default().push(atom_id);
+    }
+
+    let order_by_input: HashMap<InputId, (usize, Option<u32>)> = layout_inputs
+        .iter()
+        .map(|input| (input.id, (input.load_order, input.archive_member_offset)))
+        .collect();
+
+    for atom_ids in buckets.into_values() {
+        if atom_ids.len() < 2 {
+            continue;
+        }
+        let winner = *atom_ids
+            .iter()
+            .min_by_key(|atom_id| fold_order_key(atom_table.get(**atom_id), &order_by_input, **atom_id))
+            .expect("bucket is non-empty");
+        for loser in atom_ids {
+            if loser == winner {
+                continue;
+            }
+            redirects.insert(loser, winner);
+            kept_atoms.remove(&loser);
+            rebind_folded_symbols(sym_table, atom_table.get(loser), winner);
+        }
+    }
+
+    Ok(IcfPlan {
+        kept_atoms,
+        redirects,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FoldKey {
+    section: AtomSection,
+    size: u32,
+    align_pow2: u8,
+    flags: u32,
+    data: Vec<u8>,
+}
+
+impl FoldKey {
+    fn from_atom(atom: &Atom) -> Self {
+        Self {
+            section: atom.section,
+            size: atom.size,
+            align_pow2: atom.align_pow2,
+            flags: atom.flags.bits() & !AtomFlags::ADDRESS_TAKEN,
+            data: atom.data.clone(),
+        }
+    }
+}
+
+fn fold_order_key(
+    atom: &Atom,
+    order_by_input: &HashMap<InputId, (usize, Option<u32>)>,
+    atom_id: AtomId,
+) -> (usize, u32, u32, u32) {
+    let (load_order, archive_member_offset) =
+        order_by_input.get(&atom.origin).copied().unwrap_or((usize::MAX, None));
+    (
+        load_order,
+        archive_member_offset.unwrap_or(0),
+        atom.input_offset,
+        atom_id.0,
+    )
+}
+
+fn is_foldable_atom(atom: &Atom, sym_table: &SymbolTable) -> bool {
+    if atom.section != AtomSection::Text {
+        return false;
+    }
+    if atom.flags.has(AtomFlags::NO_DEAD_STRIP) || atom.flags.has(AtomFlags::ADDRESS_TAKEN) {
+        return false;
+    }
+    let Some(owner) = atom.owner else {
+        return false;
+    };
+    !matches!(
+        sym_table.get(owner),
+        Symbol::Defined {
+            private_extern: false,
+            ..
+        }
+    )
+}
+
+fn rebind_folded_symbols(sym_table: &mut SymbolTable, atom: &Atom, winner: AtomId) {
+    if let Some(owner) = atom.owner {
+        let value = match sym_table.get(owner) {
+            Symbol::Defined { value, .. } => *value,
+            _ => 0,
+        };
+        sym_table.bind_atom(owner, winner, value);
+    }
+    for alt in &atom.alt_entries {
+        let value = match sym_table.get(alt.symbol) {
+            Symbol::Defined { value, .. } => *value,
+            _ => alt.offset_within_atom as u64,
+        };
+        sym_table.bind_atom(alt.symbol, winner, value);
+    }
+}
+
+fn resolved_symbol_map(sym_table: &SymbolTable) -> HashMap<String, SymbolId> {
+    let mut out = HashMap::new();
+    for (symbol_id, symbol) in sym_table.iter() {
+        out.insert(
+            sym_table.interner.resolve(symbol.name()).to_string(),
+            symbol_id,
+        );
+    }
+    out
+}
+
+fn reloc_cache(
+    layout_inputs: &[LayoutInput<'_>],
+) -> Result<HashMap<(InputId, u8), Vec<Reloc>>, IcfError> {
+    let mut out = HashMap::new();
+    for input in layout_inputs {
+        for (section_idx_zero, section) in input.object.sections.iter().enumerate() {
+            if section.raw_relocs.is_empty() {
+                continue;
+            }
+            let raws = parse_raw_relocs(&section.raw_relocs, 0, section.nreloc)
+                .map_err(|err| IcfError(format!("{}: {err}", input.object.path.display())))?;
+            let relocs = parse_relocs(&raws)
+                .map_err(|err| IcfError(format!("{}: {err}", input.object.path.display())))?;
+            out.insert((input.id, (section_idx_zero + 1) as u8), relocs);
+        }
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mark_address_taken(
+    layout_inputs: &[LayoutInput<'_>],
+    atom_table: &mut AtomTable,
+    sym_table: &SymbolTable,
+    resolved_by_name: &HashMap<String, SymbolId>,
+    reloc_cache: &HashMap<(InputId, u8), Vec<Reloc>>,
+) {
+    for input in layout_inputs {
+        for (section_idx_zero, _section) in input.object.sections.iter().enumerate() {
+            let input_section = (section_idx_zero + 1) as u8;
+            let Some(relocs) = reloc_cache.get(&(input.id, input_section)) else {
+                continue;
+            };
+            for reloc in relocs {
+                if !marks_address_taken(reloc.kind) {
+                    continue;
+                }
+                for target_atom in target_atoms_for_reloc(
+                    input.object,
+                    reloc.referent,
+                    sym_table,
+                    resolved_by_name,
+                ) {
+                    atom_table
+                        .get_mut(target_atom)
+                        .flags
+                        .set(AtomFlags::ADDRESS_TAKEN);
+                }
+            }
+        }
+    }
+}
+
+fn marks_address_taken(kind: RelocKind) -> bool {
+    matches!(
+        kind,
+        RelocKind::Unsigned
+            | RelocKind::PointerToGot
+            | RelocKind::GotLoadPage21
+            | RelocKind::GotLoadPageOff12
+            | RelocKind::TlvpLoadPage21
+            | RelocKind::TlvpLoadPageOff12
+    )
+}
+
+fn relocs_for_atom<'a>(relocs: &'a [Reloc], atom: &Atom) -> impl Iterator<Item = Reloc> + 'a {
+    let start = atom.input_offset;
+    let end = atom.input_offset.saturating_add(atom.size);
+    relocs.iter().copied().filter(move |reloc| {
+        let reloc_end = reloc.offset.saturating_add(reloc.length.byte_width() as u32);
+        reloc.offset >= start && reloc_end <= end
+    })
+}
+
+fn target_atoms_for_reloc(
+    object: &crate::input::ObjectFile,
+    referent: Referent,
+    sym_table: &SymbolTable,
+    resolved_by_name: &HashMap<String, SymbolId>,
+) -> Vec<AtomId> {
+    match referent {
+        Referent::Symbol(sym_idx) => {
+            let Some(input_sym) = object.symbols.get(sym_idx as usize) else {
+                return Vec::new();
+            };
+            let Some(name) = object.symbol_name(input_sym).ok() else {
+                return Vec::new();
+            };
+            let Some(&symbol_id) = resolved_by_name.get(name) else {
+                return Vec::new();
+            };
+            match sym_table.get(symbol_id) {
+                Symbol::Defined { atom, .. } if atom.0 != 0 => vec![*atom],
+                _ => Vec::new(),
+            }
+        }
+        Referent::Section(_) => Vec::new(),
+    }
+}

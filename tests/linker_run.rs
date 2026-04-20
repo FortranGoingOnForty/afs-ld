@@ -6812,3 +6812,182 @@ fn linker_run_rebases_runtime_init_metadata_like_apple_ld() {
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(apple_out);
 }
+
+#[test]
+fn linker_run_icf_safe_folds_identical_private_text() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    };
+
+    let obj = scratch("icf-fold.o");
+    let baseline_out = scratch("icf-fold-baseline.out");
+    let our_out = scratch("icf-fold-ours.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            stp x29, x30, [sp, #-16]!
+            mov x29, sp
+            bl _helper1
+            bl _helper2
+            ldp x29, x30, [sp], #16
+            ret
+
+        .private_extern _helper1
+        _helper1:
+            mov w0, #7
+            ret
+
+        .private_extern _helper2
+        _helper2:
+            mov w0, #7
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let baseline_opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(baseline_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&baseline_opts).unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        icf_mode: afs_ld::IcfMode::Safe,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let baseline_bytes = fs::read(&baseline_out).unwrap();
+    let our_bytes = fs::read(&our_out).unwrap();
+    let baseline_symbols = symbol_values(&baseline_bytes);
+    let our_symbols = symbol_values(&our_bytes);
+    let baseline_text = output_section(&baseline_bytes, "__TEXT", "__text").unwrap().1;
+    let our_text = output_section(&our_bytes, "__TEXT", "__text").unwrap().1;
+
+    assert_eq!(
+        our_symbols.get("_helper1"),
+        our_symbols.get("_helper2"),
+        "expected afs-ld -icf=safe to coalesce identical private text atoms"
+    );
+    assert_ne!(
+        baseline_symbols.get("_helper1"),
+        baseline_symbols.get("_helper2"),
+        "expected baseline link to keep identical helpers separate"
+    );
+    assert_eq!(
+        Command::new(&our_out).status().unwrap().code(),
+        Some(7),
+        "folded executable should preserve runtime behavior"
+    );
+    assert!(
+        our_text.len() < baseline_text.len(),
+        "expected -icf=safe to reduce text size on identical helpers"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(baseline_out);
+    let _ = fs::remove_file(our_out);
+}
+
+#[test]
+fn linker_run_icf_safe_keeps_address_taken_functions_distinct() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    };
+
+    let obj = scratch("icf-address-taken.o");
+    let baseline_out = scratch("icf-address-taken-baseline.out");
+    let our_out = scratch("icf-address-taken-ours.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            stp x29, x30, [sp, #-16]!
+            mov x29, sp
+            bl _helper1
+            bl _helper2
+            ldp x29, x30, [sp], #16
+            ret
+
+        .private_extern _helper1
+        _helper1:
+            mov w0, #7
+            ret
+
+        .private_extern _helper2
+        _helper2:
+            mov w0, #7
+            ret
+
+        .section __DATA,__const
+        .p2align 3
+        _ptrs:
+            .quad _helper1
+            .quad _helper2
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let baseline_opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(baseline_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&baseline_opts).unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        icf_mode: afs_ld::IcfMode::Safe,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let baseline_bytes = fs::read(&baseline_out).unwrap();
+    let our_bytes = fs::read(&our_out).unwrap();
+    let baseline_symbols = symbol_values(&baseline_bytes);
+    let our_symbols = symbol_values(&our_bytes);
+    let baseline_text = output_section(&baseline_bytes, "__TEXT", "__text").unwrap().1;
+    let our_text = output_section(&our_bytes, "__TEXT", "__text").unwrap().1;
+
+    assert_ne!(
+        our_symbols.get("_helper1"),
+        our_symbols.get("_helper2"),
+        "address-taken helpers should not be folded by afs-ld -icf=safe"
+    );
+    assert_ne!(
+        baseline_symbols.get("_helper1"),
+        baseline_symbols.get("_helper2"),
+        "baseline link should keep address-taken helpers separate"
+    );
+    assert_eq!(
+        Command::new(&our_out).status().unwrap().code(),
+        Some(7),
+        "address-taken executable should preserve runtime behavior"
+    );
+    assert_eq!(
+        our_text.len(),
+        baseline_text.len(),
+        "address-taken helpers should not shrink under -icf=safe"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(baseline_out);
+    let _ = fs::remove_file(our_out);
+}

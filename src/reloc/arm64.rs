@@ -52,6 +52,7 @@ struct ResolveView<'a> {
     stub_helper_entry_addrs: &'a HashMap<SymbolId, u64>,
     stub_helper_header_addr: Option<u64>,
     dyld_private_addr: Option<u64>,
+    icf_redirects: Option<&'a HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
 }
 
 struct SyntheticAddressMaps {
@@ -70,6 +71,7 @@ pub fn apply_layout(
     sym_table: &SymbolTable,
     synthetic_plan: Option<&SyntheticPlan>,
     linkedit: &LinkEditPlan,
+    icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
 ) -> Result<(), RelocError> {
     let input_map: HashMap<InputId, &ObjectFile> = inputs
         .iter()
@@ -121,6 +123,7 @@ pub fn apply_layout(
         stub_helper_entry_addrs: &synth_addrs.stub_helper_entry_addrs,
         stub_helper_header_addr: synth_addrs.stub_helper_header_addr,
         dyld_private_addr: synth_addrs.dyld_private_addr,
+        icf_redirects,
     };
 
     for out_section in &mut layout.sections {
@@ -811,6 +814,7 @@ fn resolve_input_section_offset(
                 None
             }
         }) {
+            let target_atom = canonical_atom(target_atom, resolve.icf_redirects);
             let atom_addr = resolve
                 .atom_addrs
                 .get(&target_atom)
@@ -845,6 +849,23 @@ fn resolve_input_section_offset(
             )
         })?;
     Ok(section_addr + input_offset as u64)
+}
+
+fn canonical_atom(
+    atom_id: crate::resolve::AtomId,
+    redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
+) -> crate::resolve::AtomId {
+    let Some(redirects) = redirects else {
+        return atom_id;
+    };
+    let mut current = atom_id;
+    while let Some(&next) = redirects.get(&current) {
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
 }
 
 fn patch_unsigned(

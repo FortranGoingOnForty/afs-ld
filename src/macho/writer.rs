@@ -48,6 +48,7 @@ pub struct LinkEditContext<'a> {
     pub atom_table: &'a AtomTable,
     pub sym_table: &'a SymbolTable,
     pub synthetic_plan: &'a SyntheticPlan,
+    pub icf_redirects: Option<&'a HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -834,8 +835,12 @@ fn build_linkedit_plan(
     let export_bytes = pad_dyld_info_stream(build_export_trie(&symbol_plan.exports));
     let function_starts_bytes =
         build_function_starts(layout, inputs.0.layout_inputs, inputs.0.atom_table)?;
-    let data_in_code_bytes =
-        build_data_in_code(layout, inputs.0.layout_inputs, inputs.0.atom_table)?;
+    let data_in_code_bytes = build_data_in_code(
+        layout,
+        inputs.0.layout_inputs,
+        inputs.0.atom_table,
+        inputs.0.icf_redirects,
+    )?;
 
     let mut cursor = base_off as u64;
     let rebase_off = place_optional_block(&mut cursor, rebase_bytes.len(), "rebase stream offset")?;
@@ -1345,6 +1350,7 @@ fn build_data_in_code(
     layout: &Layout,
     inputs: &[LayoutInput<'_>],
     atom_table: &AtomTable,
+    icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
 ) -> Result<Vec<u8>, WriteError> {
     #[derive(Clone, Copy)]
     struct RemappedEntry {
@@ -1368,6 +1374,7 @@ fn build_data_in_code(
                 section_index,
                 section_relative,
                 entry.length as u32,
+                icf_redirects,
             )
             .ok_or_else(|| {
                 WriteError::MalformedDataInCode(
@@ -1575,6 +1582,7 @@ fn build_output_symbols(
             atom_table: inputs.0.atom_table,
             atoms_by_input_section: &atoms_by_input_section,
             atom_sections: &atom_sections,
+            icf_redirects: inputs.0.icf_redirects,
             input_id: input.id,
             file_index: file_index_by_input[&input.id],
         };
@@ -1839,6 +1847,7 @@ fn collect_local_symbols(
                     ctx.input_id,
                     input_sym.sect_idx(),
                     offset,
+                    ctx.icf_redirects,
                 )
                 .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
                 let addr =
@@ -1887,6 +1896,7 @@ struct LocalSymbolContext<'a> {
     atom_table: &'a AtomTable,
     atoms_by_input_section: &'a HashMap<(InputId, u8), Vec<crate::resolve::AtomId>>,
     atom_sections: &'a HashMap<crate::resolve::AtomId, u8>,
+    icf_redirects: Option<&'a HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
     input_id: InputId,
     file_index: usize,
 }
@@ -1901,6 +1911,7 @@ fn find_containing_atom(
     input_id: InputId,
     input_section: u8,
     offset: u32,
+    icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
 ) -> Option<(crate::resolve::AtomId, u32)> {
     find_containing_atom_range(
         atom_table,
@@ -1909,6 +1920,7 @@ fn find_containing_atom(
         input_section,
         offset,
         1,
+        icf_redirects,
     )
 }
 
@@ -1919,6 +1931,7 @@ fn find_containing_atom_range(
     input_section: u8,
     offset: u32,
     len: u32,
+    icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
 ) -> Option<(crate::resolve::AtomId, u32)> {
     atoms_by_input_section
         .get(&(input_id, input_section))
@@ -1928,9 +1941,27 @@ fn find_containing_atom_range(
                 let start = atom.input_offset;
                 let end = atom.input_offset.saturating_add(atom.size);
                 let range_end = offset.checked_add(len)?;
-                (start <= offset && range_end <= end).then_some((*atom_id, offset - start))
+                (start <= offset && range_end <= end)
+                    .then_some((canonical_atom(*atom_id, icf_redirects), offset - start))
             })
         })
+}
+
+fn canonical_atom(
+    atom_id: crate::resolve::AtomId,
+    redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
+) -> crate::resolve::AtomId {
+    let Some(redirects) = redirects else {
+        return atom_id;
+    };
+    let mut current = atom_id;
+    while let Some(&next) = redirects.get(&current) {
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
 }
 
 fn input_symbol_type(input_sym: &InputSymbol) -> u8 {
@@ -2667,11 +2698,11 @@ mod tests {
 
         let by_input_section = atoms.by_input_section();
         assert_eq!(
-            find_containing_atom(&atoms, &by_input_section, InputId(7), 3, 4),
+            find_containing_atom(&atoms, &by_input_section, InputId(7), 3, 4, None),
             Some((first, 4))
         );
         assert_eq!(
-            find_containing_atom_range(&atoms, &by_input_section, InputId(7), 3, 10, 2),
+            find_containing_atom_range(&atoms, &by_input_section, InputId(7), 3, 10, 2, None),
             Some((second, 2))
         );
     }

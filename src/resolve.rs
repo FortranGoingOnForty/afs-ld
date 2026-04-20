@@ -1135,6 +1135,7 @@ impl From<SeedError> for FetchError {
 #[derive(Debug, Default)]
 pub struct DrainReport {
     pub fetched_members: usize,
+    pub loaded_paths: Vec<PathBuf>,
     pub duplicates: Vec<InsertError>,
     pub referrers: ReferrerLog,
 }
@@ -1179,6 +1180,9 @@ fn ingest_member_bytes(
         bytes: member_bytes,
     });
     report.fetched_members += 1;
+    report
+        .loaded_paths
+        .push(inputs.objects[input_id.0 as usize].path.clone());
 
     let mut sub_report = SeedReport::default();
     seed_object(inputs, input_id, table, &mut sub_report)?;

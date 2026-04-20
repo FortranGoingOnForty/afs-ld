@@ -26,6 +26,12 @@ const KNOWN_FLAGS: &[&str] = &[
     "-current_version",
     "-compatibility_version",
     "-map",
+    "-t",
+    "-trace",
+    "-v",
+    "--version",
+    "-h",
+    "--help",
     "-x",
     "-dylib",
     "-all_load",
@@ -265,6 +271,15 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                         .ok_or_else(|| ArgsError::MissingValue("-map".into()))?,
                 ));
             }
+            "-t" | "-trace" => {
+                opts.trace_inputs = true;
+            }
+            "-v" | "--version" => {
+                opts.show_version = true;
+            }
+            "-h" | "--help" => {
+                opts.show_help = true;
+            }
             "-x" => {
                 opts.strip_locals = true;
             }
@@ -503,6 +518,26 @@ mod tests {
         let opts = parse(&argv(&["-Wl,-map,link.map", "main.o"])).unwrap();
         assert_eq!(opts.map.as_deref(), Some(std::path::Path::new("link.map")));
         assert_eq!(opts.inputs, vec![PathBuf::from("main.o")]);
+    }
+
+    #[test]
+    fn trace_flags_are_recorded() {
+        let opts = parse(&argv(&["-trace", "main.o"])).unwrap();
+        assert!(opts.trace_inputs);
+        let opts = parse(&argv(&["-t", "main.o"])).unwrap();
+        assert!(opts.trace_inputs);
+    }
+
+    #[test]
+    fn help_and_version_flags_are_recorded() {
+        let opts = parse(&argv(&["--help"])).unwrap();
+        assert!(opts.show_help);
+        let opts = parse(&argv(&["-h"])).unwrap();
+        assert!(opts.show_help);
+        let opts = parse(&argv(&["--version"])).unwrap();
+        assert!(opts.show_version);
+        let opts = parse(&argv(&["-v"])).unwrap();
+        assert!(opts.show_version);
     }
 
     #[test]

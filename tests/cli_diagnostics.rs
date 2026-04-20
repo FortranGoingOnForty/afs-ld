@@ -39,6 +39,50 @@ fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-cli-diag-{}-{name}", std::process::id()))
 }
 
+fn archive(objects: &[&PathBuf], out: &PathBuf) -> Result<(), String> {
+    let output = Command::new("libtool")
+        .arg("-static")
+        .arg("-o")
+        .arg(out)
+        .args(objects)
+        .output()
+        .map_err(|e| format!("spawn libtool: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "libtool failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn help_flag_prints_usage_and_exits_successfully() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let out = Command::new(exe)
+        .arg("--help")
+        .output()
+        .expect("afs-ld should run");
+    assert!(out.status.success(), "help should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Usage: afs-ld [options] <inputs...>"));
+    assert!(stdout.contains("-map <path>"));
+    assert!(stdout.contains("-t, -trace"));
+    assert!(stdout.contains("-v, --version"));
+}
+
+#[test]
+fn version_flag_prints_version_and_exits_successfully() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let out = Command::new(exe)
+        .arg("--version")
+        .output()
+        .expect("afs-ld should run");
+    assert!(out.status.success(), "version should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.trim(), format!("afs-ld {}", env!("CARGO_PKG_VERSION")));
+}
+
 #[test]
 fn undefined_symbol_diagnostic_is_not_double_prefixed() {
     if !have_xcrun() {
@@ -78,4 +122,80 @@ fn undefined_symbol_diagnostic_is_not_double_prefixed() {
     );
 
     let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn trace_flag_prints_loaded_inputs_and_archive_members() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let main_obj = scratch("trace-main.o");
+    let helper_obj = scratch("trace-helper.o");
+    let archive_path = scratch("libtracehelpers.a");
+    let out_path = scratch("trace.out");
+    let main_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            bl _helper
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    let helper_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _helper
+        _helper:
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(main_src, &main_obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+    if let Err(e) = assemble(helper_src, &helper_obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+    if let Err(e) = archive(&[&helper_obj], &archive_path) {
+        eprintln!("skipping: archive failed: {e}");
+        let _ = fs::remove_file(main_obj);
+        let _ = fs::remove_file(helper_obj);
+        return;
+    }
+
+    let out = Command::new(exe)
+        .arg("-t")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&main_obj)
+        .arg(&archive_path)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        out.status.success(),
+        "trace link should succeed:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("afs-ld: loading {}", main_obj.display())),
+        "missing main object trace:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("afs-ld: loading {}", archive_path.display())),
+        "missing archive trace:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("libtracehelpers.a("),
+        "missing fetched archive member trace:\n{stderr}"
+    );
+
+    let _ = fs::remove_file(main_obj);
+    let _ = fs::remove_file(helper_obj);
+    let _ = fs::remove_file(archive_path);
+    let _ = fs::remove_file(out_path);
 }

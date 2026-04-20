@@ -73,6 +73,9 @@ pub struct LinkOptions {
     pub current_version: Option<u32>,
     pub compatibility_version: Option<u32>,
     pub map: Option<PathBuf>,
+    pub trace_inputs: bool,
+    pub show_version: bool,
+    pub show_help: bool,
     pub output: Option<PathBuf>,
     pub entry: Option<String>,
     pub arch: Option<String>,
@@ -107,6 +110,9 @@ impl Default for LinkOptions {
             current_version: None,
             compatibility_version: None,
             map: None,
+            trace_inputs: false,
+            show_version: false,
+            show_help: false,
             output: None,
             entry: None,
             arch: None,
@@ -288,6 +294,9 @@ impl Linker {
 
         let mut inputs = Inputs::new();
         for (load_order, path) in load_paths.iter().enumerate() {
+            if opts.trace_inputs {
+                eprintln!("afs-ld: loading {}", path.display());
+            }
             register_input(&mut inputs, path, load_order)?;
         }
 
@@ -311,6 +320,11 @@ impl Linker {
             };
             force_load_archive(&mut inputs, &mut sym_table, archive_id, &mut force_report)?;
         }
+        if opts.trace_inputs {
+            for path in &force_report.loaded_paths {
+                eprintln!("afs-ld: loading {}", path.display());
+            }
+        }
         if !force_report.duplicates.is_empty() {
             let mut msg = String::new();
             for err in &force_report.duplicates {
@@ -320,6 +334,11 @@ impl Linker {
         }
 
         let drain_report = drain_fetches(&mut inputs, &mut sym_table, seed_report.pending_fetches)?;
+        if opts.trace_inputs {
+            for path in &drain_report.loaded_paths {
+                eprintln!("afs-ld: loading {}", path.display());
+            }
+        }
         if !drain_report.duplicates.is_empty() {
             let mut msg = String::new();
             for err in &drain_report.duplicates {

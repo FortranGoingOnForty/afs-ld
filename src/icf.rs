@@ -3,9 +3,7 @@ use std::fmt;
 
 use crate::atom::{Atom, AtomFlags, AtomSection, AtomTable};
 use crate::layout::LayoutInput;
-use crate::reloc::{
-    parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength,
-};
+use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
 use crate::resolve::{AtomId, InputId, Symbol, SymbolId, SymbolTable};
 
 #[derive(Debug, Clone, Default)]
@@ -227,8 +225,10 @@ fn fold_order_key(
     order_by_input: &HashMap<InputId, (usize, Option<u32>)>,
     atom_id: AtomId,
 ) -> (usize, u32, u32, u32) {
-    let (load_order, archive_member_offset) =
-        order_by_input.get(&atom.origin).copied().unwrap_or((usize::MAX, None));
+    let (load_order, archive_member_offset) = order_by_input
+        .get(&atom.origin)
+        .copied()
+        .unwrap_or((usize::MAX, None));
     (
         load_order,
         archive_member_offset.unwrap_or(0),
@@ -363,6 +363,8 @@ fn marks_address_taken(kind: RelocKind) -> bool {
     matches!(
         kind,
         RelocKind::Unsigned
+            | RelocKind::Page21
+            | RelocKind::PageOff12
             | RelocKind::PointerToGot
             | RelocKind::GotLoadPage21
             | RelocKind::GotLoadPageOff12
@@ -375,7 +377,9 @@ fn relocs_for_atom<'a>(relocs: &'a [Reloc], atom: &Atom) -> impl Iterator<Item =
     let start = atom.input_offset;
     let end = atom.input_offset.saturating_add(atom.size);
     relocs.iter().copied().filter(move |reloc| {
-        let reloc_end = reloc.offset.saturating_add(reloc.length.byte_width() as u32);
+        let reloc_end = reloc
+            .offset
+            .saturating_add(reloc.length.byte_width() as u32);
         reloc.offset >= start && reloc_end <= end
     })
 }
@@ -469,7 +473,10 @@ fn atom_symbols(atom: &Atom) -> impl Iterator<Item = SymbolId> + '_ {
 }
 
 fn symbol_name(sym_table: &SymbolTable, symbol_id: SymbolId) -> String {
-    sym_table.interner.resolve(sym_table.get(symbol_id).name()).to_string()
+    sym_table
+        .interner
+        .resolve(sym_table.get(symbol_id).name())
+        .to_string()
 }
 
 fn target_atoms_for_reloc(

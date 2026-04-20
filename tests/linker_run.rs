@@ -7052,6 +7052,104 @@ fn linker_run_icf_safe_keeps_address_taken_functions_distinct() {
 }
 
 #[test]
+fn linker_run_icf_safe_keeps_adrp_add_address_taken_functions_distinct() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    };
+
+    let obj = scratch("icf-adrp-address-taken.o");
+    let baseline_out = scratch("icf-adrp-address-taken-baseline.out");
+    let our_out = scratch("icf-adrp-address-taken-ours.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            stp x29, x30, [sp, #-16]!
+            mov x29, sp
+            adrp x10, _helper1@PAGE
+            add x10, x10, _helper1@PAGEOFF
+            adrp x11, _helper2@PAGE
+            add x11, x11, _helper2@PAGEOFF
+            cmp x10, x11
+            b.ne 1f
+            mov w0, #1
+            ldp x29, x30, [sp], #16
+            ret
+        1:
+            mov w0, #0
+            ldp x29, x30, [sp], #16
+            ret
+
+        .private_extern _helper1
+        _helper1:
+            mov w0, #7
+            ret
+
+        .private_extern _helper2
+        _helper2:
+            mov w0, #7
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let baseline_opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(baseline_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&baseline_opts).unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        icf_mode: afs_ld::IcfMode::Safe,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let baseline_bytes = fs::read(&baseline_out).unwrap();
+    let our_bytes = fs::read(&our_out).unwrap();
+    let baseline_symbols = symbol_values(&baseline_bytes);
+    let our_symbols = symbol_values(&our_bytes);
+    let baseline_text = output_section(&baseline_bytes, "__TEXT", "__text")
+        .unwrap()
+        .1;
+    let our_text = output_section(&our_bytes, "__TEXT", "__text").unwrap().1;
+
+    assert_ne!(
+        our_symbols.get("_helper1"),
+        our_symbols.get("_helper2"),
+        "adrp/add address-taken helpers should not be folded by afs-ld -icf=safe"
+    );
+    assert_ne!(
+        baseline_symbols.get("_helper1"),
+        baseline_symbols.get("_helper2"),
+        "baseline link should keep adrp/add address-taken helpers separate"
+    );
+    assert_eq!(
+        Command::new(&our_out).status().unwrap().code(),
+        Some(0),
+        "adrp/add address-taken executable should preserve pointer inequality"
+    );
+    assert_eq!(
+        our_text.len(),
+        baseline_text.len(),
+        "adrp/add address-taken helpers should not shrink under -icf=safe"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(baseline_out);
+    let _ = fs::remove_file(our_out);
+}
+
+#[test]
 fn linker_run_icf_safe_folds_matching_branch_relocs() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");

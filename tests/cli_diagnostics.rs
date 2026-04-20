@@ -5,6 +5,8 @@ use std::process::Command;
 use afs_ld::macho::constants::LC_UUID;
 use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand};
 
+const EXPECTED_HELP: &str = include_str!("snapshots/help.txt");
+
 fn have_xcrun() -> bool {
     Command::new("xcrun")
         .arg("-f")
@@ -127,13 +129,12 @@ fn help_flag_prints_usage_and_exits_successfully() {
         .expect("afs-ld should run");
     assert!(out.status.success(), "help should succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Usage: afs-ld [options] <inputs...>"));
-    assert!(stdout.contains("-map <path>"));
-    assert!(stdout.contains("-no_uuid"));
-    assert!(stdout.contains("-dead_strip"));
-    assert!(stdout.contains("-undefined <error|warning|suppress|dynamic_lookup>"));
-    assert!(stdout.contains("-t, -trace"));
-    assert!(stdout.contains("-v, --version"));
+    assert_eq!(stdout.as_ref(), EXPECTED_HELP);
+    assert!(
+        out.stderr.is_empty(),
+        "help should not write to stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

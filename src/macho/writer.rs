@@ -15,7 +15,8 @@ use crate::macho::dylib::DylibDependency;
 use crate::macho::exports::{ExportEntry, ExportKind};
 use crate::macho::reader::{
     write_commands, write_header, BuildTool, BuildVersionCmd, DyldInfoCmd, DylibCmd, DysymtabCmd,
-    LinkEditDataCmd, LoadCommand, MachHeader64, Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
+    LinkEditDataCmd, LoadCommand, MachHeader64, RpathCmd, Section64Header, Segment64, SymtabCmd,
+    HEADER_SIZE,
 };
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
 use crate::resolve::InputId;
@@ -355,10 +356,16 @@ fn build_commands(
                 cmd: LC_ID_DYLIB,
                 name: dylib_install_name(opts),
                 timestamp: 2,
-                current_version: pack_version(1, 0, 0),
-                compatibility_version: pack_version(1, 0, 0),
+                current_version: dylib_current_version(opts),
+                compatibility_version: dylib_compatibility_version(opts),
             }));
         }
+    }
+
+    for rpath in &opts.rpaths {
+        commands.push(LoadCommand::Rpath(RpathCmd {
+            path: rpath.clone(),
+        }));
     }
 
     for dylib in dylibs {
@@ -422,11 +429,17 @@ fn estimate_header_size(
             cmd: LC_ID_DYLIB,
             name: dylib_install_name(opts),
             timestamp: 2,
-            current_version: pack_version(1, 0, 0),
-            compatibility_version: pack_version(1, 0, 0),
+            current_version: dylib_current_version(opts),
+            compatibility_version: dylib_compatibility_version(opts),
         }
         .wire_size() as u64,
     };
+    for rpath in &opts.rpaths {
+        size += RpathCmd {
+            path: rpath.clone(),
+        }
+        .wire_size() as u64;
+    }
     for dylib in dylibs {
         size += DylibCmd {
             cmd: LC_LOAD_DYLIB,
@@ -618,6 +631,9 @@ fn header_flags(layout: &Layout, kind: OutputKind) -> u32 {
 }
 
 fn dylib_install_name(opts: &LinkOptions) -> String {
+    if let Some(name) = &opts.install_name {
+        return name.clone();
+    }
     if let Some(path) = &opts.output {
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             return format!("@rpath/{name}");
@@ -625,6 +641,15 @@ fn dylib_install_name(opts: &LinkOptions) -> String {
         return path.display().to_string();
     }
     "@rpath/a.out.dylib".to_string()
+}
+
+fn dylib_current_version(opts: &LinkOptions) -> u32 {
+    opts.current_version.unwrap_or_else(|| pack_version(1, 0, 0))
+}
+
+fn dylib_compatibility_version(opts: &LinkOptions) -> u32 {
+    opts.compatibility_version
+        .unwrap_or_else(|| pack_version(1, 0, 0))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use crate::{LinkOptions, OutputKind, PlatformVersion};
-use crate::resolve::levenshtein;
+use crate::resolve::{levenshtein, UndefinedTreatment};
 
 const KNOWN_FLAGS: &[&str] = &[
     "-o",
@@ -17,6 +17,11 @@ const KNOWN_FLAGS: &[&str] = &[
     "-L",
     "-syslibroot",
     "-platform_version",
+    "-undefined",
+    "-rpath",
+    "-install_name",
+    "-current_version",
+    "-compatibility_version",
     "-x",
     "-dylib",
     "-all_load",
@@ -81,7 +86,7 @@ fn unknown_flag(flag: &str) -> ArgsError {
     }
 }
 
-fn parse_platform_version_component(flag: &str, value: &str) -> Result<u32, ArgsError> {
+fn parse_version_component(flag: &str, value: &str) -> Result<u32, ArgsError> {
     let mut parts = value.split('.');
     let parse_part = |piece: Option<&str>| -> Result<u32, ArgsError> {
         let raw = piece.unwrap_or("0");
@@ -169,9 +174,59 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                     .next()
                     .ok_or_else(|| ArgsError::MissingValue("-platform_version".into()))?;
                 opts.platform_version = Some(PlatformVersion {
-                    minos: parse_platform_version_component("-platform_version", minos_raw)?,
-                    sdk: parse_platform_version_component("-platform_version", sdk_raw)?,
+                    minos: parse_version_component("-platform_version", minos_raw)?,
+                    sdk: parse_version_component("-platform_version", sdk_raw)?,
                 });
+            }
+            "-undefined" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| ArgsError::MissingValue("-undefined".into()))?;
+                opts.undefined_treatment = match value.as_str() {
+                    "error" => UndefinedTreatment::Error,
+                    "dynamic_lookup" => UndefinedTreatment::DynamicLookup,
+                    "warning" | "suppress" => {
+                        return Err(ArgsError::InvalidValue {
+                            flag: "-undefined".into(),
+                            value: value.clone(),
+                            expected: "`error` or `dynamic_lookup` (warning/suppress not yet supported)".into(),
+                        });
+                    }
+                    _ => {
+                        return Err(ArgsError::InvalidValue {
+                            flag: "-undefined".into(),
+                            value: value.clone(),
+                            expected: "`error` or `dynamic_lookup`".into(),
+                        });
+                    }
+                };
+            }
+            "-rpath" => {
+                opts.rpaths.push(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("-rpath".into()))?
+                        .clone(),
+                );
+            }
+            "-install_name" => {
+                opts.install_name = Some(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("-install_name".into()))?
+                        .clone(),
+                );
+            }
+            "-current_version" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| ArgsError::MissingValue("-current_version".into()))?;
+                opts.current_version = Some(parse_version_component("-current_version", value)?);
+            }
+            "-compatibility_version" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| ArgsError::MissingValue("-compatibility_version".into()))?;
+                opts.compatibility_version =
+                    Some(parse_version_component("-compatibility_version", value)?);
             }
             "-x" => {
                 opts.strip_locals = true;
@@ -311,6 +366,45 @@ mod tests {
                 ..
             } if flag == "-platform_version" && value == "13.bad"
         ));
+    }
+
+    #[test]
+    fn undefined_flag_records_dynamic_lookup() {
+        let opts = parse(&argv(&["-undefined", "dynamic_lookup", "main.o"])).unwrap();
+        assert_eq!(opts.undefined_treatment, UndefinedTreatment::DynamicLookup);
+    }
+
+    #[test]
+    fn undefined_flag_rejects_unsupported_modes() {
+        let err = parse(&argv(&["-undefined", "warning", "main.o"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::InvalidValue {
+                ref flag,
+                ref value,
+                ..
+            } if flag == "-undefined" && value == "warning"
+        ));
+    }
+
+    #[test]
+    fn dylib_metadata_flags_are_recorded() {
+        let opts = parse(&argv(&[
+            "-rpath",
+            "@loader_path/../lib",
+            "-install_name",
+            "@rpath/libdemo.dylib",
+            "-current_version",
+            "2.3.4",
+            "-compatibility_version",
+            "1.2",
+            "main.o",
+        ]))
+        .unwrap();
+        assert_eq!(opts.rpaths, vec!["@loader_path/../lib".to_string()]);
+        assert_eq!(opts.install_name.as_deref(), Some("@rpath/libdemo.dylib"));
+        assert_eq!(opts.current_version, Some((2 << 16) | (3 << 8) | 4));
+        assert_eq!(opts.compatibility_version, Some((1 << 16) | (2 << 8)));
     }
 
     #[test]

@@ -1971,6 +1971,62 @@ fn linker_run_emits_minimal_dylib_from_real_object() {
 }
 
 #[test]
+fn linker_run_uses_dylib_identity_flags() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("libmeta.o");
+    let out = scratch("libmeta.dylib");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _exported
+        _exported:
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Dylib,
+        install_name: Some("@rpath/libmeta_custom.dylib".into()),
+        current_version: Some((2 << 16) | (3 << 8) | 4),
+        compatibility_version: Some((1 << 16) | (5 << 8)),
+        rpaths: vec!["@loader_path/../lib".into()],
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
+    let id_dylib = commands
+        .iter()
+        .find_map(|cmd| match cmd {
+            LoadCommand::Dylib(cmd) if cmd.cmd == afs_ld::macho::constants::LC_ID_DYLIB => {
+                Some(cmd.clone())
+            }
+            _ => None,
+        })
+        .expect("missing LC_ID_DYLIB");
+    assert_eq!(id_dylib.name, "@rpath/libmeta_custom.dylib");
+    assert_eq!(id_dylib.current_version, (2 << 16) | (3 << 8) | 4);
+    assert_eq!(id_dylib.compatibility_version, (1 << 16) | (5 << 8));
+    assert!(commands.iter().any(
+        |cmd| matches!(cmd, LoadCommand::Rpath(r) if r.path == "@loader_path/../lib")
+    ));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_loads_minimal_dylib_via_dlopen() {
     if !have_xcrun() || !have_tool("codesign") {
         eprintln!("skipping: xcrun clang/as or codesign unavailable");
@@ -2281,6 +2337,57 @@ fn linker_run_reports_unresolved_symbol() {
     }
 
     let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn linker_run_promotes_unresolved_symbol_to_dynamic_lookup() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("missing-dynamic.o");
+    let out = scratch("missing-dynamic.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+        .section __DATA,__data
+        .p2align 3
+        .globl _missing_slot
+        _missing_slot:
+            .quad _missing
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        undefined_treatment: afs_ld::resolve::UndefinedTreatment::DynamicLookup,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let bind_records = decode_bind_records(&bytes, false).unwrap();
+    assert!(
+        bind_records
+            .iter()
+            .any(|record| record.symbol == "_missing" && record.ordinal == 0xFFFE),
+        "expected flat-lookup bind for _missing, got {bind_records:?}"
+    );
+    let (_, _, undefs) = symbol_partition_names(&bytes);
+    assert_eq!(undefs, vec!["_missing".to_string()]);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
 }
 
 #[test]
@@ -2676,6 +2783,53 @@ fn linker_run_uses_platform_version_for_build_command() {
         .expect("missing LC_BUILD_VERSION");
     assert_eq!(build.minos, (13 << 16) | (2 << 8) | 1);
     assert_eq!(build.sdk, (14 << 16) | (5 << 8));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_emits_rpath_command() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("rpath-main.o");
+    let out = scratch("rpath-main.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        rpaths: vec!["@loader_path/../Frameworks".into()],
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
+    let rpaths: Vec<String> = commands
+        .into_iter()
+        .filter_map(|cmd| match cmd {
+            LoadCommand::Rpath(cmd) => Some(cmd.path),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rpaths, vec!["@loader_path/../Frameworks".to_string()]);
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);

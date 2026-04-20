@@ -59,6 +59,11 @@ pub struct LinkOptions {
     pub search_paths: Vec<PathBuf>,
     pub syslibroot: Option<PathBuf>,
     pub platform_version: Option<PlatformVersion>,
+    pub undefined_treatment: UndefinedTreatment,
+    pub rpaths: Vec<String>,
+    pub install_name: Option<String>,
+    pub current_version: Option<u32>,
+    pub compatibility_version: Option<u32>,
     pub output: Option<PathBuf>,
     pub entry: Option<String>,
     pub arch: Option<String>,
@@ -85,6 +90,11 @@ impl Default for LinkOptions {
             search_paths: Vec::new(),
             syslibroot: None,
             platform_version: None,
+            undefined_treatment: UndefinedTreatment::Error,
+            rpaths: Vec::new(),
+            install_name: None,
+            current_version: None,
+            compatibility_version: None,
             output: None,
             entry: None,
             arch: None,
@@ -288,7 +298,7 @@ impl Linker {
         let mut referrers = seed_report.referrers.clone();
         referrers.extend_from(&force_report.referrers);
         referrers.extend_from(&drain_report.referrers);
-        let unresolved = classify_unresolved(&mut sym_table, UndefinedTreatment::Error);
+        let unresolved = classify_unresolved(&mut sym_table, opts.undefined_treatment);
         if !unresolved.errors.is_empty() {
             return Err(LinkError::UndefinedSymbols(format_undefined_diagnostic(
                 &sym_table,

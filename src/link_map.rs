@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::layout::{Layout, LayoutInput};
 use crate::macho::writer::LinkEditPlan;
+use crate::why_live::DeadStrippedSymbol;
 use crate::LinkOptions;
 
 pub fn write_link_map(
@@ -12,6 +13,7 @@ pub fn write_link_map(
     layout: &Layout,
     layout_inputs: &[LayoutInput<'_>],
     linkedit: &LinkEditPlan,
+    dead_stripped: &[DeadStrippedSymbol],
 ) -> io::Result<()> {
     let output_path = opts.output.as_deref().unwrap_or_else(|| Path::new("a.out"));
     let mut out = String::new();
@@ -25,7 +27,11 @@ pub fn write_link_map(
     }
 
     writeln!(&mut out, "\n# Sections:").unwrap();
-    writeln!(&mut out, "# Address          Size         Segment   Section").unwrap();
+    writeln!(
+        &mut out,
+        "# Address          Size         Segment   Section"
+    )
+    .unwrap();
     for section in &layout.sections {
         writeln!(
             &mut out,
@@ -38,7 +44,11 @@ pub fn write_link_map(
     writeln!(&mut out, "\n# Symbols:").unwrap();
     writeln!(&mut out, "# Address          Size         File    Name").unwrap();
     let mut symbols = linkedit.map_symbols.clone();
-    symbols.sort_by(|lhs, rhs| lhs.addr.cmp(&rhs.addr).then_with(|| lhs.name.cmp(&rhs.name)));
+    symbols.sort_by(|lhs, rhs| {
+        lhs.addr
+            .cmp(&rhs.addr)
+            .then_with(|| lhs.name.cmp(&rhs.name))
+    });
     for symbol in &symbols {
         let file = if symbol.file_index == 0 {
             "linker".to_string()
@@ -54,6 +64,14 @@ pub fn write_link_map(
     }
 
     writeln!(&mut out, "\n# Dead stripped:").unwrap();
+    for symbol in dead_stripped {
+        let file = if symbol.file_index == 0 {
+            "linker".to_string()
+        } else {
+            format!("[{:>3}]", symbol.file_index)
+        };
+        writeln!(&mut out, "{:<7} {}", file, symbol.name).unwrap();
+    }
 
     std::fs::write(path, out)
 }

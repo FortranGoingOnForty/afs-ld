@@ -3208,6 +3208,80 @@ fn linker_run_emits_map_file() {
 }
 
 #[test]
+fn linker_run_map_lists_dead_stripped_symbols() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let main_obj = scratch("map-dead-main.o");
+    let helper_obj = scratch("map-dead-helper.o");
+    let unused_obj = scratch("map-dead-unused.o");
+    let out = scratch("map-dead.out");
+    let map = scratch("map-dead.map");
+    let main_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            bl _helper
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    let helper_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _helper
+        _helper:
+            ret
+        .subsections_via_symbols
+    "#;
+    let unused_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _unused
+        _unused:
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(main_src, &main_obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+    if let Err(e) = assemble(helper_src, &helper_obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        let _ = fs::remove_file(main_obj);
+        return;
+    }
+    if let Err(e) = assemble(unused_src, &unused_obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        let _ = fs::remove_file(main_obj);
+        let _ = fs::remove_file(helper_obj);
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![main_obj.clone(), helper_obj.clone(), unused_obj.clone()],
+        output: Some(out.clone()),
+        map: Some(map.clone()),
+        dead_strip: true,
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let map_text = fs::read_to_string(&map).unwrap();
+    let dead_stripped_idx = map_text.find("# Dead stripped:").unwrap();
+    let dead_stripped = &map_text[dead_stripped_idx..];
+    assert!(dead_stripped.contains("_unused"));
+    assert!(!dead_stripped.contains("_helper"));
+
+    let _ = fs::remove_file(main_obj);
+    let _ = fs::remove_file(helper_obj);
+    let _ = fs::remove_file(unused_obj);
+    let _ = fs::remove_file(out);
+    let _ = fs::remove_file(map);
+}
+
+#[test]
 fn linker_run_carries_tbd_inputs_into_load_commands() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");
@@ -4595,6 +4669,107 @@ fn linker_run_routes_local_got_loads_through_rebased_slots() {
         Some(7),
         "expected local GOT executable to exit 7"
     );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_dead_strip_prunes_synthetic_import_sections() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("dead-strip-import.o");
+    let our_out = scratch("dead-strip-import-ours.out");
+    let apple_out = scratch("dead-strip-import-apple.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+
+        .globl _unused
+        _unused:
+            bl _puts
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd.clone()],
+        output: Some(our_out.clone()),
+        dead_strip: true,
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_with_args(
+        &obj,
+        &apple_out,
+        "_main",
+        &sdk,
+        &sdk_ver,
+        &["-dead_strip", "-no_fixup_chains"],
+    )
+    .unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    for (segname, sectname) in [
+        ("__TEXT", "__stubs"),
+        ("__TEXT", "__stub_helper"),
+        ("__DATA", "__la_symbol_ptr"),
+        ("__DATA_CONST", "__got"),
+    ] {
+        assert!(
+            output_section(&our_bytes, segname, sectname).is_none(),
+            "unexpected synthetic section {segname},{sectname} in our output"
+        );
+        assert!(
+            output_section(&apple_bytes, segname, sectname).is_none(),
+            "unexpected synthetic section {segname},{sectname} in apple output"
+        );
+    }
+    assert!(decode_bind_records(&our_bytes, false).unwrap().is_empty());
+    assert_eq!(
+        decode_bind_records(&our_bytes, false).unwrap(),
+        decode_bind_records(&apple_bytes, false).unwrap()
+    );
+
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&our_out)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let status = Command::new(&our_out).status().unwrap();
+    assert_eq!(status.code(), Some(0));
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);

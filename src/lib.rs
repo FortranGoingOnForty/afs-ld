@@ -479,12 +479,6 @@ impl Linker {
                 ordinal: dylib.ordinal,
             });
         }
-        let synthetic_plan = synth::SyntheticPlan::build(
-            &layout_inputs,
-            &atom_table,
-            &mut sym_table,
-            &inputs.dylibs,
-        )?;
         let entry_symbol = find_entry_symbol_id(opts, &sym_table)?;
         let dead_strip = opts.dead_strip.then(|| {
             why_live::DeadStripAnalysis::build(
@@ -495,6 +489,13 @@ impl Linker {
                 entry_symbol,
             )
         });
+        let synthetic_plan = synth::SyntheticPlan::build_filtered(
+            &layout_inputs,
+            &atom_table,
+            &mut sym_table,
+            &inputs.dylibs,
+            dead_strip.as_ref().map(|analysis| analysis.live_atoms()),
+        )?;
         let mut layout = Layout::build_with_synthetics_filtered(
             opts.kind,
             &layout_inputs,
@@ -568,7 +569,20 @@ impl Linker {
         let output = default_output_path(opts);
         fs::write(&output, image)?;
         if let Some(map_path) = &opts.map {
-            link_map::write_link_map(map_path, opts, &layout, &layout_inputs, &linkedit)?;
+            let dead_stripped = dead_strip
+                .as_ref()
+                .map(|analysis| {
+                    analysis.dead_stripped_symbols(&atom_table, &sym_table, &layout_inputs)
+                })
+                .unwrap_or_default();
+            link_map::write_link_map(
+                map_path,
+                opts,
+                &layout,
+                &layout_inputs,
+                &linkedit,
+                &dead_stripped,
+            )?;
         }
         if opts.kind == OutputKind::Executable {
             let mut perms = fs::metadata(&output)?.permissions();

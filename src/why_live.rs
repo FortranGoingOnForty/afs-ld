@@ -32,6 +32,12 @@ enum LiveCause {
     ParentOf(AtomId),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadStrippedSymbol {
+    pub name: String,
+    pub file_index: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct DeadStripAnalysis {
     live_atoms: HashSet<AtomId>,
@@ -94,6 +100,44 @@ impl DeadStripAnalysis {
 
     pub fn live_atoms(&self) -> &HashSet<AtomId> {
         &self.live_atoms
+    }
+
+    pub fn dead_stripped_symbols(
+        &self,
+        atom_table: &AtomTable,
+        sym_table: &SymbolTable,
+        layout_inputs: &[LayoutInput<'_>],
+    ) -> Vec<DeadStrippedSymbol> {
+        let file_index_by_input: HashMap<InputId, usize> = layout_inputs
+            .iter()
+            .enumerate()
+            .map(|(idx, input)| (input.id, idx + 1))
+            .collect();
+        let mut out = Vec::new();
+        for (atom_id, _atom) in atom_table.iter() {
+            if self.live_atoms.contains(&atom_id) {
+                continue;
+            }
+            let Some(symbols) = self.atom_symbols.get(&atom_id) else {
+                continue;
+            };
+            for &symbol_id in symbols {
+                let Symbol::Defined { origin, .. } = sym_table.get(symbol_id) else {
+                    continue;
+                };
+                out.push(DeadStrippedSymbol {
+                    name: self.symbol_name(sym_table, symbol_id),
+                    file_index: file_index_by_input.get(origin).copied().unwrap_or(0),
+                });
+            }
+        }
+        out.sort_by(|lhs, rhs| {
+            lhs.name
+                .cmp(&rhs.name)
+                .then(lhs.file_index.cmp(&rhs.file_index))
+        });
+        out.dedup_by(|lhs, rhs| lhs.name == rhs.name && lhs.file_index == rhs.file_index);
+        out
     }
 
     fn symbol_name(&self, sym_table: &SymbolTable, symbol_id: SymbolId) -> String {

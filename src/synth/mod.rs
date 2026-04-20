@@ -5,7 +5,7 @@ pub mod stubs;
 pub mod tlv;
 pub mod unwind;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -83,6 +83,16 @@ impl SyntheticPlan {
         sym_table: &mut SymbolTable,
         dylibs: &[DylibInput],
     ) -> Result<Self, SynthError> {
+        Self::build_filtered(inputs, atoms, sym_table, dylibs, None)
+    }
+
+    pub fn build_filtered(
+        inputs: &[LayoutInput<'_>],
+        atoms: &AtomTable,
+        sym_table: &mut SymbolTable,
+        dylibs: &[DylibInput],
+        live_atoms: Option<&HashSet<AtomId>>,
+    ) -> Result<Self, SynthError> {
         let input_map: HashMap<InputId, &ObjectFile> = inputs
             .iter()
             .map(|input| (input.id, input.object))
@@ -121,6 +131,9 @@ impl SyntheticPlan {
         let mut direct_binds = Vec::new();
 
         for (atom_id, atom) in atoms.iter() {
+            if live_atoms.is_some_and(|live_atoms| !live_atoms.contains(&atom_id)) {
+                continue;
+            }
             let obj = input_map.get(&atom.origin).ok_or_else(|| SynthError {
                 input: PathBuf::from("<missing object>"),
                 atom: atom_id,
@@ -495,7 +508,9 @@ fn got_page_symbol_needs_slot(
             atom,
             private_extern,
             ..
-        } => atom.0 != 0 && !*private_extern && matches!(atoms.get(*atom).section, AtomSection::Data),
+        } => {
+            atom.0 != 0 && !*private_extern && matches!(atoms.get(*atom).section, AtomSection::Data)
+        }
         _ => false,
     }
 }

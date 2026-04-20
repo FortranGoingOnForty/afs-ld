@@ -476,9 +476,22 @@ fn resolve_got_target(
 }
 
 fn got_reloc_relaxes_locally(obj: &ObjectFile, reloc: Reloc, resolve: &ResolveView<'_>) -> bool {
-    symbol_referent_id(obj, reloc.referent, resolve.sym_table)
-        .map(|symbol_id| !matches!(resolve.sym_table.get(symbol_id), Symbol::DylibImport { .. }))
-        .unwrap_or(false)
+    match symbol_referent_id(obj, reloc.referent, resolve.sym_table) {
+        Some(symbol_id) => match resolve.sym_table.get(symbol_id) {
+            Symbol::DylibImport { .. } => false,
+            Symbol::Defined {
+                atom,
+                private_extern,
+                ..
+            } => {
+                atom.0 == 0
+                    || *private_extern
+                    || !matches!(resolve.atom_table.get(*atom).section, crate::atom::AtomSection::Data)
+            }
+            _ => true,
+        },
+        None => true,
+    }
 }
 
 fn resolve_tlvp_target(

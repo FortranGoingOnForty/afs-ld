@@ -307,12 +307,18 @@ pub fn emit_bind_records(specs: &[BindRecordSpec<'_>]) -> Vec<u8> {
         let run_len = bind_run_len(specs, idx);
         if run_len > 1 {
             let stride = specs[idx + 1].segment_offset - spec.segment_offset;
-            let skip = stride - 8;
-            out.byte(BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB);
-            out.uleb(run_len as u64);
-            out.uleb(skip);
-            state.next_segment_offset = Some(spec.segment_offset + (run_len as u64) * stride);
-            idx += run_len;
+            if run_len == 2 && stride == 8 {
+                out.byte(BIND_OPCODE_DO_BIND);
+                state.next_segment_offset = Some(spec.segment_offset + 8);
+                idx += 1;
+            } else {
+                let skip = stride - 8;
+                out.byte(BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB);
+                out.uleb(run_len as u64);
+                out.uleb(skip);
+                state.next_segment_offset = Some(spec.segment_offset + (run_len as u64) * stride);
+                idx += run_len;
+            }
         } else {
             out.byte(BIND_OPCODE_DO_BIND);
             state.next_segment_offset = Some(spec.segment_offset + 8);
@@ -619,5 +625,54 @@ mod tests {
         assert_eq!(stream[idx + 1], 3);
         assert_eq!(stream[idx + 2], 0x10);
         assert_eq!(stream.last().copied(), Some(0));
+    }
+
+    #[test]
+    fn bind_encoder_keeps_adjacent_pair_uncompressed_for_apple_parity() {
+        let stream = emit_bind_records(&[
+            BindRecordSpec {
+                segment_index: 2,
+                segment_offset: 0,
+                ordinal: 2,
+                name: "_ext_data",
+                weak_import: false,
+                addend: 0,
+                terminate: false,
+            },
+            BindRecordSpec {
+                segment_index: 2,
+                segment_offset: 8,
+                ordinal: 2,
+                name: "_ext_data",
+                weak_import: false,
+                addend: 0,
+                terminate: true,
+            },
+        ]);
+
+        assert!(!stream.contains(&BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB));
+        assert_eq!(
+            stream,
+            vec![
+                BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | 2,
+                BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
+                b'_',
+                b'e',
+                b'x',
+                b't',
+                b'_',
+                b'd',
+                b'a',
+                b't',
+                b'a',
+                0,
+                BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER,
+                BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | 2,
+                0,
+                BIND_OPCODE_DO_BIND,
+                BIND_OPCODE_DO_BIND,
+                0,
+            ]
+        );
     }
 }

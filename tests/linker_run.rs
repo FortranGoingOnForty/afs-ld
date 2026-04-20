@@ -18,9 +18,9 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
     BIND_SYMBOL_FLAGS_WEAK_IMPORT, DICE_KIND_JUMP_TABLE32, INDIRECT_SYMBOL_ABS,
     INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
-    LC_FUNCTION_STARTS, LC_SEGMENT_64, LC_SYMTAB,
-    REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB,
-    REBASE_OPCODE_DONE, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
+    LC_FUNCTION_STARTS, LC_SEGMENT_64, LC_SYMTAB, REBASE_IMMEDIATE_MASK,
+    REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE,
+    REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
     REBASE_OPCODE_MASK, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
     REBASE_TYPE_POINTER, SG_READ_ONLY,
@@ -1968,6 +1968,90 @@ fn linker_run_emits_minimal_dylib_from_real_object() {
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_loads_minimal_dylib_via_dlopen() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun clang/as or codesign unavailable");
+        return;
+    }
+
+    let obj = scratch("libfoo_add.o");
+    let out = scratch("libfoo_add.dylib");
+    let caller_src = scratch("libfoo_add-caller.c");
+    let caller = scratch("libfoo_add-caller.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _foo_add
+        _foo_add:
+            add w0, w0, w1
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    fs::write(
+        &caller_src,
+        r#"
+            #include <dlfcn.h>
+            typedef int (*foo_add_fn)(int, int);
+            int main(int argc, char **argv) {
+                if (argc != 2) return 10;
+                void *handle = dlopen(argv[1], RTLD_NOW);
+                if (!handle) return 11;
+                foo_add_fn fn = (foo_add_fn)dlsym(handle, "foo_add");
+                if (!fn) return 12;
+                int value = fn(2, 3);
+                dlclose(handle);
+                return value == 5 ? 0 : 1;
+            }
+        "#,
+    )
+    .unwrap();
+
+    let output = Command::new("xcrun")
+        .args(["--sdk", "macosx", "clang", "-arch", "arm64"])
+        .arg(&caller_src)
+        .arg("-o")
+        .arg(&caller)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "xcrun clang caller failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let status = Command::new(&caller).arg(&out).status().unwrap();
+    assert_eq!(status.code(), Some(0), "expected dlopen caller to exit 0");
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+    let _ = fs::remove_file(caller_src);
+    let _ = fs::remove_file(caller);
 }
 
 #[test]

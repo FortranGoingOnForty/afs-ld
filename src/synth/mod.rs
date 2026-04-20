@@ -166,29 +166,23 @@ impl SyntheticPlan {
                     RelocKind::GotLoadPage21
                     | RelocKind::GotLoadPageOff12
                     | RelocKind::PointerToGot => {
-                        if matches!(
-                            reloc.kind,
-                            RelocKind::GotLoadPage21 | RelocKind::GotLoadPageOff12
-                        ) {
-                            let Some(symbol_id) =
-                                dylib_import_referent(obj, reloc.referent, sym_table)
-                            else {
-                                continue;
-                            };
-                            got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
-                            continue;
-                        }
                         let Some(symbol_id) = symbol_referent_id(obj, reloc.referent, sym_table)
                         else {
                             continue;
                         };
-                        if matches!(reloc.kind, RelocKind::PointerToGot)
-                            && matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. })
-                        {
+                        let needs_slot = match reloc.kind {
+                            RelocKind::PointerToGot => {
+                                !matches!(sym_table.get(symbol_id), Symbol::LazyArchive { .. })
+                            }
+                            RelocKind::GotLoadPage21 | RelocKind::GotLoadPageOff12 => {
+                                got_page_symbol_needs_slot(sym_table, atoms, symbol_id)
+                            }
+                            _ => false,
+                        };
+                        if needs_slot {
                             got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
                             continue;
                         }
-                        got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
                     }
                     RelocKind::Branch26 => {
                         let Some(symbol_id) = dylib_import_referent(obj, reloc.referent, sym_table)
@@ -488,6 +482,22 @@ fn tlv_symbol_needs_thread_pointer(sym_table: &SymbolTable, symbol_id: SymbolId)
 
 fn tlv_symbol_needs_got(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
     matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. })
+}
+
+fn got_page_symbol_needs_slot(
+    sym_table: &SymbolTable,
+    atoms: &AtomTable,
+    symbol_id: SymbolId,
+) -> bool {
+    match sym_table.get(symbol_id) {
+        Symbol::DylibImport { .. } => true,
+        Symbol::Defined {
+            atom,
+            private_extern,
+            ..
+        } => atom.0 != 0 && !*private_extern && matches!(atoms.get(*atom).section, AtomSection::Data),
+        _ => false,
+    }
 }
 
 fn direct_import_bind_supported(reloc: Reloc) -> bool {

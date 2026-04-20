@@ -9,8 +9,8 @@ pub mod args;
 pub mod atom;
 pub mod diag;
 pub mod dump;
-pub mod input;
 pub mod icf;
+pub mod input;
 pub mod layout;
 pub mod leb;
 pub mod link_map;
@@ -54,6 +54,7 @@ pub enum OutputKind {
 pub enum IcfMode {
     None,
     Safe,
+    All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,6 +324,11 @@ impl Linker {
                 "`-fixup_chains` is not yet supported".into(),
             ));
         }
+        if opts.icf_mode == IcfMode::All {
+            return Err(LinkError::UnsupportedOption(
+                "`-icf=all` is not yet supported; use `-icf=safe` or `-icf=none`".into(),
+            ));
+        }
         if opts.inputs.is_empty() && opts.library_names.is_empty() && opts.frameworks.is_empty() {
             return Err(LinkError::NoInputs);
         }
@@ -495,7 +501,14 @@ impl Linker {
             )
         });
         let icf = (opts.icf_mode == IcfMode::Safe)
-            .then(|| icf::fold_safe(&layout_inputs, &mut atom_table, &mut sym_table, dead_strip.as_ref().map(|analysis| analysis.live_atoms())))
+            .then(|| {
+                icf::fold_safe(
+                    &layout_inputs,
+                    &mut atom_table,
+                    &mut sym_table,
+                    dead_strip.as_ref().map(|analysis| analysis.live_atoms()),
+                )
+            })
             .transpose()?;
         let kept_atoms = if let Some(icf) = &icf {
             Some(icf.kept_atoms())

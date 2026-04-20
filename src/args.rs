@@ -36,6 +36,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "-dead_strip",
     "-icf=safe",
     "-icf=none",
+    "-icf=all",
     "-fixup_chains",
     "-no_fixup_chains",
     "-map",
@@ -246,8 +247,7 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                         return Err(ArgsError::InvalidValue {
                             flag: "-undefined".into(),
                             value: value.clone(),
-                            expected: "`error`, `warning`, `suppress`, or `dynamic_lookup`"
-                                .into(),
+                            expected: "`error`, `warning`, `suppress`, or `dynamic_lookup`".into(),
                         });
                     }
                 };
@@ -319,12 +319,13 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                 opts.icf_mode = match s {
                     "-icf=none" => IcfMode::None,
                     "-icf=safe" => IcfMode::Safe,
+                    "-icf=all" => IcfMode::All,
                     _ => {
                         let value = s.trim_start_matches("-icf=").to_string();
                         return Err(ArgsError::InvalidValue {
                             flag: "-icf".into(),
                             value,
-                            expected: "`safe` or `none`".into(),
+                            expected: "`safe`, `none`, or `all`".into(),
                         });
                     }
                 };
@@ -479,6 +480,12 @@ mod tests {
         assert!(opts.dead_strip);
         assert_eq!(opts.icf_mode, IcfMode::None);
         assert!(!opts.fixup_chains);
+    }
+
+    #[test]
+    fn icf_all_flag_is_recorded() {
+        let opts = parse(&argv(&["-icf=all", "foo.o"])).unwrap();
+        assert_eq!(opts.icf_mode, IcfMode::All);
     }
 
     #[test]

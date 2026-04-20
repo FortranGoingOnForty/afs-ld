@@ -31,7 +31,8 @@ Options:
   -S                              Strip debug symbols (currently a no-op warning)
   -no_uuid                        Omit LC_UUID
   -dead_strip                     Dead-strip unreferenced code/data
-  -icf=safe | -icf=none           Configure identical code folding
+  -icf=safe | -icf=none | -icf=all
+                                  Configure identical code folding (`all` currently errors)
   -fixup_chains | -no_fixup_chains
                                   Select chained fixups vs classic dyld info
   -all_load                       Force-load every archive member

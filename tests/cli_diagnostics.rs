@@ -511,6 +511,15 @@ fn icf_safe_flag_links_successfully() {
 }
 
 #[test]
+fn icf_all_flag_errors_loudly() {
+    assert_flag_errors(
+        "-icf=all",
+        "`-icf=all` is not yet supported; use `-icf=safe` or `-icf=none`",
+        "icf-all",
+    );
+}
+
+#[test]
 fn fixup_chains_flag_errors_loudly() {
     assert_flag_errors(
         "-fixup_chains",

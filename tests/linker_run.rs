@@ -31,7 +31,7 @@ use afs_ld::macho::reader::{parse_commands, parse_header, u32_le, LoadCommand, S
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, SymKind};
 use afs_ld::synth::unwind::decode_unwind_info;
-use afs_ld::{LinkError, LinkOptions, Linker, OutputKind};
+use afs_ld::{FrameworkSpec, LinkError, LinkOptions, Linker, OutputKind};
 use common::harness::diff_macho;
 
 fn have_xcrun() -> bool {
@@ -2018,9 +2018,9 @@ fn linker_run_uses_dylib_identity_flags() {
     assert_eq!(id_dylib.name, "@rpath/libmeta_custom.dylib");
     assert_eq!(id_dylib.current_version, (2 << 16) | (3 << 8) | 4);
     assert_eq!(id_dylib.compatibility_version, (1 << 16) | (5 << 8));
-    assert!(commands.iter().any(
-        |cmd| matches!(cmd, LoadCommand::Rpath(r) if r.path == "@loader_path/../lib")
-    ));
+    assert!(commands
+        .iter()
+        .any(|cmd| matches!(cmd, LoadCommand::Rpath(r) if r.path == "@loader_path/../lib")));
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
@@ -2592,14 +2592,22 @@ fn linker_run_all_load_pulls_entry_from_archive() {
     };
     Linker::run(&opts).unwrap();
 
-    let verify = Command::new("codesign").arg("-v").arg(&out).output().unwrap();
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&out)
+        .output()
+        .unwrap();
     assert!(
         verify.status.success(),
         "codesign verify failed: {}",
         String::from_utf8_lossy(&verify.stderr)
     );
     let status = Command::new(&out).status().unwrap();
-    assert_eq!(status.code(), Some(7), "expected all-load executable to exit 7");
+    assert_eq!(
+        status.code(),
+        Some(7),
+        "expected all-load executable to exit 7"
+    );
 
     let _ = fs::remove_file(member_obj);
     let _ = fs::remove_file(archive);
@@ -2660,7 +2668,11 @@ fn linker_run_force_load_pulls_entry_from_archive() {
     };
     Linker::run(&opts).unwrap();
 
-    let verify = Command::new("codesign").arg("-v").arg(&out).output().unwrap();
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&out)
+        .output()
+        .unwrap();
     assert!(
         verify.status.success(),
         "codesign verify failed: {}",
@@ -2717,10 +2729,16 @@ fn linker_run_resolves_lsystem_via_syslibroot() {
     let bytes = fs::read(&out).unwrap();
     let dylibs = load_dylib_names(&bytes).unwrap();
     assert!(
-        dylibs.iter().any(|name| name == "/usr/lib/libSystem.B.dylib"),
+        dylibs
+            .iter()
+            .any(|name| name == "/usr/lib/libSystem.B.dylib"),
         "expected libSystem load command, got {dylibs:?}"
     );
-    let verify = Command::new("codesign").arg("-v").arg(&out).output().unwrap();
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&out)
+        .output()
+        .unwrap();
     assert!(
         verify.status.success(),
         "codesign verify failed: {}",
@@ -2732,6 +2750,126 @@ fn linker_run_resolves_lsystem_via_syslibroot() {
         Some(0),
         "expected executable linked via -lSystem to exit 0"
     );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_resolves_framework_via_syslibroot() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let metal = PathBuf::from(format!(
+        "{sdk}/System/Library/Frameworks/Metal.framework/Metal.tbd"
+    ));
+    if !metal.exists() {
+        eprintln!("skipping: no Metal.tbd at {}", metal.display());
+        return;
+    }
+
+    let obj = scratch("framework-main.o");
+    let out = scratch("framework-main.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        frameworks: vec![FrameworkSpec {
+            name: "Metal".into(),
+            weak: false,
+        }],
+        syslibroot: Some(PathBuf::from(&sdk)),
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
+    assert!(commands.iter().any(|cmd| matches!(
+        cmd,
+        LoadCommand::Dylib(d)
+            if d.cmd == afs_ld::macho::constants::LC_LOAD_DYLIB
+                && d.name.contains("Metal.framework")
+    )));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_resolves_weak_framework_via_syslibroot() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let metal = PathBuf::from(format!(
+        "{sdk}/System/Library/Frameworks/Metal.framework/Metal.tbd"
+    ));
+    if !metal.exists() {
+        eprintln!("skipping: no Metal.tbd at {}", metal.display());
+        return;
+    }
+
+    let obj = scratch("weak-framework-main.o");
+    let out = scratch("weak-framework-main.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        frameworks: vec![FrameworkSpec {
+            name: "Metal".into(),
+            weak: true,
+        }],
+        syslibroot: Some(PathBuf::from(&sdk)),
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
+    assert!(commands.iter().any(|cmd| matches!(
+        cmd,
+        LoadCommand::Dylib(d)
+            if d.cmd == afs_ld::macho::constants::LC_LOAD_WEAK_DYLIB
+                && d.name.contains("Metal.framework")
+    )));
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);

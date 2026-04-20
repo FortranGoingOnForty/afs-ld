@@ -6,8 +6,8 @@
 
 use std::path::PathBuf;
 
-use crate::{LinkOptions, OutputKind, PlatformVersion};
 use crate::resolve::{levenshtein, UndefinedTreatment};
+use crate::{FrameworkSpec, LinkOptions, OutputKind, PlatformVersion};
 
 const KNOWN_FLAGS: &[&str] = &[
     "-o",
@@ -15,6 +15,9 @@ const KNOWN_FLAGS: &[&str] = &[
     "-arch",
     "-l",
     "-L",
+    "-framework",
+    "-weak_framework",
+    "-ObjC",
     "-syslibroot",
     "-platform_version",
     "-undefined",
@@ -43,7 +46,10 @@ pub enum ArgsError {
         expected: String,
     },
     /// An unrecognized flag.
-    UnknownFlag { flag: String, suggestion: Option<String> },
+    UnknownFlag {
+        flag: String,
+        suggestion: Option<String>,
+    },
 }
 
 impl std::fmt::Display for ArgsError {
@@ -150,11 +156,32 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                         .ok_or_else(|| ArgsError::MissingValue("-L".into()))?,
                 ));
             }
+            "-framework" => {
+                opts.frameworks.push(FrameworkSpec {
+                    name: it
+                        .next()
+                        .ok_or_else(|| ArgsError::MissingValue("-framework".into()))?
+                        .clone(),
+                    weak: false,
+                });
+            }
+            "-weak_framework" => {
+                opts.frameworks.push(FrameworkSpec {
+                    name: it
+                        .next()
+                        .ok_or_else(|| ArgsError::MissingValue("-weak_framework".into()))?
+                        .clone(),
+                    weak: true,
+                });
+            }
+            "-ObjC" => {
+                opts.objc_force_load = true;
+            }
             "-syslibroot" => {
-                opts.syslibroot = Some(PathBuf::from(
-                    it.next()
-                        .ok_or_else(|| ArgsError::MissingValue("-syslibroot".into()))?,
-                ));
+                opts.syslibroot =
+                    Some(PathBuf::from(it.next().ok_or_else(|| {
+                        ArgsError::MissingValue("-syslibroot".into())
+                    })?));
             }
             "-platform_version" => {
                 let platform = it
@@ -189,7 +216,9 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                         return Err(ArgsError::InvalidValue {
                             flag: "-undefined".into(),
                             value: value.clone(),
-                            expected: "`error` or `dynamic_lookup` (warning/suppress not yet supported)".into(),
+                            expected:
+                                "`error` or `dynamic_lookup` (warning/suppress not yet supported)"
+                                    .into(),
                         });
                     }
                     _ => {
@@ -238,10 +267,10 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                 opts.all_load = true;
             }
             "-force_load" => {
-                opts.force_load_archives.push(PathBuf::from(
-                    it.next()
-                        .ok_or_else(|| ArgsError::MissingValue("-force_load".into()))?,
-                ));
+                opts.force_load_archives
+                    .push(PathBuf::from(it.next().ok_or_else(|| {
+                        ArgsError::MissingValue("-force_load".into())
+                    })?));
             }
             "--dump" => {
                 opts.dump = Some(PathBuf::from(
@@ -328,9 +357,47 @@ mod tests {
     }
 
     #[test]
+    fn framework_flags_are_recorded_in_order() {
+        let opts = parse(&argv(&[
+            "-framework",
+            "Foundation",
+            "-weak_framework",
+            "Metal",
+            "main.o",
+        ]))
+        .unwrap();
+        assert_eq!(
+            opts.frameworks,
+            vec![
+                FrameworkSpec {
+                    name: "Foundation".into(),
+                    weak: false,
+                },
+                FrameworkSpec {
+                    name: "Metal".into(),
+                    weak: true,
+                }
+            ]
+        );
+        assert_eq!(opts.inputs, vec![PathBuf::from("main.o")]);
+    }
+
+    #[test]
+    fn objc_flag_is_recorded() {
+        let opts = parse(&argv(&["-ObjC", "main.o"])).unwrap();
+        assert!(opts.objc_force_load);
+    }
+
+    #[test]
     fn platform_version_flag_is_recorded() {
-        let opts =
-            parse(&argv(&["-platform_version", "macos", "13.2.1", "14.5", "main.o"])).unwrap();
+        let opts = parse(&argv(&[
+            "-platform_version",
+            "macos",
+            "13.2.1",
+            "14.5",
+            "main.o",
+        ]))
+        .unwrap();
         let platform = opts.platform_version.expect("platform version");
         assert_eq!(platform.minos, (13 << 16) | (2 << 8) | 1);
         assert_eq!(platform.sdk, (14 << 16) | (5 << 8));
@@ -351,13 +418,7 @@ mod tests {
 
     #[test]
     fn platform_version_rejects_bad_version() {
-        let err = parse(&argv(&[
-            "-platform_version",
-            "macos",
-            "13.bad",
-            "14.0",
-        ]))
-        .unwrap_err();
+        let err = parse(&argv(&["-platform_version", "macos", "13.bad", "14.0"])).unwrap_err();
         assert!(matches!(
             err,
             ArgsError::InvalidValue {

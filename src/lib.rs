@@ -32,8 +32,8 @@ use macho::tbd::{parse_tbd, parse_version, Arch, Platform, Target};
 use reloc::arm64::RelocError;
 use resolve::{
     classify_unresolved, drain_fetches, find_archive_by_path, force_load_all, force_load_archive,
-    format_duplicate_diagnostic, format_undefined_diagnostic, seed_all, DrainReport,
-    DylibLoadMeta, InputAddError, Inputs, Symbol, SymbolTable, UndefinedTreatment,
+    format_duplicate_diagnostic, format_undefined_diagnostic, seed_all, DrainReport, DylibLoadMeta,
+    InputAddError, Inputs, Symbol, SymbolTable, UndefinedTreatment,
 };
 
 const DEFAULT_TBD_VERSION: u32 = 1 << 16;
@@ -51,11 +51,18 @@ pub struct PlatformVersion {
     pub sdk: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameworkSpec {
+    pub name: String,
+    pub weak: bool,
+}
+
 /// User-facing linker configuration, populated by the CLI parser.
 #[derive(Debug, Clone)]
 pub struct LinkOptions {
     pub inputs: Vec<PathBuf>,
     pub library_names: Vec<String>,
+    pub frameworks: Vec<FrameworkSpec>,
     pub search_paths: Vec<PathBuf>,
     pub syslibroot: Option<PathBuf>,
     pub platform_version: Option<PlatformVersion>,
@@ -67,6 +74,7 @@ pub struct LinkOptions {
     pub output: Option<PathBuf>,
     pub entry: Option<String>,
     pub arch: Option<String>,
+    pub objc_force_load: bool,
     pub strip_locals: bool,
     pub all_load: bool,
     pub force_load_archives: Vec<PathBuf>,
@@ -87,6 +95,7 @@ impl Default for LinkOptions {
         Self {
             inputs: Vec::new(),
             library_names: Vec::new(),
+            frameworks: Vec::new(),
             search_paths: Vec::new(),
             syslibroot: None,
             platform_version: None,
@@ -98,6 +107,7 @@ impl Default for LinkOptions {
             output: None,
             entry: None,
             arch: None,
+            objc_force_load: false,
             strip_locals: false,
             all_load: false,
             force_load_archives: Vec::new(),
@@ -130,6 +140,7 @@ pub enum LinkError {
     EntrySymbolNotFound(String),
     ForceLoadNotArchive(PathBuf),
     LibraryNotFound(String),
+    FrameworkNotFound(String),
 }
 
 impl std::fmt::Display for LinkError {
@@ -166,6 +177,9 @@ impl std::fmt::Display for LinkError {
             }
             LinkError::LibraryNotFound(name) => {
                 write!(f, "unable to find library `{name}`")
+            }
+            LinkError::FrameworkNotFound(name) => {
+                write!(f, "unable to find framework `{name}`")
             }
         }
     }
@@ -239,7 +253,7 @@ pub struct Linker;
 
 impl Linker {
     pub fn run(opts: &LinkOptions) -> Result<(), LinkError> {
-        if opts.inputs.is_empty() && opts.library_names.is_empty() {
+        if opts.inputs.is_empty() && opts.library_names.is_empty() && opts.frameworks.is_empty() {
             return Err(LinkError::NoInputs);
         }
 
@@ -250,8 +264,23 @@ impl Linker {
         }
 
         let mut load_paths = opts.inputs.clone();
+        let mut dylib_load_kinds = std::collections::HashMap::new();
         for name in &opts.library_names {
-            load_paths.push(resolve_library_input(opts, name)?);
+            let path = resolve_library_input(opts, name)?;
+            dylib_load_kinds.insert(path.clone(), DylibLoadKind::Normal);
+            load_paths.push(path);
+        }
+        for framework in &opts.frameworks {
+            let path = resolve_framework_input(opts, &framework.name)?;
+            dylib_load_kinds.insert(
+                path.clone(),
+                if framework.weak {
+                    DylibLoadKind::Weak
+                } else {
+                    DylibLoadKind::Normal
+                },
+            );
+            load_paths.push(path);
         }
 
         let mut inputs = Inputs::new();
@@ -343,7 +372,10 @@ impl Linker {
                 continue;
             }
             dylib_loads.push(DylibDependency {
-                kind: DylibLoadKind::Normal,
+                kind: dylib_load_kinds
+                    .get(&dylib.path)
+                    .copied()
+                    .unwrap_or(DylibLoadKind::Normal),
                 install_name: dylib.load_install_name.clone(),
                 current_version: dylib.load_current_version,
                 compatibility_version: dylib.load_compatibility_version,
@@ -454,6 +486,31 @@ fn resolve_library_input(opts: &LinkOptions, name: &str) -> Result<PathBuf, Link
         }
     }
     Err(LinkError::LibraryNotFound(name.to_string()))
+}
+
+fn resolve_framework_input(opts: &LinkOptions, name: &str) -> Result<PathBuf, LinkError> {
+    let mut roots = Vec::new();
+    if let Some(root) = &opts.syslibroot {
+        roots.push(root.join("System/Library/Frameworks"));
+        roots.push(root.join("Library/Frameworks"));
+    } else {
+        roots.push(PathBuf::from("/System/Library/Frameworks"));
+        roots.push(PathBuf::from("/Library/Frameworks"));
+    }
+
+    for root in roots {
+        let framework_dir = root.join(format!("{name}.framework"));
+        for candidate in [
+            framework_dir.join(format!("{name}.tbd")),
+            framework_dir.join(name),
+        ] {
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(LinkError::FrameworkNotFound(name.to_string()))
 }
 
 fn default_output_path(opts: &LinkOptions) -> PathBuf {

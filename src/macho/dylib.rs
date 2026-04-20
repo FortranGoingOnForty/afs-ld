@@ -38,6 +38,15 @@ impl DylibLoadKind {
             _ => None,
         }
     }
+
+    pub fn load_cmd(self) -> u32 {
+        match self {
+            DylibLoadKind::Normal => LC_LOAD_DYLIB,
+            DylibLoadKind::Weak => LC_LOAD_WEAK_DYLIB,
+            DylibLoadKind::Reexport => LC_REEXPORT_DYLIB,
+            DylibLoadKind::Upward => LC_LOAD_UPWARD_DYLIB,
+        }
+    }
 }
 
 /// One dylib this file depends on. Ordinals match the two-level namespace

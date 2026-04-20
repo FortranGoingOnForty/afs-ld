@@ -370,7 +370,7 @@ fn build_commands(
 
     for dylib in dylibs {
         commands.push(LoadCommand::Dylib(DylibCmd {
-            cmd: LC_LOAD_DYLIB,
+            cmd: dylib.kind.load_cmd(),
             name: dylib.install_name.clone(),
             timestamp: 2,
             current_version: dylib.current_version,
@@ -442,7 +442,7 @@ fn estimate_header_size(
     }
     for dylib in dylibs {
         size += DylibCmd {
-            cmd: LC_LOAD_DYLIB,
+            cmd: dylib.kind.load_cmd(),
             name: dylib.install_name.clone(),
             timestamp: 2,
             current_version: dylib.current_version,
@@ -644,7 +644,8 @@ fn dylib_install_name(opts: &LinkOptions) -> String {
 }
 
 fn dylib_current_version(opts: &LinkOptions) -> u32 {
-    opts.current_version.unwrap_or_else(|| pack_version(1, 0, 0))
+    opts.current_version
+        .unwrap_or_else(|| pack_version(1, 0, 0))
 }
 
 fn dylib_compatibility_version(opts: &LinkOptions) -> u32 {

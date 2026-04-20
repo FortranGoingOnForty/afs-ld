@@ -16,3 +16,9 @@ pub fn error_verbatim(msg: &str) {
     let mut h = stderr.lock();
     let _ = writeln!(h, "{msg}");
 }
+
+pub fn warning(msg: &str) {
+    let stderr = std::io::stderr();
+    let mut h = stderr.lock();
+    let _ = writeln!(h, "afs-ld: warning: {msg}");
+}

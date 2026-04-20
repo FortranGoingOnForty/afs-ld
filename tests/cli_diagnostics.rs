@@ -2,6 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use afs_ld::macho::constants::LC_UUID;
+use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand};
+
 fn have_xcrun() -> bool {
     Command::new("xcrun")
         .arg("-f")
@@ -9,6 +12,17 @@ fn have_xcrun() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+fn minimal_main_src() -> &'static str {
+    r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#
 }
 
 fn assemble(src: &str, out: &PathBuf) -> Result<(), String> {
@@ -39,6 +53,43 @@ fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-cli-diag-{}-{name}", std::process::id()))
 }
 
+fn assemble_minimal_main(name: &str) -> Result<PathBuf, String> {
+    let obj = scratch(name);
+    assemble(minimal_main_src(), &obj)?;
+    Ok(obj)
+}
+
+fn assert_flag_errors(flag: &str, expected: &str, name: &str) {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = match assemble_minimal_main(&format!("{name}.o")) {
+        Ok(obj) => obj,
+        Err(e) => {
+            eprintln!("skipping: assemble failed: {e}");
+            return;
+        }
+    };
+    let out_path = scratch(&format!("{name}.out"));
+    let out = Command::new(exe)
+        .arg(flag)
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert!(!out.status.success(), "{flag} should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(expected),
+        "missing expected `{expected}` in stderr:\n{stderr}"
+    );
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
+}
+
 fn archive(objects: &[&PathBuf], out: &PathBuf) -> Result<(), String> {
     let output = Command::new("libtool")
         .arg("-static")
@@ -67,6 +118,8 @@ fn help_flag_prints_usage_and_exits_successfully() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Usage: afs-ld [options] <inputs...>"));
     assert!(stdout.contains("-map <path>"));
+    assert!(stdout.contains("-no_uuid"));
+    assert!(stdout.contains("-dead_strip"));
     assert!(stdout.contains("-t, -trace"));
     assert!(stdout.contains("-v, --version"));
 }
@@ -80,7 +133,129 @@ fn version_flag_prints_version_and_exits_successfully() {
         .expect("afs-ld should run");
     assert!(out.status.success(), "version should succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(stdout.trim(), format!("afs-ld {}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        stdout.trim(),
+        format!("afs-ld {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn no_uuid_flag_omits_uuid_load_command() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = match assemble_minimal_main("no-uuid-main.o") {
+        Ok(obj) => obj,
+        Err(e) => {
+            eprintln!("skipping: assemble failed: {e}");
+            return;
+        }
+    };
+    let out_path = scratch("no-uuid.out");
+    let out = Command::new(exe)
+        .arg("-no_uuid")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        out.status.success(),
+        "-no_uuid link should succeed:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let bytes = fs::read(&out_path).expect("read linked output");
+    let header = parse_header(&bytes).expect("parse header");
+    let commands = parse_commands(&header, &bytes).expect("parse commands");
+    assert!(
+        commands.iter().all(|cmd| match cmd {
+            LoadCommand::Raw { cmd, .. } => *cmd != LC_UUID,
+            _ => true,
+        }),
+        "expected -no_uuid output to omit LC_UUID"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
+}
+
+#[test]
+fn strip_debug_flag_warns_but_links_successfully() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = match assemble_minimal_main("strip-debug-main.o") {
+        Ok(obj) => obj,
+        Err(e) => {
+            eprintln!("skipping: assemble failed: {e}");
+            return;
+        }
+    };
+    let out_path = scratch("strip-debug.out");
+    let out = Command::new(exe)
+        .arg("-S")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        out.status.success(),
+        "-S link should succeed:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("afs-ld: warning: `-S` requested"),
+        "expected -S warning:\n{stderr}"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
+}
+
+#[test]
+fn relocatable_flag_errors_loudly() {
+    assert_flag_errors(
+        "-r",
+        "`-r` relocatable output is not yet supported",
+        "relocatable",
+    );
+}
+
+#[test]
+fn bundle_flag_errors_loudly() {
+    assert_flag_errors("-bundle", "`-bundle` output is not yet supported", "bundle");
+}
+
+#[test]
+fn dead_strip_flag_errors_loudly() {
+    assert_flag_errors(
+        "-dead_strip",
+        "`-dead_strip` is not yet supported",
+        "dead-strip",
+    );
+}
+
+#[test]
+fn icf_safe_flag_errors_loudly() {
+    assert_flag_errors("-icf=safe", "`-icf=safe` is not yet supported", "icf-safe");
+}
+
+#[test]
+fn fixup_chains_flag_errors_loudly() {
+    assert_flag_errors(
+        "-fixup_chains",
+        "`-fixup_chains` is not yet supported",
+        "fixup-chains",
+    );
 }
 
 #[test]

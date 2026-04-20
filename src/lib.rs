@@ -48,6 +48,12 @@ pub enum OutputKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcfMode {
+    None,
+    Safe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlatformVersion {
     pub minos: u32,
     pub sdk: u32,
@@ -81,8 +87,15 @@ pub struct LinkOptions {
     pub output: Option<PathBuf>,
     pub entry: Option<String>,
     pub arch: Option<String>,
+    pub relocatable: bool,
+    pub bundle: bool,
     pub objc_force_load: bool,
     pub strip_locals: bool,
+    pub strip_debug: bool,
+    pub emit_uuid: bool,
+    pub dead_strip: bool,
+    pub icf_mode: IcfMode,
+    pub fixup_chains: bool,
     pub all_load: bool,
     pub force_load_archives: Vec<PathBuf>,
     pub kind: OutputKind,
@@ -119,8 +132,15 @@ impl Default for LinkOptions {
             output: None,
             entry: None,
             arch: None,
+            relocatable: false,
+            bundle: false,
             objc_force_load: false,
             strip_locals: false,
+            strip_debug: false,
+            emit_uuid: true,
+            dead_strip: false,
+            icf_mode: IcfMode::None,
+            fixup_chains: false,
             all_load: false,
             force_load_archives: Vec::new(),
             kind: OutputKind::Executable,
@@ -154,6 +174,7 @@ pub enum LinkError {
     LibraryNotFound(String),
     FrameworkNotFound(String),
     WhyLive(String),
+    UnsupportedOption(String),
 }
 
 impl std::fmt::Display for LinkError {
@@ -195,6 +216,7 @@ impl std::fmt::Display for LinkError {
                 write!(f, "unable to find framework `{name}`")
             }
             LinkError::WhyLive(msg) => write!(f, "{msg}"),
+            LinkError::UnsupportedOption(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -267,6 +289,31 @@ pub struct Linker;
 
 impl Linker {
     pub fn run(opts: &LinkOptions) -> Result<(), LinkError> {
+        if opts.relocatable {
+            return Err(LinkError::UnsupportedOption(
+                "`-r` relocatable output is not yet supported".into(),
+            ));
+        }
+        if opts.bundle {
+            return Err(LinkError::UnsupportedOption(
+                "`-bundle` output is not yet supported".into(),
+            ));
+        }
+        if opts.dead_strip {
+            return Err(LinkError::UnsupportedOption(
+                "`-dead_strip` is not yet supported".into(),
+            ));
+        }
+        if opts.icf_mode == IcfMode::Safe {
+            return Err(LinkError::UnsupportedOption(
+                "`-icf=safe` is not yet supported".into(),
+            ));
+        }
+        if opts.fixup_chains {
+            return Err(LinkError::UnsupportedOption(
+                "`-fixup_chains` is not yet supported".into(),
+            ));
+        }
         if opts.inputs.is_empty() && opts.library_names.is_empty() && opts.frameworks.is_empty() {
             return Err(LinkError::NoInputs);
         }
@@ -275,6 +322,12 @@ impl Linker {
             if arch != "arm64" {
                 return Err(LinkError::UnsupportedArch(arch.clone()));
             }
+        }
+
+        if opts.strip_debug {
+            crate::diag::warning(
+                "`-S` requested, but afs-ld does not currently emit debug symbols",
+            );
         }
 
         let mut load_paths = opts.inputs.clone();
@@ -461,9 +514,14 @@ impl Linker {
         )?;
 
         let entry_symbol = find_entry_symbol_id(opts, &sym_table)?;
-        if let Some(report) =
-            why_live::format_explanations(opts, &layout_inputs, &atom_table, &sym_table, entry_symbol)
-                .map_err(LinkError::WhyLive)?
+        if let Some(report) = why_live::format_explanations(
+            opts,
+            &layout_inputs,
+            &atom_table,
+            &sym_table,
+            entry_symbol,
+        )
+        .map_err(LinkError::WhyLive)?
         {
             print!("{report}");
         }

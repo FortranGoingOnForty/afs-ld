@@ -17,12 +17,20 @@ Options:
   -syslibroot <path>              Prefix SDK search roots
   -platform_version macos <min> <sdk>
                                   Set LC_BUILD_VERSION payload
+  -r                              Relocatable output (deferred; errors)
+  -bundle                         Bundle output (deferred; errors)
   -undefined <error|dynamic_lookup>
                                   Control unresolved-symbol treatment
   -rpath <path>                   Add LC_RPATH
   -install_name <path>            Override dylib install name
   -current_version <v>            Override dylib current version
   -compatibility_version <v>      Override dylib compatibility version
+  -S                              Strip debug symbols (currently a no-op warning)
+  -no_uuid                        Omit LC_UUID
+  -dead_strip                     Dead-strip unreferenced code/data (deferred; errors)
+  -icf=safe | -icf=none           Configure identical code folding
+  -fixup_chains | -no_fixup_chains
+                                  Select chained fixups vs classic dyld info
   -all_load                       Force-load every archive member
   -force_load <archive>           Force-load one archive
   -t, -trace                      Print input paths as they are loaded

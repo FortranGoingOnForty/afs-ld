@@ -146,6 +146,12 @@ afs-ld: loading /usr/lib/libSystem.tbd
 - CLI surface passes a snapshot test against the `--help` output.
 
 ## Remaining Flag Slices
+- [x] `-r` / `-bundle` explicit deferred errors
+- [x] `-S`
+- [x] `-no_uuid`
+- [x] `-dead_strip`
+- [x] `-icf=safe` / `-icf=none`
+- [x] `-fixup_chains` / `-no_fixup_chains`
 - [x] `-Wl,<comma-separated>` normalization
 - [x] `-map <path>`
 - [x] `-t` / `-trace`

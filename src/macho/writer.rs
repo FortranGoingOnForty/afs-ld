@@ -352,14 +352,18 @@ fn build_commands(
             commands.push(LoadCommand::Symtab(linkedit.symtab));
             commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
             commands.push(raw_dylinker_command("/usr/lib/dyld"));
-            commands.push(raw_uuid_command(stable_uuid(layout, kind)));
+            if opts.emit_uuid {
+                commands.push(raw_uuid_command(stable_uuid(layout, kind)));
+            }
             commands.push(LoadCommand::BuildVersion(build_version_command(opts)));
             commands.push(raw_source_version_command(0));
             commands.push(raw_entry_point(resolve_entryoff(layout, entry_point)?, 0));
         }
         OutputKind::Dylib => {
             commands.push(LoadCommand::BuildVersion(build_version_command(opts)));
-            commands.push(raw_uuid_command(stable_uuid(layout, kind)));
+            if opts.emit_uuid {
+                commands.push(raw_uuid_command(stable_uuid(layout, kind)));
+            }
             commands.push(LoadCommand::Dylib(DylibCmd {
                 cmd: LC_ID_DYLIB,
                 name: dylib_install_name(opts),
@@ -426,7 +430,9 @@ fn estimate_header_size(
         size += (8 + 64 + 80 * segment.sections.len()) as u64;
     }
     size += build_version_command(opts).wire_size() as u64;
-    size += 24;
+    if opts.emit_uuid {
+        size += 24;
+    }
     size += match kind {
         OutputKind::Executable => {
             raw_dylinker_command("/usr/lib/dyld").cmdsize() as u64
@@ -1503,12 +1509,7 @@ fn build_output_symbols(
             input_id: input.id,
             file_index: file_index_by_input[&input.id],
         };
-        collect_local_symbols(
-            layout,
-            &ctx,
-            input.object,
-            &mut locals,
-        )?;
+        collect_local_symbols(layout, &ctx, input.object, &mut locals)?;
     }
     collect_synthetic_local_symbols(layout, inputs.0.synthetic_plan, &mut locals)?;
     sort_local_symbols(&mut locals);
@@ -1545,7 +1546,12 @@ fn build_output_symbols(
         let size = if atom.0 == 0 {
             0
         } else {
-            inputs.0.atom_table.get(*atom).size.saturating_sub(*value as u32) as u64
+            inputs
+                .0
+                .atom_table
+                .get(*atom)
+                .size
+                .saturating_sub(*value as u32) as u64
         };
         let mut n_desc = 0;
         if *weak {
@@ -1760,13 +1766,9 @@ fn collect_local_symbols(
                             atom_id,
                         ))?
                         + delta as u64;
-                let n_sect =
-                    *ctx.atom_sections
-                        .get(&atom_id)
-                        .ok_or(WriteError::DefinedSymbolSectionMissing(
-                            SymbolId(u32::MAX),
-                            atom_id,
-                        ))?;
+                let n_sect = *ctx.atom_sections.get(&atom_id).ok_or(
+                    WriteError::DefinedSymbolSectionMissing(SymbolId(u32::MAX), atom_id),
+                )?;
                 out.push(OutputSymbolSpec {
                     symbol: None,
                     name,

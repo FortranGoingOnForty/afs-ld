@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use crate::resolve::{levenshtein, UndefinedTreatment};
-use crate::{FrameworkSpec, LinkOptions, OutputKind, PlatformVersion};
+use crate::{FrameworkSpec, IcfMode, LinkOptions, OutputKind, PlatformVersion};
 
 const KNOWN_FLAGS: &[&str] = &[
     "-o",
@@ -20,11 +20,20 @@ const KNOWN_FLAGS: &[&str] = &[
     "-ObjC",
     "-syslibroot",
     "-platform_version",
+    "-r",
+    "-bundle",
     "-undefined",
     "-rpath",
     "-install_name",
     "-current_version",
     "-compatibility_version",
+    "-S",
+    "-no_uuid",
+    "-dead_strip",
+    "-icf=safe",
+    "-icf=none",
+    "-fixup_chains",
+    "-no_fixup_chains",
     "-map",
     "-why_live",
     "-t",
@@ -214,6 +223,12 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                     sdk: parse_version_component("-platform_version", sdk_raw)?,
                 });
             }
+            "-r" => {
+                opts.relocatable = true;
+            }
+            "-bundle" => {
+                opts.bundle = true;
+            }
             "-undefined" => {
                 let value = it
                     .next()
@@ -265,6 +280,35 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                     .ok_or_else(|| ArgsError::MissingValue("-compatibility_version".into()))?;
                 opts.compatibility_version =
                     Some(parse_version_component("-compatibility_version", value)?);
+            }
+            "-S" => {
+                opts.strip_debug = true;
+            }
+            "-no_uuid" => {
+                opts.emit_uuid = false;
+            }
+            "-dead_strip" => {
+                opts.dead_strip = true;
+            }
+            s if s.starts_with("-icf=") => {
+                opts.icf_mode = match s {
+                    "-icf=none" => IcfMode::None,
+                    "-icf=safe" => IcfMode::Safe,
+                    _ => {
+                        let value = s.trim_start_matches("-icf=").to_string();
+                        return Err(ArgsError::InvalidValue {
+                            flag: "-icf".into(),
+                            value,
+                            expected: "`safe` or `none`".into(),
+                        });
+                    }
+                };
+            }
+            "-fixup_chains" => {
+                opts.fixup_chains = true;
+            }
+            "-no_fixup_chains" => {
+                opts.fixup_chains = false;
             }
             "-map" => {
                 opts.map = Some(PathBuf::from(
@@ -377,9 +421,52 @@ mod tests {
     }
 
     #[test]
+    fn deferred_output_flags_are_recorded() {
+        let opts = parse(&argv(&["-r", "-bundle", "foo.o"])).unwrap();
+        assert!(opts.relocatable);
+        assert!(opts.bundle);
+    }
+
+    #[test]
     fn strip_locals_flag_is_recorded() {
         let opts = parse(&argv(&["-x", "foo.o"])).unwrap();
         assert!(opts.strip_locals);
+    }
+
+    #[test]
+    fn strip_debug_and_uuid_flags_are_recorded() {
+        let opts = parse(&argv(&["-S", "-no_uuid", "foo.o"])).unwrap();
+        assert!(opts.strip_debug);
+        assert!(!opts.emit_uuid);
+    }
+
+    #[test]
+    fn dead_strip_icf_and_fixup_chain_flags_are_recorded() {
+        let opts = parse(&argv(&[
+            "-dead_strip",
+            "-icf=safe",
+            "-fixup_chains",
+            "-no_fixup_chains",
+            "-icf=none",
+            "foo.o",
+        ]))
+        .unwrap();
+        assert!(opts.dead_strip);
+        assert_eq!(opts.icf_mode, IcfMode::None);
+        assert!(!opts.fixup_chains);
+    }
+
+    #[test]
+    fn icf_flag_rejects_unknown_modes() {
+        let err = parse(&argv(&["-icf=aggressive", "main.o"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::InvalidValue {
+                ref flag,
+                ref value,
+                ..
+            } if flag == "-icf" && value == "aggressive"
+        ));
     }
 
     #[test]
@@ -538,8 +625,18 @@ mod tests {
 
     #[test]
     fn why_live_flag_accumulates_symbols() {
-        let opts = parse(&argv(&["-why_live", "_helper", "-why_live", "_leaf", "main.o"])).unwrap();
-        assert_eq!(opts.why_live, vec!["_helper".to_string(), "_leaf".to_string()]);
+        let opts = parse(&argv(&[
+            "-why_live",
+            "_helper",
+            "-why_live",
+            "_leaf",
+            "main.o",
+        ]))
+        .unwrap();
+        assert_eq!(
+            opts.why_live,
+            vec!["_helper".to_string(), "_leaf".to_string()]
+        );
     }
 
     #[test]

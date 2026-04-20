@@ -402,6 +402,77 @@ fn dead_strip_removes_unreferenced_symbols_and_reports_why_live() {
 }
 
 #[test]
+fn dead_strip_keeps_no_dead_strip_roots() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = scratch("dead-strip-no-dead-strip.o");
+    let out_path = scratch("dead-strip-no-dead-strip.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+
+        .globl _keep
+        _keep:
+            ret
+        .desc _keep, 0x20
+
+        .globl _drop
+        _drop:
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let out = Command::new(exe)
+        .arg("-dead_strip")
+        .arg("-why_live")
+        .arg("_keep")
+        .arg("-why_live")
+        .arg("_drop")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        out.status.success(),
+        "-dead_strip link should succeed:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("_keep is live because:"));
+    assert!(stdout.contains("_keep is marked N_NO_DEAD_STRIP (GC root)"));
+    assert!(stdout.contains("_drop is not live (dead-stripped)"));
+
+    let symbols = match nm_defined_names(&out_path) {
+        Ok(symbols) => symbols,
+        Err(e) => {
+            panic!("nm failed: {e}");
+        }
+    };
+    assert!(symbols.contains(&"_main".to_string()));
+    assert!(symbols.contains(&"_keep".to_string()));
+    assert!(
+        !symbols.contains(&"_drop".to_string()),
+        "dead-stripped symbol still present:\n{}",
+        symbols.join("\n")
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
+}
+
+#[test]
 fn icf_safe_flag_errors_loudly() {
     assert_flag_errors("-icf=safe", "`-icf=safe` is not yet supported", "icf-safe");
 }

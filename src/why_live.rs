@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 
-use crate::atom::AtomTable;
+use crate::atom::{Atom, AtomSection, AtomTable};
 use crate::input::ObjectFile;
 use crate::layout::LayoutInput;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent};
@@ -566,6 +566,8 @@ fn build_forward_edges(
                 for target_atom in target_atoms_for_reloc(
                     input.id,
                     input.object,
+                    atom_table.get(source_atom),
+                    reloc,
                     reloc.referent,
                     reloc.subtrahend,
                     atom_table,
@@ -646,6 +648,8 @@ fn find_atom_for_offset(
 fn target_atoms_for_reloc(
     input_id: InputId,
     object: &ObjectFile,
+    source_atom: &Atom,
+    reloc: crate::reloc::Reloc,
     referent: Referent,
     subtrahend: Option<Referent>,
     atom_table: &AtomTable,
@@ -656,6 +660,8 @@ fn target_atoms_for_reloc(
     let mut out = referent_atoms(
         input_id,
         object,
+        source_atom,
+        reloc,
         referent,
         atom_table,
         sym_table,
@@ -666,6 +672,8 @@ fn target_atoms_for_reloc(
         out.extend(referent_atoms(
             input_id,
             object,
+            source_atom,
+            reloc,
             subtrahend,
             atom_table,
             sym_table,
@@ -682,8 +690,10 @@ fn target_atoms_for_reloc(
 fn referent_atoms(
     input_id: InputId,
     object: &ObjectFile,
+    source_atom: &Atom,
+    reloc: crate::reloc::Reloc,
     referent: Referent,
-    _atom_table: &AtomTable,
+    atom_table: &AtomTable,
     sym_table: &SymbolTable,
     resolved_by_name: &HashMap<String, SymbolId>,
     atoms_by_input_section: &HashMap<(InputId, u8), Vec<AtomId>>,
@@ -704,11 +714,45 @@ fn referent_atoms(
                 _ => Vec::new(),
             }
         }
-        Referent::Section(section_index) => atoms_by_input_section
-            .get(&(input_id, section_index))
-            .cloned()
-            .unwrap_or_default(),
+        Referent::Section(section_index) => {
+            if let Some(atom_id) =
+                section_referent_atom(input_id, source_atom, reloc, section_index, atom_table, atoms_by_input_section)
+            {
+                vec![atom_id]
+            } else {
+                atoms_by_input_section
+                    .get(&(input_id, section_index))
+                    .cloned()
+                    .unwrap_or_default()
+            }
+        }
     }
+}
+
+fn section_referent_atom(
+    input_id: InputId,
+    source_atom: &Atom,
+    reloc: crate::reloc::Reloc,
+    section_index: u8,
+    atom_table: &AtomTable,
+    atoms_by_input_section: &HashMap<(InputId, u8), Vec<AtomId>>,
+) -> Option<AtomId> {
+    if source_atom.section == AtomSection::CompactUnwind
+        && reloc.offset == source_atom.input_offset
+        && source_atom.data.len() >= 8
+    {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&source_atom.data[..8]);
+        let target_offset = u64::from_le_bytes(buf) as u32;
+        return find_atom_for_offset(
+            atom_table,
+            atoms_by_input_section,
+            input_id,
+            section_index,
+            target_offset,
+        );
+    }
+    None
 }
 
 fn target_symbols_for_reloc(

@@ -5166,6 +5166,81 @@ fn linker_run_emits_multi_function_unwind_info_like_ld() {
 }
 
 #[test]
+fn linker_run_dead_strip_prunes_unused_unwind_records_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+
+    let obj = scratch("unwind-dead-strip.o");
+    let our_out = scratch("unwind-dead-strip-ours.out");
+    let apple_out = scratch("unwind-dead-strip-apple.out");
+    let src = r#"
+        int helper(void) {
+            return 1;
+        }
+
+        int unused(void) {
+            return 2;
+        }
+
+        int main(void) {
+            return helper();
+        }
+    "#;
+    if let Err(e) = compile_c(src, &obj) {
+        eprintln!("skipping: clang compile failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        dead_strip: true,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_with_args(
+        &obj,
+        &apple_out,
+        "_main",
+        &sdk,
+        &sdk_ver,
+        &["-dead_strip"],
+    )
+    .unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let (_, our_unwind) = output_section(&our_bytes, "__TEXT", "__unwind_info").unwrap();
+    let (_, apple_unwind) = output_section(&apple_bytes, "__TEXT", "__unwind_info").unwrap();
+    let our_decoded = decode_unwind_info(&our_unwind).unwrap();
+    let apple_decoded = decode_unwind_info(&apple_unwind).unwrap();
+    let normalize = |records: &[afs_ld::synth::unwind::DecodedUnwindRecord]| {
+        let base = records.first().map(|record| record.function_offset).unwrap_or(0);
+        records
+            .iter()
+            .map(|record| (record.function_offset - base, record.encoding))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(normalize(&our_decoded.records), normalize(&apple_decoded.records));
+    assert_eq!(our_decoded.records.len(), 2);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
 fn linker_run_handles_large_unwind_function_gaps() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");

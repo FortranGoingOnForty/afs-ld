@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::atom::{Atom, AtomTable};
+use crate::atom::{Atom, AtomSection, AtomTable};
 use crate::input::ObjectFile;
 use crate::layout::{Layout, LayoutInput};
 use crate::macho::writer::LinkEditPlan;
@@ -139,6 +139,7 @@ pub fn apply_layout(
                     "missing parsed object".to_string(),
                 )
             })?;
+            patch_eh_frame_cie_pointer(&mut placed.data, atom, &resolve)?;
             let relocs = reloc_cache
                 .get(&(atom.origin, atom.input_section))
                 .map(Vec::as_slice)
@@ -164,6 +165,77 @@ pub fn apply_layout(
         synthesize_stub_helper_section(layout, plan, &resolve, linkedit)?;
     }
 
+    Ok(())
+}
+
+fn patch_eh_frame_cie_pointer(
+    bytes: &mut [u8],
+    atom: &Atom,
+    resolve: &ResolveView<'_>,
+) -> Result<(), RelocError> {
+    if atom.section != AtomSection::EhFrame || bytes.len() < 8 {
+        return Ok(());
+    }
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&bytes[4..8]);
+    let cie_delta = u32::from_le_bytes(buf);
+    if cie_delta == 0 {
+        return Ok(());
+    }
+
+    let cie_offset = atom
+        .input_offset
+        .checked_add(4)
+        .and_then(|value| value.checked_sub(cie_delta))
+        .ok_or_else(|| {
+            reloc_error(
+                atom,
+                &PathBuf::from("<eh_frame>"),
+                4,
+                RelocKind::Unsigned,
+                "__eh_frame CIE pointer",
+                "invalid CIE back-pointer".to_string(),
+            )
+        })?;
+    let cie_atom = resolve
+        .atoms_by_input_section
+        .get(&(atom.origin, atom.input_section))
+        .and_then(|atom_ids| {
+            atom_ids.iter().find_map(|atom_id| {
+                let candidate = resolve.atom_table.get(*atom_id);
+                let start = candidate.input_offset;
+                let end = candidate.input_offset.saturating_add(candidate.size);
+                (start <= cie_offset && cie_offset < end).then_some(*atom_id)
+            })
+        })
+        .and_then(|atom_id| resolve.atom_addrs.get(&atom_id).copied())
+        .ok_or_else(|| {
+            reloc_error(
+                atom,
+                &PathBuf::from("<eh_frame>"),
+                4,
+                RelocKind::Unsigned,
+                "__eh_frame CIE pointer",
+                "eh_frame CIE atom is missing from the final layout".to_string(),
+            )
+        })?;
+    let fde_field = resolve
+        .atom_addrs
+        .get(&atom.id)
+        .copied()
+        .ok_or_else(|| {
+            reloc_error(
+                atom,
+                &PathBuf::from("<eh_frame>"),
+                4,
+                RelocKind::Unsigned,
+                "__eh_frame CIE pointer",
+                "eh_frame atom is missing a final address".to_string(),
+            )
+        })?
+        + 4;
+    let rewritten = fde_field.wrapping_sub(cie_atom) as u32;
+    bytes[4..8].copy_from_slice(&rewritten.to_le_bytes());
     Ok(())
 }
 
@@ -486,7 +558,10 @@ fn got_reloc_relaxes_locally(obj: &ObjectFile, reloc: Reloc, resolve: &ResolveVi
             } => {
                 atom.0 == 0
                     || *private_extern
-                    || !matches!(resolve.atom_table.get(*atom).section, crate::atom::AtomSection::Data)
+                    || !matches!(
+                        resolve.atom_table.get(*atom).section,
+                        crate::atom::AtomSection::Data
+                    )
             }
             _ => true,
         },

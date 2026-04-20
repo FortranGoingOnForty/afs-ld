@@ -5209,15 +5209,7 @@ fn linker_run_dead_strip_prunes_unused_unwind_records_like_ld() {
         ..LinkOptions::default()
     };
     Linker::run(&opts).unwrap();
-    apple_link_with_args(
-        &obj,
-        &apple_out,
-        "_main",
-        &sdk,
-        &sdk_ver,
-        &["-dead_strip"],
-    )
-    .unwrap();
+    apple_link_with_args(&obj, &apple_out, "_main", &sdk, &sdk_ver, &["-dead_strip"]).unwrap();
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
@@ -5226,13 +5218,19 @@ fn linker_run_dead_strip_prunes_unused_unwind_records_like_ld() {
     let our_decoded = decode_unwind_info(&our_unwind).unwrap();
     let apple_decoded = decode_unwind_info(&apple_unwind).unwrap();
     let normalize = |records: &[afs_ld::synth::unwind::DecodedUnwindRecord]| {
-        let base = records.first().map(|record| record.function_offset).unwrap_or(0);
+        let base = records
+            .first()
+            .map(|record| record.function_offset)
+            .unwrap_or(0);
         records
             .iter()
             .map(|record| (record.function_offset - base, record.encoding))
             .collect::<Vec<_>>()
     };
-    assert_eq!(normalize(&our_decoded.records), normalize(&apple_decoded.records));
+    assert_eq!(
+        normalize(&our_decoded.records),
+        normalize(&apple_decoded.records)
+    );
     assert_eq!(our_decoded.records.len(), 2);
 
     let _ = fs::remove_file(obj);
@@ -5350,6 +5348,112 @@ fn linker_run_preserves_eh_frame_like_ld() {
     };
     Linker::run(&opts).unwrap();
     apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert!(output_section(&our_bytes, "__TEXT", "__eh_frame").is_some());
+    assert_eq!(
+        output_section(&our_bytes, "__TEXT", "__eh_frame")
+            .unwrap()
+            .1
+            .len(),
+        output_section(&apple_bytes, "__TEXT", "__eh_frame")
+            .unwrap()
+            .1
+            .len()
+    );
+    let our_dump = normalized_eh_frame_dump(
+        &our_out,
+        output_section(&our_bytes, "__TEXT", "__text").unwrap().0,
+    )
+    .unwrap();
+    let apple_dump = normalized_eh_frame_dump(
+        &apple_out,
+        output_section(&apple_bytes, "__TEXT", "__text").unwrap().0,
+    )
+    .unwrap();
+    assert_eq!(our_dump, apple_dump);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_dead_strip_preserves_pruned_eh_frame_like_ld() {
+    if !have_xcrun() || !have_xcrun_tool("dwarfdump") {
+        eprintln!("skipping: xcrun dwarfdump unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+
+    let obj = scratch("eh-frame-dead-strip.o");
+    let our_out = scratch("eh-frame-dead-strip-ours.out");
+    let apple_out = scratch("eh-frame-dead-strip-apple.out");
+    let asm = r#"
+        .text
+        .globl _main
+        .p2align 2
+    _main:
+        .cfi_startproc
+        sub sp, sp, #16
+        .cfi_def_cfa_offset 16
+        str x30, [sp, #8]
+        .cfi_offset w30, -8
+        bl _helper
+        ldr x30, [sp, #8]
+        add sp, sp, #16
+        ret
+        .cfi_endproc
+
+        .globl _helper
+        .p2align 2
+    _helper:
+        .cfi_startproc
+        sub sp, sp, #16
+        .cfi_def_cfa_offset 16
+        str x30, [sp, #8]
+        .cfi_offset w30, -8
+        ldr x30, [sp, #8]
+        add sp, sp, #16
+        ret
+        .cfi_endproc
+
+        .globl _unused
+        .p2align 2
+    _unused:
+        .cfi_startproc
+        sub sp, sp, #16
+        .cfi_def_cfa_offset 16
+        str x30, [sp, #8]
+        .cfi_offset w30, -8
+        ldr x30, [sp, #8]
+        add sp, sp, #16
+        ret
+        .cfi_endproc
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(asm, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        dead_strip: true,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_with_args(&obj, &apple_out, "_main", &sdk, &sdk_ver, &["-dead_strip"]).unwrap();
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();

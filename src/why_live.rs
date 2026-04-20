@@ -583,6 +583,18 @@ fn build_forward_edges(
         }
     }
 
+    for (atom_id, atom) in atom_table.iter() {
+        if atom.section != AtomSection::EhFrame {
+            continue;
+        }
+        let Some(cie_atom) = eh_frame_cie_atom(atom_table, &atoms_by_input_section, atom) else {
+            continue;
+        };
+        if atom_id != cie_atom {
+            edge_set.insert((atom_id, cie_atom));
+        }
+    }
+
     let mut forward_edges = HashMap::<AtomId, Vec<AtomId>>::new();
     for (source, target) in edge_set {
         forward_edges.entry(source).or_default().push(target);
@@ -715,9 +727,14 @@ fn referent_atoms(
             }
         }
         Referent::Section(section_index) => {
-            if let Some(atom_id) =
-                section_referent_atom(input_id, source_atom, reloc, section_index, atom_table, atoms_by_input_section)
-            {
+            if let Some(atom_id) = section_referent_atom(
+                input_id,
+                source_atom,
+                reloc,
+                section_index,
+                atom_table,
+                atoms_by_input_section,
+            ) {
                 vec![atom_id]
             } else {
                 atoms_by_input_section
@@ -753,6 +770,30 @@ fn section_referent_atom(
         );
     }
     None
+}
+
+fn eh_frame_cie_atom(
+    atom_table: &AtomTable,
+    atoms_by_input_section: &HashMap<(InputId, u8), Vec<AtomId>>,
+    atom: &Atom,
+) -> Option<AtomId> {
+    if atom.section != AtomSection::EhFrame || atom.data.len() < 8 {
+        return None;
+    }
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&atom.data[4..8]);
+    let cie_delta = u32::from_le_bytes(buf);
+    if cie_delta == 0 {
+        return None;
+    }
+    let cie_offset = atom.input_offset.checked_add(4)?.checked_sub(cie_delta)?;
+    find_atom_for_offset(
+        atom_table,
+        atoms_by_input_section,
+        atom.origin,
+        atom.input_section,
+        cie_offset,
+    )
 }
 
 fn target_symbols_for_reloc(

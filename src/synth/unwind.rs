@@ -212,6 +212,12 @@ fn collect_records(
         if atom.section != AtomSection::CompactUnwind {
             continue;
         }
+        if atom
+            .parent_of
+            .is_some_and(|parent| layout.atom_addr(parent).is_none())
+        {
+            continue;
+        }
         let Some(obj) = input_map.get(&atom.origin) else {
             return Err(UnwindError {
                 input: PathBuf::from("<missing object>"),

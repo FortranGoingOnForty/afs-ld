@@ -3,12 +3,12 @@
 //! Groups atoms into output sections, orders them deterministically, and
 //! assigns segment VM/file ranges once the final Mach-O header size is known.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::atom::AtomTable;
 use crate::input::ObjectFile;
 use crate::macho::constants::SG_READ_ONLY;
-use crate::resolve::InputId;
+use crate::resolve::{AtomId, InputId};
 use crate::section::{
     is_zerofill, InputSection, OutputAtom, OutputSection, OutputSectionId, OutputSegment, Prot,
 };
@@ -75,7 +75,7 @@ impl Layout {
         atoms: &AtomTable,
         header_size: u64,
     ) -> Self {
-        Self::build_with_synthetics(kind, inputs, atoms, header_size, None)
+        Self::build_with_synthetics_filtered(kind, inputs, atoms, header_size, None, None)
     }
 
     pub fn build_with_synthetics(
@@ -85,6 +85,17 @@ impl Layout {
         header_size: u64,
         synthetic_plan: Option<&SyntheticPlan>,
     ) -> Self {
+        Self::build_with_synthetics_filtered(kind, inputs, atoms, header_size, synthetic_plan, None)
+    }
+
+    pub fn build_with_synthetics_filtered(
+        kind: OutputKind,
+        inputs: &[LayoutInput<'_>],
+        atoms: &AtomTable,
+        header_size: u64,
+        synthetic_plan: Option<&SyntheticPlan>,
+        live_atoms: Option<&HashSet<AtomId>>,
+    ) -> Self {
         let input_map: HashMap<InputId, LayoutInput<'_>> =
             inputs.iter().map(|input| (input.id, *input)).collect();
 
@@ -92,6 +103,9 @@ impl Layout {
         let mut section_index: HashMap<SectionKey, usize> = HashMap::new();
 
         for (atom_id, atom) in atoms.iter() {
+            if live_atoms.is_some_and(|live_atoms| !live_atoms.contains(&atom_id)) {
+                continue;
+            }
             let input = input_map
                 .get(&atom.origin)
                 .unwrap_or_else(|| panic!("missing object for input {:?}", atom.origin));

@@ -34,9 +34,9 @@ use macho::tbd::{parse_tbd, parse_version, Arch, Platform, Target};
 use reloc::arm64::RelocError;
 use resolve::{
     classify_unresolved, drain_fetches, find_archive_by_path, force_load_all, force_load_archive,
-    format_duplicate_diagnostic, format_undefined_diagnostic,
-    format_undefined_warning_diagnostic, seed_all, DrainReport, DylibLoadMeta, InputAddError,
-    Inputs, Symbol, SymbolTable, UndefinedTreatment,
+    format_duplicate_diagnostic, format_undefined_diagnostic, format_undefined_warning_diagnostic,
+    seed_all, DrainReport, DylibLoadMeta, InputAddError, Inputs, Symbol, SymbolTable,
+    UndefinedTreatment,
 };
 
 const DEFAULT_TBD_VERSION: u32 = 1 << 16;
@@ -308,11 +308,6 @@ impl Linker {
                 "`-bundle` output is not yet supported".into(),
             ));
         }
-        if opts.dead_strip {
-            return Err(LinkError::UnsupportedOption(
-                "`-dead_strip` is not yet supported".into(),
-            ));
-        }
         if opts.icf_mode == IcfMode::Safe {
             return Err(LinkError::UnsupportedOption(
                 "`-icf=safe` is not yet supported".into(),
@@ -490,12 +485,23 @@ impl Linker {
             &mut sym_table,
             &inputs.dylibs,
         )?;
-        let mut layout = Layout::build_with_synthetics(
+        let entry_symbol = find_entry_symbol_id(opts, &sym_table)?;
+        let dead_strip = opts.dead_strip.then(|| {
+            why_live::DeadStripAnalysis::build(
+                opts,
+                &layout_inputs,
+                &atom_table,
+                &sym_table,
+                entry_symbol,
+            )
+        });
+        let mut layout = Layout::build_with_synthetics_filtered(
             opts.kind,
             &layout_inputs,
             &atom_table,
             0,
             Some(&synthetic_plan),
+            dead_strip.as_ref().map(|analysis| analysis.live_atoms()),
         );
         let linkedit_context = macho::writer::LinkEditContext {
             layout_inputs: &layout_inputs,
@@ -535,13 +541,13 @@ impl Linker {
             &linkedit,
         )?;
 
-        let entry_symbol = find_entry_symbol_id(opts, &sym_table)?;
         if let Some(report) = why_live::format_explanations(
             opts,
             &layout_inputs,
             &atom_table,
             &sym_table,
             entry_symbol,
+            dead_strip.as_ref(),
         )
         .map_err(LinkError::WhyLive)?
         {

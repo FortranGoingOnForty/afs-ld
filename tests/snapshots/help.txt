@@ -30,7 +30,7 @@ Options:
   -x                              Strip local symbols
   -S                              Strip debug symbols (currently a no-op warning)
   -no_uuid                        Omit LC_UUID
-  -dead_strip                     Dead-strip unreferenced code/data (deferred; errors)
+  -dead_strip                     Dead-strip unreferenced code/data
   -icf=safe | -icf=none           Configure identical code folding
   -fixup_chains | -no_fixup_chains
                                   Select chained fixups vs classic dyld info

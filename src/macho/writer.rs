@@ -785,6 +785,7 @@ fn build_linkedit_plan(
     let symbol_plan = build_output_symbols(
         layout,
         kind,
+        opts.dead_strip,
         opts.strip_locals,
         &visibility,
         inputs,
@@ -1518,6 +1519,7 @@ fn collect_imports(
 fn build_output_symbols(
     layout: &Layout,
     kind: OutputKind,
+    dead_strip: bool,
     strip_locals: bool,
     visibility: &SymbolVisibilityPolicy,
     inputs: LinkEditInputs<'_>,
@@ -1602,6 +1604,9 @@ fn build_output_symbols(
         let (n_type, n_sect, n_value) = if atom.0 == 0 {
             (absolute_symbol_type(hidden), NO_SECT, *value)
         } else {
+            if dead_strip && layout.atom_addr(*atom).is_none() {
+                continue;
+            }
             let addr = layout
                 .atom_addr(*atom)
                 .ok_or(WriteError::DefinedSymbolAtomMissing(symbol_id, *atom))?;

@@ -120,6 +120,26 @@ fn archive(objects: &[&PathBuf], out: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+fn nm_defined_names(path: &PathBuf) -> Result<Vec<String>, String> {
+    let output = Command::new("xcrun")
+        .args(["nm", "-gj"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("spawn xcrun nm: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "xcrun nm failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
 #[test]
 fn help_flag_prints_usage_and_exits_successfully() {
     let exe = env!("CARGO_BIN_EXE_afs-ld");
@@ -287,12 +307,98 @@ fn bundle_flag_errors_loudly() {
 }
 
 #[test]
-fn dead_strip_flag_errors_loudly() {
-    assert_flag_errors(
-        "-dead_strip",
-        "`-dead_strip` is not yet supported",
-        "dead-strip",
+fn dead_strip_removes_unreferenced_symbols_and_reports_why_live() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let main_obj = scratch("dead-strip-main.o");
+    let helper_obj = scratch("dead-strip-helper.o");
+    let unused_obj = scratch("dead-strip-unused.o");
+    let out_path = scratch("dead-strip.out");
+    let main_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            bl _helper
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    let helper_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _helper
+        _helper:
+            ret
+        .subsections_via_symbols
+    "#;
+    let unused_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _unused
+        _unused:
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(main_src, &main_obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+    if let Err(e) = assemble(helper_src, &helper_obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        let _ = fs::remove_file(main_obj);
+        return;
+    }
+    if let Err(e) = assemble(unused_src, &unused_obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        let _ = fs::remove_file(main_obj);
+        let _ = fs::remove_file(helper_obj);
+        return;
+    }
+
+    let out = Command::new(exe)
+        .arg("-dead_strip")
+        .arg("-why_live")
+        .arg("_helper")
+        .arg("-why_live")
+        .arg("_unused")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&main_obj)
+        .arg(&helper_obj)
+        .arg(&unused_obj)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        out.status.success(),
+        "-dead_strip link should succeed:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("_helper is live because:"));
+    assert!(stdout.contains("_helper is reachable from _main"));
+    assert!(stdout.contains("_main is in -e _main (GC root)"));
+    assert!(stdout.contains("_unused is not live (dead-stripped)"));
+
+    let symbols = match nm_defined_names(&out_path) {
+        Ok(symbols) => symbols,
+        Err(e) => {
+            panic!("nm failed: {e}");
+        }
+    };
+    assert!(symbols.contains(&"_main".to_string()));
+    assert!(symbols.contains(&"_helper".to_string()));
+    assert!(
+        !symbols.contains(&"_unused".to_string()),
+        "dead-stripped symbol still present:\n{}",
+        symbols.join("\n")
+    );
+
+    let _ = fs::remove_file(main_obj);
+    let _ = fs::remove_file(helper_obj);
+    let _ = fs::remove_file(unused_obj);
+    let _ = fs::remove_file(out_path);
 }
 
 #[test]

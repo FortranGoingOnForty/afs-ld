@@ -7,13 +7,34 @@
 use std::path::PathBuf;
 
 use crate::{LinkOptions, OutputKind};
+use crate::resolve::levenshtein;
+
+const KNOWN_FLAGS: &[&str] = &[
+    "-o",
+    "-e",
+    "-arch",
+    "-x",
+    "-dylib",
+    "-all_load",
+    "-force_load",
+    "--dump",
+    "--dump-archive",
+    "--dump-dylib",
+    "--dump-tbd",
+];
 
 #[derive(Debug)]
 pub enum ArgsError {
     /// A flag that takes an argument was supplied without one.
     MissingValue(String),
+    /// A recognized flag got a value we do not accept.
+    InvalidValue {
+        flag: String,
+        value: String,
+        expected: String,
+    },
     /// An unrecognized flag.
-    UnknownFlag(String),
+    UnknownFlag { flag: String, suggestion: Option<String> },
 }
 
 impl std::fmt::Display for ArgsError {
@@ -22,13 +43,37 @@ impl std::fmt::Display for ArgsError {
             ArgsError::MissingValue(flag) => {
                 write!(f, "flag `{flag}` requires a value")
             }
-            ArgsError::UnknownFlag(flag) => {
+            ArgsError::InvalidValue {
+                flag,
+                value,
+                expected,
+            } => {
                 write!(
                     f,
-                    "unknown flag `{flag}` (Sprint 19 adds the full `ld` surface)"
+                    "flag `{flag}` got invalid value `{value}` (expected {expected})"
                 )
             }
+            ArgsError::UnknownFlag { flag, suggestion } => {
+                write!(f, "unknown flag `{flag}`")?;
+                if let Some(suggestion) = suggestion {
+                    write!(f, " (did you mean `{suggestion}`?)")?;
+                }
+                write!(f, " (Sprint 19 adds the full `ld` surface)")
+            }
         }
+    }
+}
+
+fn unknown_flag(flag: &str) -> ArgsError {
+    let suggestion = KNOWN_FLAGS
+        .iter()
+        .map(|candidate| (levenshtein(flag, candidate), *candidate))
+        .filter(|(distance, _)| *distance <= 3)
+        .min_by_key(|(distance, candidate)| (*distance, candidate.len()))
+        .map(|(_, candidate)| candidate.to_string());
+    ArgsError::UnknownFlag {
+        flag: flag.to_string(),
+        suggestion,
     }
 }
 
@@ -63,6 +108,15 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
             "-dylib" => {
                 opts.kind = OutputKind::Dylib;
             }
+            "-all_load" => {
+                opts.all_load = true;
+            }
+            "-force_load" => {
+                opts.force_load_archives.push(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("-force_load".into()))?,
+                ));
+            }
             "--dump" => {
                 opts.dump = Some(PathBuf::from(
                     it.next()
@@ -88,7 +142,7 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                     })?));
             }
             s if s.starts_with('-') => {
-                return Err(ArgsError::UnknownFlag(s.to_string()));
+                return Err(unknown_flag(s));
             }
             _ => {
                 opts.inputs.push(PathBuf::from(arg));
@@ -127,6 +181,36 @@ mod tests {
     }
 
     #[test]
+    fn all_load_flag_is_recorded() {
+        let opts = parse(&argv(&["-all_load", "libfoo.a"])).unwrap();
+        assert!(opts.all_load);
+        assert_eq!(opts.inputs, vec![PathBuf::from("libfoo.a")]);
+    }
+
+    #[test]
+    fn force_load_flag_accumulates_archive_paths() {
+        let opts = parse(&argv(&[
+            "-force_load",
+            "liba.a",
+            "-force_load",
+            "libb.a",
+            "main.o",
+        ]))
+        .unwrap();
+        assert_eq!(
+            opts.force_load_archives,
+            vec![PathBuf::from("liba.a"), PathBuf::from("libb.a")]
+        );
+        assert_eq!(opts.inputs, vec![PathBuf::from("main.o")]);
+    }
+
+    #[test]
+    fn missing_force_load_value_errors() {
+        let err = parse(&argv(&["-force_load"])).unwrap_err();
+        assert!(matches!(err, ArgsError::MissingValue(ref f) if f == "-force_load"));
+    }
+
+    #[test]
     fn missing_output_value_errors() {
         let err = parse(&argv(&["-o"])).unwrap_err();
         assert!(matches!(err, ArgsError::MissingValue(ref f) if f == "-o"));
@@ -135,7 +219,25 @@ mod tests {
     #[test]
     fn unknown_flag_errors() {
         let err = parse(&argv(&["-nonsense"])).unwrap_err();
-        assert!(matches!(err, ArgsError::UnknownFlag(ref f) if f == "-nonsense"));
+        assert!(matches!(
+            err,
+            ArgsError::UnknownFlag {
+                ref flag,
+                suggestion: None
+            } if flag == "-nonsense"
+        ));
+    }
+
+    #[test]
+    fn unknown_flag_suggests_nearby_match() {
+        let err = parse(&argv(&["-all_lod"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::UnknownFlag {
+                ref flag,
+                suggestion: Some(ref suggestion)
+            } if flag == "-all_lod" && suggestion == "-all_load"
+        ));
     }
 
     #[test]

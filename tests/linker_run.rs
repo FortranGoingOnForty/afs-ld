@@ -2432,6 +2432,146 @@ fn fetched_archive_member_undefined_reports_member_referrer() {
 }
 
 #[test]
+fn linker_run_all_load_pulls_entry_from_archive() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun as or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: no macOS SDK path");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let member_obj = scratch("all-load-main.o");
+    let archive = scratch("all-load-main.a");
+    let out = scratch("all-load-main.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #7
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &member_obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+    let ar = Command::new("ar")
+        .arg("rcs")
+        .arg(&archive)
+        .arg(&member_obj)
+        .output()
+        .unwrap();
+    if !ar.status.success() {
+        eprintln!(
+            "skipping: ar failed: {}",
+            String::from_utf8_lossy(&ar.stderr)
+        );
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![archive.clone(), tbd],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        all_load: true,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let verify = Command::new("codesign").arg("-v").arg(&out).output().unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let status = Command::new(&out).status().unwrap();
+    assert_eq!(status.code(), Some(7), "expected all-load executable to exit 7");
+
+    let _ = fs::remove_file(member_obj);
+    let _ = fs::remove_file(archive);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_force_load_pulls_entry_from_archive() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun as or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: no macOS SDK path");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let member_obj = scratch("force-load-main.o");
+    let archive = scratch("force-load-main.a");
+    let out = scratch("force-load-main.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #9
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &member_obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+    let ar = Command::new("ar")
+        .arg("rcs")
+        .arg(&archive)
+        .arg(&member_obj)
+        .output()
+        .unwrap();
+    if !ar.status.success() {
+        eprintln!(
+            "skipping: ar failed: {}",
+            String::from_utf8_lossy(&ar.stderr)
+        );
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![archive.clone(), tbd],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        force_load_archives: vec![archive.clone()],
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let verify = Command::new("codesign").arg("-v").arg(&out).output().unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let status = Command::new(&out).status().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(9),
+        "expected force-load executable to exit 9"
+    );
+
+    let _ = fs::remove_file(member_obj);
+    let _ = fs::remove_file(archive);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_carries_tbd_inputs_into_load_commands() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");

@@ -31,8 +31,9 @@ use macho::reader::ReadError;
 use macho::tbd::{parse_tbd, parse_version, Arch, Platform, Target};
 use reloc::arm64::RelocError;
 use resolve::{
-    classify_unresolved, drain_fetches, format_duplicate_diagnostic, format_undefined_diagnostic,
-    seed_all, DylibLoadMeta, InputAddError, Inputs, Symbol, SymbolTable, UndefinedTreatment,
+    classify_unresolved, drain_fetches, find_archive_by_path, force_load_all, force_load_archive,
+    format_duplicate_diagnostic, format_undefined_diagnostic, seed_all, DrainReport,
+    DylibLoadMeta, InputAddError, Inputs, Symbol, SymbolTable, UndefinedTreatment,
 };
 
 const DEFAULT_TBD_VERSION: u32 = 1 << 16;
@@ -52,6 +53,8 @@ pub struct LinkOptions {
     pub entry: Option<String>,
     pub arch: Option<String>,
     pub strip_locals: bool,
+    pub all_load: bool,
+    pub force_load_archives: Vec<PathBuf>,
     pub kind: OutputKind,
     /// When set, afs-ld operates in dump mode and prints the given file's
     /// header + load commands instead of linking.
@@ -72,6 +75,8 @@ impl Default for LinkOptions {
             entry: None,
             arch: None,
             strip_locals: false,
+            all_load: false,
+            force_load_archives: Vec::new(),
             kind: OutputKind::Executable,
             dump: None,
             dump_archive: None,
@@ -99,6 +104,7 @@ pub enum LinkError {
     UnsupportedArch(String),
     NoTbdDocument(PathBuf),
     EntrySymbolNotFound(String),
+    ForceLoadNotArchive(PathBuf),
 }
 
 impl std::fmt::Display for LinkError {
@@ -125,6 +131,13 @@ impl std::fmt::Display for LinkError {
             }
             LinkError::EntrySymbolNotFound(name) => {
                 write!(f, "entry symbol `{name}` was not found in linked objects")
+            }
+            LinkError::ForceLoadNotArchive(path) => {
+                write!(
+                    f,
+                    "{}: -force_load requires a path that is also present as an archive input",
+                    path.display()
+                )
             }
         }
     }
@@ -223,6 +236,24 @@ impl Linker {
             return Err(LinkError::DuplicateSymbols(msg));
         }
 
+        let mut force_report = DrainReport::default();
+        if opts.all_load {
+            force_load_all(&mut inputs, &mut sym_table, &mut force_report)?;
+        }
+        for archive_path in &opts.force_load_archives {
+            let Some(archive_id) = find_archive_by_path(&inputs, archive_path) else {
+                return Err(LinkError::ForceLoadNotArchive(archive_path.clone()));
+            };
+            force_load_archive(&mut inputs, &mut sym_table, archive_id, &mut force_report)?;
+        }
+        if !force_report.duplicates.is_empty() {
+            let mut msg = String::new();
+            for err in &force_report.duplicates {
+                msg.push_str(&format_duplicate_diagnostic(&sym_table, &inputs, err));
+            }
+            return Err(LinkError::DuplicateSymbols(msg));
+        }
+
         let drain_report = drain_fetches(&mut inputs, &mut sym_table, seed_report.pending_fetches)?;
         if !drain_report.duplicates.is_empty() {
             let mut msg = String::new();
@@ -232,6 +263,7 @@ impl Linker {
             return Err(LinkError::DuplicateSymbols(msg));
         }
         let mut referrers = seed_report.referrers.clone();
+        referrers.extend_from(&force_report.referrers);
         referrers.extend_from(&drain_report.referrers);
         let unresolved = classify_unresolved(&mut sym_table, UndefinedTreatment::Error);
         if !unresolved.errors.is_empty() {

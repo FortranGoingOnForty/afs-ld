@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 
 use crate::atom::{Atom, AtomSection, AtomTable};
+use crate::icf::FoldedSymbol;
 use crate::input::ObjectFile;
 use crate::layout::LayoutInput;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent};
@@ -242,19 +243,36 @@ pub fn format_explanations(
     sym_table: &SymbolTable,
     entry_symbol: Option<SymbolId>,
     dead_strip: Option<&DeadStripAnalysis>,
+    folded_symbols: &[FoldedSymbol],
 ) -> Result<Option<String>, String> {
     if opts.why_live.is_empty() {
         return Ok(None);
     }
 
+    let folded_by_name: HashMap<&str, &str> = folded_symbols
+        .iter()
+        .map(|symbol| (symbol.name.as_str(), symbol.winner.as_str()))
+        .collect();
+
     if let Some(dead_strip) = dead_strip {
         let mut out = String::new();
         for (idx, requested) in opts.why_live.iter().enumerate() {
-            let Some(&target) = dead_strip.resolved_by_name.get(requested) else {
+            let winner = folded_by_name
+                .get(requested.as_str())
+                .copied()
+                .unwrap_or(requested.as_str());
+            let Some(&target) = dead_strip.resolved_by_name.get(winner) else {
                 return Err(format!("`-why_live` symbol `{requested}` was not found"));
             };
             if idx > 0 {
                 out.push('\n');
+            }
+            if winner != requested {
+                writeln!(
+                    &mut out,
+                    "{requested} was folded to {winner} by -icf=safe"
+                )
+                .unwrap();
             }
             out.push_str(&dead_strip.format_symbol_explanation(sym_table, target));
         }
@@ -264,11 +282,22 @@ pub fn format_explanations(
     let graph = WhyLiveGraph::build(opts, layout_inputs, atom_table, sym_table, entry_symbol);
     let mut out = String::new();
     for (idx, requested) in opts.why_live.iter().enumerate() {
-        let Some(&target) = graph.resolved_by_name.get(requested) else {
+        let winner = folded_by_name
+            .get(requested.as_str())
+            .copied()
+            .unwrap_or(requested.as_str());
+        let Some(&target) = graph.resolved_by_name.get(winner) else {
             return Err(format!("`-why_live` symbol `{requested}` was not found"));
         };
         if idx > 0 {
             out.push('\n');
+        }
+        if winner != requested {
+            writeln!(
+                &mut out,
+                "{requested} was folded to {winner} by -icf=safe"
+            )
+            .unwrap();
         }
         let target_name = graph.symbol_name(target);
         writeln!(&mut out, "{target_name} is live because:").unwrap();

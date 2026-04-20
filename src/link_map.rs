@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::layout::{Layout, LayoutInput};
 use crate::macho::writer::LinkEditPlan;
+use crate::icf::FoldedSymbol;
 use crate::why_live::DeadStrippedSymbol;
 use crate::LinkOptions;
 
@@ -13,6 +14,7 @@ pub fn write_link_map(
     layout: &Layout,
     layout_inputs: &[LayoutInput<'_>],
     linkedit: &LinkEditPlan,
+    folded_symbols: &[FoldedSymbol],
     dead_stripped: &[DeadStrippedSymbol],
 ) -> io::Result<()> {
     let output_path = opts.output.as_deref().unwrap_or_else(|| Path::new("a.out"));
@@ -59,6 +61,21 @@ pub fn write_link_map(
             &mut out,
             "{:#018x} {:#010x}   {:<7} {}",
             symbol.addr, symbol.size, file, symbol.name
+        )
+        .unwrap();
+    }
+
+    writeln!(&mut out, "\n# Folded symbols:").unwrap();
+    for symbol in folded_symbols {
+        let file = if symbol.file_index == 0 {
+            "linker".to_string()
+        } else {
+            format!("[{:>3}]", symbol.file_index)
+        };
+        writeln!(
+            &mut out,
+            "{:<7} {} folded to {}",
+            file, symbol.name, symbol.winner
         )
         .unwrap();
     }

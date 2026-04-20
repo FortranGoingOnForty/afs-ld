@@ -14,6 +14,13 @@ pub struct IcfPlan {
     redirects: HashMap<AtomId, AtomId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldedSymbol {
+    pub name: String,
+    pub winner: String,
+    pub file_index: usize,
+}
+
 impl IcfPlan {
     pub fn kept_atoms(&self) -> &HashSet<AtomId> {
         &self.kept_atoms
@@ -21,6 +28,51 @@ impl IcfPlan {
 
     pub fn redirects(&self) -> &HashMap<AtomId, AtomId> {
         &self.redirects
+    }
+
+    pub fn folded_symbols(
+        &self,
+        atom_table: &AtomTable,
+        sym_table: &SymbolTable,
+        layout_inputs: &[LayoutInput<'_>],
+    ) -> Vec<FoldedSymbol> {
+        let file_index_by_input: HashMap<InputId, usize> = layout_inputs
+            .iter()
+            .enumerate()
+            .map(|(idx, input)| (input.id, idx + 1))
+            .collect();
+        let mut out = Vec::new();
+        for (&loser, &winner) in &self.redirects {
+            let winner = canonical_atom(winner, &self.redirects);
+            let Some(winner_symbol) = representative_symbol(atom_table.get(winner)) else {
+                continue;
+            };
+            let winner_name = symbol_name(sym_table, winner_symbol);
+            for symbol_id in atom_symbols(atom_table.get(loser)) {
+                let Symbol::Defined { origin, .. } = sym_table.get(symbol_id) else {
+                    continue;
+                };
+                let name = symbol_name(sym_table, symbol_id);
+                if name == winner_name {
+                    continue;
+                }
+                out.push(FoldedSymbol {
+                    name,
+                    winner: winner_name.clone(),
+                    file_index: file_index_by_input.get(origin).copied().unwrap_or(0),
+                });
+            }
+        }
+        out.sort_by(|lhs, rhs| {
+            lhs.name
+                .cmp(&rhs.name)
+                .then_with(|| lhs.winner.cmp(&rhs.winner))
+                .then_with(|| lhs.file_index.cmp(&rhs.file_index))
+        });
+        out.dedup_by(|lhs, rhs| {
+            lhs.name == rhs.name && lhs.winner == rhs.winner && lhs.file_index == rhs.file_index
+        });
+        out
     }
 }
 
@@ -186,21 +238,24 @@ fn fold_order_key(
 }
 
 fn is_foldable_atom(atom: &Atom, sym_table: &SymbolTable) -> bool {
-    if atom.section != AtomSection::Text {
+    if !matches!(
+        atom.section,
+        AtomSection::Text
+            | AtomSection::ConstData
+            | AtomSection::CStringLiterals
+            | AtomSection::Literal16
+    ) {
         return false;
     }
     if atom.flags.has(AtomFlags::NO_DEAD_STRIP) || atom.flags.has(AtomFlags::ADDRESS_TAKEN) {
         return false;
     }
-    let Some(owner) = atom.owner else {
-        return false;
-    };
     !matches!(
-        sym_table.get(owner),
-        Symbol::Defined {
+        atom.owner.map(|owner| sym_table.get(owner)),
+        Some(Symbol::Defined {
             private_extern: false,
             ..
-        }
+        })
     )
 }
 
@@ -400,6 +455,21 @@ fn canonical_atom(atom_id: AtomId, redirects: &HashMap<AtomId, AtomId>) -> AtomI
         current = next;
     }
     current
+}
+
+fn representative_symbol(atom: &Atom) -> Option<SymbolId> {
+    atom.owner
+        .or_else(|| atom.alt_entries.first().map(|alt| alt.symbol))
+}
+
+fn atom_symbols(atom: &Atom) -> impl Iterator<Item = SymbolId> + '_ {
+    atom.owner
+        .into_iter()
+        .chain(atom.alt_entries.iter().map(|alt| alt.symbol))
+}
+
+fn symbol_name(sym_table: &SymbolTable, symbol_id: SymbolId) -> String {
+    sym_table.interner.resolve(sym_table.get(symbol_id).name()).to_string()
 }
 
 fn target_atoms_for_reloc(

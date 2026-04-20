@@ -556,6 +556,10 @@ impl Linker {
             &linkedit,
             icf.as_ref().map(|plan| plan.redirects()),
         )?;
+        let folded_symbols = icf
+            .as_ref()
+            .map(|plan| plan.folded_symbols(&atom_table, &sym_table, &layout_inputs))
+            .unwrap_or_default();
 
         if let Some(report) = why_live::format_explanations(
             opts,
@@ -564,6 +568,7 @@ impl Linker {
             &sym_table,
             entry_symbol,
             dead_strip.as_ref(),
+            &folded_symbols,
         )
         .map_err(LinkError::WhyLive)?
         {
@@ -596,6 +601,7 @@ impl Linker {
                 &layout,
                 &layout_inputs,
                 &linkedit,
+                &folded_symbols,
                 &dead_stripped,
             )?;
         }

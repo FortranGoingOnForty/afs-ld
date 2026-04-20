@@ -3282,6 +3282,61 @@ fn linker_run_map_lists_dead_stripped_symbols() {
 }
 
 #[test]
+fn linker_run_map_lists_folded_symbols_under_icf_safe() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("map-icf-folded.o");
+    let out = scratch("map-icf-folded.out");
+    let map = scratch("map-icf-folded.map");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            bl _helper1
+            bl _helper2
+            mov w0, #0
+            ret
+
+        .private_extern _helper1
+        _helper1:
+            mov w0, #7
+            ret
+
+        .private_extern _helper2
+        _helper2:
+            mov w0, #7
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        map: Some(map.clone()),
+        icf_mode: afs_ld::IcfMode::Safe,
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let map_text = fs::read_to_string(&map).unwrap();
+    let folded_idx = map_text.find("# Folded symbols:").unwrap();
+    let folded = &map_text[folded_idx..];
+    assert!(folded.contains("_helper2 folded to _helper1"));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+    let _ = fs::remove_file(map);
+}
+
+#[test]
 fn linker_run_carries_tbd_inputs_into_load_commands() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");
@@ -7175,6 +7230,158 @@ fn linker_run_icf_safe_keeps_distinct_branch_targets_unfolded() {
         our_text.len(),
         baseline_text.len(),
         "distinct branch-target wrappers should not shrink under -icf=safe"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(baseline_out);
+    let _ = fs::remove_file(our_out);
+}
+
+#[test]
+fn linker_run_icf_safe_folds_identical_private_const_data() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    };
+
+    let obj = scratch("icf-const-fold.o");
+    let baseline_out = scratch("icf-const-fold-baseline.out");
+    let our_out = scratch("icf-const-fold-ours.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+
+        .section __TEXT,__const
+        .p2align 3
+        .private_extern _const1
+        _const1:
+            .quad 0x1122334455667788
+        .p2align 3
+        .private_extern _const2
+        _const2:
+            .quad 0x1122334455667788
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let baseline_opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(baseline_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&baseline_opts).unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        icf_mode: afs_ld::IcfMode::Safe,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let baseline_bytes = fs::read(&baseline_out).unwrap();
+    let our_bytes = fs::read(&our_out).unwrap();
+    let baseline_symbols = symbol_values(&baseline_bytes);
+    let our_symbols = symbol_values(&our_bytes);
+    let baseline_const = output_section(&baseline_bytes, "__TEXT", "__const").unwrap().1;
+    let our_const = output_section(&our_bytes, "__TEXT", "__const").unwrap().1;
+
+    assert_ne!(
+        baseline_symbols.get("_const1"),
+        baseline_symbols.get("_const2"),
+        "baseline link should keep identical private const atoms separate"
+    );
+    assert_eq!(
+        our_symbols.get("_const1"),
+        our_symbols.get("_const2"),
+        "expected afs-ld -icf=safe to coalesce identical private const atoms"
+    );
+    assert!(
+        our_const.len() < baseline_const.len(),
+        "expected -icf=safe to reduce const section size on identical atoms"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(baseline_out);
+    let _ = fs::remove_file(our_out);
+}
+
+#[test]
+fn linker_run_icf_safe_folds_identical_private_cstrings() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    };
+
+    let obj = scratch("icf-cstring-fold.o");
+    let baseline_out = scratch("icf-cstring-fold-baseline.out");
+    let our_out = scratch("icf-cstring-fold-ours.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+
+        .section __TEXT,__cstring,cstring_literals
+        .private_extern _str1
+        _str1:
+            .asciz "fold me"
+        .private_extern _str2
+        _str2:
+            .asciz "fold me"
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let baseline_opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(baseline_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&baseline_opts).unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        icf_mode: afs_ld::IcfMode::Safe,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let baseline_bytes = fs::read(&baseline_out).unwrap();
+    let our_bytes = fs::read(&our_out).unwrap();
+    let baseline_symbols = symbol_values(&baseline_bytes);
+    let our_symbols = symbol_values(&our_bytes);
+    let baseline_cstrings = output_section(&baseline_bytes, "__TEXT", "__cstring").unwrap().1;
+    let our_cstrings = output_section(&our_bytes, "__TEXT", "__cstring").unwrap().1;
+
+    assert_ne!(
+        baseline_symbols.get("_str1"),
+        baseline_symbols.get("_str2"),
+        "baseline link should keep identical private cstrings separate"
+    );
+    assert_eq!(
+        our_symbols.get("_str1"),
+        our_symbols.get("_str2"),
+        "expected afs-ld -icf=safe to coalesce identical private cstrings"
+    );
+    assert!(
+        our_cstrings.len() < baseline_cstrings.len(),
+        "expected -icf=safe to reduce cstring section size on identical literals"
     );
 
     let _ = fs::remove_file(obj);

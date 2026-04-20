@@ -872,3 +872,64 @@ fn why_live_reports_transitive_symbol_chain() {
     let _ = fs::remove_file(leaf_obj);
     let _ = fs::remove_file(out_path);
 }
+
+#[test]
+fn why_live_reports_folded_symbol_winner_chain() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = scratch("why-live-folded.o");
+    let out_path = scratch("why-live-folded.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            stp x29, x30, [sp, #-16]!
+            mov x29, sp
+            bl _helper1
+            bl _helper2
+            mov w0, #0
+            ldp x29, x30, [sp], #16
+            ret
+
+        .private_extern _helper1
+        _helper1:
+            mov w0, #0
+            ret
+
+        .private_extern _helper2
+        _helper2:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let out = Command::new(exe)
+        .arg("-icf=safe")
+        .arg("-why_live")
+        .arg("_helper2")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        out.status.success(),
+        "why_live folded-symbol link should succeed:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("_helper2 was folded to _helper1 by -icf=safe"));
+    assert!(stdout.contains("_helper1 is live because:"));
+    assert!(stdout.contains("_helper1 is reachable from _main"));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
+}

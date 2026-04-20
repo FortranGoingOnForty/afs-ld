@@ -6,13 +6,17 @@
 
 use std::path::PathBuf;
 
-use crate::{LinkOptions, OutputKind};
+use crate::{LinkOptions, OutputKind, PlatformVersion};
 use crate::resolve::levenshtein;
 
 const KNOWN_FLAGS: &[&str] = &[
     "-o",
     "-e",
     "-arch",
+    "-l",
+    "-L",
+    "-syslibroot",
+    "-platform_version",
     "-x",
     "-dylib",
     "-all_load",
@@ -77,6 +81,29 @@ fn unknown_flag(flag: &str) -> ArgsError {
     }
 }
 
+fn parse_platform_version_component(flag: &str, value: &str) -> Result<u32, ArgsError> {
+    let mut parts = value.split('.');
+    let parse_part = |piece: Option<&str>| -> Result<u32, ArgsError> {
+        let raw = piece.unwrap_or("0");
+        raw.parse::<u32>().map_err(|_| ArgsError::InvalidValue {
+            flag: flag.to_string(),
+            value: value.to_string(),
+            expected: "version like <major>[.<minor>[.<patch>]]".into(),
+        })
+    };
+    let major = parse_part(parts.next())?;
+    let minor = parse_part(parts.next())?;
+    let patch = parse_part(parts.next())?;
+    if parts.next().is_some() {
+        return Err(ArgsError::InvalidValue {
+            flag: flag.to_string(),
+            value: value.to_string(),
+            expected: "version like <major>[.<minor>[.<patch>]]".into(),
+        });
+    }
+    Ok((major << 16) | ((minor & 0xff) << 8) | (patch & 0xff))
+}
+
 pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
     let mut opts = LinkOptions::default();
     let mut it = argv.iter();
@@ -101,6 +128,50 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                         .ok_or_else(|| ArgsError::MissingValue("-arch".into()))?
                         .clone(),
                 );
+            }
+            "-l" => {
+                opts.library_names.push(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("-l".into()))?
+                        .clone(),
+                );
+            }
+            s if s.starts_with("-l") && s.len() > 2 => {
+                opts.library_names.push(s[2..].to_string());
+            }
+            "-L" => {
+                opts.search_paths.push(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("-L".into()))?,
+                ));
+            }
+            "-syslibroot" => {
+                opts.syslibroot = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("-syslibroot".into()))?,
+                ));
+            }
+            "-platform_version" => {
+                let platform = it
+                    .next()
+                    .ok_or_else(|| ArgsError::MissingValue("-platform_version".into()))?;
+                if platform != "macos" {
+                    return Err(ArgsError::InvalidValue {
+                        flag: "-platform_version".into(),
+                        value: platform.clone(),
+                        expected: "platform `macos`".into(),
+                    });
+                }
+                let minos_raw = it
+                    .next()
+                    .ok_or_else(|| ArgsError::MissingValue("-platform_version".into()))?;
+                let sdk_raw = it
+                    .next()
+                    .ok_or_else(|| ArgsError::MissingValue("-platform_version".into()))?;
+                opts.platform_version = Some(PlatformVersion {
+                    minos: parse_platform_version_component("-platform_version", minos_raw)?,
+                    sdk: parse_platform_version_component("-platform_version", sdk_raw)?,
+                });
             }
             "-x" => {
                 opts.strip_locals = true;
@@ -181,6 +252,68 @@ mod tests {
     }
 
     #[test]
+    fn l_flag_accepts_separate_value() {
+        let opts = parse(&argv(&["-l", "System", "main.o"])).unwrap();
+        assert_eq!(opts.library_names, vec!["System".to_string()]);
+        assert_eq!(opts.inputs, vec![PathBuf::from("main.o")]);
+    }
+
+    #[test]
+    fn l_flag_accepts_joined_value() {
+        let opts = parse(&argv(&["-lSystem", "main.o"])).unwrap();
+        assert_eq!(opts.library_names, vec!["System".to_string()]);
+        assert_eq!(opts.inputs, vec![PathBuf::from("main.o")]);
+    }
+
+    #[test]
+    fn search_path_and_syslibroot_flags_are_recorded() {
+        let opts = parse(&argv(&["-L", "/tmp/lib", "-syslibroot", "/sdk", "main.o"])).unwrap();
+        assert_eq!(opts.search_paths, vec![PathBuf::from("/tmp/lib")]);
+        assert_eq!(opts.syslibroot, Some(PathBuf::from("/sdk")));
+    }
+
+    #[test]
+    fn platform_version_flag_is_recorded() {
+        let opts =
+            parse(&argv(&["-platform_version", "macos", "13.2.1", "14.5", "main.o"])).unwrap();
+        let platform = opts.platform_version.expect("platform version");
+        assert_eq!(platform.minos, (13 << 16) | (2 << 8) | 1);
+        assert_eq!(platform.sdk, (14 << 16) | (5 << 8));
+    }
+
+    #[test]
+    fn platform_version_rejects_non_macos_platform() {
+        let err = parse(&argv(&["-platform_version", "ios", "13.0", "13.0"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::InvalidValue {
+                ref flag,
+                ref value,
+                ..
+            } if flag == "-platform_version" && value == "ios"
+        ));
+    }
+
+    #[test]
+    fn platform_version_rejects_bad_version() {
+        let err = parse(&argv(&[
+            "-platform_version",
+            "macos",
+            "13.bad",
+            "14.0",
+        ]))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::InvalidValue {
+                ref flag,
+                ref value,
+                ..
+            } if flag == "-platform_version" && value == "13.bad"
+        ));
+    }
+
+    #[test]
     fn all_load_flag_is_recorded() {
         let opts = parse(&argv(&["-all_load", "libfoo.a"])).unwrap();
         assert!(opts.all_load);
@@ -208,6 +341,12 @@ mod tests {
     fn missing_force_load_value_errors() {
         let err = parse(&argv(&["-force_load"])).unwrap_err();
         assert!(matches!(err, ArgsError::MissingValue(ref f) if f == "-force_load"));
+    }
+
+    #[test]
+    fn missing_l_value_errors() {
+        let err = parse(&argv(&["-l"])).unwrap_err();
+        assert!(matches!(err, ArgsError::MissingValue(ref f) if f == "-l"));
     }
 
     #[test]

@@ -45,10 +45,20 @@ pub enum OutputKind {
     Dylib,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformVersion {
+    pub minos: u32,
+    pub sdk: u32,
+}
+
 /// User-facing linker configuration, populated by the CLI parser.
 #[derive(Debug, Clone)]
 pub struct LinkOptions {
     pub inputs: Vec<PathBuf>,
+    pub library_names: Vec<String>,
+    pub search_paths: Vec<PathBuf>,
+    pub syslibroot: Option<PathBuf>,
+    pub platform_version: Option<PlatformVersion>,
     pub output: Option<PathBuf>,
     pub entry: Option<String>,
     pub arch: Option<String>,
@@ -71,6 +81,10 @@ impl Default for LinkOptions {
     fn default() -> Self {
         Self {
             inputs: Vec::new(),
+            library_names: Vec::new(),
+            search_paths: Vec::new(),
+            syslibroot: None,
+            platform_version: None,
             output: None,
             entry: None,
             arch: None,
@@ -105,6 +119,7 @@ pub enum LinkError {
     NoTbdDocument(PathBuf),
     EntrySymbolNotFound(String),
     ForceLoadNotArchive(PathBuf),
+    LibraryNotFound(String),
 }
 
 impl std::fmt::Display for LinkError {
@@ -138,6 +153,9 @@ impl std::fmt::Display for LinkError {
                     "{}: -force_load requires a path that is also present as an archive input",
                     path.display()
                 )
+            }
+            LinkError::LibraryNotFound(name) => {
+                write!(f, "unable to find library `{name}`")
             }
         }
     }
@@ -211,7 +229,7 @@ pub struct Linker;
 
 impl Linker {
     pub fn run(opts: &LinkOptions) -> Result<(), LinkError> {
-        if opts.inputs.is_empty() {
+        if opts.inputs.is_empty() && opts.library_names.is_empty() {
             return Err(LinkError::NoInputs);
         }
 
@@ -221,8 +239,13 @@ impl Linker {
             }
         }
 
+        let mut load_paths = opts.inputs.clone();
+        for name in &opts.library_names {
+            load_paths.push(resolve_library_input(opts, name)?);
+        }
+
         let mut inputs = Inputs::new();
-        for (load_order, path) in opts.inputs.iter().enumerate() {
+        for (load_order, path) in load_paths.iter().enumerate() {
             register_input(&mut inputs, path, load_order)?;
         }
 
@@ -389,6 +412,38 @@ impl Linker {
         }
         Ok(())
     }
+}
+
+fn resolve_library_input(opts: &LinkOptions, name: &str) -> Result<PathBuf, LinkError> {
+    let mut search_dirs = Vec::new();
+    for dir in &opts.search_paths {
+        search_dirs.push(dir.clone());
+        if let Some(root) = &opts.syslibroot {
+            if let Ok(stripped) = dir.strip_prefix("/") {
+                search_dirs.push(root.join(stripped));
+            }
+        }
+    }
+    if let Some(root) = &opts.syslibroot {
+        search_dirs.push(root.join("usr/lib"));
+    } else {
+        search_dirs.push(PathBuf::from("/usr/lib"));
+    }
+
+    let candidates = [
+        format!("lib{name}.tbd"),
+        format!("lib{name}.dylib"),
+        format!("lib{name}.a"),
+    ];
+    for dir in search_dirs {
+        for candidate in &candidates {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+    }
+    Err(LinkError::LibraryNotFound(name.to_string()))
 }
 
 fn default_output_path(opts: &LinkOptions) -> PathBuf {

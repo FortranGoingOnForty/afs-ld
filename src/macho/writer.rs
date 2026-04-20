@@ -344,28 +344,12 @@ fn build_commands(
             commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
             commands.push(raw_dylinker_command("/usr/lib/dyld"));
             commands.push(raw_uuid_command(stable_uuid(layout, kind)));
-            commands.push(LoadCommand::BuildVersion(BuildVersionCmd {
-                platform: PLATFORM_MACOS,
-                minos: pack_version(11, 0, 0),
-                sdk: pack_version(11, 0, 0),
-                tools: vec![BuildTool {
-                    tool: 3,
-                    version: pack_version(0, 1, 0),
-                }],
-            }));
+            commands.push(LoadCommand::BuildVersion(build_version_command(opts)));
             commands.push(raw_source_version_command(0));
             commands.push(raw_entry_point(resolve_entryoff(layout, entry_point)?, 0));
         }
         OutputKind::Dylib => {
-            commands.push(LoadCommand::BuildVersion(BuildVersionCmd {
-                platform: PLATFORM_MACOS,
-                minos: pack_version(11, 0, 0),
-                sdk: pack_version(11, 0, 0),
-                tools: vec![BuildTool {
-                    tool: 3,
-                    version: pack_version(0, 1, 0),
-                }],
-            }));
+            commands.push(LoadCommand::BuildVersion(build_version_command(opts)));
             commands.push(raw_uuid_command(stable_uuid(layout, kind)));
             commands.push(LoadCommand::Dylib(DylibCmd {
                 cmd: LC_ID_DYLIB,
@@ -426,16 +410,7 @@ fn estimate_header_size(
     for segment in &layout.segments {
         size += (8 + 64 + 80 * segment.sections.len()) as u64;
     }
-    size += BuildVersionCmd {
-        platform: PLATFORM_MACOS,
-        minos: pack_version(11, 0, 0),
-        sdk: pack_version(11, 0, 0),
-        tools: vec![BuildTool {
-            tool: 3,
-            version: pack_version(0, 1, 0),
-        }],
-    }
-    .wire_size() as u64;
+    size += build_version_command(opts).wire_size() as u64;
     size += 24;
     size += match kind {
         OutputKind::Executable => {
@@ -567,6 +542,22 @@ fn raw_linkedit_command(cmd: u32, dataoff: u32, datasize: u32) -> LoadCommand {
         cmd,
         cmdsize: 16,
         data,
+    }
+}
+
+fn build_version_command(opts: &LinkOptions) -> BuildVersionCmd {
+    let platform = opts.platform_version.unwrap_or(crate::PlatformVersion {
+        minos: pack_version(11, 0, 0),
+        sdk: pack_version(11, 0, 0),
+    });
+    BuildVersionCmd {
+        platform: PLATFORM_MACOS,
+        minos: platform.minos,
+        sdk: platform.sdk,
+        tools: vec![BuildTool {
+            tool: 3,
+            version: pack_version(0, 1, 0),
+        }],
     }
 }
 

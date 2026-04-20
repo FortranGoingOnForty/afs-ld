@@ -2572,6 +2572,116 @@ fn linker_run_force_load_pulls_entry_from_archive() {
 }
 
 #[test]
+fn linker_run_resolves_lsystem_via_syslibroot() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun as or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: no macOS SDK path");
+        return;
+    };
+
+    let obj = scratch("lsystem-main.o");
+    let out = scratch("lsystem-main.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        library_names: vec!["System".into()],
+        syslibroot: Some(PathBuf::from(&sdk)),
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let dylibs = load_dylib_names(&bytes).unwrap();
+    assert!(
+        dylibs.iter().any(|name| name == "/usr/lib/libSystem.B.dylib"),
+        "expected libSystem load command, got {dylibs:?}"
+    );
+    let verify = Command::new("codesign").arg("-v").arg(&out).output().unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let status = Command::new(&out).status().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "expected executable linked via -lSystem to exit 0"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_uses_platform_version_for_build_command() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("platform-version.o");
+    let out = scratch("platform-version.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        platform_version: Some(afs_ld::PlatformVersion {
+            minos: (13 << 16) | (2 << 8) | 1,
+            sdk: (14 << 16) | (5 << 8),
+        }),
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
+    let build = commands
+        .into_iter()
+        .find_map(|cmd| match cmd {
+            LoadCommand::BuildVersion(cmd) => Some(cmd),
+            _ => None,
+        })
+        .expect("missing LC_BUILD_VERSION");
+    assert_eq!(build.minos, (13 << 16) | (2 << 8) | 1);
+    assert_eq!(build.sdk, (14 << 16) | (5 << 8));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_carries_tbd_inputs_into_load_commands() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");

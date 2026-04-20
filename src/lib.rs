@@ -338,6 +338,11 @@ impl Linker {
                 "`-S` requested, but afs-ld does not currently emit debug symbols",
             );
         }
+        if opts.objc_force_load {
+            crate::diag::warning(
+                "`-ObjC` requested, but afs-ld does not yet scan Objective-C archive metadata; the flag currently has no effect",
+            );
+        }
 
         let mut load_paths = opts.inputs.clone();
         let mut dylib_load_kinds = std::collections::HashMap::new();

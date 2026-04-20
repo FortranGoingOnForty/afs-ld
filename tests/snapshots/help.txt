@@ -11,7 +11,7 @@ Options:
   -L <dir>                        Add library search path
   -framework <name>               Link framework
   -weak_framework <name>          Link weak framework
-  -ObjC                           Force Objective-C archive loading mode
+  -ObjC                           Objective-C archive loading mode (currently a no-op warning)
   -syslibroot <path>              Prefix SDK search roots
   -platform_version macos <min> <sdk>
                                   Set LC_BUILD_VERSION payload

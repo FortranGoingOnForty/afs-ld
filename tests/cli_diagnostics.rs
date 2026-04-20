@@ -235,6 +235,44 @@ fn strip_debug_flag_warns_but_links_successfully() {
 }
 
 #[test]
+fn objc_flag_warns_but_links_successfully() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = match assemble_minimal_main("objc-main.o") {
+        Ok(obj) => obj,
+        Err(e) => {
+            eprintln!("skipping: assemble failed: {e}");
+            return;
+        }
+    };
+    let out_path = scratch("objc.out");
+    let out = Command::new(exe)
+        .arg("-ObjC")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        out.status.success(),
+        "-ObjC link should succeed:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("afs-ld: warning: `-ObjC` requested"),
+        "expected -ObjC warning:\n{stderr}"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
+}
+
+#[test]
 fn relocatable_flag_errors_loudly() {
     assert_flag_errors(
         "-r",

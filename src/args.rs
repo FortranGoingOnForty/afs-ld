@@ -27,6 +27,10 @@ const KNOWN_FLAGS: &[&str] = &[
     "-install_name",
     "-current_version",
     "-compatibility_version",
+    "-exported_symbols_list",
+    "-unexported_symbols_list",
+    "-exported_symbol",
+    "-unexported_symbol",
     "-S",
     "-no_uuid",
     "-dead_strip",
@@ -280,6 +284,33 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                     .ok_or_else(|| ArgsError::MissingValue("-compatibility_version".into()))?;
                 opts.compatibility_version =
                     Some(parse_version_component("-compatibility_version", value)?);
+            }
+            "-exported_symbols_list" => {
+                opts.exported_symbols_lists
+                    .push(PathBuf::from(it.next().ok_or_else(|| {
+                        ArgsError::MissingValue("-exported_symbols_list".into())
+                    })?));
+            }
+            "-unexported_symbols_list" => {
+                opts.unexported_symbols_lists.push(PathBuf::from(
+                    it.next().ok_or_else(|| {
+                        ArgsError::MissingValue("-unexported_symbols_list".into())
+                    })?,
+                ));
+            }
+            "-exported_symbol" => {
+                opts.exported_symbols.push(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("-exported_symbol".into()))?
+                        .clone(),
+                );
+            }
+            "-unexported_symbol" => {
+                opts.unexported_symbols.push(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("-unexported_symbol".into()))?
+                        .clone(),
+                );
             }
             "-S" => {
                 opts.strip_debug = true;
@@ -600,6 +631,32 @@ mod tests {
         assert_eq!(opts.install_name.as_deref(), Some("@rpath/libdemo.dylib"));
         assert_eq!(opts.current_version, Some((2 << 16) | (3 << 8) | 4));
         assert_eq!(opts.compatibility_version, Some((1 << 16) | (2 << 8)));
+    }
+
+    #[test]
+    fn export_visibility_flags_are_recorded() {
+        let opts = parse(&argv(&[
+            "-exported_symbols_list",
+            "exports.txt",
+            "-unexported_symbols_list",
+            "hidden.txt",
+            "-exported_symbol",
+            "_keep",
+            "-unexported_symbol",
+            "_drop",
+            "main.o",
+        ]))
+        .unwrap();
+        assert_eq!(
+            opts.exported_symbols_lists,
+            vec![PathBuf::from("exports.txt")]
+        );
+        assert_eq!(
+            opts.unexported_symbols_lists,
+            vec![PathBuf::from("hidden.txt")]
+        );
+        assert_eq!(opts.exported_symbols, vec!["_keep".to_string()]);
+        assert_eq!(opts.unexported_symbols, vec!["_drop".to_string()]);
     }
 
     #[test]

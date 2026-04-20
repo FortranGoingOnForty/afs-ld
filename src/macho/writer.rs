@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fs;
 use std::path::PathBuf;
 
 use crate::atom::AtomTable;
@@ -70,6 +71,7 @@ pub enum WriteError {
     ImportSymbolWrongKind(SymbolId),
     MalformedRelocations(PathBuf, u8, String),
     MalformedDataInCode(PathBuf, String),
+    SymbolListRead(PathBuf, String),
 }
 
 impl fmt::Display for WriteError {
@@ -126,6 +128,13 @@ impl fmt::Display for WriteError {
                 write!(
                     f,
                     "failed to remap LC_DATA_IN_CODE in {}: {detail}",
+                    path.display()
+                )
+            }
+            WriteError::SymbolListRead(path, detail) => {
+                write!(
+                    f,
+                    "{}: unable to read symbol list: {detail}",
                     path.display()
                 )
             }
@@ -772,7 +781,15 @@ fn build_linkedit_plan(
         .iter()
         .map(|record| (record.symbol, record))
         .collect();
-    let symbol_plan = build_output_symbols(layout, kind, opts.strip_locals, inputs, &imports)?;
+    let visibility = SymbolVisibilityPolicy::from_opts(opts)?;
+    let symbol_plan = build_output_symbols(
+        layout,
+        kind,
+        opts.strip_locals,
+        &visibility,
+        inputs,
+        &imports,
+    )?;
     let mut symtab_bytes = Vec::new();
     write_nlist_table(&symbol_plan.symbols, &mut symtab_bytes);
 
@@ -945,6 +962,43 @@ struct OutputSymbolSpec {
     n_value: u64,
     size: u64,
     file_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SymbolVisibilityPolicy {
+    exported: Vec<String>,
+    unexported: Vec<String>,
+}
+
+impl SymbolVisibilityPolicy {
+    fn from_opts(opts: &LinkOptions) -> Result<Self, WriteError> {
+        let mut exported = opts.exported_symbols.clone();
+        let mut unexported = opts.unexported_symbols.clone();
+        for path in &opts.exported_symbols_lists {
+            exported.extend(read_symbol_patterns(path)?);
+        }
+        for path in &opts.unexported_symbols_lists {
+            unexported.extend(read_symbol_patterns(path)?);
+        }
+        Ok(Self {
+            exported,
+            unexported,
+        })
+    }
+
+    fn hides(&self, name: &str) -> bool {
+        if !self.exported.is_empty()
+            && !self
+                .exported
+                .iter()
+                .any(|pattern| wildcard_matches(pattern, name))
+        {
+            return true;
+        }
+        self.unexported
+            .iter()
+            .any(|pattern| wildcard_matches(pattern, name))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1465,6 +1519,7 @@ fn build_output_symbols(
     layout: &Layout,
     kind: OutputKind,
     strip_locals: bool,
+    visibility: &SymbolVisibilityPolicy,
     inputs: LinkEditInputs<'_>,
     imports: &[ImportSymbolRecord],
 ) -> Result<SymbolTablePlan, WriteError> {
@@ -1488,11 +1543,23 @@ fn build_output_symbols(
             .segment("__TEXT")
             .ok_or(WriteError::MissingSegment("__TEXT"))?
             .vm_addr;
-        external_defineds.push(OutputSymbolSpec {
+        let hide_header = visibility.hides("__mh_execute_header");
+        let header_partition = if hide_header {
+            OutputSymbolPartition::Local
+        } else {
+            OutputSymbolPartition::ExternalDefined
+        };
+        let header_type = defined_symbol_type(hide_header);
+        let target = if hide_header {
+            &mut locals
+        } else {
+            &mut external_defineds
+        };
+        target.push(OutputSymbolSpec {
             symbol: None,
             name: "__mh_execute_header".to_string(),
-            partition: OutputSymbolPartition::ExternalDefined,
-            n_type: N_SECT | N_EXT,
+            partition: header_partition,
+            n_type: header_type,
             n_sect: 1,
             n_desc: REFERENCED_DYNAMICALLY,
             n_value: text_vmaddr,
@@ -1512,7 +1579,6 @@ fn build_output_symbols(
         collect_local_symbols(layout, &ctx, input.object, &mut locals)?;
     }
     collect_synthetic_local_symbols(layout, inputs.0.synthetic_plan, &mut locals)?;
-    sort_local_symbols(&mut locals);
 
     for (symbol_id, symbol) in sym_table.iter() {
         let Symbol::Defined {
@@ -1532,8 +1598,9 @@ fn build_output_symbols(
             continue;
         }
         let name = sym_table.interner.resolve(*name).to_string();
+        let hidden = visibility.hides(&name);
         let (n_type, n_sect, n_value) = if atom.0 == 0 {
-            (absolute_symbol_type(*private_extern), NO_SECT, *value)
+            (absolute_symbol_type(hidden), NO_SECT, *value)
         } else {
             let addr = layout
                 .atom_addr(*atom)
@@ -1541,7 +1608,7 @@ fn build_output_symbols(
             let sect = *atom_sections
                 .get(atom)
                 .ok_or(WriteError::DefinedSymbolSectionMissing(symbol_id, *atom))?;
-            (defined_symbol_type(*private_extern), sect, addr + *value)
+            (defined_symbol_type(hidden), sect, addr + *value)
         };
         let size = if atom.0 == 0 {
             0
@@ -1560,10 +1627,20 @@ fn build_output_symbols(
         if *no_dead_strip {
             n_desc |= N_NO_DEAD_STRIP;
         }
-        external_defineds.push(OutputSymbolSpec {
+        let partition = if hidden {
+            OutputSymbolPartition::Local
+        } else {
+            OutputSymbolPartition::ExternalDefined
+        };
+        let target = if hidden {
+            &mut locals
+        } else {
+            &mut external_defineds
+        };
+        target.push(OutputSymbolSpec {
             symbol: Some(symbol_id),
             name,
-            partition: OutputSymbolPartition::ExternalDefined,
+            partition,
             n_type,
             n_sect,
             n_desc,
@@ -1573,6 +1650,7 @@ fn build_output_symbols(
         });
     }
 
+    sort_local_symbols(&mut locals);
     external_defineds.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
     for import in imports {
         let mut n_desc = import.ordinal << 8;
@@ -1926,19 +2004,61 @@ fn section_is_thread_local(layout: &Layout, n_sect: u8) -> bool {
 }
 
 fn defined_symbol_type(private_extern: bool) -> u8 {
-    let mut n_type = N_SECT | N_EXT;
     if private_extern {
-        n_type |= N_PEXT;
+        N_SECT | N_PEXT
+    } else {
+        N_SECT | N_EXT
     }
-    n_type
 }
 
 fn absolute_symbol_type(private_extern: bool) -> u8 {
-    let mut n_type = N_ABS | N_EXT;
     if private_extern {
-        n_type |= N_PEXT;
+        N_ABS | N_PEXT
+    } else {
+        N_ABS | N_EXT
     }
-    n_type
+}
+
+fn read_symbol_patterns(path: &PathBuf) -> Result<Vec<String>, WriteError> {
+    let contents = fs::read_to_string(path)
+        .map_err(|err| WriteError::SymbolListRead(path.clone(), err.to_string()))?;
+    Ok(contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let mut p = 0usize;
+    let mut v = 0usize;
+    let mut star = None;
+    let mut backtrack = 0usize;
+
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            backtrack = v;
+        } else if let Some(star_idx) = star {
+            p = star_idx + 1;
+            backtrack += 1;
+            v = backtrack;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 fn place_optional_block(

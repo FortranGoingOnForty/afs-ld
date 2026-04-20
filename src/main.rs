@@ -25,6 +25,10 @@ Options:
   -install_name <path>            Override dylib install name
   -current_version <v>            Override dylib current version
   -compatibility_version <v>      Override dylib compatibility version
+  -exported_symbols_list <file>   Export only symbols matching file patterns
+  -unexported_symbols_list <file> Hide symbols matching file patterns
+  -exported_symbol <sym>          Export one symbol/pattern
+  -unexported_symbol <sym>        Hide one symbol/pattern
   -S                              Strip debug symbols (currently a no-op warning)
   -no_uuid                        Omit LC_UUID
   -dead_strip                     Dead-strip unreferenced code/data (deferred; errors)

@@ -18,7 +18,7 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
     BIND_SYMBOL_FLAGS_WEAK_IMPORT, DICE_KIND_JUMP_TABLE32, INDIRECT_SYMBOL_ABS,
     INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
-    LC_FUNCTION_STARTS, LC_SEGMENT_64, LC_SYMTAB, REBASE_IMMEDIATE_MASK,
+    LC_FUNCTION_STARTS, LC_SEGMENT_64, LC_SYMTAB, N_PEXT, REBASE_IMMEDIATE_MASK,
     REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE,
     REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
@@ -369,6 +369,13 @@ fn canonical_symbol_records(bytes: &[u8]) -> Vec<CanonicalSymbolRecord> {
                 value,
             }
         })
+        .collect()
+}
+
+fn canonical_symbol_record_map(bytes: &[u8]) -> HashMap<String, CanonicalSymbolRecord> {
+    canonical_symbol_records(bytes)
+        .into_iter()
+        .map(|record| (record.name.clone(), record))
         .collect()
 }
 
@@ -2024,6 +2031,184 @@ fn linker_run_uses_dylib_identity_flags() {
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_honors_exported_symbol_filters_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("export-filter.o");
+    let our_out = scratch("export-filter-ours.dylib");
+    let apple_out = scratch("export-filter-apple.dylib");
+    let list_path = scratch("export-filter-exports.txt");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _alpha
+        .globl _beta
+        .globl _gamma
+        _alpha:
+            ret
+        _beta:
+            ret
+        _gamma:
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+    fs::write(&list_path, "_bet?\n").unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Dylib,
+        exported_symbols: vec!["_alpha".into()],
+        exported_symbols_lists: vec![list_path.clone()],
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let apple = Command::new("xcrun")
+        .args(["clang", "-arch", "arm64", "-dynamiclib"])
+        .arg(&obj)
+        .arg("-o")
+        .arg(&apple_out)
+        .arg("-Wl,-exported_symbol,_alpha")
+        .arg(format!(
+            "-Wl,-exported_symbols_list,{}",
+            list_path.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        apple.status.success(),
+        "xcrun ld failed: {}",
+        String::from_utf8_lossy(&apple.stderr)
+    );
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert_eq!(
+        canonical_export_records(&our_bytes),
+        canonical_export_records(&apple_bytes)
+    );
+    assert_eq!(
+        dyld_info_export_names(&our_bytes).unwrap(),
+        vec!["_alpha".to_string(), "_beta".to_string()]
+    );
+    assert_eq!(
+        canonical_symbol_record_map(&our_bytes),
+        canonical_symbol_record_map(&apple_bytes)
+    );
+
+    let our_symbols = canonical_symbol_record_map(&our_bytes);
+    let gamma = our_symbols.get("_gamma").expect("missing _gamma");
+    assert_ne!(
+        gamma.n_type & N_PEXT,
+        0,
+        "expected _gamma to be private extern"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+    let _ = fs::remove_file(list_path);
+}
+
+#[test]
+fn linker_run_honors_unexported_symbol_filters_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("unexport-filter.o");
+    let our_out = scratch("unexport-filter-ours.dylib");
+    let apple_out = scratch("unexport-filter-apple.dylib");
+    let list_path = scratch("unexport-filter-hidden.txt");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _alpha
+        .globl _beta
+        .globl _gamma
+        _alpha:
+            ret
+        _beta:
+            ret
+        _gamma:
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+    fs::write(&list_path, "_bet?\n").unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Dylib,
+        unexported_symbols: vec!["_gamma".into()],
+        unexported_symbols_lists: vec![list_path.clone()],
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let apple = Command::new("xcrun")
+        .args(["clang", "-arch", "arm64", "-dynamiclib"])
+        .arg(&obj)
+        .arg("-o")
+        .arg(&apple_out)
+        .arg("-Wl,-unexported_symbol,_gamma")
+        .arg(format!(
+            "-Wl,-unexported_symbols_list,{}",
+            list_path.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        apple.status.success(),
+        "xcrun ld failed: {}",
+        String::from_utf8_lossy(&apple.stderr)
+    );
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    assert_eq!(
+        canonical_export_records(&our_bytes),
+        canonical_export_records(&apple_bytes)
+    );
+    assert_eq!(
+        dyld_info_export_names(&our_bytes).unwrap(),
+        vec!["_alpha".to_string()]
+    );
+    assert_eq!(
+        canonical_symbol_record_map(&our_bytes),
+        canonical_symbol_record_map(&apple_bytes)
+    );
+
+    let our_symbols = canonical_symbol_record_map(&our_bytes);
+    for name in ["_beta", "_gamma"] {
+        let record = our_symbols
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert_ne!(
+            record.n_type & N_PEXT,
+            0,
+            "expected {name} to be private extern"
+        );
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+    let _ = fs::remove_file(list_path);
 }
 
 #[test]

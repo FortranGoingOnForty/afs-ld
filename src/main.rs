@@ -9,6 +9,7 @@ Usage: afs-ld [options] <inputs...>
 Options:
   -o <path>                       Write output to <path>
   -map <path>                     Emit text link map
+  -why_live <symbol>              Print a reachability chain for <symbol>
   -l<name> / -l <name>            Search for library
   -L <dir>                        Add library search path
   -framework <name>               Link framework

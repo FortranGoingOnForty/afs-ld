@@ -20,6 +20,7 @@ pub mod section;
 pub mod string_table;
 pub mod symbol;
 pub mod synth;
+pub mod why_live;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -73,6 +74,7 @@ pub struct LinkOptions {
     pub current_version: Option<u32>,
     pub compatibility_version: Option<u32>,
     pub map: Option<PathBuf>,
+    pub why_live: Vec<String>,
     pub trace_inputs: bool,
     pub show_version: bool,
     pub show_help: bool,
@@ -110,6 +112,7 @@ impl Default for LinkOptions {
             current_version: None,
             compatibility_version: None,
             map: None,
+            why_live: Vec::new(),
             trace_inputs: false,
             show_version: false,
             show_help: false,
@@ -150,6 +153,7 @@ pub enum LinkError {
     ForceLoadNotArchive(PathBuf),
     LibraryNotFound(String),
     FrameworkNotFound(String),
+    WhyLive(String),
 }
 
 impl std::fmt::Display for LinkError {
@@ -190,6 +194,7 @@ impl std::fmt::Display for LinkError {
             LinkError::FrameworkNotFound(name) => {
                 write!(f, "unable to find framework `{name}`")
             }
+            LinkError::WhyLive(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -455,6 +460,14 @@ impl Linker {
             &linkedit,
         )?;
 
+        let entry_symbol = find_entry_symbol_id(opts, &sym_table)?;
+        if let Some(report) =
+            why_live::format_explanations(opts, &layout_inputs, &atom_table, &sym_table, entry_symbol)
+                .map_err(LinkError::WhyLive)?
+        {
+            print!("{report}");
+        }
+
         let mut image = Vec::new();
         let entry_point = resolve_entry_point(opts, &sym_table)?;
         macho::writer::write_finalized_with_linkedit(
@@ -611,6 +624,23 @@ fn resolve_entry_point(
     opts: &LinkOptions,
     sym_table: &SymbolTable,
 ) -> Result<Option<macho::writer::EntryPoint>, LinkError> {
+    let Some(symbol_id) = find_entry_symbol_id(opts, sym_table)? else {
+        return Ok(None);
+    };
+    let Symbol::Defined { atom, value, .. } = sym_table.get(symbol_id) else {
+        let name = sym_table.interner.resolve(sym_table.get(symbol_id).name());
+        return Err(LinkError::EntrySymbolNotFound(name.to_string()));
+    };
+    Ok(Some(macho::writer::EntryPoint {
+        atom: *atom,
+        atom_value: *value,
+    }))
+}
+
+fn find_entry_symbol_id(
+    opts: &LinkOptions,
+    sym_table: &SymbolTable,
+) -> Result<Option<resolve::SymbolId>, LinkError> {
     let name = if let Some(name) = &opts.entry {
         name.as_str()
     } else if opts.kind == OutputKind::Executable {
@@ -630,13 +660,7 @@ fn resolve_entry_point(
     else {
         return Err(LinkError::EntrySymbolNotFound(name.to_string()));
     };
-    let Symbol::Defined { atom, value, .. } = sym_table.get(symbol_id) else {
-        return Err(LinkError::EntrySymbolNotFound(name.to_string()));
-    };
-    Ok(Some(macho::writer::EntryPoint {
-        atom: *atom,
-        atom_value: *value,
-    }))
+    Ok(Some(symbol_id))
 }
 
 fn symbol_defined(sym_table: &SymbolTable, name: &str) -> bool {

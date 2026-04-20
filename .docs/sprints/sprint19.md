@@ -151,4 +151,4 @@ afs-ld: loading /usr/lib/libSystem.tbd
 - [x] `-t` / `-trace`
 - [x] `-v` / `--version`
 - [x] `-h` / `--help`
-- [ ] `-why_live <symbol>`
+- [x] `-why_live <symbol>`

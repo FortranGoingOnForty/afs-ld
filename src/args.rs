@@ -26,6 +26,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "-current_version",
     "-compatibility_version",
     "-map",
+    "-why_live",
     "-t",
     "-trace",
     "-v",
@@ -270,6 +271,13 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                     it.next()
                         .ok_or_else(|| ArgsError::MissingValue("-map".into()))?,
                 ));
+            }
+            "-why_live" => {
+                opts.why_live.push(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("-why_live".into()))?
+                        .clone(),
+                );
             }
             "-t" | "-trace" => {
                 opts.trace_inputs = true;
@@ -526,6 +534,12 @@ mod tests {
         assert!(opts.trace_inputs);
         let opts = parse(&argv(&["-t", "main.o"])).unwrap();
         assert!(opts.trace_inputs);
+    }
+
+    #[test]
+    fn why_live_flag_accumulates_symbols() {
+        let opts = parse(&argv(&["-why_live", "_helper", "-why_live", "_leaf", "main.o"])).unwrap();
+        assert_eq!(opts.why_live, vec!["_helper".to_string(), "_leaf".to_string()]);
     }
 
     #[test]

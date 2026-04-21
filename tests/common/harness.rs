@@ -34,6 +34,7 @@ use afs_ld::macho::reader::{
 };
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, SymKind};
+use afs_ld::synth::stubs::{STUB_HELPER_ENTRY_SIZE, STUB_HELPER_HEADER_SIZE};
 use afs_ld::synth::unwind::decode_unwind_info;
 
 #[derive(Debug, Clone)]
@@ -874,6 +875,16 @@ pub fn compare_sections(
             }
             continue;
         }
+        if segname == "__TEXT" && sectname == "__stub_helper" {
+            let ours = canonical_stub_helper(ours)?;
+            let theirs = canonical_stub_helper(theirs)?;
+            if ours != theirs {
+                return Err(format!(
+                    "canonical stub helper surface diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                ));
+            }
+            continue;
+        }
         let (_, our_bytes) = output_section(ours, segname, sectname)
             .ok_or_else(|| format!("missing section {segname},{sectname} in afs-ld output"))?;
         let (_, their_bytes) = output_section(theirs, segname, sectname)
@@ -923,12 +934,8 @@ pub fn compare_page_refs(
             decode_page_reference(&our_bytes, our_addr, check.site_offset, check.kind)?;
         let their_target =
             decode_page_reference(&their_bytes, their_addr, check.site_offset, check.kind)?;
-        let expected_ours = *our_symbols
-            .get(&check.symbol)
-            .ok_or_else(|| format!("missing symbol {} in afs-ld output", check.symbol))?;
-        let expected_theirs = *their_symbols
-            .get(&check.symbol)
-            .ok_or_else(|| format!("missing symbol {} in Apple output", check.symbol))?;
+        let expected_ours = resolve_page_ref_expectation(ours, &our_symbols, &check.symbol)?;
+        let expected_theirs = resolve_page_ref_expectation(theirs, &their_symbols, &check.symbol)?;
         if our_target != expected_ours || their_target != expected_theirs {
             return Err(format!(
                 "page ref {},{}+0x{:x} -> {} diverged: ours=0x{:x} expected=0x{:x}; theirs=0x{:x} expected=0x{:x}",
@@ -944,6 +951,36 @@ pub fn compare_page_refs(
         }
     }
     Ok(())
+}
+
+fn resolve_page_ref_expectation(
+    bytes: &[u8],
+    symbols: &BTreeMap<String, u64>,
+    reference: &str,
+) -> Result<u64, String> {
+    if let Some(spec) = reference.strip_prefix("@SECTION:") {
+        let (section_spec, addend) = if let Some((section_spec, addend)) = spec.rsplit_once('+') {
+            (section_spec, parse_u64(addend)?)
+        } else {
+            (spec, 0)
+        };
+        let (segname, sectname) = section_spec
+            .split_once(',')
+            .ok_or_else(|| format!("invalid @SECTION page-ref target `{reference}`"))?;
+        let (addr, data) = output_section(bytes, segname, sectname)
+            .ok_or_else(|| format!("missing section {segname},{sectname} in output"))?;
+        if addend > data.len() as u64 {
+            return Err(format!(
+                "@SECTION target `{reference}` exceeds section size {}",
+                data.len()
+            ));
+        }
+        return Ok(addr + addend);
+    }
+    symbols
+        .get(reference)
+        .copied()
+        .ok_or_else(|| format!("missing symbol {reference} in output"))
 }
 
 pub fn run_program(path: &Path, args: &[String]) -> Result<ProgramOutput, String> {
@@ -1612,7 +1649,7 @@ fn load_dylib_names(bytes: &[u8]) -> Result<Vec<String>, String> {
 struct CanonicalSymbolRecord {
     name: String,
     n_type: u8,
-    n_sect: u8,
+    section: Option<(String, String)>,
     n_desc: u16,
     value: u64,
 }
@@ -1648,24 +1685,28 @@ fn canonical_symbol_records(bytes: &[u8]) -> Result<Vec<CanonicalSymbolRecord>, 
         parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).map_err(|e| e.to_string())?;
     let strings =
         StringTable::from_file(bytes, symtab.stroff, symtab.strsize).map_err(|e| e.to_string())?;
-    let section_addrs = section_addrs(bytes)?;
+    let sections = section_regions(bytes)?;
     Ok(symbols
         .iter()
         .map(|symbol| {
-            let value = if symbol.kind() == SymKind::Sect && symbol.sect_idx() != 0 {
-                let section_addr = section_addrs[symbol.sect_idx() as usize - 1];
-                if symbol.value() >= section_addr {
-                    symbol.value() - section_addr
+            let (section, value) = if symbol.kind() == SymKind::Sect && symbol.sect_idx() != 0 {
+                let section = &sections[symbol.sect_idx() as usize - 1];
+                let value = if symbol.value() >= section.addr {
+                    symbol.value() - section.addr
                 } else {
                     symbol.value()
-                }
+                };
+                (
+                    Some((section.segname.clone(), section.sectname.clone())),
+                    value,
+                )
             } else {
-                symbol.value()
+                (None, symbol.value())
             };
             CanonicalSymbolRecord {
                 name: strings.get(symbol.strx()).unwrap().to_string(),
                 n_type: symbol.raw.n_type,
-                n_sect: symbol.raw.n_sect,
+                section,
                 n_desc: symbol.raw.n_desc,
                 value,
             }
@@ -1677,7 +1718,7 @@ fn canonical_symbol_records(bytes: &[u8]) -> Result<Vec<CanonicalSymbolRecord>, 
 fn is_optional_dyld_stub_binder_record(record: &CanonicalSymbolRecord) -> bool {
     record.name == "dyld_stub_binder"
         && (record.n_type & N_TYPE) == N_UNDF
-        && record.n_sect == 0
+        && record.section.is_none()
 }
 
 fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExportRecord>, String> {
@@ -1739,7 +1780,10 @@ fn symbol_partition_names(bytes: &[u8]) -> Result<(Vec<String>, Vec<String>, Vec
     Ok((
         names_for(dysymtab.ilocalsym, dysymtab.nlocalsym),
         names_for(dysymtab.iextdefsym, dysymtab.nextdefsym),
-        names_for(dysymtab.iundefsym, dysymtab.nundefsym),
+        names_for(dysymtab.iundefsym, dysymtab.nundefsym)
+            .into_iter()
+            .filter(|name| name != "dyld_stub_binder")
+            .collect(),
     ))
 }
 
@@ -1877,9 +1921,21 @@ fn canonical_data_in_code(bytes: &[u8]) -> Result<Vec<DataInCodeRecord>, String>
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CanonicalBindLocation {
+    Section {
+        segname: String,
+        sectname: String,
+        offset: u64,
+    },
+    Segment {
+        segment_index: u8,
+        segment_offset: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CanonicalBindRecord {
-    segment_index: u8,
-    segment_offset: u64,
+    location: CanonicalBindLocation,
     ordinal: i32,
     symbol: String,
     weak_import: bool,
@@ -1951,8 +2007,7 @@ fn canonical_bind_records(
             }
             BIND_OPCODE_DO_BIND => {
                 out.push(CanonicalBindRecord {
-                    segment_index,
-                    segment_offset,
+                    location: canonical_bind_location(bytes, segment_index, segment_offset)?,
                     ordinal,
                     symbol: symbol.clone(),
                     weak_import,
@@ -1966,8 +2021,7 @@ fn canonical_bind_records(
                     read_uleb(&stream[cursor..]).map_err(|e| format!("bind uleb: {e}"))?;
                 cursor += used;
                 out.push(CanonicalBindRecord {
-                    segment_index,
-                    segment_offset,
+                    location: canonical_bind_location(bytes, segment_index, segment_offset)?,
                     ordinal,
                     symbol: symbol.clone(),
                     weak_import,
@@ -1978,8 +2032,7 @@ fn canonical_bind_records(
             }
             BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED => {
                 out.push(CanonicalBindRecord {
-                    segment_index,
-                    segment_offset,
+                    location: canonical_bind_location(bytes, segment_index, segment_offset)?,
                     ordinal,
                     symbol: symbol.clone(),
                     weak_import,
@@ -1997,8 +2050,7 @@ fn canonical_bind_records(
                 cursor += skip_used;
                 for _ in 0..count {
                     out.push(CanonicalBindRecord {
-                        segment_index,
-                        segment_offset,
+                        location: canonical_bind_location(bytes, segment_index, segment_offset)?,
                         ordinal,
                         symbol: symbol.clone(),
                         weak_import,
@@ -2112,17 +2164,125 @@ fn symtab_and_dysymtab(
 }
 
 fn section_addrs(bytes: &[u8]) -> Result<Vec<u64>, String> {
+    Ok(section_regions(bytes)?
+        .into_iter()
+        .map(|section| section.addr)
+        .collect())
+}
+
+#[derive(Debug, Clone)]
+struct SegmentRegion {
+    index: u8,
+    segname: String,
+    vmaddr: u64,
+    vmsize: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SectionRegion {
+    segment_index: u8,
+    segname: String,
+    sectname: String,
+    addr: u64,
+    size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalSectionLocation {
+    segname: String,
+    sectname: String,
+    offset: u64,
+}
+
+fn segment_regions(bytes: &[u8]) -> Result<Vec<SegmentRegion>, String> {
     let header = parse_header(bytes).map_err(|e| e.to_string())?;
     let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
+    let mut index = 0u8;
     for cmd in commands {
         if let LoadCommand::Segment64(seg) = cmd {
-            for section in seg.sections {
-                out.push(section.addr);
-            }
+            out.push(SegmentRegion {
+                index,
+                segname: seg.segname_str().to_string(),
+                vmaddr: seg.vmaddr,
+                vmsize: seg.vmsize,
+            });
+            index = index.saturating_add(1);
         }
     }
     Ok(out)
+}
+
+fn section_regions(bytes: &[u8]) -> Result<Vec<SectionRegion>, String> {
+    let header = parse_header(bytes).map_err(|e| e.to_string())?;
+    let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    let mut segment_index = 0u8;
+    for cmd in commands {
+        if let LoadCommand::Segment64(seg) = cmd {
+            for section in seg.sections {
+                out.push(SectionRegion {
+                    segment_index,
+                    segname: section.segname_str().to_string(),
+                    sectname: section.sectname_str().to_string(),
+                    addr: section.addr,
+                    size: section.size,
+                });
+            }
+            segment_index = segment_index.saturating_add(1);
+        }
+    }
+    Ok(out)
+}
+
+fn canonical_bind_location(
+    bytes: &[u8],
+    segment_index: u8,
+    segment_offset: u64,
+) -> Result<CanonicalBindLocation, String> {
+    let segments = segment_regions(bytes)?;
+    let sections = section_regions(bytes)?;
+    let Some(segment) = segments.iter().find(|segment| segment.index == segment_index) else {
+        return Ok(CanonicalBindLocation::Segment {
+            segment_index,
+            segment_offset,
+        });
+    };
+    if segment_offset >= segment.vmsize {
+        return Ok(CanonicalBindLocation::Segment {
+            segment_index,
+            segment_offset,
+        });
+    }
+    let addr = segment.vmaddr + segment_offset;
+    if let Some(section) = sections.iter().find(|section| {
+        section.segment_index == segment_index
+            && section.addr <= addr
+            && addr < section.addr + section.size
+    }) {
+        return Ok(CanonicalBindLocation::Section {
+            segname: section.segname.clone(),
+            sectname: section.sectname.clone(),
+            offset: addr - section.addr,
+        });
+    }
+    Ok(CanonicalBindLocation::Segment {
+        segment_index,
+        segment_offset,
+    })
+}
+
+fn canonical_section_location(bytes: &[u8], addr: u64) -> Result<CanonicalSectionLocation, String> {
+    let sections = section_regions(bytes)?;
+    let section = sections
+        .into_iter()
+        .find(|section| section.addr <= addr && addr < section.addr + section.size)
+        .ok_or_else(|| format!("address 0x{addr:x} is not inside any output section"))?;
+    Ok(CanonicalSectionLocation {
+        segname: section.segname,
+        sectname: section.sectname,
+        offset: addr - section.addr,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2204,6 +2364,70 @@ fn canonical_stub_targets(bytes: &[u8]) -> Result<Vec<u64>, String> {
     Ok(out)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalStubHelper {
+    dyld_private: CanonicalSectionLocation,
+    binder_got: CanonicalSectionLocation,
+    lazy_bind_offsets: Vec<u32>,
+}
+
+fn canonical_stub_helper(bytes: &[u8]) -> Result<CanonicalStubHelper, String> {
+    let (section_addr, section_bytes) = output_section(bytes, "__TEXT", "__stub_helper")
+        .ok_or_else(|| "missing __TEXT,__stub_helper section".to_string())?;
+    if section_bytes.len() < STUB_HELPER_HEADER_SIZE as usize {
+        return Err(format!(
+            "__TEXT,__stub_helper is too small for header: {} < {}",
+            section_bytes.len(),
+            STUB_HELPER_HEADER_SIZE
+        ));
+    }
+    let dyld_private_target =
+        decode_page_reference(&section_bytes, section_addr, 0, PageRefKind::Add)?;
+    let binder_got_target =
+        decode_page_reference(&section_bytes, section_addr, 12, PageRefKind::Load)?;
+    let dyld_private = canonical_section_location(bytes, dyld_private_target)?;
+    let binder_got = canonical_section_location(bytes, binder_got_target)?;
+
+    let entry_bytes = &section_bytes[STUB_HELPER_HEADER_SIZE as usize..];
+    if entry_bytes.len() % STUB_HELPER_ENTRY_SIZE as usize != 0 {
+        return Err(format!(
+            "__TEXT,__stub_helper entries {} are not a multiple of {}",
+            entry_bytes.len(),
+            STUB_HELPER_ENTRY_SIZE
+        ));
+    }
+
+    let mut lazy_bind_offsets = Vec::new();
+    for (idx, chunk) in entry_bytes
+        .chunks_exact(STUB_HELPER_ENTRY_SIZE as usize)
+        .enumerate()
+    {
+        let entry_addr = section_addr
+            + STUB_HELPER_HEADER_SIZE as u64
+            + (idx as u64) * STUB_HELPER_ENTRY_SIZE as u64;
+        let ldr = read_insn(chunk, 0)?;
+        if ldr != 0x1800_0050 {
+            return Err(format!(
+                "stub helper entry at 0x{entry_addr:x} does not start with LDR literal"
+            ));
+        }
+        let branch = read_insn(chunk, 4)?;
+        let branch_target = decode_branch26_target(branch, entry_addr + 4)?;
+        if branch_target != section_addr {
+            return Err(format!(
+                "stub helper entry at 0x{entry_addr:x} branches to 0x{branch_target:x}, expected header 0x{section_addr:x}"
+            ));
+        }
+        lazy_bind_offsets.push(u32_le(&chunk[8..12]));
+    }
+
+    Ok(CanonicalStubHelper {
+        dyld_private,
+        binder_got,
+        lazy_bind_offsets,
+    })
+}
+
 fn decode_stub_target(bytes: &[u8], stub_addr: u64) -> Result<u64, String> {
     let adrp = read_insn(bytes, 0)?;
     let ldr = read_insn(bytes, 4)?;
@@ -2232,6 +2456,21 @@ fn decode_stub_target(bytes: &[u8], stub_addr: u64) -> Result<u64, String> {
     let adrp_base = ((stub_addr as i64) & !0xfff) + (adrp_pages << 12);
     let scaled = ((ldr >> 10) & 0xfff) as u64;
     Ok((adrp_base as u64) + scaled * 8)
+}
+
+fn decode_branch26_target(insn: u32, place: u64) -> Result<u64, String> {
+    if (insn & 0xfc00_0000) != 0x1400_0000 {
+        return Err(format!(
+            "instruction 0x{insn:08x} at 0x{place:x} is not a B/BL branch26"
+        ));
+    }
+    let imm26 = sign_extend_26((insn & 0x03ff_ffff) as i64);
+    Ok(((place as i64) + (imm26 << 2)) as u64)
+}
+
+fn sign_extend_26(value: i64) -> i64 {
+    let shift = 64 - 26;
+    (value << shift) >> shift
 }
 
 fn symbol_values(bytes: &[u8]) -> Result<BTreeMap<String, u64>, String> {

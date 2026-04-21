@@ -214,6 +214,10 @@ pub struct LinkPhaseTimings {
     pub layout: Duration,
     pub synth_sections: Duration,
     pub synth_linkedit_finalize: Duration,
+    pub synth_linkedit_symbol_plan: Duration,
+    pub synth_linkedit_dyld_info: Duration,
+    pub synth_linkedit_metadata_tables: Duration,
+    pub synth_linkedit_code_signature: Duration,
     pub synth_unwind: Duration,
     pub reloc_apply: Duration,
     pub write_output: Duration,
@@ -661,17 +665,26 @@ impl Linker {
         let phase_started = Instant::now();
         let mut linkedit = None;
         let mut synth_linkedit_finalize = Duration::ZERO;
+        let mut synth_linkedit_symbol_plan = Duration::ZERO;
+        let mut synth_linkedit_dyld_info = Duration::ZERO;
+        let mut synth_linkedit_metadata_tables = Duration::ZERO;
+        let mut synth_linkedit_code_signature = Duration::ZERO;
         let mut synth_unwind = Duration::ZERO;
         for _ in 0..4 {
             let phase_started = Instant::now();
-            let (next_layout, next_linkedit) = macho::writer::finalize_layout_with_linkedit(
-                &layout,
-                opts.kind,
-                opts,
-                &dylib_loads,
-                linkedit_context,
-            )?;
+            let (next_layout, next_linkedit, linkedit_timings) =
+                macho::writer::finalize_layout_with_linkedit(
+                    &layout,
+                    opts.kind,
+                    opts,
+                    &dylib_loads,
+                    linkedit_context,
+                )?;
             synth_linkedit_finalize += phase_started.elapsed();
+            synth_linkedit_symbol_plan += linkedit_timings.symbol_plan;
+            synth_linkedit_dyld_info += linkedit_timings.dyld_info;
+            synth_linkedit_metadata_tables += linkedit_timings.metadata_tables;
+            synth_linkedit_code_signature += linkedit_timings.code_signature;
             layout = next_layout;
             linkedit = Some(next_linkedit);
             let phase_started = Instant::now();
@@ -689,6 +702,10 @@ impl Linker {
         }
         let linkedit = linkedit.expect("finalize loop always runs at least once");
         phases.synth_linkedit_finalize = synth_linkedit_finalize;
+        phases.synth_linkedit_symbol_plan = synth_linkedit_symbol_plan;
+        phases.synth_linkedit_dyld_info = synth_linkedit_dyld_info;
+        phases.synth_linkedit_metadata_tables = synth_linkedit_metadata_tables;
+        phases.synth_linkedit_code_signature = synth_linkedit_code_signature;
         phases.synth_unwind = synth_unwind;
         phases.synth_sections = phase_started.elapsed();
         let phase_started = Instant::now();

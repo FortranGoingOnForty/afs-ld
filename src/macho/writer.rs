@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::atom::AtomTable;
 use crate::input::{DataInCodeEntry, ObjectFile};
@@ -53,6 +54,23 @@ pub struct LinkEditContext<'a> {
 }
 
 pub type ParsedRelocCache = HashMap<(InputId, u8), Vec<Reloc>>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkEditBuildTimings {
+    pub symbol_plan: Duration,
+    pub dyld_info: Duration,
+    pub metadata_tables: Duration,
+    pub code_signature: Duration,
+}
+
+impl std::ops::AddAssign for LinkEditBuildTimings {
+    fn add_assign(&mut self, rhs: Self) {
+        self.symbol_plan += rhs.symbol_plan;
+        self.dyld_info += rhs.dyld_info;
+        self.metadata_tables += rhs.metadata_tables;
+        self.code_signature += rhs.code_signature;
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkMapSymbol {
@@ -192,7 +210,7 @@ pub fn finalize_layout_with_linkedit(
     opts: &LinkOptions,
     dylibs: &[DylibDependency],
     context: LinkEditContext<'_>,
-) -> Result<(Layout, LinkEditPlan), WriteError> {
+) -> Result<(Layout, LinkEditPlan, LinkEditBuildTimings), WriteError> {
     finalize_with_linkedit(layout, kind, opts, dylibs, Some(LinkEditInputs(context)))
 }
 
@@ -232,20 +250,25 @@ fn finalize_with_linkedit(
     opts: &LinkOptions,
     dylibs: &[DylibDependency],
     inputs: Option<LinkEditInputs<'_>>,
-) -> Result<(Layout, LinkEditPlan), WriteError> {
+) -> Result<(Layout, LinkEditPlan, LinkEditBuildTimings), WriteError> {
     let mut layout = layout.clone();
-    let mut linkedit = build_linkedit_plan(&layout, kind, opts, inputs)?;
+    let (mut linkedit, mut timings) = build_linkedit_plan_profiled(&layout, kind, opts, inputs)?;
     apply_indirect_starts(&mut layout, &linkedit);
     let header_size = estimate_header_size(&layout, kind, opts, dylibs, &linkedit);
     layout.relayout(header_size);
 
-    linkedit = build_linkedit_plan(&layout, kind, opts, inputs)?;
+    let (next_linkedit, next_timings) = build_linkedit_plan_profiled(&layout, kind, opts, inputs)?;
+    linkedit = next_linkedit;
+    timings += next_timings;
     apply_indirect_starts(&mut layout, &linkedit);
     let exact_header_size =
         HEADER_SIZE as u64 + exact_sizeofcmds(&layout, kind, opts, dylibs, &linkedit)? as u64;
     if exact_header_size != header_size {
         layout.relayout(exact_header_size);
-        linkedit = build_linkedit_plan(&layout, kind, opts, inputs)?;
+        let (next_linkedit, next_timings) =
+            build_linkedit_plan_profiled(&layout, kind, opts, inputs)?;
+        linkedit = next_linkedit;
+        timings += next_timings;
         apply_indirect_starts(&mut layout, &linkedit);
     }
 
@@ -254,7 +277,7 @@ fn finalize_with_linkedit(
         .ok_or(WriteError::MissingSegment("__LINKEDIT"))?;
     linkedit_seg.file_size = linkedit.total_size().max(1);
     linkedit_seg.vm_size = align_up(linkedit.total_size().max(1), PAGE_SIZE);
-    Ok((layout, linkedit))
+    Ok((layout, linkedit, timings))
 }
 
 fn exact_sizeofcmds(
@@ -805,6 +828,16 @@ fn build_linkedit_plan(
     opts: &LinkOptions,
     inputs: Option<LinkEditInputs<'_>>,
 ) -> Result<LinkEditPlan, WriteError> {
+    build_linkedit_plan_profiled(layout, kind, opts, inputs).map(|(plan, _)| plan)
+}
+
+fn build_linkedit_plan_profiled(
+    layout: &Layout,
+    kind: OutputKind,
+    opts: &LinkOptions,
+    inputs: Option<LinkEditInputs<'_>>,
+) -> Result<(LinkEditPlan, LinkEditBuildTimings), WriteError> {
+    let mut timings = LinkEditBuildTimings::default();
     let linkedit = layout
         .segment("__LINKEDIT")
         .cloned()
@@ -812,50 +845,57 @@ fn build_linkedit_plan(
     let base_off = u32_fit(linkedit.file_off, "linkedit file offset")?;
 
     let Some(inputs) = inputs else {
-        return Ok(LinkEditPlan {
-            base_off,
-            symtab: SymtabCmd {
-                symoff: base_off,
-                nsyms: 0,
-                stroff: base_off,
-                strsize: 8,
+        let phase_started = std::time::Instant::now();
+        let code_signature = Some(build_code_signature(
+            layout,
+            kind,
+            opts,
+            base_off as u64 + 8,
+        )?);
+        timings.code_signature += phase_started.elapsed();
+        return Ok((
+            LinkEditPlan {
+                base_off,
+                symtab: SymtabCmd {
+                    symoff: base_off,
+                    nsyms: 0,
+                    stroff: base_off,
+                    strsize: 8,
+                },
+                dysymtab: DysymtabCmd::default(),
+                dyld_info: DyldInfoCmd::default(),
+                loh: None,
+                function_starts: LinkEditDataCmd {
+                    dataoff: base_off,
+                    datasize: 0,
+                },
+                data_in_code: LinkEditDataCmd {
+                    dataoff: base_off,
+                    datasize: 0,
+                },
+                symtab_bytes: Vec::new(),
+                indirect_bytes: Vec::new(),
+                rebase_bytes: Vec::new(),
+                bind_bytes: Vec::new(),
+                weak_bind_bytes: Vec::new(),
+                lazy_bind_bytes: Vec::new(),
+                export_bytes: Vec::new(),
+                loh_bytes: Vec::new(),
+                function_starts_bytes: Vec::new(),
+                data_in_code_bytes: Vec::new(),
+                strtab_bytes: vec![0; 8],
+                code_signature,
+                indirect_starts: HashMap::new(),
+                lazy_bind_offsets: HashMap::new(),
+                map_symbols: Vec::new(),
             },
-            dysymtab: DysymtabCmd::default(),
-            dyld_info: DyldInfoCmd::default(),
-            loh: None,
-            function_starts: LinkEditDataCmd {
-                dataoff: base_off,
-                datasize: 0,
-            },
-            data_in_code: LinkEditDataCmd {
-                dataoff: base_off,
-                datasize: 0,
-            },
-            symtab_bytes: Vec::new(),
-            indirect_bytes: Vec::new(),
-            rebase_bytes: Vec::new(),
-            bind_bytes: Vec::new(),
-            weak_bind_bytes: Vec::new(),
-            lazy_bind_bytes: Vec::new(),
-            export_bytes: Vec::new(),
-            loh_bytes: Vec::new(),
-            function_starts_bytes: Vec::new(),
-            data_in_code_bytes: Vec::new(),
-            strtab_bytes: vec![0; 8],
-            code_signature: Some(build_code_signature(
-                layout,
-                kind,
-                opts,
-                base_off as u64 + 8,
-            )?),
-            indirect_starts: HashMap::new(),
-            lazy_bind_offsets: HashMap::new(),
-            map_symbols: Vec::new(),
-        });
+            timings,
+        ));
     };
     let sym_table = inputs.0.sym_table;
     let synthetic_plan = inputs.0.synthetic_plan;
 
+    let phase_started = std::time::Instant::now();
     let imports = collect_imports(sym_table, synthetic_plan)?;
     let import_lookup: HashMap<SymbolId, &ImportSymbolRecord> = imports
         .iter()
@@ -871,6 +911,7 @@ fn build_linkedit_plan(
         inputs,
         &imports,
     )?;
+    timings.symbol_plan += phase_started.elapsed();
     let mut symtab_bytes = Vec::new();
     write_nlist_table(&symbol_plan.symbols, &mut symtab_bytes);
 
@@ -906,12 +947,16 @@ fn build_linkedit_plan(
         indirect_bytes.extend_from_slice(&index.to_le_bytes());
     }
 
+    let phase_started = std::time::Instant::now();
     let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
     let rebase_bytes = pad_dyld_info_stream(build_rebase_stream(layout, synthetic_plan, inputs)?);
     let bind_bytes = pad_dyld_info_stream(bind_streams.bind);
     let weak_bind_bytes = pad_dyld_info_stream(bind_streams.weak_bind);
     let lazy_bind_bytes = pad_dyld_info_stream(bind_streams.lazy_bind);
     let export_bytes = pad_dyld_info_stream(build_export_trie(&symbol_plan.exports));
+    timings.dyld_info += phase_started.elapsed();
+
+    let phase_started = std::time::Instant::now();
     let loh_bytes = build_loh(
         layout,
         inputs.0.layout_inputs,
@@ -926,6 +971,7 @@ fn build_linkedit_plan(
         inputs.0.atom_table,
         inputs.0.icf_redirects,
     )?;
+    timings.metadata_tables += phase_started.elapsed();
 
     let mut cursor = base_off as u64;
     let rebase_off = place_optional_block(&mut cursor, rebase_bytes.len(), "rebase stream offset")?;
@@ -961,50 +1007,56 @@ fn build_linkedit_plan(
         "string table offset",
     )?;
     let regular_end = stroff as u64 + symbol_plan.strtab_bytes.len() as u64;
-    Ok(LinkEditPlan {
-        base_off,
-        symtab: SymtabCmd {
-            symoff,
-            nsyms: symbol_plan.symbols.len() as u32,
-            stroff,
-            strsize: symbol_plan.strtab_bytes.len() as u32,
+    let phase_started = std::time::Instant::now();
+    let code_signature = Some(build_code_signature(layout, kind, opts, regular_end)?);
+    timings.code_signature += phase_started.elapsed();
+    Ok((
+        LinkEditPlan {
+            base_off,
+            symtab: SymtabCmd {
+                symoff,
+                nsyms: symbol_plan.symbols.len() as u32,
+                stroff,
+                strsize: symbol_plan.strtab_bytes.len() as u32,
+            },
+            dysymtab: DysymtabCmd {
+                indirectsymoff,
+                nindirectsyms: indirect_symbols.len() as u32,
+                ..symbol_plan.dysymtab
+            },
+            dyld_info: DyldInfoCmd {
+                rebase_off,
+                rebase_size: rebase_bytes.len() as u32,
+                bind_off: bindoff,
+                bind_size: bind_bytes.len() as u32,
+                weak_bind_off,
+                weak_bind_size: weak_bind_bytes.len() as u32,
+                lazy_bind_off,
+                lazy_bind_size: lazy_bind_bytes.len() as u32,
+                export_off,
+                export_size: export_bytes.len() as u32,
+            },
+            loh,
+            function_starts,
+            data_in_code,
+            symtab_bytes,
+            indirect_bytes,
+            rebase_bytes,
+            bind_bytes,
+            weak_bind_bytes,
+            lazy_bind_bytes,
+            export_bytes,
+            loh_bytes,
+            function_starts_bytes,
+            data_in_code_bytes,
+            strtab_bytes: symbol_plan.strtab_bytes,
+            code_signature,
+            indirect_starts,
+            lazy_bind_offsets: bind_streams.lazy_offsets,
+            map_symbols: symbol_plan.map_symbols,
         },
-        dysymtab: DysymtabCmd {
-            indirectsymoff,
-            nindirectsyms: indirect_symbols.len() as u32,
-            ..symbol_plan.dysymtab
-        },
-        dyld_info: DyldInfoCmd {
-            rebase_off,
-            rebase_size: rebase_bytes.len() as u32,
-            bind_off: bindoff,
-            bind_size: bind_bytes.len() as u32,
-            weak_bind_off,
-            weak_bind_size: weak_bind_bytes.len() as u32,
-            lazy_bind_off,
-            lazy_bind_size: lazy_bind_bytes.len() as u32,
-            export_off,
-            export_size: export_bytes.len() as u32,
-        },
-        loh,
-        function_starts,
-        data_in_code,
-        symtab_bytes,
-        indirect_bytes,
-        rebase_bytes,
-        bind_bytes,
-        weak_bind_bytes,
-        lazy_bind_bytes,
-        export_bytes,
-        loh_bytes,
-        function_starts_bytes,
-        data_in_code_bytes,
-        strtab_bytes: symbol_plan.strtab_bytes,
-        code_signature: Some(build_code_signature(layout, kind, opts, regular_end)?),
-        indirect_starts,
-        lazy_bind_offsets: bind_streams.lazy_offsets,
-        map_symbols: symbol_plan.map_symbols,
-    })
+        timings,
+    ))
 }
 
 fn build_code_signature(

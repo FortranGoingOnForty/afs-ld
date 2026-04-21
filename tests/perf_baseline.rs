@@ -39,7 +39,7 @@ fn executable_opts(inputs: Vec<PathBuf>, output: PathBuf) -> LinkOptions {
 
 fn assert_profile_basics(name: &str, profile: &LinkProfile) {
     eprintln!(
-        "{name}: total={:?} parse={:?} resolve={:?} atomize={:?} layout={:?} synth={:?} (linkedit={:?} unwind={:?}) reloc={:?} write={:?}",
+        "{name}: total={:?} parse={:?} resolve={:?} atomize={:?} layout={:?} synth={:?} (linkedit={:?}: symbols={:?} dyld={:?} metadata={:?} codesig={:?}; unwind={:?}) reloc={:?} write={:?}",
         profile.total_wall,
         profile.phases.input_parsing,
         profile.phases.symbol_resolution,
@@ -47,6 +47,10 @@ fn assert_profile_basics(name: &str, profile: &LinkProfile) {
         profile.phases.layout,
         profile.phases.synth_sections,
         profile.phases.synth_linkedit_finalize,
+        profile.phases.synth_linkedit_symbol_plan,
+        profile.phases.synth_linkedit_dyld_info,
+        profile.phases.synth_linkedit_metadata_tables,
+        profile.phases.synth_linkedit_code_signature,
         profile.phases.synth_unwind,
         profile.phases.reloc_apply,
         profile.phases.write_output,
@@ -64,6 +68,14 @@ fn assert_profile_basics(name: &str, profile: &LinkProfile) {
         profile.phases.synth_sections
             >= profile.phases.synth_linkedit_finalize + profile.phases.synth_unwind,
         "{name}: synth subphases exceeded synth total"
+    );
+    assert!(
+        profile.phases.synth_linkedit_finalize
+            >= profile.phases.synth_linkedit_symbol_plan
+                + profile.phases.synth_linkedit_dyld_info
+                + profile.phases.synth_linkedit_metadata_tables
+                + profile.phases.synth_linkedit_code_signature,
+        "{name}: linkedit subphases exceeded linkedit total"
     );
 }
 

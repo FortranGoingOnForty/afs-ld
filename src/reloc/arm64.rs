@@ -8,10 +8,12 @@ use crate::layout::{Layout, LayoutInput};
 use crate::macho::writer::LinkEditPlan;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
 use crate::resolve::{InputId, Symbol, SymbolId, SymbolTable};
+use crate::section::{OutputSection, SectionKind};
 use crate::symbol::{InputSymbol, SymKind};
 use crate::synth::stubs::{STUB_HELPER_ENTRY_SIZE, STUB_HELPER_HEADER_SIZE, STUB_SIZE};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::SyntheticPlan;
+use crate::{LinkOptions, ThunkMode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelocError {
@@ -64,14 +66,94 @@ struct SyntheticAddressMaps {
     dyld_private_addr: Option<u64>,
 }
 
+pub struct ApplyLayoutPlan<'a> {
+    pub synthetic_plan: Option<&'a SyntheticPlan>,
+    pub thunk_plan: Option<&'a ThunkPlan>,
+    pub linkedit: &'a LinkEditPlan,
+    pub icf_redirects: Option<&'a HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
+}
+
+struct InputSectionResolveCtx<'a> {
+    obj: &'a ObjectFile,
+    atom: &'a Atom,
+    kind: RelocKind,
+    referent: &'a str,
+}
+
+const THUNK_SIZE: u64 = 12;
+const BR_X16: u32 = 0xd61f_0200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BranchTargetKey {
+    Symbol(SymbolId),
+    Stub(SymbolId),
+    InputSectionOffset {
+        origin: InputId,
+        input_section: u8,
+        input_offset: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThunkEntry {
+    target: BranchTargetKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ThunkPlan {
+    redirects: HashMap<(crate::resolve::AtomId, u32), usize>,
+    entries: Vec<ThunkEntry>,
+}
+
+impl ThunkPlan {
+    pub fn output_sections(&self) -> Vec<OutputSection> {
+        if self.entries.is_empty() {
+            return Vec::new();
+        }
+        vec![OutputSection {
+            segment: "__TEXT".into(),
+            name: "__thunks".into(),
+            kind: SectionKind::Text,
+            align_pow2: 2,
+            flags: crate::macho::constants::S_REGULAR
+                | crate::macho::constants::S_ATTR_PURE_INSTRUCTIONS
+                | crate::macho::constants::S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            atoms: Vec::new(),
+            synthetic_offset: 0,
+            synthetic_data: vec![0; self.entries.len() * THUNK_SIZE as usize],
+            addr: 0,
+            size: (self.entries.len() as u64) * THUNK_SIZE,
+            file_off: 0,
+        }]
+    }
+
+    fn redirect_for(&self, atom: crate::resolve::AtomId, atom_offset: u32) -> Option<usize> {
+        self.redirects.get(&(atom, atom_offset)).copied()
+    }
+
+    fn thunk_addrs(&self, layout: &Layout) -> HashMap<usize, u64> {
+        let Some(section) = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__TEXT" && section.name == "__thunks")
+        else {
+            return HashMap::new();
+        };
+        (0..self.entries.len())
+            .map(|index| (index, section.addr + (index as u64) * THUNK_SIZE))
+            .collect()
+    }
+}
+
 pub fn apply_layout(
     layout: &mut Layout,
     inputs: &[LayoutInput<'_>],
     atoms: &AtomTable,
     sym_table: &SymbolTable,
-    synthetic_plan: Option<&SyntheticPlan>,
-    linkedit: &LinkEditPlan,
-    icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
+    plan: ApplyLayoutPlan<'_>,
 ) -> Result<(), RelocError> {
     let input_map: HashMap<InputId, &ObjectFile> = inputs
         .iter()
@@ -110,7 +192,7 @@ pub fn apply_layout(
     let atom_addrs = atom_address_map(layout);
     let atoms_by_input_section = atoms.by_input_section();
     let section_addrs = input_section_address_map(layout, atoms);
-    let synth_addrs = synthetic_address_maps(layout, synthetic_plan);
+    let synth_addrs = synthetic_address_maps(layout, plan.synthetic_plan);
     let resolve = ResolveView {
         sym_table,
         atom_table: atoms,
@@ -123,8 +205,11 @@ pub fn apply_layout(
         stub_helper_entry_addrs: &synth_addrs.stub_helper_entry_addrs,
         stub_helper_header_addr: synth_addrs.stub_helper_header_addr,
         dyld_private_addr: synth_addrs.dyld_private_addr,
-        icf_redirects,
+        icf_redirects: plan.icf_redirects,
     };
+    let thunk_addrs = plan
+        .thunk_plan
+        .map(|thunk_plan| thunk_plan.thunk_addrs(layout));
 
     for out_section in &mut layout.sections {
         for placed in &mut out_section.atoms {
@@ -148,24 +233,36 @@ pub fn apply_layout(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             for reloc in relocs_for_atom(relocs, atom) {
-                apply_one(&mut placed.data, atom, obj, reloc, &resolve)?;
+                apply_one(
+                    &mut placed.data,
+                    atom,
+                    obj,
+                    reloc,
+                    &resolve,
+                    plan.thunk_plan,
+                    thunk_addrs.as_ref(),
+                )?;
             }
         }
     }
 
-    if let Some(plan) = synthetic_plan {
+    if let Some(thunk_plan) = plan.thunk_plan {
+        synthesize_thunk_section(layout, thunk_plan, &resolve)?;
+    }
+
+    if let Some(synthetic_plan) = plan.synthetic_plan {
         synthesize_thread_variable_section(
             layout,
-            plan,
+            synthetic_plan,
             atoms,
             &input_map,
             &reloc_cache,
             &resolve,
         )?;
-        synthesize_got_section(layout, plan, &resolve)?;
-        synthesize_stub_section(layout, plan, &resolve)?;
-        synthesize_lazy_pointer_section(layout, plan, &resolve)?;
-        synthesize_stub_helper_section(layout, plan, &resolve, linkedit)?;
+        synthesize_got_section(layout, synthetic_plan, &resolve)?;
+        synthesize_stub_section(layout, synthetic_plan, &resolve)?;
+        synthesize_lazy_pointer_section(layout, synthetic_plan, &resolve)?;
+        synthesize_stub_helper_section(layout, synthetic_plan, &resolve, plan.linkedit)?;
     }
 
     Ok(())
@@ -222,21 +319,16 @@ fn patch_eh_frame_cie_pointer(
                 "eh_frame CIE atom is missing from the final layout".to_string(),
             )
         })?;
-    let fde_field = resolve
-        .atom_addrs
-        .get(&atom.id)
-        .copied()
-        .ok_or_else(|| {
-            reloc_error(
-                atom,
-                &PathBuf::from("<eh_frame>"),
-                4,
-                RelocKind::Unsigned,
-                "__eh_frame CIE pointer",
-                "eh_frame atom is missing a final address".to_string(),
-            )
-        })?
-        + 4;
+    let fde_field = resolve.atom_addrs.get(&atom.id).copied().ok_or_else(|| {
+        reloc_error(
+            atom,
+            &PathBuf::from("<eh_frame>"),
+            4,
+            RelocKind::Unsigned,
+            "__eh_frame CIE pointer",
+            "eh_frame atom is missing a final address".to_string(),
+        )
+    })? + 4;
     let rewritten = fde_field.wrapping_sub(cie_atom) as u32;
     bytes[4..8].copy_from_slice(&rewritten.to_le_bytes());
     Ok(())
@@ -359,12 +451,129 @@ fn synthetic_address_maps(
     }
 }
 
+pub fn plan_thunks(
+    opts: &LinkOptions,
+    layout: &Layout,
+    inputs: &[LayoutInput<'_>],
+    atoms: &AtomTable,
+    sym_table: &SymbolTable,
+    synthetic_plan: Option<&SyntheticPlan>,
+    icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
+) -> Result<Option<ThunkPlan>, RelocError> {
+    if opts.thunks == ThunkMode::None {
+        return Ok(None);
+    }
+
+    let input_map: HashMap<InputId, &ObjectFile> = inputs
+        .iter()
+        .map(|input| (input.id, input.object))
+        .collect();
+    let mut reloc_cache: HashMap<(InputId, u8), Vec<Reloc>> = HashMap::new();
+    for input in inputs {
+        for (sect_idx, section) in input.object.sections.iter().enumerate() {
+            let relocs = if section.nreloc == 0 {
+                Vec::new()
+            } else {
+                let raws =
+                    parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(|err| {
+                        RelocError {
+                            input: input.object.path.clone(),
+                            atom: crate::resolve::AtomId(0),
+                            atom_offset: 0,
+                            kind: RelocKind::Unsigned,
+                            referent: format!("section {},{}", section.segname, section.sectname),
+                            detail: err.to_string(),
+                        }
+                    })?;
+                parse_relocs(&raws).map_err(|err| RelocError {
+                    input: input.object.path.clone(),
+                    atom: crate::resolve::AtomId(0),
+                    atom_offset: 0,
+                    kind: RelocKind::Unsigned,
+                    referent: format!("section {},{}", section.segname, section.sectname),
+                    detail: err.to_string(),
+                })?
+            };
+            reloc_cache.insert((input.id, (sect_idx + 1) as u8), relocs);
+        }
+    }
+
+    let atom_addrs = atom_address_map(layout);
+    let atoms_by_input_section = atoms.by_input_section();
+    let section_addrs = input_section_address_map(layout, atoms);
+    let synth_addrs = synthetic_address_maps(layout, synthetic_plan);
+    let resolve = ResolveView {
+        sym_table,
+        atom_table: atoms,
+        atom_addrs: &atom_addrs,
+        atoms_by_input_section: &atoms_by_input_section,
+        section_addrs: &section_addrs,
+        stub_addrs: &synth_addrs.stub_addrs,
+        got_addrs: &synth_addrs.got_addrs,
+        lazy_pointer_addrs: &synth_addrs.lazy_pointer_addrs,
+        stub_helper_entry_addrs: &synth_addrs.stub_helper_entry_addrs,
+        stub_helper_header_addr: synth_addrs.stub_helper_header_addr,
+        dyld_private_addr: synth_addrs.dyld_private_addr,
+        icf_redirects,
+    };
+
+    let mut redirects = HashMap::new();
+    let mut index = HashMap::new();
+    let mut entries = Vec::new();
+    for (atom_id, atom) in atoms.iter() {
+        let Some(obj) = input_map.get(&atom.origin) else {
+            continue;
+        };
+        let relocs = reloc_cache
+            .get(&(atom.origin, atom.input_section))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for reloc in relocs_for_atom(relocs, atom) {
+            if reloc.kind != RelocKind::Branch26 {
+                continue;
+            }
+            let local_offset = reloc.offset.saturating_sub(atom.input_offset);
+            let Some(place) = resolve.atom_addrs.get(&atom.id).copied() else {
+                continue;
+            };
+            let place = place + local_offset as u64;
+            let target_key = resolve_branch_target_key(obj, atom, reloc, &resolve)?;
+            let target = resolve_branch_target_from_key(obj, atom, reloc, target_key, &resolve)?;
+            let needs_thunk = match opts.thunks {
+                ThunkMode::None => false,
+                ThunkMode::Safe => !branch26_in_range(place, target),
+                ThunkMode::All => true,
+            };
+            if !needs_thunk {
+                continue;
+            }
+            let thunk_index = if let Some(&existing) = index.get(&target_key) {
+                existing
+            } else {
+                let next = entries.len();
+                entries.push(ThunkEntry { target: target_key });
+                index.insert(target_key, next);
+                next
+            };
+            redirects.insert((atom_id, local_offset), thunk_index);
+        }
+    }
+
+    if entries.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(ThunkPlan { redirects, entries }))
+    }
+}
+
 fn apply_one(
     bytes: &mut [u8],
     atom: &Atom,
     obj: &ObjectFile,
     reloc: Reloc,
     resolve: &ResolveView<'_>,
+    thunk_plan: Option<&ThunkPlan>,
+    thunk_addrs: Option<&HashMap<usize, u64>>,
 ) -> Result<(), RelocError> {
     let local_offset = reloc.offset.checked_sub(atom.input_offset).ok_or_else(|| {
         reloc_error(
@@ -422,15 +631,29 @@ fn apply_one(
             resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)?,
             resolve,
         ),
-        RelocKind::Branch26 => patch_branch26(
-            bytes,
-            atom,
-            obj,
-            local_offset,
-            reloc,
-            place,
-            resolve_branch_target(obj, atom, reloc, resolve)?,
-        ),
+        RelocKind::Branch26 => {
+            let target = if let Some(plan) = thunk_plan {
+                if let Some(index) = plan.redirect_for(atom.id, local_offset) {
+                    thunk_addrs
+                        .and_then(|addrs| addrs.get(&index).copied())
+                        .ok_or_else(|| {
+                            reloc_error(
+                                atom,
+                                &obj.path,
+                                local_offset,
+                                reloc.kind,
+                                &describe_referent(obj, reloc.referent),
+                                "thunk section missing final address".to_string(),
+                            )
+                        })?
+                } else {
+                    resolve_branch_target(obj, atom, reloc, resolve)?
+                }
+            } else {
+                resolve_branch_target(obj, atom, reloc, resolve)?
+            };
+            patch_branch26(bytes, atom, obj, local_offset, reloc, place, target)
+        }
         RelocKind::Page21 => patch_page21(
             bytes,
             atom,
@@ -507,19 +730,224 @@ fn resolve_branch_target(
     reloc: Reloc,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
+    let key = resolve_branch_target_key(obj, atom, reloc, resolve)?;
+    resolve_branch_target_from_key(obj, atom, reloc, key, resolve)
+}
+
+fn resolve_branch_target_key(
+    obj: &ObjectFile,
+    atom: &Atom,
+    reloc: Reloc,
+    resolve: &ResolveView<'_>,
+) -> Result<BranchTargetKey, RelocError> {
     if let Some(symbol_id) = dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table) {
-        return resolve.stub_addrs.get(&symbol_id).copied().ok_or_else(|| {
-            reloc_error(
+        return Ok(BranchTargetKey::Stub(symbol_id));
+    }
+    match reloc.referent {
+        Referent::Section(section_idx) => Ok(BranchTargetKey::InputSectionOffset {
+            origin: atom.origin,
+            input_section: section_idx,
+            input_offset: 0,
+        }),
+        Referent::Symbol(sym_idx) => {
+            let input_sym = obj.symbols.get(sym_idx as usize).ok_or_else(|| {
+                reloc_error(
+                    atom,
+                    &obj.path,
+                    0,
+                    reloc.kind,
+                    &format!("symbol #{sym_idx}"),
+                    "symbol index is out of range".to_string(),
+                )
+            })?;
+            if let Ok(name) = obj.symbol_name(input_sym) {
+                if let Some((symbol_id, _)) = resolve
+                    .sym_table
+                    .iter()
+                    .find(|(_, symbol)| resolve.sym_table.interner.resolve(symbol.name()) == name)
+                {
+                    return Ok(BranchTargetKey::Symbol(symbol_id));
+                }
+            }
+            match input_sym.kind() {
+                SymKind::Sect => {
+                    let section = obj.section_for_symbol(input_sym).ok_or_else(|| {
+                        reloc_error(
+                            atom,
+                            &obj.path,
+                            0,
+                            reloc.kind,
+                            &describe_input_symbol(obj, input_sym),
+                            "section-backed symbol did not resolve to an input section".to_string(),
+                        )
+                    })?;
+                    Ok(BranchTargetKey::InputSectionOffset {
+                        origin: atom.origin,
+                        input_section: input_sym.sect_idx(),
+                        input_offset: input_sym.value().saturating_sub(section.addr) as u32,
+                    })
+                }
+                SymKind::Abs => Err(reloc_error(
+                    atom,
+                    &obj.path,
+                    0,
+                    reloc.kind,
+                    &describe_input_symbol(obj, input_sym),
+                    "absolute BRANCH26 targets are not supported".to_string(),
+                )),
+                SymKind::Undef => Err(reloc_error(
+                    atom,
+                    &obj.path,
+                    0,
+                    reloc.kind,
+                    &describe_input_symbol(obj, input_sym),
+                    "symbol remained undefined at relocation time".to_string(),
+                )),
+                SymKind::Indirect => Err(reloc_error(
+                    atom,
+                    &obj.path,
+                    0,
+                    reloc.kind,
+                    &describe_input_symbol(obj, input_sym),
+                    "indirect BRANCH26 targets are not yet supported".to_string(),
+                )),
+            }
+        }
+    }
+}
+
+fn resolve_branch_target_from_key(
+    obj: &ObjectFile,
+    atom: &Atom,
+    reloc: Reloc,
+    key: BranchTargetKey,
+    resolve: &ResolveView<'_>,
+) -> Result<u64, RelocError> {
+    match key {
+        BranchTargetKey::Symbol(symbol_id) => match resolve.sym_table.get(symbol_id) {
+            Symbol::Defined {
+                atom: target_atom,
+                value,
+                ..
+            } => resolve
+                .atom_addrs
+                .get(&canonical_atom(*target_atom, resolve.icf_redirects))
+                .copied()
+                .map(|addr| addr + *value)
+                .ok_or_else(|| {
+                    reloc_error(
+                        atom,
+                        &obj.path,
+                        reloc.offset.saturating_sub(atom.input_offset),
+                        reloc.kind,
+                        &describe_referent(obj, reloc.referent),
+                        "target atom missing final address".to_string(),
+                    )
+                }),
+            Symbol::DylibImport { .. } => Err(reloc_error(
                 atom,
                 &obj.path,
                 reloc.offset.saturating_sub(atom.input_offset),
                 reloc.kind,
                 &describe_referent(obj, reloc.referent),
                 "dylib import is missing synthetic stub".to_string(),
-            )
-        });
+            )),
+            other => Err(reloc_error(
+                atom,
+                &obj.path,
+                reloc.offset.saturating_sub(atom.input_offset),
+                reloc.kind,
+                &describe_referent(obj, reloc.referent),
+                format!("symbol resolved to unsupported state {:?}", other.kind()),
+            )),
+        },
+        BranchTargetKey::Stub(symbol_id) => {
+            resolve.stub_addrs.get(&symbol_id).copied().ok_or_else(|| {
+                reloc_error(
+                    atom,
+                    &obj.path,
+                    reloc.offset.saturating_sub(atom.input_offset),
+                    reloc.kind,
+                    &describe_referent(obj, reloc.referent),
+                    "dylib import is missing synthetic stub".to_string(),
+                )
+            })
+        }
+        BranchTargetKey::InputSectionOffset {
+            origin,
+            input_section,
+            input_offset,
+        } => resolve_input_section_offset(
+            origin,
+            input_section,
+            input_offset,
+            InputSectionResolveCtx {
+                obj,
+                atom,
+                kind: reloc.kind,
+                referent: &describe_referent(obj, reloc.referent),
+            },
+            resolve,
+        ),
     }
-    resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)
+}
+
+fn branch26_in_range(place: u64, target: u64) -> bool {
+    let delta = target.wrapping_sub(place) as i64;
+    delta & 0b11 == 0 && fits_signed(delta >> 2, 26)
+}
+
+fn synthesize_thunk_section(
+    layout: &mut Layout,
+    plan: &ThunkPlan,
+    resolve: &ResolveView<'_>,
+) -> Result<(), RelocError> {
+    let Some(section) = layout
+        .sections
+        .iter_mut()
+        .find(|section| section.segment == "__TEXT" && section.name == "__thunks")
+    else {
+        return Ok(());
+    };
+    if section.synthetic_data.len() != plan.entries.len() * THUNK_SIZE as usize {
+        section
+            .synthetic_data
+            .resize(plan.entries.len() * THUNK_SIZE as usize, 0);
+    }
+    for (idx, entry) in plan.entries.iter().enumerate() {
+        let thunk_addr = section.addr + (idx as u64) * THUNK_SIZE;
+        let target = match entry.target {
+            BranchTargetKey::Symbol(symbol_id) => match resolve.sym_table.get(symbol_id) {
+                Symbol::Defined { atom, value, .. } => resolve
+                    .atom_addrs
+                    .get(&canonical_atom(*atom, resolve.icf_redirects))
+                    .copied()
+                    .map(|addr| addr + *value),
+                _ => None,
+            },
+            BranchTargetKey::Stub(symbol_id) => resolve.stub_addrs.get(&symbol_id).copied(),
+            BranchTargetKey::InputSectionOffset {
+                origin,
+                input_section,
+                input_offset,
+            } => resolve_input_section_offset_simple(origin, input_section, input_offset, resolve),
+        }
+        .ok_or_else(|| RelocError {
+            input: PathBuf::from("<synthetic thunks>"),
+            atom: crate::resolve::AtomId(0),
+            atom_offset: (idx as u32) * THUNK_SIZE as u32,
+            kind: RelocKind::Branch26,
+            referent: "thunk target".to_string(),
+            detail: "missing final target address".to_string(),
+        })?;
+        let adrp = encode_adrp_reg(16, thunk_addr, target, "thunk target")?;
+        let add = encode_add_x_reg_pageoff(16, target, "thunk target")?;
+        let start = idx * THUNK_SIZE as usize;
+        section.synthetic_data[start..start + 4].copy_from_slice(&adrp.to_le_bytes());
+        section.synthetic_data[start + 4..start + 8].copy_from_slice(&add.to_le_bytes());
+        section.synthetic_data[start + 8..start + 12].copy_from_slice(&BR_X16.to_le_bytes());
+    }
+    Ok(())
 }
 
 fn resolve_got_target(
@@ -752,12 +1180,14 @@ fn resolve_input_symbol_at_origin(
             let section_offset = input_sym.value().saturating_sub(section.addr) as u32;
             resolve_input_section_offset(
                 origin,
-                obj,
-                atom,
-                kind,
                 input_sym.sect_idx(),
                 section_offset,
-                &describe_input_symbol(obj, input_sym),
+                InputSectionResolveCtx {
+                    obj,
+                    atom,
+                    kind,
+                    referent: &describe_input_symbol(obj, input_sym),
+                },
                 resolve,
             )
         }
@@ -782,12 +1212,9 @@ fn resolve_input_symbol_at_origin(
 
 fn resolve_input_section_offset(
     origin: InputId,
-    obj: &ObjectFile,
-    atom: &Atom,
-    kind: RelocKind,
     input_section: u8,
     input_offset: u32,
-    referent: &str,
+    ctx: InputSectionResolveCtx<'_>,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
     if let Some(atom_ids) = resolve.atoms_by_input_section.get(&(origin, input_section)) {
@@ -810,11 +1237,11 @@ fn resolve_input_section_offset(
                 .copied()
                 .ok_or_else(|| {
                     reloc_error(
-                        atom,
-                        &obj.path,
+                        ctx.atom,
+                        &ctx.obj.path,
                         0,
-                        kind,
-                        referent,
+                        ctx.kind,
+                        ctx.referent,
                         "section-backed symbol's containing atom is missing a final address"
                             .to_string(),
                     )
@@ -829,15 +1256,49 @@ fn resolve_input_section_offset(
         .copied()
         .ok_or_else(|| {
             reloc_error(
-                atom,
-                &obj.path,
+                ctx.atom,
+                &ctx.obj.path,
                 0,
-                kind,
-                referent,
+                ctx.kind,
+                ctx.referent,
                 "section-backed symbol's output section is missing".to_string(),
             )
         })?;
     Ok(section_addr + input_offset as u64)
+}
+
+fn resolve_input_section_offset_simple(
+    origin: InputId,
+    input_section: u8,
+    input_offset: u32,
+    resolve: &ResolveView<'_>,
+) -> Option<u64> {
+    if let Some(atom_ids) = resolve.atoms_by_input_section.get(&(origin, input_section)) {
+        if let Some((target_atom, delta)) = atom_ids.iter().find_map(|atom_id| {
+            let candidate = resolve.atom_table.get(*atom_id);
+            let start = candidate.input_offset;
+            let end = candidate.input_offset.saturating_add(candidate.size);
+            if start <= input_offset && input_offset < end {
+                Some((*atom_id, input_offset - start))
+            } else if input_offset == end {
+                Some((*atom_id, candidate.size))
+            } else {
+                None
+            }
+        }) {
+            let target_atom = canonical_atom(target_atom, resolve.icf_redirects);
+            return resolve
+                .atom_addrs
+                .get(&target_atom)
+                .copied()
+                .map(|addr| addr + delta as u64);
+        }
+    }
+    resolve
+        .section_addrs
+        .get(&(origin, input_section))
+        .copied()
+        .map(|section_addr| section_addr + input_offset as u64)
 }
 
 fn canonical_atom(

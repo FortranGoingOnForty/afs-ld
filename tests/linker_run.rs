@@ -4308,7 +4308,7 @@ fn relocated_sections_match_apple_ld_across_fixture_matrix() {
 }
 
 #[test]
-fn linker_run_rejects_out_of_range_branch26() {
+fn linker_run_thunks_none_rejects_out_of_range_branch26() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun as unavailable");
         return;
@@ -4320,7 +4320,10 @@ fn linker_run_rejects_out_of_range_branch26() {
         .section __TEXT,__text,regular,pure_instructions
         .globl _main
         _main:
+            stp x29, x30, [sp, #-16]!
+            mov x29, sp
             bl _helper
+            ldp x29, x30, [sp], #16
             ret
 
         .zerofill __DATA,__bss,_gap,0x9000000,0
@@ -4340,6 +4343,7 @@ fn linker_run_rejects_out_of_range_branch26() {
         inputs: vec![obj.clone()],
         output: Some(out),
         kind: OutputKind::Executable,
+        thunks: afs_ld::ThunkMode::None,
         ..LinkOptions::default()
     };
     let err = Linker::run(&opts).unwrap_err();
@@ -4354,6 +4358,124 @@ fn linker_run_rejects_out_of_range_branch26() {
     }
 
     let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn linker_run_inserts_thunk_for_out_of_range_branch26() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+
+    let obj = scratch("branch26-thunk.o");
+    let out = scratch("branch26-thunk.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            stp x29, x30, [sp, #-16]!
+            mov x29, sp
+            bl _helper
+            ldp x29, x30, [sp], #16
+            ret
+
+        .zerofill __DATA,__bss,_gap,0x9000000,0
+
+        .section __FAR,__text,regular,pure_instructions
+        .globl _helper
+        _helper:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let (thunks_addr, thunks) = output_section(&bytes, "__TEXT", "__thunks").unwrap();
+    assert_eq!(thunks.len(), 12, "expected one synthetic thunk");
+    assert_eq!(
+        decode_branch_target(&text, text_addr, 8).unwrap(),
+        thunks_addr,
+        "expected _main BL to target __thunks"
+    );
+    assert!(is_adrp(read_insn(&thunks, 0).unwrap()));
+    assert!(is_add_imm_64(read_insn(&thunks, 4).unwrap()));
+    assert_eq!(read_insn(&thunks, 8).unwrap(), 0xd61f_0200);
+
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let status = Command::new(&out).status().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "expected thunked executable to exit 0"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_safe_thunks_do_not_grow_small_programs() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("branch26-small.o");
+    let out = scratch("branch26-small.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            bl _helper
+            ret
+
+        _helper:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    assert!(
+        output_section(&fs::read(&out).unwrap(), "__TEXT", "__thunks").is_none(),
+        "small in-range program should not gain __thunks"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
 }
 
 #[test]

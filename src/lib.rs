@@ -59,6 +59,13 @@ pub enum IcfMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThunkMode {
+    None,
+    Safe,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlatformVersion {
     pub minos: u32,
     pub sdk: u32,
@@ -105,6 +112,7 @@ pub struct LinkOptions {
     pub dead_strip: bool,
     pub no_loh: bool,
     pub icf_mode: IcfMode,
+    pub thunks: ThunkMode,
     pub fixup_chains: bool,
     pub all_load: bool,
     pub force_load_archives: Vec<PathBuf>,
@@ -155,6 +163,7 @@ impl Default for LinkOptions {
             dead_strip: false,
             no_loh: false,
             icf_mode: IcfMode::None,
+            thunks: ThunkMode::Safe,
             fixup_chains: false,
             all_load: false,
             force_load_archives: Vec::new(),
@@ -546,6 +555,26 @@ impl Linker {
             Some(&synthetic_plan),
             kept_atoms,
         );
+        let thunk_plan = reloc::arm64::plan_thunks(
+            opts,
+            &layout,
+            &layout_inputs,
+            &atom_table,
+            &sym_table,
+            Some(&synthetic_plan),
+            icf.as_ref().map(|plan| plan.redirects()),
+        )?;
+        if let Some(plan) = &thunk_plan {
+            layout = Layout::build_with_synthetics_and_extra_filtered(
+                opts.kind,
+                &layout_inputs,
+                &atom_table,
+                0,
+                Some(&synthetic_plan),
+                kept_atoms,
+                &plan.output_sections(),
+            );
+        }
         let linkedit_context = macho::writer::LinkEditContext {
             layout_inputs: &layout_inputs,
             atom_table: &atom_table,
@@ -581,9 +610,12 @@ impl Linker {
             &layout_inputs,
             &atom_table,
             &sym_table,
-            Some(&synthetic_plan),
-            &linkedit,
-            icf.as_ref().map(|plan| plan.redirects()),
+            reloc::arm64::ApplyLayoutPlan {
+                synthetic_plan: Some(&synthetic_plan),
+                thunk_plan: thunk_plan.as_ref(),
+                linkedit: &linkedit,
+                icf_redirects: icf.as_ref().map(|plan| plan.redirects()),
+            },
         )?;
         let folded_symbols = icf
             .as_ref()

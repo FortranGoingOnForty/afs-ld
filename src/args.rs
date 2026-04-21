@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use crate::resolve::{levenshtein, UndefinedTreatment};
-use crate::{FrameworkSpec, IcfMode, LinkOptions, OutputKind, PlatformVersion};
+use crate::{FrameworkSpec, IcfMode, LinkOptions, OutputKind, PlatformVersion, ThunkMode};
 
 const KNOWN_FLAGS: &[&str] = &[
     "-o",
@@ -34,6 +34,9 @@ const KNOWN_FLAGS: &[&str] = &[
     "-S",
     "-no_uuid",
     "-no_loh",
+    "-thunks=none",
+    "-thunks=safe",
+    "-thunks=all",
     "-dead_strip",
     "-icf=safe",
     "-icf=none",
@@ -316,6 +319,21 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
             "-no_loh" => {
                 opts.no_loh = true;
             }
+            s if s.starts_with("-thunks=") => {
+                opts.thunks = match s {
+                    "-thunks=none" => ThunkMode::None,
+                    "-thunks=safe" => ThunkMode::Safe,
+                    "-thunks=all" => ThunkMode::All,
+                    _ => {
+                        let value = s.trim_start_matches("-thunks=").to_string();
+                        return Err(ArgsError::InvalidValue {
+                            flag: "-thunks".into(),
+                            value,
+                            expected: "`none`, `safe`, or `all`".into(),
+                        });
+                    }
+                };
+            }
             "-dead_strip" => {
                 opts.dead_strip = true;
             }
@@ -480,6 +498,7 @@ mod tests {
     fn dead_strip_icf_and_fixup_chain_flags_are_recorded() {
         let opts = parse(&argv(&[
             "-dead_strip",
+            "-thunks=all",
             "-icf=safe",
             "-fixup_chains",
             "-no_fixup_chains",
@@ -488,8 +507,22 @@ mod tests {
         ]))
         .unwrap();
         assert!(opts.dead_strip);
+        assert_eq!(opts.thunks, ThunkMode::All);
         assert_eq!(opts.icf_mode, IcfMode::None);
         assert!(!opts.fixup_chains);
+    }
+
+    #[test]
+    fn thunks_flag_rejects_unknown_modes() {
+        let err = parse(&argv(&["-thunks=clustered", "main.o"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::InvalidValue {
+                ref flag,
+                ref value,
+                ..
+            } if flag == "-thunks" && value == "clustered"
+        ));
     }
 
     #[test]

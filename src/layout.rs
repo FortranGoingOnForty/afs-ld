@@ -85,7 +85,15 @@ impl Layout {
         header_size: u64,
         synthetic_plan: Option<&SyntheticPlan>,
     ) -> Self {
-        Self::build_with_synthetics_filtered(kind, inputs, atoms, header_size, synthetic_plan, None)
+        Self::build_with_synthetics_and_extra_filtered(
+            kind,
+            inputs,
+            atoms,
+            header_size,
+            synthetic_plan,
+            None,
+            &[],
+        )
     }
 
     pub fn build_with_synthetics_filtered(
@@ -95,6 +103,26 @@ impl Layout {
         header_size: u64,
         synthetic_plan: Option<&SyntheticPlan>,
         live_atoms: Option<&HashSet<AtomId>>,
+    ) -> Self {
+        Self::build_with_synthetics_and_extra_filtered(
+            kind,
+            inputs,
+            atoms,
+            header_size,
+            synthetic_plan,
+            live_atoms,
+            &[],
+        )
+    }
+
+    pub fn build_with_synthetics_and_extra_filtered(
+        kind: OutputKind,
+        inputs: &[LayoutInput<'_>],
+        atoms: &AtomTable,
+        header_size: u64,
+        synthetic_plan: Option<&SyntheticPlan>,
+        live_atoms: Option<&HashSet<AtomId>>,
+        extra_sections: &[OutputSection],
     ) -> Self {
         let input_map: HashMap<InputId, LayoutInput<'_>> =
             inputs.iter().map(|input| (input.id, *input)).collect();
@@ -171,6 +199,15 @@ impl Layout {
                 } else {
                     sections.push(synthetic);
                 }
+            }
+        }
+        for synthetic in extra_sections.iter().cloned() {
+            if let Some(existing) = sections.iter_mut().find(|section| {
+                section.segment == synthetic.segment && section.name == synthetic.name
+            }) {
+                merge_synthetic_section(existing, synthetic);
+            } else {
+                sections.push(synthetic);
             }
         }
 
@@ -502,6 +539,7 @@ fn section_rank(segment: &str, section: &str) -> usize {
     let order: &[&str] = match segment {
         "__TEXT" => &[
             "__text",
+            "__thunks",
             "__stubs",
             "__stub_helper",
             "__cstring",

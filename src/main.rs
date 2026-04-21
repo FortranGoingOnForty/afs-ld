@@ -37,6 +37,7 @@ Options:
   -S                              Strip debug symbols (currently a no-op warning)
   -no_uuid                        Omit LC_UUID
   -no_loh                         Accepted for compatibility (currently warns; no effect)
+  -thunks=<none|safe|all>         Configure branch thunks
   -dead_strip                     Dead-strip unreferenced code/data
   -icf=safe | -icf=none | -icf=all
                                   Configure identical code folding (`all` currently errors)

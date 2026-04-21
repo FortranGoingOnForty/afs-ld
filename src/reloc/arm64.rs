@@ -44,6 +44,7 @@ impl std::error::Error for RelocError {}
 
 struct ResolveView<'a> {
     sym_table: &'a SymbolTable,
+    symbol_name_index: &'a HashMap<String, SymbolId>,
     atom_table: &'a AtomTable,
     atom_addrs: &'a HashMap<crate::resolve::AtomId, u64>,
     atoms_by_input_section: &'a HashMap<(InputId, u8), Vec<crate::resolve::AtomId>>,
@@ -236,8 +237,10 @@ pub fn apply_layout(
     let atoms_by_input_section = atoms.by_input_section();
     let section_addrs = input_section_address_map(layout, atoms);
     let synth_addrs = synthetic_address_maps(layout, plan.synthetic_plan);
+    let symbol_name_index = build_symbol_name_index(sym_table);
     let resolve = ResolveView {
         sym_table,
+        symbol_name_index: &symbol_name_index,
         atom_table: atoms,
         atom_addrs: &atom_addrs,
         atoms_by_input_section: &atoms_by_input_section,
@@ -556,8 +559,10 @@ pub fn plan_thunks(
     let atoms_by_input_section = atoms.by_input_section();
     let section_addrs = input_section_address_map(layout, atoms);
     let synth_addrs = synthetic_address_maps(layout, synthetic_plan);
+    let symbol_name_index = build_symbol_name_index(sym_table);
     let resolve = ResolveView {
         sym_table,
+        symbol_name_index: &symbol_name_index,
         atom_table: atoms,
         atom_addrs: &atom_addrs,
         atoms_by_input_section: &atoms_by_input_section,
@@ -683,7 +688,7 @@ fn apply_one(
     })? + local_offset as u64;
     match reloc.kind {
         RelocKind::Unsigned => {
-            if dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table).is_some() {
+            if dylib_import_symbol_id(obj, reloc.referent, resolve).is_some() {
                 if direct_import_bind_supported(reloc) {
                     clear_direct_import_slot(bytes, atom, obj, local_offset, reloc)
                 } else {
@@ -801,7 +806,7 @@ fn apply_one(
         ),
         RelocKind::TlvpLoadPageOff12 => {
             let target = resolve_tlvp_pageoff_target(obj, atom, reloc, resolve)?;
-            if dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table).is_some() {
+            if dylib_import_symbol_id(obj, reloc.referent, resolve).is_some() {
                 patch_pageoff12(bytes, atom, obj, local_offset, reloc, target)
             } else {
                 patch_tlvp_pageoff12(bytes, atom, obj, local_offset, reloc, target)
@@ -826,7 +831,7 @@ fn resolve_branch_target_key(
     reloc: Reloc,
     resolve: &ResolveView<'_>,
 ) -> Result<BranchTargetKey, RelocError> {
-    if let Some(symbol_id) = dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table) {
+    if let Some(symbol_id) = dylib_import_symbol_id(obj, reloc.referent, resolve) {
         return Ok(BranchTargetKey::Stub(symbol_id));
     }
     match reloc.referent {
@@ -847,11 +852,7 @@ fn resolve_branch_target_key(
                 )
             })?;
             if let Ok(name) = obj.symbol_name(input_sym) {
-                if let Some((symbol_id, _)) = resolve
-                    .sym_table
-                    .iter()
-                    .find(|(_, symbol)| resolve.sym_table.interner.resolve(symbol.name()) == name)
-                {
+                if let Some(symbol_id) = resolve.symbol_name_index.get(name).copied() {
                     return Ok(BranchTargetKey::Symbol(symbol_id));
                 }
             }
@@ -1085,7 +1086,7 @@ fn resolve_got_target(
     reloc: Reloc,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
-    let Some(symbol_id) = symbol_referent_id(obj, reloc.referent, resolve.sym_table) else {
+    let Some(symbol_id) = symbol_referent_id(obj, reloc.referent, resolve) else {
         return Err(reloc_error(
             atom,
             &obj.path,
@@ -1108,7 +1109,7 @@ fn resolve_got_target(
 }
 
 fn got_reloc_relaxes_locally(obj: &ObjectFile, reloc: Reloc, resolve: &ResolveView<'_>) -> bool {
-    match symbol_referent_id(obj, reloc.referent, resolve.sym_table) {
+    match symbol_referent_id(obj, reloc.referent, resolve) {
         Some(symbol_id) => match resolve.sym_table.get(symbol_id) {
             Symbol::DylibImport { .. } => false,
             Symbol::Defined { .. } => true,
@@ -1124,7 +1125,7 @@ fn resolve_tlvp_target(
     reloc: Reloc,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
-    if dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table).is_some() {
+    if dylib_import_symbol_id(obj, reloc.referent, resolve).is_some() {
         return resolve_got_target(obj, atom, reloc, resolve);
     }
     resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)
@@ -1136,7 +1137,7 @@ fn resolve_tlvp_pageoff_target(
     reloc: Reloc,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
-    if dylib_import_symbol_id(obj, reloc.referent, resolve.sym_table).is_some() {
+    if dylib_import_symbol_id(obj, reloc.referent, resolve).is_some() {
         return resolve_got_target(obj, atom, reloc, resolve);
     }
     resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)
@@ -1189,12 +1190,15 @@ fn resolve_symbol_referent(
     })?;
 
     if let Ok(name) = obj.symbol_name(input_sym) {
-        if let Some((_, symbol)) = resolve
-            .sym_table
-            .iter()
-            .find(|(_, symbol)| resolve.sym_table.interner.resolve(symbol.name()) == name)
-        {
-            return resolve_global_symbol(obj, atom, kind, name, symbol, resolve);
+        if let Some(symbol_id) = resolve.symbol_name_index.get(name).copied() {
+            return resolve_global_symbol(
+                obj,
+                atom,
+                kind,
+                name,
+                resolve.sym_table.get(symbol_id),
+                resolve,
+            );
         }
     }
 
@@ -1204,27 +1208,35 @@ fn resolve_symbol_referent(
 fn dylib_import_symbol_id(
     obj: &ObjectFile,
     referent: Referent,
-    sym_table: &SymbolTable,
+    resolve: &ResolveView<'_>,
 ) -> Option<SymbolId> {
-    let symbol_id = symbol_referent_id(obj, referent, sym_table)?;
-    matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. }).then_some(symbol_id)
+    let symbol_id = symbol_referent_id(obj, referent, resolve)?;
+    matches!(resolve.sym_table.get(symbol_id), Symbol::DylibImport { .. }).then_some(symbol_id)
 }
 
 fn symbol_referent_id(
     obj: &ObjectFile,
     referent: Referent,
-    sym_table: &SymbolTable,
+    resolve: &ResolveView<'_>,
 ) -> Option<SymbolId> {
     let Referent::Symbol(sym_idx) = referent else {
         return None;
     };
     let input_sym = obj.symbols.get(sym_idx as usize)?;
     let name = obj.symbol_name(input_sym).ok()?;
-    let (symbol_id, symbol) = sym_table
+    resolve.symbol_name_index.get(name).copied()
+}
+
+fn build_symbol_name_index(sym_table: &SymbolTable) -> HashMap<String, SymbolId> {
+    sym_table
         .iter()
-        .find(|(_, symbol)| sym_table.interner.resolve(symbol.name()) == name)?;
-    let _ = symbol;
-    Some(symbol_id)
+        .map(|(symbol_id, symbol)| {
+            (
+                sym_table.interner.resolve(symbol.name()).to_string(),
+                symbol_id,
+            )
+        })
+        .collect()
 }
 
 fn resolve_global_symbol(

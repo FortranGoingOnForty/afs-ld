@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -191,26 +191,42 @@ fn collect_records(
         .iter()
         .map(|input| (input.id, input.object))
         .collect();
+    let compact_unwind_sections: HashSet<(InputId, u8)> = atoms
+        .iter()
+        .filter(|(_, atom)| atom.section == AtomSection::CompactUnwind)
+        .map(|(_, atom)| (atom.origin, atom.input_section))
+        .collect();
     let mut reloc_cache: HashMap<(InputId, u8), Vec<Reloc>> = HashMap::new();
-    for input in inputs {
-        for (section_idx, section) in input.object.sections.iter().enumerate() {
-            if section.nreloc == 0 {
-                continue;
-            }
-            let raws = parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(|err| {
-                UnwindError {
-                    input: input.object.path.clone(),
-                    atom: AtomId(0),
-                    detail: err.to_string(),
-                }
+    for (input_id, section_idx) in compact_unwind_sections {
+        let obj = input_map.get(&input_id).ok_or_else(|| UnwindError {
+            input: PathBuf::from("<missing object>"),
+            atom: AtomId(0),
+            detail: "missing parsed object".to_string(),
+        })?;
+        let section = obj
+            .sections
+            .get((section_idx as usize).saturating_sub(1))
+            .ok_or_else(|| UnwindError {
+                input: obj.path.clone(),
+                atom: AtomId(0),
+                detail: format!("compact-unwind section {} is out of range", section_idx),
             })?;
-            let relocs = parse_relocs(&raws).map_err(|err| UnwindError {
-                input: input.object.path.clone(),
+        if section.nreloc == 0 {
+            continue;
+        }
+        let raws = parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(|err| {
+            UnwindError {
+                input: obj.path.clone(),
                 atom: AtomId(0),
                 detail: err.to_string(),
-            })?;
-            reloc_cache.insert((input.id, (section_idx + 1) as u8), relocs);
-        }
+            }
+        })?;
+        let relocs = parse_relocs(&raws).map_err(|err| UnwindError {
+            input: obj.path.clone(),
+            atom: AtomId(0),
+            detail: err.to_string(),
+        })?;
+        reloc_cache.insert((input_id, section_idx), relocs);
     }
 
     let mut records = Vec::new();

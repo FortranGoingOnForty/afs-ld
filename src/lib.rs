@@ -213,6 +213,8 @@ pub struct LinkPhaseTimings {
     pub atomization: Duration,
     pub layout: Duration,
     pub synth_sections: Duration,
+    pub synth_linkedit_finalize: Duration,
+    pub synth_unwind: Duration,
     pub reloc_apply: Duration,
     pub write_output: Duration,
 }
@@ -654,7 +656,10 @@ impl Linker {
         };
         let phase_started = Instant::now();
         let mut linkedit = None;
+        let mut synth_linkedit_finalize = Duration::ZERO;
+        let mut synth_unwind = Duration::ZERO;
         for _ in 0..4 {
+            let phase_started = Instant::now();
             let (next_layout, next_linkedit) = macho::writer::finalize_layout_with_linkedit(
                 &layout,
                 opts.kind,
@@ -662,8 +667,10 @@ impl Linker {
                 &dylib_loads,
                 linkedit_context,
             )?;
+            synth_linkedit_finalize += phase_started.elapsed();
             layout = next_layout;
             linkedit = Some(next_linkedit);
+            let phase_started = Instant::now();
             let changed = synth::unwind::synthesize(
                 &mut layout,
                 &layout_inputs,
@@ -671,11 +678,14 @@ impl Linker {
                 &sym_table,
                 &synthetic_plan,
             )?;
+            synth_unwind += phase_started.elapsed();
             if !changed {
                 break;
             }
         }
         let linkedit = linkedit.expect("finalize loop always runs at least once");
+        phases.synth_linkedit_finalize = synth_linkedit_finalize;
+        phases.synth_unwind = synth_unwind;
         phases.synth_sections = phase_started.elapsed();
         let phase_started = Instant::now();
         reloc::arm64::apply_layout(

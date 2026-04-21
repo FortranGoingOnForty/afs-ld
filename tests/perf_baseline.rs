@@ -25,12 +25,12 @@ fn executable_opts(inputs: Vec<PathBuf>, output: PathBuf) -> LinkOptions {
         inputs,
         output: Some(output),
         syslibroot: sdk_path().map(PathBuf::from),
-        platform_version: sdk_version().and_then(|v| {
+        platform_version: sdk_version().map(|v| {
             let parsed = afs_ld::macho::tbd::parse_version(&v);
-            Some(afs_ld::PlatformVersion {
+            afs_ld::PlatformVersion {
                 minos: parsed,
                 sdk: parsed,
-            })
+            }
         }),
         library_names: vec!["System".into()],
         ..LinkOptions::default()
@@ -39,13 +39,15 @@ fn executable_opts(inputs: Vec<PathBuf>, output: PathBuf) -> LinkOptions {
 
 fn assert_profile_basics(name: &str, profile: &LinkProfile) {
     eprintln!(
-        "{name}: total={:?} parse={:?} resolve={:?} atomize={:?} layout={:?} synth={:?} reloc={:?} write={:?}",
+        "{name}: total={:?} parse={:?} resolve={:?} atomize={:?} layout={:?} synth={:?} (linkedit={:?} unwind={:?}) reloc={:?} write={:?}",
         profile.total_wall,
         profile.phases.input_parsing,
         profile.phases.symbol_resolution,
         profile.phases.atomization,
         profile.phases.layout,
         profile.phases.synth_sections,
+        profile.phases.synth_linkedit_finalize,
+        profile.phases.synth_unwind,
         profile.phases.reloc_apply,
         profile.phases.write_output,
     );
@@ -57,6 +59,11 @@ fn assert_profile_basics(name: &str, profile: &LinkProfile) {
     assert!(
         profile.phases.accounted_total() > Duration::ZERO,
         "{name}: all phase timings were zero"
+    );
+    assert!(
+        profile.phases.synth_sections
+            >= profile.phases.synth_linkedit_finalize + profile.phases.synth_unwind,
+        "{name}: synth subphases exceeded synth total"
     );
 }
 

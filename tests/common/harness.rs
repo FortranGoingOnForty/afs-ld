@@ -13,14 +13,14 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_ld::macho::constants::{
-    LC_BUILD_VERSION, LC_CODE_SIGNATURE, LC_DYSYMTAB, LC_DYLD_INFO_ONLY, LC_LOAD_DYLIB,
+    LC_BUILD_VERSION, LC_CODE_SIGNATURE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_LOAD_DYLIB,
     LC_SEGMENT_64, LC_SYMTAB, LC_UUID,
-};
-use afs_ld::macho::reader::{
-    parse_commands, parse_header, u32_le, BuildVersionCmd, DyldInfoCmd, LoadCommand,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::ExportKind;
+use afs_ld::macho::reader::{
+    parse_commands, parse_header, u32_le, BuildVersionCmd, DyldInfoCmd, LoadCommand,
+};
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, SymKind};
 
@@ -38,6 +38,7 @@ pub struct LinkCase {
     pub absent_load_commands: Vec<u32>,
     pub runtime_args: Vec<String>,
     pub notes: Option<String>,
+    pub case_tolerances: Vec<CaseTolerance>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,22 @@ pub struct PageRefCheck {
 pub enum PageRefKind {
     Add,
     Load,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaseTolerance {
+    pub region: ToleranceRegion,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToleranceRegion {
+    SectionBytes {
+        segname: String,
+        sectname: Option<String>,
+        start: usize,
+        end_inclusive: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,10 +309,10 @@ pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
         let artifacts = read_artifacts(&path.join("artifacts.txt"))?;
         let ignored_load_commands =
             read_load_command_names(&path.join("ignored_load_commands.txt"))?;
-        let absent_load_commands =
-            read_load_command_names(&path.join("absent_load_commands.txt"))?;
+        let absent_load_commands = read_load_command_names(&path.join("absent_load_commands.txt"))?;
         let runtime_args = read_tokens_if_present(&path.join("runtime.txt"))?;
         let notes = fs::read_to_string(path.join("notes.md")).ok();
+        let case_tolerances = parse_case_tolerances(notes.as_deref())?;
 
         cases.push(LinkCase {
             name,
@@ -310,6 +327,7 @@ pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
             absent_load_commands,
             runtime_args,
             notes,
+            case_tolerances,
         });
     }
 
@@ -375,8 +393,8 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
     }
     for artifact in &case.artifacts {
         let src = case.dir.join("inputs").join(&artifact.src_name);
-        let src_contents =
-            fs::read_to_string(&src).map_err(|e| format!("read artifact src {}: {e}", src.display()))?;
+        let src_contents = fs::read_to_string(&src)
+            .map_err(|e| format!("read artifact src {}: {e}", src.display()))?;
         let out = work_dir.join(&artifact.out_name);
         match artifact.kind {
             ArtifactKind::ClangDylib => compile_dylib_c(&src_contents, &out)?,
@@ -393,13 +411,7 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
     let their_path = work_dir.join(format!("apple.{suffix}"));
 
     let our_args = expand_args(
-        &case.args,
-        &compiled,
-        &sidecars,
-        &artifacts,
-        &our_path,
-        &sdk,
-        &sdk_ver,
+        &case.args, &compiled, &sidecars, &artifacts, &our_path, &sdk, &sdk_ver,
     )?;
     let their_args = expand_args(
         &case.args,
@@ -560,7 +572,11 @@ pub fn compare_command_details(
     Ok(())
 }
 
-pub fn ensure_absent_load_commands(bytes: &[u8], commands: &[u32], side: &str) -> Result<(), String> {
+pub fn ensure_absent_load_commands(
+    bytes: &[u8],
+    commands: &[u32],
+    side: &str,
+) -> Result<(), String> {
     let ids = command_ids(bytes)?;
     for command in commands {
         if ids.contains(command) {
@@ -599,13 +615,19 @@ pub fn compare_sections(
     ours: &[u8],
     theirs: &[u8],
     sections: &[(String, String)],
+    case_tolerances: &[CaseTolerance],
 ) -> Result<(), String> {
     for (segname, sectname) in sections {
         let (_, our_bytes) = output_section(ours, segname, sectname)
             .ok_or_else(|| format!("missing section {segname},{sectname} in afs-ld output"))?;
         let (_, their_bytes) = output_section(theirs, segname, sectname)
             .ok_or_else(|| format!("missing section {segname},{sectname} in Apple output"))?;
-        let diff = diff_macho(&our_bytes, &their_bytes);
+        let diff = apply_section_tolerances(
+            diff_macho(&our_bytes, &their_bytes),
+            segname,
+            sectname,
+            case_tolerances,
+        );
         if !diff.is_clean() {
             return Err(format!(
                 "section bytes differ for {segname},{sectname}: {:#?}",
@@ -616,7 +638,11 @@ pub fn compare_sections(
     Ok(())
 }
 
-pub fn compare_page_refs(ours: &[u8], theirs: &[u8], checks: &[PageRefCheck]) -> Result<(), String> {
+pub fn compare_page_refs(
+    ours: &[u8],
+    theirs: &[u8],
+    checks: &[PageRefCheck],
+) -> Result<(), String> {
     if checks.is_empty() {
         return Ok(());
     }
@@ -624,10 +650,21 @@ pub fn compare_page_refs(ours: &[u8], theirs: &[u8], checks: &[PageRefCheck]) ->
     let their_symbols = symbol_values(theirs)?;
     for check in checks {
         let (our_addr, our_bytes) = output_section(ours, &check.segname, &check.sectname)
-            .ok_or_else(|| format!("missing section {},{} in afs-ld output", check.segname, check.sectname))?;
+            .ok_or_else(|| {
+                format!(
+                    "missing section {},{} in afs-ld output",
+                    check.segname, check.sectname
+                )
+            })?;
         let (their_addr, their_bytes) = output_section(theirs, &check.segname, &check.sectname)
-            .ok_or_else(|| format!("missing section {},{} in Apple output", check.segname, check.sectname))?;
-        let our_target = decode_page_reference(&our_bytes, our_addr, check.site_offset, check.kind)?;
+            .ok_or_else(|| {
+                format!(
+                    "missing section {},{} in Apple output",
+                    check.segname, check.sectname
+                )
+            })?;
+        let our_target =
+            decode_page_reference(&our_bytes, our_addr, check.site_offset, check.kind)?;
         let their_target =
             decode_page_reference(&their_bytes, their_addr, check.site_offset, check.kind)?;
         let expected_ours = *our_symbols
@@ -758,6 +795,67 @@ pub fn diff_macho(ours: &[u8], theirs: &[u8]) -> DiffReport {
     report
 }
 
+pub fn parse_case_tolerances(notes: Option<&str>) -> Result<Vec<CaseTolerance>, String> {
+    let Some(notes) = notes else {
+        return Ok(Vec::new());
+    };
+
+    let mut tolerances = Vec::new();
+    let mut in_block = false;
+    for raw_line in notes.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "tolerated:" {
+            in_block = true;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        if !line.starts_with("- region:") {
+            // Stop once the simple tolerated block ends.
+            if !line.starts_with('#') && !raw_line.starts_with(' ') && !raw_line.starts_with('\t') {
+                break;
+            }
+            continue;
+        }
+        tolerances.push(parse_case_tolerance_line(line)?);
+    }
+    Ok(tolerances)
+}
+
+pub fn apply_section_tolerances(
+    mut diff: DiffReport,
+    segname: &str,
+    sectname: &str,
+    case_tolerances: &[CaseTolerance],
+) -> DiffReport {
+    if diff.critical.is_empty() || case_tolerances.is_empty() {
+        return diff;
+    }
+
+    let mut remaining = Vec::new();
+    for chunk in diff.critical.drain(..) {
+        let tolerated = case_tolerances.iter().find(|tol| {
+            tolerance_covers_chunk(tol, segname, sectname, chunk.offset, chunk.len)
+        });
+        if let Some(tol) = tolerated {
+            diff.tolerated.push(DiffChunk {
+                offset: chunk.offset,
+                len: chunk.len,
+                reason: tol.reason.clone(),
+                category: DiffCategory::Tolerated("case-note"),
+            });
+        } else {
+            remaining.push(chunk);
+        }
+    }
+    diff.critical = remaining;
+    diff
+}
+
 fn unique_temp_dir(case_name: &str) -> Result<PathBuf, String> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -772,9 +870,93 @@ fn unique_temp_dir(case_name: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn parse_case_tolerance_line(line: &str) -> Result<CaseTolerance, String> {
+    let rest = line
+        .strip_prefix("- region:")
+        .ok_or_else(|| format!("invalid tolerance line `{line}`"))?
+        .trim();
+    let (before_reason, reason_part) = rest
+        .split_once(" reason:")
+        .ok_or_else(|| format!("missing `reason:` in tolerance line `{line}`"))?;
+    let (region_part, bytes_part) = before_reason
+        .split_once(" bytes ")
+        .ok_or_else(|| format!("missing `bytes` range in tolerance line `{line}`"))?;
+    let reason = reason_part.trim().trim_matches('"').to_string();
+    if reason.is_empty() {
+        return Err(format!("empty tolerance reason in `{line}`"));
+    }
+    let (start, end_inclusive) = parse_tolerance_range(bytes_part.trim())?;
+    let region_token = region_part.trim();
+    let (segname, sectname) = match region_token.split_once(',') {
+        Some((segname, sectname)) => (segname.trim().to_string(), Some(sectname.trim().to_string())),
+        None => (region_token.to_string(), None),
+    };
+    if segname.is_empty() {
+        return Err(format!("empty tolerance region in `{line}`"));
+    }
+    Ok(CaseTolerance {
+        region: ToleranceRegion::SectionBytes {
+            segname,
+            sectname,
+            start,
+            end_inclusive,
+        },
+        reason,
+    })
+}
+
+fn parse_tolerance_range(range: &str) -> Result<(usize, usize), String> {
+    let (start, end) = range
+        .split_once('-')
+        .ok_or_else(|| format!("invalid tolerance range `{range}`"))?;
+    let start = parse_usize(start.trim())?;
+    let end = parse_usize(end.trim())?;
+    if end < start {
+        return Err(format!("tolerance range end before start in `{range}`"));
+    }
+    Ok((start, end))
+}
+
+fn parse_usize(token: &str) -> Result<usize, String> {
+    if let Some(rest) = token.strip_prefix("0x") {
+        usize::from_str_radix(rest, 16).map_err(|e| format!("parse usize `{token}`: {e}"))
+    } else {
+        token
+            .parse::<usize>()
+            .map_err(|e| format!("parse usize `{token}`: {e}"))
+    }
+}
+
+fn tolerance_covers_chunk(
+    tolerance: &CaseTolerance,
+    segname: &str,
+    sectname: &str,
+    offset: usize,
+    len: usize,
+) -> bool {
+    match &tolerance.region {
+        ToleranceRegion::SectionBytes {
+            segname: expected_seg,
+            sectname: expected_sect,
+            start,
+            end_inclusive,
+        } => {
+            if expected_seg != segname {
+                return false;
+            }
+            if let Some(expected_sect) = expected_sect {
+                if expected_sect != sectname {
+                    return false;
+                }
+            }
+            let end = offset.saturating_add(len.saturating_sub(1));
+            offset >= *start && end <= *end_inclusive
+        }
+    }
+}
+
 fn read_tokens(path: &Path) -> Result<Vec<String>, String> {
-    let contents =
-        fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let contents = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     Ok(contents
         .lines()
         .map(str::trim)
@@ -1031,10 +1213,7 @@ fn tolerated_mask(bytes: &[u8]) -> Vec<Option<&'static str>> {
         return mask;
     };
     let cmd_base = 32usize;
-    let Ok(cmd_limit) = cmd_base
-        .checked_add(header.sizeofcmds as usize)
-        .ok_or(())
-    else {
+    let Ok(cmd_limit) = cmd_base.checked_add(header.sizeofcmds as usize).ok_or(()) else {
         return mask;
     };
     if cmd_limit > bytes.len() {
@@ -1143,7 +1322,9 @@ struct CanonicalExportRecord {
     kind: CanonicalExportKind,
 }
 
-fn canonical_symbol_record_map(bytes: &[u8]) -> Result<BTreeMap<String, CanonicalSymbolRecord>, String> {
+fn canonical_symbol_record_map(
+    bytes: &[u8],
+) -> Result<BTreeMap<String, CanonicalSymbolRecord>, String> {
     Ok(canonical_symbol_records(bytes)?
         .into_iter()
         .map(|record| (record.name.clone(), record))
@@ -1152,7 +1333,8 @@ fn canonical_symbol_record_map(bytes: &[u8]) -> Result<BTreeMap<String, Canonica
 
 fn canonical_symbol_records(bytes: &[u8]) -> Result<Vec<CanonicalSymbolRecord>, String> {
     let (symtab, _) = symtab_and_dysymtab(bytes)?;
-    let symbols = parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).map_err(|e| e.to_string())?;
+    let symbols =
+        parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).map_err(|e| e.to_string())?;
     let strings =
         StringTable::from_file(bytes, symtab.stroff, symtab.strsize).map_err(|e| e.to_string())?;
     let section_addrs = section_addrs(bytes)?;
@@ -1313,7 +1495,8 @@ fn symbol_values(bytes: &[u8]) -> Result<BTreeMap<String, u64>, String> {
             _ => None,
         })
         .ok_or_else(|| "missing LC_SYMTAB".to_string())?;
-    let symbols = parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).map_err(|e| e.to_string())?;
+    let symbols =
+        parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).map_err(|e| e.to_string())?;
     let strings =
         StringTable::from_file(bytes, symtab.stroff, symtab.strsize).map_err(|e| e.to_string())?;
     let mut out = BTreeMap::new();

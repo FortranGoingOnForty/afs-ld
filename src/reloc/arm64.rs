@@ -94,8 +94,16 @@ enum BranchTargetKey {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ThunkBucketKey {
+    segment: String,
+    target: BranchTargetKey,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ThunkEntry {
+    segment: String,
+    slot_in_segment: usize,
     target: BranchTargetKey,
 }
 
@@ -110,24 +118,33 @@ impl ThunkPlan {
         if self.entries.is_empty() {
             return Vec::new();
         }
-        vec![OutputSection {
-            segment: "__TEXT".into(),
-            name: "__thunks".into(),
-            kind: SectionKind::Text,
-            align_pow2: 2,
-            flags: crate::macho::constants::S_REGULAR
-                | crate::macho::constants::S_ATTR_PURE_INSTRUCTIONS
-                | crate::macho::constants::S_ATTR_SOME_INSTRUCTIONS,
-            reserved1: 0,
-            reserved2: 0,
-            reserved3: 0,
-            atoms: Vec::new(),
-            synthetic_offset: 0,
-            synthetic_data: vec![0; self.entries.len() * THUNK_SIZE as usize],
-            addr: 0,
-            size: (self.entries.len() as u64) * THUNK_SIZE,
-            file_off: 0,
-        }]
+        let mut counts = HashMap::new();
+        for entry in &self.entries {
+            *counts.entry(entry.segment.clone()).or_insert(0usize) += 1;
+        }
+        let mut sections: Vec<_> = counts
+            .into_iter()
+            .map(|(segment, count)| OutputSection {
+                segment,
+                name: "__thunks".into(),
+                kind: SectionKind::Text,
+                align_pow2: 2,
+                flags: crate::macho::constants::S_REGULAR
+                    | crate::macho::constants::S_ATTR_PURE_INSTRUCTIONS
+                    | crate::macho::constants::S_ATTR_SOME_INSTRUCTIONS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                atoms: Vec::new(),
+                synthetic_offset: 0,
+                synthetic_data: vec![0; count * THUNK_SIZE as usize],
+                addr: 0,
+                size: (count as u64) * THUNK_SIZE,
+                file_off: 0,
+            })
+            .collect();
+        sections.sort_by(|a, b| a.segment.cmp(&b.segment));
+        sections
     }
 
     fn redirect_for(&self, atom: crate::resolve::AtomId, atom_offset: u32) -> Option<usize> {
@@ -135,15 +152,21 @@ impl ThunkPlan {
     }
 
     fn thunk_addrs(&self, layout: &Layout) -> HashMap<usize, u64> {
-        let Some(section) = layout
+        let bases: HashMap<_, _> = layout
             .sections
             .iter()
-            .find(|section| section.segment == "__TEXT" && section.name == "__thunks")
-        else {
-            return HashMap::new();
-        };
-        (0..self.entries.len())
-            .map(|index| (index, section.addr + (index as u64) * THUNK_SIZE))
+            .filter(|section| section.name == "__thunks")
+            .map(|section| (section.segment.clone(), section.addr))
+            .collect();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                bases
+                    .get(&entry.segment)
+                    .copied()
+                    .map(|base| (index, base + (entry.slot_in_segment as u64) * THUNK_SIZE))
+            })
             .collect()
     }
 }
@@ -365,6 +388,16 @@ fn input_section_address_map(layout: &Layout, atoms: &AtomTable) -> HashMap<(Inp
     out
 }
 
+fn atom_output_segment_map(layout: &Layout) -> HashMap<crate::resolve::AtomId, String> {
+    let mut out = HashMap::new();
+    for section in &layout.sections {
+        for placed in &section.atoms {
+            out.insert(placed.atom, section.segment.clone());
+        }
+    }
+    out
+}
+
 fn synthetic_address_maps(
     layout: &Layout,
     synthetic_plan: Option<&SyntheticPlan>,
@@ -499,6 +532,7 @@ pub fn plan_thunks(
     }
 
     let atom_addrs = atom_address_map(layout);
+    let atom_segments = atom_output_segment_map(layout);
     let atoms_by_input_section = atoms.by_input_section();
     let section_addrs = input_section_address_map(layout, atoms);
     let synth_addrs = synthetic_address_maps(layout, synthetic_plan);
@@ -518,8 +552,8 @@ pub fn plan_thunks(
     };
 
     let mut redirects = HashMap::new();
-    let mut index = HashMap::new();
-    let mut entries = Vec::new();
+    let mut index: HashMap<ThunkBucketKey, usize> = HashMap::new();
+    let mut entries: Vec<ThunkEntry> = Vec::new();
     for (atom_id, atom) in atoms.iter() {
         let Some(obj) = input_map.get(&atom.origin) else {
             continue;
@@ -536,6 +570,9 @@ pub fn plan_thunks(
             let Some(place) = resolve.atom_addrs.get(&atom.id).copied() else {
                 continue;
             };
+            let Some(caller_segment) = atom_segments.get(&atom.id).cloned() else {
+                continue;
+            };
             let place = place + local_offset as u64;
             let target_key = resolve_branch_target_key(obj, atom, reloc, &resolve)?;
             let target = resolve_branch_target_from_key(obj, atom, reloc, target_key, &resolve)?;
@@ -547,12 +584,24 @@ pub fn plan_thunks(
             if !needs_thunk {
                 continue;
             }
-            let thunk_index = if let Some(&existing) = index.get(&target_key) {
+            let bucket_key = ThunkBucketKey {
+                segment: caller_segment.clone(),
+                target: target_key,
+            };
+            let thunk_index = if let Some(&existing) = index.get(&bucket_key) {
                 existing
             } else {
                 let next = entries.len();
-                entries.push(ThunkEntry { target: target_key });
-                index.insert(target_key, next);
+                let slot_in_segment = entries
+                    .iter()
+                    .filter(|entry| entry.segment == caller_segment)
+                    .count();
+                entries.push(ThunkEntry {
+                    segment: caller_segment.clone(),
+                    slot_in_segment,
+                    target: target_key,
+                });
+                index.insert(bucket_key, next);
                 next
             };
             redirects.insert((atom_id, local_offset), thunk_index);
@@ -902,20 +951,35 @@ fn synthesize_thunk_section(
     plan: &ThunkPlan,
     resolve: &ResolveView<'_>,
 ) -> Result<(), RelocError> {
-    let Some(section) = layout
+    let mut counts = HashMap::new();
+    for entry in &plan.entries {
+        *counts.entry(entry.segment.as_str()).or_insert(0usize) += 1;
+    }
+    for section in layout
         .sections
         .iter_mut()
-        .find(|section| section.segment == "__TEXT" && section.name == "__thunks")
-    else {
-        return Ok(());
-    };
-    if section.synthetic_data.len() != plan.entries.len() * THUNK_SIZE as usize {
-        section
-            .synthetic_data
-            .resize(plan.entries.len() * THUNK_SIZE as usize, 0);
+        .filter(|section| section.name == "__thunks")
+    {
+        let expected_len =
+            counts.get(section.segment.as_str()).copied().unwrap_or(0) * THUNK_SIZE as usize;
+        if section.synthetic_data.len() != expected_len {
+            section.synthetic_data.resize(expected_len, 0);
+        }
     }
     for (idx, entry) in plan.entries.iter().enumerate() {
-        let thunk_addr = section.addr + (idx as u64) * THUNK_SIZE;
+        let section = layout
+            .sections
+            .iter_mut()
+            .find(|section| section.segment == entry.segment && section.name == "__thunks")
+            .ok_or_else(|| RelocError {
+                input: PathBuf::from("<synthetic thunks>"),
+                atom: crate::resolve::AtomId(0),
+                atom_offset: (idx as u32) * THUNK_SIZE as u32,
+                kind: RelocKind::Branch26,
+                referent: "thunk section".to_string(),
+                detail: format!("missing thunk section for segment {}", entry.segment),
+            })?;
+        let thunk_addr = section.addr + (entry.slot_in_segment as u64) * THUNK_SIZE;
         let target = match entry.target {
             BranchTargetKey::Symbol(symbol_id) => match resolve.sym_table.get(symbol_id) {
                 Symbol::Defined { atom, value, .. } => resolve
@@ -942,7 +1006,7 @@ fn synthesize_thunk_section(
         })?;
         let adrp = encode_adrp_reg(16, thunk_addr, target, "thunk target")?;
         let add = encode_add_x_reg_pageoff(16, target, "thunk target")?;
-        let start = idx * THUNK_SIZE as usize;
+        let start = entry.slot_in_segment * THUNK_SIZE as usize;
         section.synthetic_data[start..start + 4].copy_from_slice(&adrp.to_le_bytes());
         section.synthetic_data[start + 4..start + 8].copy_from_slice(&add.to_le_bytes());
         section.synthetic_data[start + 8..start + 12].copy_from_slice(&BR_X16.to_le_bytes());

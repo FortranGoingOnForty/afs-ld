@@ -17,8 +17,10 @@ use afs_ld::macho::constants::{
     LC_SEGMENT_64, LC_SYMTAB, LC_UUID,
 };
 use afs_ld::macho::reader::{parse_commands, parse_header, u32_le, BuildVersionCmd, LoadCommand};
+use afs_ld::macho::dylib::DylibFile;
+use afs_ld::macho::exports::ExportKind;
 use afs_ld::string_table::StringTable;
-use afs_ld::symbol::parse_nlist_table;
+use afs_ld::symbol::{parse_nlist_table, SymKind};
 
 #[derive(Debug, Clone)]
 pub struct LinkCase {
@@ -39,6 +41,8 @@ pub struct LinkCase {
 pub enum CommandCheck {
     BuildVersion,
     LoadDylibNames,
+    ExportRecords,
+    SymbolRecordMap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,6 +251,7 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
         sdk_version().ok_or_else(|| "xcrun --show-sdk-version unavailable".to_string())?;
     let work_dir = unique_temp_dir(&case.name)?;
     let mut compiled = BTreeMap::new();
+    let mut sidecars = BTreeMap::new();
     for input in &case.inputs {
         let stem = input
             .file_stem()
@@ -258,6 +263,27 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
         assemble(&src, &obj)?;
         compiled.insert(format!("{stem}.o"), obj);
     }
+    let files_dir = case.dir.join("files");
+    if files_dir.is_dir() {
+        for entry in fs::read_dir(&files_dir)
+            .map_err(|e| format!("read sidecar files for {}: {e}", case.name))?
+        {
+            let entry = entry.map_err(|e| format!("read sidecar entry for {}: {e}", case.name))?;
+            let src = entry.path();
+            if !src.is_file() {
+                continue;
+            }
+            let name = src
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| format!("invalid sidecar file name {}", src.display()))?
+                .to_string();
+            let dst = work_dir.join(&name);
+            fs::copy(&src, &dst)
+                .map_err(|e| format!("copy sidecar {} -> {}: {e}", src.display(), dst.display()))?;
+            sidecars.insert(name, dst);
+        }
+    }
 
     let suffix = if case.args.iter().any(|arg| arg == "-dylib") {
         "dylib"
@@ -267,8 +293,8 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
     let our_path = work_dir.join(format!("ours.{suffix}"));
     let their_path = work_dir.join(format!("apple.{suffix}"));
 
-    let our_args = expand_args(&case.args, &compiled, &our_path, &sdk, &sdk_ver)?;
-    let their_args = expand_args(&case.args, &compiled, &their_path, &sdk, &sdk_ver)?;
+    let our_args = expand_args(&case.args, &compiled, &sidecars, &our_path, &sdk, &sdk_ver)?;
+    let their_args = expand_args(&case.args, &compiled, &sidecars, &their_path, &sdk, &sdk_ver)?;
 
     let our_output = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
         .args(&our_args)
@@ -365,6 +391,24 @@ pub fn compare_command_details(
                 if ours != theirs {
                     return Err(format!(
                         "LC_LOAD_DYLIB names diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                    ));
+                }
+            }
+            CommandCheck::ExportRecords => {
+                let ours = canonical_export_records(ours)?;
+                let theirs = canonical_export_records(theirs)?;
+                if ours != theirs {
+                    return Err(format!(
+                        "canonical export records diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                    ));
+                }
+            }
+            CommandCheck::SymbolRecordMap => {
+                let ours = canonical_symbol_record_map(ours)?;
+                let theirs = canonical_symbol_record_map(theirs)?;
+                if ours != theirs {
+                    return Err(format!(
+                        "canonical symbol record map diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
                     ));
                 }
             }
@@ -690,6 +734,8 @@ fn parse_command_check(name: &str) -> Result<CommandCheck, String> {
     match name {
         "build_version" => Ok(CommandCheck::BuildVersion),
         "load_dylib_names" => Ok(CommandCheck::LoadDylibNames),
+        "export_records" => Ok(CommandCheck::ExportRecords),
+        "symbol_record_map" => Ok(CommandCheck::SymbolRecordMap),
         other => Err(format!("unknown command check `{other}`")),
     }
 }
@@ -735,6 +781,7 @@ fn parse_u64(value: &str) -> Result<u64, String> {
 fn expand_args(
     args: &[String],
     compiled: &BTreeMap<String, PathBuf>,
+    sidecars: &BTreeMap<String, PathBuf>,
     out: &Path,
     sdk: &str,
     sdk_ver: &str,
@@ -761,6 +808,16 @@ fn expand_args(
                 .get(name)
                 .ok_or_else(|| format!("unknown parity input placeholder `{name}`"))?;
             expanded.push(input.to_string_lossy().to_string());
+            continue;
+        }
+        if let Some(name) = arg
+            .strip_prefix("@FILE:")
+            .and_then(|rest| rest.strip_suffix('@'))
+        {
+            let file = sidecars
+                .get(name)
+                .ok_or_else(|| format!("unknown parity sidecar placeholder `{name}`"))?;
+            expanded.push(file.to_string_lossy().to_string());
             continue;
         }
         expanded.push(arg.clone());
@@ -859,6 +916,152 @@ fn load_dylib_names(bytes: &[u8]) -> Result<Vec<String>, String> {
             _ => None,
         })
         .collect())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalSymbolRecord {
+    name: String,
+    n_type: u8,
+    n_sect: u8,
+    n_desc: u16,
+    value: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CanonicalExportKind {
+    Regular(u64),
+    ThreadLocal(u64),
+    Absolute(u64),
+    Reexport { ordinal: u32, imported_name: String },
+    StubAndResolver { stub: u64, resolver: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalExportRecord {
+    name: String,
+    flags: u64,
+    kind: CanonicalExportKind,
+}
+
+fn canonical_symbol_record_map(bytes: &[u8]) -> Result<BTreeMap<String, CanonicalSymbolRecord>, String> {
+    Ok(canonical_symbol_records(bytes)?
+        .into_iter()
+        .map(|record| (record.name.clone(), record))
+        .collect())
+}
+
+fn canonical_symbol_records(bytes: &[u8]) -> Result<Vec<CanonicalSymbolRecord>, String> {
+    let (symtab, _) = symtab_and_dysymtab(bytes)?;
+    let symbols = parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).map_err(|e| e.to_string())?;
+    let strings =
+        StringTable::from_file(bytes, symtab.stroff, symtab.strsize).map_err(|e| e.to_string())?;
+    let section_addrs = section_addrs(bytes)?;
+    Ok(symbols
+        .iter()
+        .map(|symbol| {
+            let value = if symbol.kind() == SymKind::Sect && symbol.sect_idx() != 0 {
+                let section_addr = section_addrs[symbol.sect_idx() as usize - 1];
+                if symbol.value() >= section_addr {
+                    symbol.value() - section_addr
+                } else {
+                    symbol.value()
+                }
+            } else {
+                symbol.value()
+            };
+            CanonicalSymbolRecord {
+                name: strings.get(symbol.strx()).unwrap().to_string(),
+                n_type: symbol.raw.n_type,
+                n_sect: symbol.raw.n_sect,
+                n_desc: symbol.raw.n_desc,
+                value,
+            }
+        })
+        .collect())
+}
+
+fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExportRecord>, String> {
+    let dylib = DylibFile::parse("/tmp/canonical.dylib", bytes).map_err(|e| e.to_string())?;
+    let symbol_values: BTreeMap<String, u64> = canonical_symbol_records(bytes)?
+        .into_iter()
+        .map(|record| (record.name, record.value))
+        .collect();
+    let mut out = dylib
+        .exports
+        .entries()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|entry| {
+            let kind = match entry.kind {
+                ExportKind::Regular { .. } => {
+                    CanonicalExportKind::Regular(*symbol_values.get(&entry.name).unwrap())
+                }
+                ExportKind::ThreadLocal { .. } => {
+                    CanonicalExportKind::ThreadLocal(*symbol_values.get(&entry.name).unwrap())
+                }
+                ExportKind::Absolute { .. } => {
+                    CanonicalExportKind::Absolute(*symbol_values.get(&entry.name).unwrap())
+                }
+                ExportKind::Reexport {
+                    ordinal,
+                    imported_name,
+                } => CanonicalExportKind::Reexport {
+                    ordinal,
+                    imported_name,
+                },
+                ExportKind::StubAndResolver { stub, resolver } => {
+                    CanonicalExportKind::StubAndResolver { stub, resolver }
+                }
+            };
+            CanonicalExportRecord {
+                name: entry.name,
+                flags: entry.flags,
+                kind,
+            }
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+    Ok(out)
+}
+
+fn symtab_and_dysymtab(
+    bytes: &[u8],
+) -> Result<
+    (
+        afs_ld::macho::reader::SymtabCmd,
+        afs_ld::macho::reader::DysymtabCmd,
+    ),
+    String,
+> {
+    let header = parse_header(bytes).map_err(|e| e.to_string())?;
+    let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
+    let mut symtab = None;
+    let mut dysymtab = None;
+    for cmd in commands {
+        match cmd {
+            LoadCommand::Symtab(cmd) => symtab = Some(cmd),
+            LoadCommand::Dysymtab(cmd) => dysymtab = Some(cmd),
+            _ => {}
+        }
+    }
+    Ok((
+        symtab.ok_or_else(|| "missing LC_SYMTAB".to_string())?,
+        dysymtab.ok_or_else(|| "missing LC_DYSYMTAB".to_string())?,
+    ))
+}
+
+fn section_addrs(bytes: &[u8]) -> Result<Vec<u64>, String> {
+    let header = parse_header(bytes).map_err(|e| e.to_string())?;
+    let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for cmd in commands {
+        if let LoadCommand::Segment64(seg) = cmd {
+            for section in seg.sections {
+                out.push(section.addr);
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn symbol_values(bytes: &[u8]) -> Result<BTreeMap<String, u64>, String> {

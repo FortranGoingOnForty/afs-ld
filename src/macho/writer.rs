@@ -385,10 +385,6 @@ fn build_commands(
             commands.push(raw_entry_point(resolve_entryoff(layout, entry_point)?, 0));
         }
         OutputKind::Dylib => {
-            commands.push(LoadCommand::BuildVersion(build_version_command(opts)));
-            if opts.emit_uuid {
-                commands.push(raw_uuid_command(stable_uuid(layout, kind)));
-            }
             commands.push(LoadCommand::Dylib(DylibCmd {
                 cmd: LC_ID_DYLIB,
                 name: dylib_install_name(opts),
@@ -396,6 +392,14 @@ fn build_commands(
                 current_version: dylib_current_version(opts),
                 compatibility_version: dylib_compatibility_version(opts),
             }));
+            commands.push(LoadCommand::DyldInfoOnly(linkedit.dyld_info));
+            commands.push(LoadCommand::Symtab(linkedit.symtab));
+            commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
+            if opts.emit_uuid {
+                commands.push(raw_uuid_command(stable_uuid(layout, kind)));
+            }
+            commands.push(LoadCommand::BuildVersion(build_version_command(opts)));
+            commands.push(raw_source_version_command(0));
         }
     }
 
@@ -441,12 +445,6 @@ fn build_commands(
     } else {
         commands.push(raw_linkedit_command(LC_CODE_SIGNATURE, 0, 0));
     }
-    if kind == OutputKind::Dylib {
-        commands.push(LoadCommand::DyldInfoOnly(linkedit.dyld_info));
-        commands.push(LoadCommand::Symtab(linkedit.symtab));
-        commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
-    }
-
     Ok(commands)
 }
 
@@ -471,14 +469,17 @@ fn estimate_header_size(
                 + 24
                 + raw_source_version_command(0).cmdsize() as u64
         }
-        OutputKind::Dylib => DylibCmd {
-            cmd: LC_ID_DYLIB,
-            name: dylib_install_name(opts),
-            timestamp: 2,
-            current_version: dylib_current_version(opts),
-            compatibility_version: dylib_compatibility_version(opts),
+        OutputKind::Dylib => {
+            DylibCmd {
+                cmd: LC_ID_DYLIB,
+                name: dylib_install_name(opts),
+                timestamp: 2,
+                current_version: dylib_current_version(opts),
+                compatibility_version: dylib_compatibility_version(opts),
+            }
+            .wire_size() as u64
+                + raw_source_version_command(0).cmdsize() as u64
         }
-        .wire_size() as u64,
     };
     for rpath in &opts.rpaths {
         size += RpathCmd {

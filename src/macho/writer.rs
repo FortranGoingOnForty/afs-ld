@@ -11,7 +11,6 @@ use crate::atom::AtomTable;
 use crate::input::{DataInCodeEntry, ObjectFile};
 use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
 use crate::leb::write_uleb;
-use crate::loh::{write_loh_blob, LohEntry};
 use crate::macho::constants::*;
 use crate::macho::dylib::DylibDependency;
 use crate::macho::exports::{ExportEntry, ExportKind};
@@ -1464,80 +1463,14 @@ fn build_data_in_code(
 }
 
 fn build_loh(
-    layout: &Layout,
-    inputs: &[LayoutInput<'_>],
-    atom_table: &AtomTable,
-    icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
+    _layout: &Layout,
+    _inputs: &[LayoutInput<'_>],
+    _atom_table: &AtomTable,
+    _icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
 ) -> Result<Vec<u8>, WriteError> {
-    #[derive(Clone)]
-    struct RemappedEntry {
-        input_order: usize,
-        input_entry_index: usize,
-        first_arg: u32,
-        entry: LohEntry,
-    }
-
-    let atoms_by_input_section = atom_table.by_input_section();
-    let mut remapped = Vec::new();
-    for (input_order, input) in inputs.iter().enumerate() {
-        for (input_entry_index, entry) in input.object.loh.iter().cloned().enumerate() {
-            let mut args = Vec::with_capacity(entry.args.len());
-            for input_offset in entry.args {
-                let (section_index, section_relative) =
-                    remap_loh_to_section(input.object, input_offset)?;
-                let (atom_id, atom_delta) = find_containing_atom_range(
-                    atom_table,
-                    &atoms_by_input_section,
-                    input.id,
-                    section_index,
-                    section_relative,
-                    4,
-                    icf_redirects,
-                )
-                .ok_or_else(|| {
-                    WriteError::MalformedLoh(
-                        input.object.path.clone(),
-                        format!(
-                            "instruction at file offset {} did not land inside any atom",
-                            input_offset
-                        ),
-                    )
-                })?;
-                let output_offset = layout.atom_file_offset(atom_id).ok_or_else(|| {
-                    WriteError::MalformedLoh(
-                        input.object.path.clone(),
-                        format!(
-                            "atom {:?} for instruction at file offset {} is missing from final layout",
-                            atom_id, input_offset
-                        ),
-                    )
-                })? + atom_delta as u64;
-                args.push(u32_fit(output_offset, "LOH output offset")?);
-            }
-            remapped.push(RemappedEntry {
-                input_order,
-                input_entry_index,
-                first_arg: args.first().copied().unwrap_or(0),
-                entry: LohEntry {
-                    kind: entry.kind,
-                    args,
-                },
-            });
-        }
-    }
-
-    remapped.sort_by(|a, b| {
-        a.first_arg
-            .cmp(&b.first_arg)
-            .then_with(|| a.input_order.cmp(&b.input_order))
-            .then_with(|| a.input_entry_index.cmp(&b.input_entry_index))
-    });
-    Ok(write_loh_blob(
-        &remapped
-            .into_iter()
-            .map(|entry| entry.entry)
-            .collect::<Vec<_>>(),
-    ))
+    // Current Apple ld omits LC_LINKER_OPTIMIZATION_HINT from final linked
+    // executables and dylibs on our parity corpus, so we do the same.
+    Ok(Vec::new())
 }
 
 fn remap_data_in_code_to_section(
@@ -1584,46 +1517,6 @@ fn remap_data_in_code_to_section(
         format!(
             "entry at input offset {} (len {}) does not map to any executable input section range",
             entry.offset, entry.length
-        ),
-    ))
-}
-
-fn remap_loh_to_section(object: &ObjectFile, input_offset: u32) -> Result<(u8, u32), WriteError> {
-    let instruction_start = input_offset as u64;
-    let instruction_end = instruction_start.checked_add(4).ok_or_else(|| {
-        WriteError::MalformedLoh(
-            object.path.clone(),
-            format!("instruction at input offset {} overflows u64", input_offset),
-        )
-    })?;
-    let mut matches = object
-        .sections
-        .iter()
-        .enumerate()
-        .filter(|(_, section)| !section.data.is_empty() && is_executable(section.kind))
-        .filter_map(|(idx, section)| {
-            let section_start = section.addr;
-            let section_end = section.addr.checked_add(section.size)?;
-            (section_start <= instruction_start && instruction_end <= section_end)
-                .then_some(((idx + 1) as u8, (instruction_start - section_start) as u32))
-        });
-    if let Some(mapped) = matches.next() {
-        if matches.next().is_none() {
-            return Ok(mapped);
-        }
-        return Err(WriteError::MalformedLoh(
-            object.path.clone(),
-            format!(
-                "instruction at input offset {} ambiguously matches multiple executable input sections",
-                input_offset
-            ),
-        ));
-    }
-    Err(WriteError::MalformedLoh(
-        object.path.clone(),
-        format!(
-            "instruction at input offset {} does not map to any executable input section range",
-            input_offset
         ),
     ))
 }

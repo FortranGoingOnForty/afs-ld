@@ -217,7 +217,7 @@ fn no_uuid_flag_omits_uuid_load_command() {
 }
 
 #[test]
-fn no_loh_flag_links_successfully() {
+fn no_loh_flag_warns_but_links_successfully() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun as unavailable");
         return;
@@ -243,6 +243,11 @@ fn no_loh_flag_links_successfully() {
         out.status.success(),
         "-no_loh link should succeed:\nstderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("afs-ld: warning: `-no_loh` requested"),
+        "expected -no_loh warning:\n{stderr}"
     );
     assert!(
         out_path.is_file(),

@@ -360,6 +360,11 @@ impl Linker {
                 "`-ObjC` requested, but afs-ld does not yet scan Objective-C archive metadata; the flag currently has no effect",
             );
         }
+        if opts.no_loh {
+            crate::diag::warning(
+                "`-no_loh` requested, but afs-ld currently matches Apple ld by omitting final-output LOH; the flag has no effect",
+            );
+        }
 
         let mut load_paths = opts.inputs.clone();
         let mut dylib_load_kinds = std::collections::HashMap::new();
@@ -580,7 +585,6 @@ impl Linker {
             &linkedit,
             icf.as_ref().map(|plan| plan.redirects()),
         )?;
-        loh::relax_layout(&mut layout, &linkedit, !opts.no_loh)?;
         let folded_symbols = icf
             .as_ref()
             .map(|plan| plan.folded_symbols(&atom_table, &sym_table, &layout_inputs))

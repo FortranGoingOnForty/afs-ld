@@ -1,0 +1,16 @@
+-dylib
+-arch
+arm64
+-platform_version
+macos
+@SDK_VERSION@
+@SDK_VERSION@
+-syslibroot
+@SDK_PATH@
+-lSystem
+-install_name
+@rpath/export-shared-data-prefix.dylib
+-no_fixup_chains
+-o
+@OUT@
+@INPUT:main.o@

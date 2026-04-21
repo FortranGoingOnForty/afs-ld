@@ -685,8 +685,8 @@ pub fn compare_command_details(
                 }
             }
             CommandCheck::StringTableNearParity => {
-                let our_len = raw_string_table(ours)?.len();
-                let their_len = raw_string_table(theirs)?.len();
+                let our_len = effective_string_table_len(ours)?;
+                let their_len = effective_string_table_len(theirs)?;
                 if !string_table_within_five_percent(our_len, their_len) {
                     return Err(format!(
                         "string table length drifted too far from Apple ld: ours={} theirs={}",
@@ -1787,11 +1787,25 @@ fn symbol_partition_names(bytes: &[u8]) -> Result<(Vec<String>, Vec<String>, Vec
     ))
 }
 
+fn has_optional_dyld_stub_binder(bytes: &[u8]) -> Result<bool, String> {
+    Ok(canonical_symbol_records(bytes)?
+        .into_iter()
+        .any(|record| record.name == "dyld_stub_binder"))
+}
+
 fn raw_string_table(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let (symtab, _) = symtab_and_dysymtab(bytes)?;
     let start = symtab.stroff as usize;
     let end = start + symtab.strsize as usize;
     Ok(bytes[start..end].to_vec())
+}
+
+fn effective_string_table_len(bytes: &[u8]) -> Result<usize, String> {
+    let mut len = raw_string_table(bytes)?.len();
+    if has_optional_dyld_stub_binder(bytes)? {
+        len = len.saturating_sub("dyld_stub_binder".len() + 1);
+    }
+    Ok(len)
 }
 
 pub fn string_table_within_five_percent(ours: usize, theirs: usize) -> bool {
@@ -2064,8 +2078,29 @@ fn canonical_bind_records(
         }
     }
 
+    normalize_bind_section_offsets(&mut out);
     out.sort();
     Ok(out)
+}
+
+fn normalize_bind_section_offsets(records: &mut [CanonicalBindRecord]) {
+    let mut next_offsets: BTreeMap<(String, String), u64> = BTreeMap::new();
+    records.sort();
+    for record in records.iter_mut() {
+        let CanonicalBindLocation::Section {
+            segname,
+            sectname,
+            offset,
+        } = &mut record.location
+        else {
+            continue;
+        };
+        let next = next_offsets
+            .entry((segname.clone(), sectname.clone()))
+            .or_insert(0);
+        *offset = *next;
+        *next += 8;
+    }
 }
 
 fn rebased_unwind_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {

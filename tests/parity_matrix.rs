@@ -48,7 +48,8 @@ fn parity_corpus() {
         if let Some(dir) = artifact_dir.as_ref() {
             write_case_artifact(dir, &case, &report).expect("write case artifact");
         }
-        if let Some(error) = report.error_message() {
+        if let Some(error) = report.error_message(&case.name) {
+            eprintln!("parity failure:\n{error}\n");
             failures.push(error);
         }
         case_reports.push((case, report));
@@ -108,13 +109,26 @@ impl CaseReport {
         self.steps.iter().all(|step| step.error.is_none())
     }
 
-    fn error_message(&self) -> Option<String> {
+    fn error_message(&self, case_name: &str) -> Option<String> {
         self.steps.iter().find_map(|step| {
-            step.error
-                .as_ref()
-                .map(|error| format!("{} failed:\n{}", step.name, error))
+            step.error.as_ref().map(|error| {
+                format!("[{case_name}] {} failed:\n{}", step.name, error)
+            })
         })
     }
+}
+
+#[test]
+fn case_report_error_message_includes_case_name() {
+    let mut report = CaseReport::default();
+    report.push("section parity", Err("stub bytes differ".into()));
+    assert_eq!(
+        report.error_message("classic_lazy_branch_only_calls"),
+        Some(
+            "[classic_lazy_branch_only_calls] section parity failed:\nstub bytes differ"
+                .to_string()
+        )
+    );
 }
 
 fn run_case(case: &LinkCase) -> CaseReport {

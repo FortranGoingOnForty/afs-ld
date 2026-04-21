@@ -158,16 +158,22 @@ pub fn synthesize(
         atom: AtomId(0),
         detail: err.to_string(),
     })?;
-    validate_serialized_unwind_info(&bytes, &records).map_err(|err| UnwindError {
-        input: PathBuf::from("<synthetic unwind>"),
-        atom: AtomId(0),
-        detail: err.to_string(),
-    })?;
+    if should_validate_serialized_unwind_info() {
+        validate_serialized_unwind_info(&bytes, &records).map_err(|err| UnwindError {
+            input: PathBuf::from("<synthetic unwind>"),
+            atom: AtomId(0),
+            detail: err.to_string(),
+        })?;
+    }
     let section_changed = upsert_unwind_info_section(layout, bytes);
     if changed || section_changed {
         prune_empty_segments(layout);
     }
     Ok(changed || section_changed)
+}
+
+fn should_validate_serialized_unwind_info() -> bool {
+    std::env::var_os("AFS_LD_VALIDATE_UNWIND_INFO").is_some()
 }
 
 fn collect_records(

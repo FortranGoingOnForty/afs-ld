@@ -1240,6 +1240,7 @@ fn collect_rebase_sites(
         .iter()
         .map(|input| (input.id, input.object))
         .collect();
+    let symbol_name_index = build_symbol_name_index(inputs.0.sym_table);
 
     for section in &layout.sections {
         if !matches!(section.segment.as_str(), "__DATA" | "__DATA_CONST") {
@@ -1264,7 +1265,7 @@ fn collect_rebase_sites(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             for reloc in relocs_for_rebase(relocs, atom) {
-                if !reloc_needs_rebase(obj, reloc, inputs.0.sym_table) {
+                if !reloc_needs_rebase(obj, reloc, inputs.0.sym_table, &symbol_name_index) {
                     continue;
                 }
                 let local_offset = reloc.offset.saturating_sub(atom.input_offset) as u64;
@@ -1349,7 +1350,12 @@ fn relocs_for_rebase<'a>(
     })
 }
 
-fn reloc_needs_rebase(obj: &ObjectFile, reloc: Reloc, sym_table: &SymbolTable) -> bool {
+fn reloc_needs_rebase(
+    obj: &ObjectFile,
+    reloc: Reloc,
+    sym_table: &SymbolTable,
+    symbol_name_index: &HashMap<String, SymbolId>,
+) -> bool {
     if reloc.kind != RelocKind::Unsigned
         || reloc.length != RelocLength::Quad
         || reloc.pcrel
@@ -1364,7 +1370,7 @@ fn reloc_needs_rebase(obj: &ObjectFile, reloc: Reloc, sym_table: &SymbolTable) -
             let Some(input_sym) = obj.symbols.get(sym_idx as usize) else {
                 return false;
             };
-            match symbol_referent_id(obj, reloc.referent, sym_table) {
+            match symbol_referent_id(obj, reloc.referent, symbol_name_index) {
                 Some(symbol_id) => match sym_table.get(symbol_id) {
                     Symbol::DylibImport { .. } => false,
                     Symbol::Defined { atom, .. } => atom.0 != 0,
@@ -1377,20 +1383,29 @@ fn reloc_needs_rebase(obj: &ObjectFile, reloc: Reloc, sym_table: &SymbolTable) -
     }
 }
 
+fn build_symbol_name_index(sym_table: &SymbolTable) -> HashMap<String, SymbolId> {
+    sym_table
+        .iter()
+        .map(|(symbol_id, symbol)| {
+            (
+                sym_table.interner.resolve(symbol.name()).to_string(),
+                symbol_id,
+            )
+        })
+        .collect()
+}
+
 fn symbol_referent_id(
     obj: &ObjectFile,
     referent: Referent,
-    sym_table: &SymbolTable,
+    symbol_name_index: &HashMap<String, SymbolId>,
 ) -> Option<SymbolId> {
     let Referent::Symbol(sym_idx) = referent else {
         return None;
     };
     let input_sym = obj.symbols.get(sym_idx as usize)?;
     let name = obj.symbol_name(input_sym).ok()?;
-    let (symbol_id, _) = sym_table
-        .iter()
-        .find(|(_, symbol)| sym_table.interner.resolve(symbol.name()) == name)?;
-    Some(symbol_id)
+    symbol_name_index.get(name).copied()
 }
 
 fn build_function_starts(

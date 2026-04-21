@@ -49,15 +49,21 @@ struct SectionKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExtraSectionAnchor {
-    pub segment: String,
-    pub name: String,
+pub enum ExtraSectionAnchor {
+    AfterSection { segment: String, name: String },
+    AfterAtom(AtomId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtraOutputSection {
     pub after_section: Option<ExtraSectionAnchor>,
     pub section: OutputSection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtraLayoutSections<'a> {
+    pub extra_sections: &'a [ExtraOutputSection],
+    pub split_after_atoms: &'a [AtomId],
 }
 
 fn output_section_key(input_section: &InputSection) -> SectionKey {
@@ -104,7 +110,10 @@ impl Layout {
             header_size,
             synthetic_plan,
             None,
-            &[],
+            ExtraLayoutSections {
+                extra_sections: &[],
+                split_after_atoms: &[],
+            },
         )
     }
 
@@ -123,7 +132,10 @@ impl Layout {
             header_size,
             synthetic_plan,
             live_atoms,
-            &[],
+            ExtraLayoutSections {
+                extra_sections: &[],
+                split_after_atoms: &[],
+            },
         )
     }
 
@@ -134,7 +146,7 @@ impl Layout {
         header_size: u64,
         synthetic_plan: Option<&SyntheticPlan>,
         live_atoms: Option<&HashSet<AtomId>>,
-        extra_sections: &[ExtraOutputSection],
+        extra_layout: ExtraLayoutSections<'_>,
     ) -> Self {
         let input_map: HashMap<InputId, LayoutInput<'_>> =
             inputs.iter().map(|input| (input.id, *input)).collect();
@@ -223,8 +235,6 @@ impl Layout {
                 .then_with(|| a.name.cmp(&b.name))
         });
 
-        insert_extra_sections(&mut sections, extra_sections);
-
         for section in &mut sections {
             section.atoms.sort_by(|a, b| {
                 let lhs = atoms.get(a.atom);
@@ -248,7 +258,12 @@ impl Layout {
                     .then_with(|| lhs.input_offset.cmp(&rhs.input_offset))
                     .then_with(|| a.atom.cmp(&b.atom))
             });
+        }
 
+        split_sections_after_atoms(&mut sections, extra_layout.split_after_atoms);
+        insert_extra_sections(&mut sections, extra_layout.extra_sections);
+
+        for section in &mut sections {
             let mut size = 0u64;
             for placed in &mut section.atoms {
                 let atom = atoms.get(placed.atom);
@@ -441,21 +456,79 @@ impl Layout {
     }
 }
 
+fn split_sections_after_atoms(sections: &mut Vec<OutputSection>, split_after_atoms: &[AtomId]) {
+    if split_after_atoms.is_empty() {
+        return;
+    }
+    let split_points: HashSet<AtomId> = split_after_atoms.iter().copied().collect();
+    let mut out = Vec::with_capacity(sections.len());
+    for mut section in std::mem::take(sections) {
+        if section.atoms.len() < 2 || !section.synthetic_data.is_empty() {
+            out.push(section);
+            continue;
+        }
+        if !section
+            .atoms
+            .iter()
+            .any(|placed| split_points.contains(&placed.atom))
+        {
+            out.push(section);
+            continue;
+        }
+        let atoms = std::mem::take(&mut section.atoms);
+        let last_idx = atoms.len().saturating_sub(1);
+        let mut current = split_section_template(&section);
+        for (idx, placed) in atoms.into_iter().enumerate() {
+            let split_here = split_points.contains(&placed.atom) && idx != last_idx;
+            current.atoms.push(placed);
+            if split_here {
+                out.push(current);
+                current = split_section_template(&section);
+            }
+        }
+        out.push(current);
+    }
+    *sections = out;
+}
+
+fn split_section_template(section: &OutputSection) -> OutputSection {
+    OutputSection {
+        segment: section.segment.clone(),
+        name: section.name.clone(),
+        kind: section.kind,
+        align_pow2: section.align_pow2,
+        flags: section.flags,
+        reserved1: section.reserved1,
+        reserved2: section.reserved2,
+        reserved3: section.reserved3,
+        atoms: Vec::new(),
+        synthetic_offset: 0,
+        synthetic_data: Vec::new(),
+        addr: 0,
+        size: 0,
+        file_off: 0,
+    }
+}
+
 fn insert_extra_sections(sections: &mut Vec<OutputSection>, extra_sections: &[ExtraOutputSection]) {
     for extra in extra_sections {
         let section = extra.section.clone();
         if let Some(anchor) = &extra.after_section {
             let insert_at = sections
                 .iter()
-                .rposition(|candidate| {
-                    candidate.segment == anchor.segment && candidate.name == anchor.name
+                .rposition(|candidate| match anchor {
+                    ExtraSectionAnchor::AfterSection { segment, name } => {
+                        candidate.segment == *segment && candidate.name == *name
+                    }
+                    ExtraSectionAnchor::AfterAtom(atom_id) => candidate
+                        .atoms
+                        .last()
+                        .map(|placed| placed.atom == *atom_id)
+                        .unwrap_or(false),
                 })
                 .map(|idx| idx + 1)
                 .unwrap_or_else(|| {
-                    panic!(
-                        "missing anchor section {},{} for synthetic section {},{}",
-                        anchor.segment, anchor.name, section.segment, section.name
-                    )
+                    panic!("missing anchor {:?} for synthetic section {},{}", anchor, section.segment, section.name)
                 });
             sections.insert(insert_at, section);
         } else {

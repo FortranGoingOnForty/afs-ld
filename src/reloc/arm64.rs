@@ -103,7 +103,7 @@ struct ThunkBucketKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ThunkIsland {
     segment: String,
-    after_section: String,
+    after_atom: crate::resolve::AtomId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,52 +121,46 @@ pub struct ThunkPlan {
 }
 
 impl ThunkPlan {
+    pub fn split_after_atoms(&self) -> Vec<crate::resolve::AtomId> {
+        self.islands.iter().map(|island| island.after_atom).collect()
+    }
+
     pub fn output_sections(&self) -> Vec<ExtraOutputSection> {
         if self.entries.is_empty() {
             return Vec::new();
         }
-        let mut counts: HashMap<usize, usize> = HashMap::new();
+        let mut counts = vec![0usize; self.islands.len()];
         for entry in &self.entries {
-            *counts.entry(entry.island).or_insert(0usize) += 1;
+            counts[entry.island] += 1;
         }
-        let mut sections: Vec<_> = counts
-            .into_iter()
-            .map(|(island, count)| {
-                let island_desc = &self.islands[island];
-                ExtraOutputSection {
-                    after_section: Some(ExtraSectionAnchor {
-                        segment: island_desc.segment.clone(),
-                        name: island_desc.after_section.clone(),
-                    }),
-                    section: OutputSection {
-                        segment: island_desc.segment.clone(),
-                        name: "__thunks".into(),
-                        kind: SectionKind::Text,
-                        align_pow2: 2,
-                        flags: crate::macho::constants::S_REGULAR
-                            | crate::macho::constants::S_ATTR_PURE_INSTRUCTIONS
-                            | crate::macho::constants::S_ATTR_SOME_INSTRUCTIONS,
-                        reserved1: 0,
-                        reserved2: 0,
-                        reserved3: 0,
-                        atoms: Vec::new(),
-                        synthetic_offset: 0,
-                        synthetic_data: vec![0; count * THUNK_SIZE as usize],
-                        addr: 0,
-                        size: (count as u64) * THUNK_SIZE,
-                        file_off: 0,
-                    },
-                }
-            })
-            .collect();
-        sections.sort_by(|a, b| {
-            a.section.segment.cmp(&b.section.segment).then_with(|| {
-                a.after_section
-                    .as_ref()
-                    .map(|anchor| anchor.name.as_str())
-                    .cmp(&b.after_section.as_ref().map(|anchor| anchor.name.as_str()))
-            })
-        });
+        let mut sections = Vec::new();
+        for (island, island_desc) in self.islands.iter().enumerate() {
+            let count = counts[island];
+            if count == 0 {
+                continue;
+            }
+            sections.push(ExtraOutputSection {
+                after_section: Some(ExtraSectionAnchor::AfterAtom(island_desc.after_atom)),
+                section: OutputSection {
+                    segment: island_desc.segment.clone(),
+                    name: "__thunks".into(),
+                    kind: SectionKind::Text,
+                    align_pow2: 2,
+                    flags: crate::macho::constants::S_REGULAR
+                        | crate::macho::constants::S_ATTR_PURE_INSTRUCTIONS
+                        | crate::macho::constants::S_ATTR_SOME_INSTRUCTIONS,
+                    reserved1: 0,
+                    reserved2: 0,
+                    reserved3: 0,
+                    atoms: Vec::new(),
+                    synthetic_offset: 0,
+                    synthetic_data: vec![0; count * THUNK_SIZE as usize],
+                    addr: 0,
+                    size: (count as u64) * THUNK_SIZE,
+                    file_off: 0,
+                },
+            });
+        }
         sections
     }
 
@@ -424,16 +418,6 @@ fn atom_output_segment_map(layout: &Layout) -> HashMap<crate::resolve::AtomId, S
     out
 }
 
-fn atom_output_section_map(layout: &Layout) -> HashMap<crate::resolve::AtomId, (String, String)> {
-    let mut out = HashMap::new();
-    for section in &layout.sections {
-        for placed in &section.atoms {
-            out.insert(placed.atom, (section.segment.clone(), section.name.clone()));
-        }
-    }
-    out
-}
-
 fn synthetic_address_maps(
     layout: &Layout,
     synthetic_plan: Option<&SyntheticPlan>,
@@ -569,7 +553,6 @@ pub fn plan_thunks(
 
     let atom_addrs = atom_address_map(layout);
     let atom_segments = atom_output_segment_map(layout);
-    let atom_sections = atom_output_section_map(layout);
     let atoms_by_input_section = atoms.by_input_section();
     let section_addrs = input_section_address_map(layout, atoms);
     let synth_addrs = synthetic_address_maps(layout, synthetic_plan);
@@ -589,7 +572,7 @@ pub fn plan_thunks(
     };
 
     let mut redirects = HashMap::new();
-    let mut island_index: HashMap<(String, String), usize> = HashMap::new();
+    let mut island_index: HashMap<crate::resolve::AtomId, usize> = HashMap::new();
     let mut index: HashMap<ThunkBucketKey, usize> = HashMap::new();
     let mut islands: Vec<ThunkIsland> = Vec::new();
     let mut entries: Vec<ThunkEntry> = Vec::new();
@@ -612,9 +595,6 @@ pub fn plan_thunks(
             let Some(caller_segment) = atom_segments.get(&atom.id).cloned() else {
                 continue;
             };
-            let Some((_, caller_section)) = atom_sections.get(&atom.id).cloned() else {
-                continue;
-            };
             let place = place + local_offset as u64;
             let target_key = resolve_branch_target_key(obj, atom, reloc, &resolve)?;
             let target = resolve_branch_target_from_key(obj, atom, reloc, target_key, &resolve)?;
@@ -626,17 +606,15 @@ pub fn plan_thunks(
             if !needs_thunk {
                 continue;
             }
-            let island = if let Some(&existing) =
-                island_index.get(&(caller_segment.clone(), caller_section.clone()))
-            {
+            let island = if let Some(&existing) = island_index.get(&atom_id) {
                 existing
             } else {
                 let next = islands.len();
                 islands.push(ThunkIsland {
                     segment: caller_segment.clone(),
-                    after_section: caller_section.clone(),
+                    after_atom: atom_id,
                 });
-                island_index.insert((caller_segment.clone(), caller_section.clone()), next);
+                island_index.insert(atom_id, next);
                 next
             };
             let bucket_key = ThunkBucketKey {
@@ -1024,7 +1002,7 @@ fn synthesize_thunk_section(
             referent: "thunk section".to_string(),
             detail: format!(
                 "missing thunk section for island after {},{}",
-                island.segment, island.after_section
+                island.segment, island.after_atom.0
             ),
         })?;
         let section = &mut layout.sections[section_idx];
@@ -1042,7 +1020,7 @@ fn synthesize_thunk_section(
             referent: "thunk section".to_string(),
             detail: format!(
                 "missing thunk section for island after {},{}",
-                island.segment, island.after_section
+                island.segment, island.after_atom.0
             ),
         })?;
         let section = &mut layout.sections[section_idx];
@@ -1090,7 +1068,11 @@ fn find_thunk_section_index(layout: &Layout, island: &ThunkIsland) -> Option<usi
         .find_map(|(idx, section)| {
             let prev = &layout.sections[idx - 1];
             (prev.segment == island.segment
-                && prev.name == island.after_section
+                && prev
+                    .atoms
+                    .last()
+                    .map(|placed| placed.atom == island.after_atom)
+                    .unwrap_or(false)
                 && section.segment == island.segment
                 && section.name == "__thunks")
                 .then_some(idx)
@@ -2623,6 +2605,21 @@ fn reloc_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    use crate::atom::{AtomFlags, AtomSection};
+    use crate::input::ObjectFile;
+    use crate::macho::constants::{
+        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, N_EXT, N_SECT,
+        S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_REGULAR,
+    };
+    use crate::macho::reader::MachHeader64;
+    use crate::reloc::{write_raw_relocs, write_relocs};
+    use crate::resolve::{InsertOutcome, Symbol, SymbolTable};
+    use crate::section::InputSection;
+    use crate::string_table::StringTable;
+    use crate::symbol::{InputSymbol, RawNlist};
+    use crate::OutputKind;
 
     #[test]
     fn branch26_patches_low_bits() {
@@ -2684,5 +2681,195 @@ mod tests {
         assert!(fits_signed(-(1 << 25), 26));
         assert!(!fits_signed(1 << 25, 26));
         assert!(!fits_signed(-(1 << 25) - 1, 26));
+    }
+
+    #[test]
+    fn thunk_plan_splits_monolithic_text_section_into_multiple_islands() {
+        let gap = 0x0900_0000u32;
+        let caller2_offset = 4 + gap;
+        let target_offset = 8 + gap * 2;
+        let raw_relocs = branch26_raw_relocs(&[0, caller2_offset]);
+        let object = thunk_test_object(raw_relocs, target_offset as u64, target_offset as u64 + 4);
+
+        let mut atoms = AtomTable::new();
+        let caller1 = atoms.push(test_atom(0, 4));
+        atoms.push(test_atom(4, gap));
+        let caller2 = atoms.push(test_atom(caller2_offset, 4));
+        atoms.push(test_atom(caller2_offset + 4, gap));
+        let target = atoms.push(test_atom(target_offset, 4));
+
+        let mut sym_table = SymbolTable::new();
+        let target_name = sym_table.intern("_target");
+        let insert = sym_table
+            .insert(Symbol::Defined {
+                name: target_name,
+                origin: crate::resolve::InputId(0),
+                atom: target,
+                value: 0,
+                weak: false,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap();
+        assert!(matches!(insert, InsertOutcome::Inserted(_)));
+
+        let inputs = [LayoutInput {
+            id: crate::resolve::InputId(0),
+            object: &object,
+            load_order: 0,
+            archive_member_offset: None,
+        }];
+        let opts = LinkOptions {
+            kind: OutputKind::Executable,
+            ..LinkOptions::default()
+        };
+        let base_layout = Layout::build(OutputKind::Executable, &inputs, &atoms, 0);
+        let plan = plan_thunks(&opts, &base_layout, &inputs, &atoms, &sym_table, None, None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            plan.redirect_for(caller1, 0),
+            Some(0),
+            "expected first caller to use its own thunk"
+        );
+        assert_eq!(
+            plan.redirect_for(caller2, 0),
+            Some(1),
+            "expected second caller to use its own thunk"
+        );
+
+        let rebuilt = Layout::build_with_synthetics_and_extra_filtered(
+            OutputKind::Executable,
+            &inputs,
+            &atoms,
+            0,
+            None,
+            None,
+            crate::layout::ExtraLayoutSections {
+                extra_sections: &plan.output_sections(),
+                split_after_atoms: &plan.split_after_atoms(),
+            },
+        );
+        let text_section_count = rebuilt
+            .sections
+            .iter()
+            .filter(|section| section.segment == "__TEXT" && section.name == "__text")
+            .count();
+        let thunk_section_count = rebuilt
+            .sections
+            .iter()
+            .filter(|section| section.segment == "__TEXT" && section.name == "__thunks")
+            .count();
+        assert_eq!(
+            text_section_count, 3,
+            "expected the monolithic text section to split around the two caller atoms"
+        );
+        assert_eq!(
+            thunk_section_count, 2,
+            "expected one thunk island per far caller atom"
+        );
+        let text_sequence: Vec<_> = rebuilt
+            .sections
+            .iter()
+            .filter(|section| section.segment == "__TEXT")
+            .map(|section| section.name.as_str())
+            .collect();
+        assert_eq!(
+            text_sequence,
+            vec!["__text", "__thunks", "__text", "__thunks", "__text"]
+        );
+
+        let replan = plan_thunks(&opts, &rebuilt, &inputs, &atoms, &sym_table, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            replan, plan,
+            "expected thunk planning to converge once the intra-section islands exist"
+        );
+    }
+
+    fn branch26_raw_relocs(offsets: &[u32]) -> Vec<u8> {
+        let relocs: Vec<_> = offsets
+            .iter()
+            .copied()
+            .map(|offset| crate::reloc::Reloc {
+                offset,
+                kind: RelocKind::Branch26,
+                length: RelocLength::Word,
+                pcrel: true,
+                referent: Referent::Symbol(0),
+                addend: 0,
+                subtrahend: None,
+            })
+            .collect();
+        let raws = write_relocs(&relocs).unwrap();
+        let mut out = Vec::new();
+        write_raw_relocs(&raws, &mut out);
+        out
+    }
+
+    fn thunk_test_object(raw_relocs: Vec<u8>, target_offset: u64, section_size: u64) -> ObjectFile {
+        let strings = b"\0_target\0".to_vec();
+        ObjectFile {
+            path: PathBuf::from("/tmp/thunk-plan.o"),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections: vec![InputSection {
+                segname: "__TEXT".into(),
+                sectname: "__text".into(),
+                kind: crate::section::SectionKind::Text,
+                addr: 0,
+                size: section_size,
+                align_pow2: 2,
+                flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                offset: 0,
+                reloff: 0,
+                nreloc: (raw_relocs.len() / 8) as u32,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                data: Vec::new(),
+                raw_relocs,
+            }],
+            symbols: vec![InputSymbol::from_raw(RawNlist {
+                strx: 1,
+                n_type: N_SECT | N_EXT,
+                n_sect: 1,
+                n_desc: 0,
+                n_value: target_offset,
+            })],
+            strings: StringTable::from_bytes(strings),
+            symtab: None,
+            dysymtab: None,
+            loh: Vec::new(),
+            data_in_code: Vec::new(),
+        }
+    }
+
+    fn test_atom(input_offset: u32, size: u32) -> Atom {
+        Atom {
+            id: crate::resolve::AtomId(0),
+            origin: crate::resolve::InputId(0),
+            input_section: 1,
+            section: AtomSection::Text,
+            input_offset,
+            size,
+            align_pow2: 2,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: Vec::new(),
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        }
     }
 }

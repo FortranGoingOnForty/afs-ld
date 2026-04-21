@@ -30,7 +30,7 @@ use std::{fs, io};
 
 use atom::{atomize_object, backpatch_symbol_atoms, AtomTable};
 use icf::IcfError;
-use layout::{Layout, LayoutInput};
+use layout::{ExtraLayoutSections, Layout, LayoutInput};
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
 use macho::reader::ReadError;
 use macho::tbd::{parse_tbd, parse_version, Arch, Platform, Target};
@@ -580,6 +580,9 @@ impl Linker {
             let extra_sections = next_plan
                 .as_ref()
                 .map_or_else(Vec::new, |plan| plan.output_sections());
+            let split_after_atoms = next_plan
+                .as_ref()
+                .map_or_else(Vec::new, |plan| plan.split_after_atoms());
             layout = Layout::build_with_synthetics_and_extra_filtered(
                 opts.kind,
                 &layout_inputs,
@@ -587,7 +590,10 @@ impl Linker {
                 0,
                 Some(&synthetic_plan),
                 kept_atoms,
-                &extra_sections,
+                ExtraLayoutSections {
+                    extra_sections: &extra_sections,
+                    split_after_atoms: &split_after_atoms,
+                },
             );
             thunk_plan = next_plan;
         }

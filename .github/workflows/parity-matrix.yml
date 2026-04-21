@@ -20,9 +20,13 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Run parity harness proof tests
+        run: cargo test --test diff_harness_tolerates_known_linkedit --test parity_harness --test parity_canary -- --nocapture
+
       - name: Run parity matrix
         env:
           PARITY_MATRIX_ARTIFACT_DIR: ${{ github.workspace }}/parity-matrix-artifacts
+          PARITY_MATRIX_MAX_SECONDS: "120"
         run: cargo test --test parity_matrix -- --nocapture
 
       - name: Upload parity artifacts

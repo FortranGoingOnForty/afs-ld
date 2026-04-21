@@ -7,6 +7,7 @@ use common::harness::diff_macho;
 const MH_MAGIC_64: u32 = 0xFEEDFACF;
 const CPU_TYPE_ARM64: u32 = 0x0100_000C;
 const MH_EXECUTE: u32 = 2;
+const LC_ID_DYLIB: u32 = 0x0D;
 const LC_UUID: u32 = 0x1B;
 const LC_CODE_SIGNATURE: u32 = 0x1D;
 
@@ -34,6 +35,18 @@ fn differing_code_signature_blob_bytes_are_tolerated() {
     assert_eq!(report.tolerated.len(), 1);
 }
 
+#[test]
+fn differing_dylib_timestamps_are_tolerated() {
+    let ours = synth_dylib_image(2);
+    let theirs = synth_dylib_image(7);
+    let report = diff_macho(&ours, &theirs);
+    assert!(
+        report.is_clean(),
+        "dylib timestamp-only diff should be tolerated: {report:#?}"
+    );
+    assert_eq!(report.tolerated.len(), 1);
+}
+
 fn synth_uuid_image(uuid: [u8; 16]) -> Vec<u8> {
     let mut out = Vec::new();
     push_header(&mut out, 1, 24);
@@ -54,6 +67,20 @@ fn synth_code_signature_image(blob: [u8; 8]) -> Vec<u8> {
     out.extend_from_slice(&datasize.to_le_bytes());
     out.resize(dataoff as usize, 0);
     out.extend_from_slice(&blob);
+    out
+}
+
+fn synth_dylib_image(timestamp: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let cmdsize = 32u32;
+    push_header(&mut out, 1, cmdsize);
+    out.extend_from_slice(&LC_ID_DYLIB.to_le_bytes());
+    out.extend_from_slice(&cmdsize.to_le_bytes());
+    out.extend_from_slice(&24u32.to_le_bytes());
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(b"x\0\0\0\0\0\0\0");
     out
 }
 

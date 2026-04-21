@@ -1,0 +1,17 @@
+-arch
+arm64
+-platform_version
+macos
+@SDK_VERSION@
+@SDK_VERSION@
+-syslibroot
+@SDK_PATH@
+-lSystem
+-e
+_main
+-no_fixup_chains
+-o
+@OUT@
+@INPUT:main.o@
+@ARTIFACT:liba.a@
+@ARTIFACT:libb.a@

@@ -8,6 +8,7 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use common::harness::{
     compare_command_details, compare_command_ids, compare_page_refs, compare_runtime,
@@ -21,6 +22,7 @@ fn parity_corpus() {
         eprintln!("skipping: xcrun as/ld unavailable");
         return;
     }
+    let started = Instant::now();
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -62,6 +64,16 @@ fn parity_corpus() {
         failures.len(),
         failures.join("\n\n")
     );
+
+    if let Some(limit) = parity_matrix_time_limit() {
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed <= limit,
+            "parity matrix exceeded scale budget: {:?} > {:?}",
+            elapsed,
+            limit
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -259,6 +271,12 @@ fn slug(name: &str) -> String {
             }
         })
         .collect()
+}
+
+fn parity_matrix_time_limit() -> Option<Duration> {
+    let raw = std::env::var("PARITY_MATRIX_MAX_SECONDS").ok()?;
+    let seconds = raw.parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
 }
 
 fn escape_html(text: &str) -> String {

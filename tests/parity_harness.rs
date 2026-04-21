@@ -2,7 +2,9 @@
 
 mod common;
 
-use common::harness::{apply_section_tolerances, diff_macho, parse_case_tolerances};
+use common::harness::{
+    apply_section_tolerances, diff_macho, parse_case_tolerances, string_table_within_five_percent,
+};
 
 #[test]
 fn notes_tolerance_block_parses_section_range() {
@@ -45,4 +47,20 @@ tolerated:
         "unexpectedly tolerated unrelated diff: {filtered:#?}"
     );
     assert_eq!(filtered.critical.len(), 1);
+}
+
+#[test]
+fn string_table_near_parity_accepts_small_suffix_dedup_drift() {
+    assert!(
+        string_table_within_five_percent(101, 100),
+        "1% string-table drift should stay within the Sprint 27 allowance"
+    );
+}
+
+#[test]
+fn string_table_near_parity_rejects_large_suffix_dedup_drift() {
+    assert!(
+        !string_table_within_five_percent(120, 100),
+        "20% string-table drift should fail the Sprint 27 allowance"
+    );
 }

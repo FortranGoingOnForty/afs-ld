@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,7 +16,8 @@ use afs_ld::leb::read_uleb;
 use afs_ld::macho::constants::{
     INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_CODE_SIGNATURE,
     LC_DATA_IN_CODE, LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
-    LC_FUNCTION_STARTS, LC_LOAD_DYLIB, LC_SEGMENT_64, LC_SYMTAB, LC_UUID,
+    LC_FUNCTION_STARTS, LC_ID_DYLIB, LC_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB, LC_LOAD_WEAK_DYLIB,
+    LC_REEXPORT_DYLIB, LC_SEGMENT_64, LC_SYMTAB, LC_UUID,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::ExportKind;
@@ -101,11 +102,14 @@ struct ArtifactSpec {
     src_name: String,
     out_name: String,
     kind: ArtifactKind,
+    dep_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArtifactKind {
     ClangDylib,
+    ClangArchive,
+    ClangReexportDylib,
 }
 
 pub struct LinkOutputs {
@@ -278,6 +282,54 @@ fn compile_dylib_c(src: &str, out: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+fn compile_archive_c(src: &str, out: &PathBuf) -> Result<(), String> {
+    let obj = out.with_extension("o");
+    compile_c(src, &obj)?;
+    let output = Command::new("libtool")
+        .args(["-static", "-o"])
+        .arg(out)
+        .arg(&obj)
+        .output()
+        .map_err(|e| format!("spawn libtool archive: {e}"))?;
+    let _ = fs::remove_file(&obj);
+    if !output.status.success() {
+        return Err(format!(
+            "libtool archive failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn compile_reexport_dylib_c(src: &str, out: &PathBuf, dep: &Path) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "afs-ld-parity-{}-{}.c",
+        std::process::id(),
+        out.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("reexport")
+    ));
+    fs::write(&tmp, src).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    let install_name = out.to_string_lossy().to_string();
+    let output = Command::new("xcrun")
+        .args(["--sdk", "macosx", "clang", "-arch", "arm64", "-dynamiclib"])
+        .arg(&tmp)
+        .arg(format!("-Wl,-install_name,{install_name}"))
+        .arg(format!("-Wl,-reexport_library,{}", dep.display()))
+        .arg("-o")
+        .arg(out)
+        .output()
+        .map_err(|e| format!("spawn xcrun clang reexport dylib: {e}"))?;
+    let _ = fs::remove_file(&tmp);
+    if !output.status.success() {
+        return Err(format!(
+            "xcrun clang reexport dylib failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
 pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
     let mut cases = Vec::new();
     let entries =
@@ -302,7 +354,9 @@ pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
             let input = input.map_err(|e| format!("read input entry for {}: {e}", name))?;
             let input_path = input.path();
             match input_path.extension().and_then(|s| s.to_str()) {
-                Some("s") | Some("c") => inputs.push(input_path),
+                Some("s") | Some("c") | Some("o") | Some("a") | Some("tbd") => {
+                    inputs.push(input_path)
+                }
                 _ => {}
             }
         }
@@ -320,6 +374,14 @@ pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
         let page_ref_checks = read_page_refs(&path.join("page_refs.txt"))?;
         let command_checks = read_command_checks(&path.join("command_checks.txt"))?;
         let artifacts = read_artifacts(&path.join("artifacts.txt"))?;
+        let artifact_srcs: HashSet<&str> =
+            artifacts.iter().map(|artifact| artifact.src_name.as_str()).collect();
+        inputs.retain(|input| {
+            input.file_name()
+                .and_then(|s| s.to_str())
+                .map(|name| !artifact_srcs.contains(name))
+                .unwrap_or(true)
+        });
         let ignored_load_commands =
             read_load_command_names(&path.join("ignored_load_commands.txt"))?;
         let absent_load_commands = read_load_command_names(&path.join("absent_load_commands.txt"))?;
@@ -354,26 +416,50 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
     let sdk_ver =
         sdk_version().ok_or_else(|| "xcrun --show-sdk-version unavailable".to_string())?;
     let work_dir = unique_temp_dir(&case.name)?;
-    let mut compiled = BTreeMap::new();
-    let mut sidecars = BTreeMap::new();
-    let mut artifacts = BTreeMap::new();
+    let mut compiled: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut sidecars: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut artifacts: BTreeMap<String, PathBuf> = BTreeMap::new();
     for input in &case.inputs {
         let stem = input
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or_else(|| format!("invalid input stem {}", input.display()))?;
-        let src = fs::read_to_string(input)
-            .map_err(|e| format!("read parity input {}: {e}", input.display()))?;
         match input.extension().and_then(|s| s.to_str()) {
             Some("s") => {
+                let src = fs::read_to_string(input)
+                    .map_err(|e| format!("read parity input {}: {e}", input.display()))?;
                 let obj = work_dir.join(format!("{stem}.o"));
                 assemble(&src, &obj)?;
                 compiled.insert(format!("{stem}.o"), obj);
             }
             Some("c") => {
+                let src = fs::read_to_string(input)
+                    .map_err(|e| format!("read parity input {}: {e}", input.display()))?;
                 let obj = work_dir.join(format!("{stem}.o"));
                 compile_c(&src, &obj)?;
                 compiled.insert(format!("{stem}.o"), obj);
+            }
+            Some("o") | Some("a") | Some("tbd") => {
+                let copied = work_dir.join(
+                    input
+                        .file_name()
+                        .ok_or_else(|| format!("invalid input file name {}", input.display()))?,
+                );
+                fs::copy(input, &copied).map_err(|e| {
+                    format!(
+                        "copy parity input {} -> {}: {e}",
+                        input.display(),
+                        copied.display()
+                    )
+                })?;
+                compiled.insert(
+                    input
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .ok_or_else(|| format!("invalid UTF-8 input file {}", input.display()))?
+                        .to_string(),
+                    copied,
+                );
             }
             other => {
                 return Err(format!(
@@ -412,6 +498,19 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
         let out = work_dir.join(&artifact.out_name);
         match artifact.kind {
             ArtifactKind::ClangDylib => compile_dylib_c(&src_contents, &out)?,
+            ArtifactKind::ClangArchive => compile_archive_c(&src_contents, &out)?,
+            ArtifactKind::ClangReexportDylib => {
+                let dep_name = artifact.dep_name.as_ref().ok_or_else(|| {
+                    format!(
+                        "missing reexport dependency for artifact {}",
+                        artifact.out_name
+                    )
+                })?;
+                let dep = artifacts
+                    .get(dep_name)
+                    .ok_or_else(|| format!("unknown reexport dependency `{dep_name}`"))?;
+                compile_reexport_dylib_c(&src_contents, &out, dep)?;
+            }
         }
         artifacts.insert(artifact.out_name.clone(), out);
     }
@@ -842,9 +941,9 @@ pub fn compare_runtime(our_path: &Path, their_path: &Path, args: &[String]) -> R
 
 /// Byte-level diff between two Mach-O images or section byte slices.
 ///
-/// Sprint 27 starts tolerating a very small allowlist: UUID command bytes and
-/// code-signature command/blob bytes at matching offsets. Unknown diffs remain
-/// critical.
+/// Sprint 27 starts tolerating a very small allowlist: UUID bytes, dylib
+/// timestamp fields, and code-signature command/blob bytes at matching
+/// offsets. Unknown diffs remain critical.
 pub fn diff_macho(ours: &[u8], theirs: &[u8]) -> DiffReport {
     let mut report = DiffReport::default();
 
@@ -1203,20 +1302,48 @@ fn read_artifacts(path: &Path) -> Result<Vec<ArtifactSpec>, String> {
         let out_name = parts
             .next()
             .ok_or_else(|| format!("missing artifact output in {}", path.display()))?;
+        let dep_name = parts.next().map(str::to_string);
         if parts.next().is_some() {
             return Err(format!(
                 "too many fields in artifact spec `{line}` from {}",
                 path.display()
             ));
         }
-        let kind = match kind {
-            "clang_dylib" => ArtifactKind::ClangDylib,
+        let (kind, dep_name) = match kind {
+            "clang_dylib" => {
+                if dep_name.is_some() {
+                    return Err(format!(
+                        "clang_dylib takes exactly 3 fields in {}",
+                        path.display()
+                    ));
+                }
+                (ArtifactKind::ClangDylib, None)
+            }
+            "clang_archive" => {
+                if dep_name.is_some() {
+                    return Err(format!(
+                        "clang_archive takes exactly 3 fields in {}",
+                        path.display()
+                    ));
+                }
+                (ArtifactKind::ClangArchive, None)
+            }
+            "clang_reexport_dylib" => {
+                let dep_name = dep_name.ok_or_else(|| {
+                    format!(
+                        "clang_reexport_dylib needs a dependency artifact in {}",
+                        path.display()
+                    )
+                })?;
+                (ArtifactKind::ClangReexportDylib, Some(dep_name))
+            }
             other => return Err(format!("unknown artifact kind `{other}`")),
         };
         specs.push(ArtifactSpec {
             src_name: src_name.to_string(),
             out_name: out_name.to_string(),
             kind,
+            dep_name,
         });
     }
     Ok(specs)
@@ -1388,6 +1515,12 @@ fn tolerated_mask(bytes: &[u8]) -> Vec<Option<&'static str>> {
                             mark_range(&mut mask, dataoff, end, "code-signature hashes");
                         }
                     }
+                }
+            }
+            LC_ID_DYLIB | LC_LOAD_DYLIB | LC_LOAD_WEAK_DYLIB | LC_REEXPORT_DYLIB
+            | LC_LOAD_UPWARD_DYLIB => {
+                if cmdsize >= 16 {
+                    mark_range(&mut mask, cursor + 12, cursor + 16, "dylib timestamp");
                 }
             }
             _ => {}
@@ -1573,7 +1706,7 @@ fn raw_string_table(bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(bytes[start..end].to_vec())
 }
 
-fn string_table_within_five_percent(ours: usize, theirs: usize) -> bool {
+pub fn string_table_within_five_percent(ours: usize, theirs: usize) -> bool {
     let delta = ours.abs_diff(theirs);
     delta * 20 <= theirs
 }

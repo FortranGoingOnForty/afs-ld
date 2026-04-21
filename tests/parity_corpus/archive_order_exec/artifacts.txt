@@ -1,0 +1,2 @@
+clang_archive a.c liba.a
+clang_archive b.c libb.a

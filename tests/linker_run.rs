@@ -9,6 +9,7 @@ use std::process::Command;
 mod common;
 
 use afs_ld::leb::read_uleb;
+use afs_ld::loh::{parse_loh_blob, LOH_ARM64_ADRP_ADD};
 use afs_ld::macho::constants::{
     BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DONE, BIND_OPCODE_DO_BIND,
     BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED, BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB,
@@ -18,9 +19,9 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
     BIND_SYMBOL_FLAGS_WEAK_IMPORT, DICE_KIND_JUMP_TABLE32, INDIRECT_SYMBOL_ABS,
     INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
-    LC_FUNCTION_STARTS, LC_SEGMENT_64, LC_SYMTAB, N_PEXT, REBASE_IMMEDIATE_MASK,
-    REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE,
-    REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
+    LC_FUNCTION_STARTS, LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, N_PEXT,
+    REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB,
+    REBASE_OPCODE_DONE, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
     REBASE_OPCODE_MASK, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
     REBASE_TYPE_POINTER, SG_READ_ONLY,
@@ -516,10 +517,16 @@ fn raw_linkedit_data_cmd(bytes: &[u8], expected_cmd: u32) -> (u32, u32) {
     let header = parse_header(bytes).unwrap();
     let commands = parse_commands(&header, bytes).unwrap();
     for cmd in commands {
-        if let LoadCommand::Raw { cmd, data, .. } = cmd {
-            if cmd == expected_cmd {
+        match cmd {
+            LoadCommand::Raw { cmd, data, .. } if cmd == expected_cmd => {
                 return (u32_le(&data[0..4]), u32_le(&data[4..8]));
             }
+            LoadCommand::LinkerOptimizationHint(linkedit)
+                if expected_cmd == LC_LINKER_OPTIMIZATION_HINT =>
+            {
+                return (linkedit.dataoff, linkedit.datasize);
+            }
+            _ => {}
         }
     }
     panic!("missing raw linkedit command 0x{expected_cmd:x}");
@@ -770,6 +777,10 @@ fn canonical_data_in_code(bytes: &[u8]) -> Vec<DataInCodeRecord> {
             kind: record.kind,
         })
         .collect()
+}
+
+fn decode_loh(bytes: &[u8]) -> Vec<afs_ld::loh::LohEntry> {
+    parse_loh_blob(&linkedit_payload(bytes, LC_LINKER_OPTIMIZATION_HINT)).unwrap()
 }
 
 fn assert_strtab_within_five_percent(ours: &[u8], apple: &[u8]) {
@@ -1916,6 +1927,62 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
     let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_preserves_loh_payloads_from_input_objects() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("loh-main.o");
+    let out = scratch("loh-main.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+        Lloh0:
+            adrp x0, _msg@PAGE
+        Lloh1:
+            add x0, x0, _msg@PAGEOFF
+            mov x0, #0
+            ret
+        .section __DATA,__data
+        _msg:
+            .quad 0
+        .loh AdrpAdd Lloh0, Lloh1
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let loh = decode_loh(&bytes);
+    assert_eq!(loh.len(), 1);
+    assert_eq!(loh[0].kind, LOH_ARM64_ADRP_ADD);
+    assert_eq!(loh[0].args.len(), 2);
+    assert_eq!(loh[0].args[1] - loh[0].args[0], 4);
+
+    let text = output_section_header(&bytes, "__TEXT", "__text").unwrap();
+    let text_start = text.offset;
+    let text_end = text.offset + text.size as u32;
+    for &arg in &loh[0].args {
+        assert!(
+            text_start <= arg && arg + 4 <= text_end,
+            "LOH instruction offset {arg:#x} escaped __TEXT,__text [{text_start:#x}, {text_end:#x})",
+        );
+    }
 }
 
 #[test]
@@ -7556,7 +7623,9 @@ fn linker_run_icf_safe_folds_identical_private_literal16() {
     let baseline_literals = output_section(&baseline_bytes, "__TEXT", "__literal16")
         .unwrap()
         .1;
-    let our_literals = output_section(&our_bytes, "__TEXT", "__literal16").unwrap().1;
+    let our_literals = output_section(&our_bytes, "__TEXT", "__literal16")
+        .unwrap()
+        .1;
 
     assert_ne!(
         baseline_symbols.get("_lit1"),

@@ -11,6 +11,7 @@ use crate::atom::AtomTable;
 use crate::input::{DataInCodeEntry, ObjectFile};
 use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
 use crate::leb::write_uleb;
+use crate::loh::{write_loh_blob, LohEntry};
 use crate::macho::constants::*;
 use crate::macho::dylib::DylibDependency;
 use crate::macho::exports::{ExportEntry, ExportKind};
@@ -71,6 +72,7 @@ pub enum WriteError {
     ImportSymbolMissing(SymbolId),
     ImportSymbolWrongKind(SymbolId),
     MalformedRelocations(PathBuf, u8, String),
+    MalformedLoh(PathBuf, String),
     MalformedDataInCode(PathBuf, String),
     SymbolListRead(PathBuf, String),
 }
@@ -125,6 +127,13 @@ impl fmt::Display for WriteError {
                 path.display(),
                 section
             ),
+            WriteError::MalformedLoh(path, detail) => {
+                write!(
+                    f,
+                    "failed to remap LC_LINKER_OPTIMIZATION_HINT in {}: {detail}",
+                    path.display()
+                )
+            }
             WriteError::MalformedDataInCode(path, detail) => {
                 write!(
                     f,
@@ -289,6 +298,7 @@ pub fn write_finalized_with_linkedit(
     let weak_bind_off = linkedit_plan.dyld_info.weak_bind_off as usize;
     let lazy_bind_off = linkedit_plan.dyld_info.lazy_bind_off as usize;
     let export_off = linkedit_plan.dyld_info.export_off as usize;
+    let loh_off = linkedit_plan.loh.map(|loh| loh.dataoff as usize);
     let function_starts_off = linkedit_plan.function_starts.dataoff as usize;
     let data_in_code_off = linkedit_plan.data_in_code.dataoff as usize;
     let stroff = linkedit_plan.symtab.stroff as usize;
@@ -319,6 +329,12 @@ pub fn write_finalized_with_linkedit(
     if !linkedit_plan.export_bytes.is_empty() {
         let end = export_off + linkedit_plan.export_bytes.len();
         out[export_off..end].copy_from_slice(&linkedit_plan.export_bytes);
+    }
+    if let Some(loh_off) = loh_off {
+        if !linkedit_plan.loh_bytes.is_empty() {
+            let end = loh_off + linkedit_plan.loh_bytes.len();
+            out[loh_off..end].copy_from_slice(&linkedit_plan.loh_bytes);
+        }
     }
     if !linkedit_plan.function_starts_bytes.is_empty() {
         let end = function_starts_off + linkedit_plan.function_starts_bytes.len();
@@ -400,6 +416,13 @@ fn build_commands(
         }));
     }
 
+    if let Some(loh) = linkedit.loh {
+        commands.push(raw_linkedit_command(
+            LC_LINKER_OPTIMIZATION_HINT,
+            loh.dataoff,
+            loh.datasize,
+        ));
+    }
     commands.push(raw_linkedit_command(
         LC_FUNCTION_STARTS,
         linkedit.function_starts.dataoff,
@@ -433,7 +456,7 @@ fn estimate_header_size(
     kind: OutputKind,
     opts: &LinkOptions,
     dylibs: &[DylibDependency],
-    _linkedit: &LinkEditPlan,
+    linkedit: &LinkEditPlan,
 ) -> u64 {
     let mut size = HEADER_SIZE as u64;
     for segment in &layout.segments {
@@ -477,6 +500,9 @@ fn estimate_header_size(
     size += SymtabCmd::WIRE_SIZE as u64;
     size += DysymtabCmd::WIRE_SIZE as u64;
     size += 16 * 3;
+    if linkedit.loh.is_some() {
+        size += 16;
+    }
     size += DyldInfoCmd::WIRE_SIZE as u64;
     size
 }
@@ -683,6 +709,7 @@ pub struct LinkEditPlan {
     pub symtab: SymtabCmd,
     pub dysymtab: DysymtabCmd,
     pub dyld_info: DyldInfoCmd,
+    pub loh: Option<LinkEditDataCmd>,
     pub function_starts: LinkEditDataCmd,
     pub data_in_code: LinkEditDataCmd,
     pub symtab_bytes: Vec<u8>,
@@ -692,6 +719,7 @@ pub struct LinkEditPlan {
     weak_bind_bytes: Vec<u8>,
     lazy_bind_bytes: Vec<u8>,
     export_bytes: Vec<u8>,
+    loh_bytes: Vec<u8>,
     function_starts_bytes: Vec<u8>,
     data_in_code_bytes: Vec<u8>,
     pub strtab_bytes: Vec<u8>,
@@ -745,6 +773,7 @@ fn build_linkedit_plan(
             },
             dysymtab: DysymtabCmd::default(),
             dyld_info: DyldInfoCmd::default(),
+            loh: None,
             function_starts: LinkEditDataCmd {
                 dataoff: base_off,
                 datasize: 0,
@@ -760,6 +789,7 @@ fn build_linkedit_plan(
             weak_bind_bytes: Vec::new(),
             lazy_bind_bytes: Vec::new(),
             export_bytes: Vec::new(),
+            loh_bytes: Vec::new(),
             function_starts_bytes: Vec::new(),
             data_in_code_bytes: Vec::new(),
             strtab_bytes: vec![0; 8],
@@ -833,6 +863,12 @@ fn build_linkedit_plan(
     let weak_bind_bytes = pad_dyld_info_stream(bind_streams.weak_bind);
     let lazy_bind_bytes = pad_dyld_info_stream(bind_streams.lazy_bind);
     let export_bytes = pad_dyld_info_stream(build_export_trie(&symbol_plan.exports));
+    let loh_bytes = build_loh(
+        layout,
+        inputs.0.layout_inputs,
+        inputs.0.atom_table,
+        inputs.0.icf_redirects,
+    )?;
     let function_starts_bytes =
         build_function_starts(layout, inputs.0.layout_inputs, inputs.0.atom_table)?;
     let data_in_code_bytes = build_data_in_code(
@@ -856,6 +892,7 @@ fn build_linkedit_plan(
         "lazy bind stream offset",
     )?;
     let export_off = place_optional_block(&mut cursor, export_bytes.len(), "export trie offset")?;
+    let loh = place_optional_linkedit_data_block(&mut cursor, loh_bytes.len(), "LOH offset")?;
     let function_starts = place_linkedit_data_block(
         &mut cursor,
         function_starts_bytes.len(),
@@ -900,6 +937,7 @@ fn build_linkedit_plan(
             export_off,
             export_size: export_bytes.len() as u32,
         },
+        loh,
         function_starts,
         data_in_code,
         symtab_bytes,
@@ -909,6 +947,7 @@ fn build_linkedit_plan(
         weak_bind_bytes,
         lazy_bind_bytes,
         export_bytes,
+        loh_bytes,
         function_starts_bytes,
         data_in_code_bytes,
         strtab_bytes: symbol_plan.strtab_bytes,
@@ -1420,6 +1459,83 @@ fn build_data_in_code(
     Ok(out)
 }
 
+fn build_loh(
+    layout: &Layout,
+    inputs: &[LayoutInput<'_>],
+    atom_table: &AtomTable,
+    icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
+) -> Result<Vec<u8>, WriteError> {
+    #[derive(Clone)]
+    struct RemappedEntry {
+        input_order: usize,
+        input_entry_index: usize,
+        first_arg: u32,
+        entry: LohEntry,
+    }
+
+    let atoms_by_input_section = atom_table.by_input_section();
+    let mut remapped = Vec::new();
+    for (input_order, input) in inputs.iter().enumerate() {
+        for (input_entry_index, entry) in input.object.loh.iter().cloned().enumerate() {
+            let mut args = Vec::with_capacity(entry.args.len());
+            for input_offset in entry.args {
+                let (section_index, section_relative) =
+                    remap_loh_to_section(input.object, input_offset)?;
+                let (atom_id, atom_delta) = find_containing_atom_range(
+                    atom_table,
+                    &atoms_by_input_section,
+                    input.id,
+                    section_index,
+                    section_relative,
+                    4,
+                    icf_redirects,
+                )
+                .ok_or_else(|| {
+                    WriteError::MalformedLoh(
+                        input.object.path.clone(),
+                        format!(
+                            "instruction at file offset {} did not land inside any atom",
+                            input_offset
+                        ),
+                    )
+                })?;
+                let output_offset = layout.atom_file_offset(atom_id).ok_or_else(|| {
+                    WriteError::MalformedLoh(
+                        input.object.path.clone(),
+                        format!(
+                            "atom {:?} for instruction at file offset {} is missing from final layout",
+                            atom_id, input_offset
+                        ),
+                    )
+                })? + atom_delta as u64;
+                args.push(u32_fit(output_offset, "LOH output offset")?);
+            }
+            remapped.push(RemappedEntry {
+                input_order,
+                input_entry_index,
+                first_arg: args.first().copied().unwrap_or(0),
+                entry: LohEntry {
+                    kind: entry.kind,
+                    args,
+                },
+            });
+        }
+    }
+
+    remapped.sort_by(|a, b| {
+        a.first_arg
+            .cmp(&b.first_arg)
+            .then_with(|| a.input_order.cmp(&b.input_order))
+            .then_with(|| a.input_entry_index.cmp(&b.input_entry_index))
+    });
+    Ok(write_loh_blob(
+        &remapped
+            .into_iter()
+            .map(|entry| entry.entry)
+            .collect::<Vec<_>>(),
+    ))
+}
+
 fn remap_data_in_code_to_section(
     object: &ObjectFile,
     entry: DataInCodeEntry,
@@ -1464,6 +1580,46 @@ fn remap_data_in_code_to_section(
         format!(
             "entry at input offset {} (len {}) does not map to any executable input section range",
             entry.offset, entry.length
+        ),
+    ))
+}
+
+fn remap_loh_to_section(object: &ObjectFile, input_offset: u32) -> Result<(u8, u32), WriteError> {
+    let instruction_start = input_offset as u64;
+    let instruction_end = instruction_start.checked_add(4).ok_or_else(|| {
+        WriteError::MalformedLoh(
+            object.path.clone(),
+            format!("instruction at input offset {} overflows u64", input_offset),
+        )
+    })?;
+    let mut matches = object
+        .sections
+        .iter()
+        .enumerate()
+        .filter(|(_, section)| !section.data.is_empty() && is_executable(section.kind))
+        .filter_map(|(idx, section)| {
+            let section_start = section.addr;
+            let section_end = section.addr.checked_add(section.size)?;
+            (section_start <= instruction_start && instruction_end <= section_end)
+                .then_some(((idx + 1) as u8, (instruction_start - section_start) as u32))
+        });
+    if let Some(mapped) = matches.next() {
+        if matches.next().is_none() {
+            return Ok(mapped);
+        }
+        return Err(WriteError::MalformedLoh(
+            object.path.clone(),
+            format!(
+                "instruction at input offset {} ambiguously matches multiple executable input sections",
+                input_offset
+            ),
+        ));
+    }
+    Err(WriteError::MalformedLoh(
+        object.path.clone(),
+        format!(
+            "instruction at input offset {} does not map to any executable input section range",
+            input_offset
         ),
     ))
 }
@@ -2131,6 +2287,17 @@ fn place_linkedit_data_block(
         dataoff,
         datasize: size as u32,
     })
+}
+
+fn place_optional_linkedit_data_block(
+    cursor: &mut u64,
+    size: usize,
+    context: &'static str,
+) -> Result<Option<LinkEditDataCmd>, WriteError> {
+    if size == 0 {
+        return Ok(None);
+    }
+    Ok(Some(place_linkedit_data_block(cursor, size, context)?))
 }
 
 fn push_indirect_section(

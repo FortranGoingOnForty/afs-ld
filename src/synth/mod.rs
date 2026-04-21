@@ -1203,6 +1203,7 @@ mod tests {
             strings: StringTable::from_bytes(strings),
             symtab: None,
             dysymtab: None,
+            loh: Vec::new(),
             data_in_code: Vec::new(),
         }
     }
@@ -1288,6 +1289,7 @@ mod tests {
             strings: StringTable::from_bytes(strings),
             symtab: None,
             dysymtab: None,
+            loh: Vec::new(),
             data_in_code: Vec::new(),
         }
     }
@@ -1337,6 +1339,7 @@ mod tests {
             strings: StringTable::from_bytes(strings),
             symtab: None,
             dysymtab: None,
+            loh: Vec::new(),
             data_in_code: Vec::new(),
         }
     }

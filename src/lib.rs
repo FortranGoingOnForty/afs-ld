@@ -14,6 +14,7 @@ pub mod input;
 pub mod layout;
 pub mod leb;
 pub mod link_map;
+pub mod loh;
 pub mod macho;
 pub mod reloc;
 pub mod resolve;

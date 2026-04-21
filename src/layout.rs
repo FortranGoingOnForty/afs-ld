@@ -668,6 +668,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            loh: Vec::new(),
             data_in_code: Vec::new(),
         };
 
@@ -755,6 +756,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            loh: Vec::new(),
             data_in_code: Vec::new(),
         };
 
@@ -817,6 +819,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            loh: Vec::new(),
             data_in_code: Vec::new(),
         };
 
@@ -875,6 +878,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            loh: Vec::new(),
             data_in_code: Vec::new(),
         };
 
@@ -947,6 +951,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            loh: Vec::new(),
             data_in_code: Vec::new(),
         };
 
@@ -1008,6 +1013,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            loh: Vec::new(),
             data_in_code: Vec::new(),
         };
 
@@ -1143,6 +1149,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            loh: Vec::new(),
             data_in_code: Vec::new(),
         };
 
@@ -1230,6 +1237,7 @@ mod tests {
             strings: crate::string_table::StringTable::from_bytes(vec![0]),
             symtab: None,
             dysymtab: None,
+            loh: Vec::new(),
             data_in_code: Vec::new(),
         };
 

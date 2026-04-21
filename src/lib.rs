@@ -103,6 +103,7 @@ pub struct LinkOptions {
     pub strip_debug: bool,
     pub emit_uuid: bool,
     pub dead_strip: bool,
+    pub no_loh: bool,
     pub icf_mode: IcfMode,
     pub fixup_chains: bool,
     pub all_load: bool,
@@ -152,6 +153,7 @@ impl Default for LinkOptions {
             strip_debug: false,
             emit_uuid: true,
             dead_strip: false,
+            no_loh: false,
             icf_mode: IcfMode::None,
             fixup_chains: false,
             all_load: false,
@@ -179,6 +181,7 @@ pub enum LinkError {
     Synth(synth::SynthError),
     Unwind(synth::unwind::UnwindError),
     Icf(IcfError),
+    Loh(loh::LohError),
     DuplicateSymbols(String),
     UndefinedSymbols(String),
     UnsupportedArch(String),
@@ -205,6 +208,7 @@ impl std::fmt::Display for LinkError {
             LinkError::Synth(e) => write!(f, "{e}"),
             LinkError::Unwind(e) => write!(f, "{e}"),
             LinkError::Icf(e) => write!(f, "{e}"),
+            LinkError::Loh(e) => write!(f, "{e}"),
             LinkError::DuplicateSymbols(msg) | LinkError::UndefinedSymbols(msg) => {
                 write!(f, "{msg}")
             }
@@ -301,6 +305,12 @@ impl From<synth::unwind::UnwindError> for LinkError {
 impl From<IcfError> for LinkError {
     fn from(value: IcfError) -> Self {
         LinkError::Icf(value)
+    }
+}
+
+impl From<loh::LohError> for LinkError {
+    fn from(value: loh::LohError) -> Self {
+        LinkError::Loh(value)
     }
 }
 
@@ -570,6 +580,7 @@ impl Linker {
             &linkedit,
             icf.as_ref().map(|plan| plan.redirects()),
         )?;
+        loh::relax_layout(&mut layout, &linkedit, !opts.no_loh)?;
         let folded_symbols = icf
             .as_ref()
             .map(|plan| plan.folded_symbols(&atom_table, &sym_table, &layout_inputs))

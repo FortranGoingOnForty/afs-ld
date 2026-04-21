@@ -748,6 +748,10 @@ impl LinkEditPlan {
     pub fn lazy_bind_offset(&self, symbol: SymbolId) -> Option<u32> {
         self.lazy_bind_offsets.get(&symbol).copied()
     }
+
+    pub fn loh_bytes(&self) -> &[u8] {
+        &self.loh_bytes
+    }
 }
 
 fn build_linkedit_plan(

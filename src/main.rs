@@ -36,6 +36,7 @@ Options:
   -x                              Strip local symbols
   -S                              Strip debug symbols (currently a no-op warning)
   -no_uuid                        Omit LC_UUID
+  -no_loh                         Skip LOH relaxation
   -dead_strip                     Dead-strip unreferenced code/data
   -icf=safe | -icf=none | -icf=all
                                   Configure identical code folding (`all` currently errors)

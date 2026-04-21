@@ -33,6 +33,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "-unexported_symbol",
     "-S",
     "-no_uuid",
+    "-no_loh",
     "-dead_strip",
     "-icf=safe",
     "-icf=none",
@@ -312,6 +313,9 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
             "-no_uuid" => {
                 opts.emit_uuid = false;
             }
+            "-no_loh" => {
+                opts.no_loh = true;
+            }
             "-dead_strip" => {
                 opts.dead_strip = true;
             }
@@ -464,6 +468,12 @@ mod tests {
         let opts = parse(&argv(&["-S", "-no_uuid", "foo.o"])).unwrap();
         assert!(opts.strip_debug);
         assert!(!opts.emit_uuid);
+    }
+
+    #[test]
+    fn no_loh_flag_is_recorded() {
+        let opts = parse(&argv(&["-no_loh", "foo.o"])).unwrap();
+        assert!(opts.no_loh);
     }
 
     #[test]

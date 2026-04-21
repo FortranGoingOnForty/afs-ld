@@ -4549,6 +4549,72 @@ fn linker_run_places_thunks_in_caller_segment() {
 }
 
 #[test]
+fn linker_run_replans_thunks_until_layout_converges() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let obj = scratch("branch26-thunk-fixed-point.o");
+    let out = scratch("branch26-thunk-fixed-point.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            bl _overflow
+            bl _borderline
+            mov w0, #0
+            ret
+
+        .zerofill __TEXT,__apad,_gap,0x7ffffec,2
+
+        .section __TEXT,__late,regular,pure_instructions
+        .globl _borderline
+        _borderline:
+            ret
+
+        .globl _overflow
+        _overflow:
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let (thunks_addr, thunks) = output_section(&bytes, "__TEXT", "__thunks").unwrap();
+    assert_eq!(
+        thunks.len(),
+        24,
+        "expected two thunks after fixed-point replanning"
+    );
+    let mut actual_targets = [
+        decode_branch_target(&text, text_addr, 0).unwrap(),
+        decode_branch_target(&text, text_addr, 4).unwrap(),
+    ];
+    actual_targets.sort_unstable();
+    assert_eq!(
+        actual_targets,
+        [thunks_addr, thunks_addr + 12],
+        "expected both branches to redirect through the two thunk slots"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");

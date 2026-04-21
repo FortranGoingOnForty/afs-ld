@@ -43,6 +43,7 @@ use resolve::{
 };
 
 const DEFAULT_TBD_VERSION: u32 = 1 << 16;
+const THUNK_PLAN_MAX_ITERATIONS: usize = 16;
 
 /// What kind of Mach-O file the linker is producing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +200,7 @@ pub enum LinkError {
     ForceLoadNotArchive(PathBuf),
     LibraryNotFound(String),
     FrameworkNotFound(String),
+    ThunkPlanningDidNotConverge,
     WhyLive(String),
     UnsupportedOption(String),
 }
@@ -242,6 +244,9 @@ impl std::fmt::Display for LinkError {
             }
             LinkError::FrameworkNotFound(name) => {
                 write!(f, "unable to find framework `{name}`")
+            }
+            LinkError::ThunkPlanningDidNotConverge => {
+                write!(f, "thunk planning did not converge")
             }
             LinkError::WhyLive(msg) => write!(f, "{msg}"),
             LinkError::UnsupportedOption(msg) => write!(f, "{msg}"),
@@ -547,6 +552,7 @@ impl Linker {
             &inputs.dylibs,
             kept_atoms,
         )?;
+        let icf_redirects = icf.as_ref().map(|plan| plan.redirects());
         let mut layout = Layout::build_with_synthetics_filtered(
             opts.kind,
             &layout_inputs,
@@ -555,16 +561,25 @@ impl Linker {
             Some(&synthetic_plan),
             kept_atoms,
         );
-        let thunk_plan = reloc::arm64::plan_thunks(
-            opts,
-            &layout,
-            &layout_inputs,
-            &atom_table,
-            &sym_table,
-            Some(&synthetic_plan),
-            icf.as_ref().map(|plan| plan.redirects()),
-        )?;
-        if let Some(plan) = &thunk_plan {
+        let mut thunk_plan = None;
+        let mut thunk_converged = false;
+        for _ in 0..THUNK_PLAN_MAX_ITERATIONS {
+            let next_plan = reloc::arm64::plan_thunks(
+                opts,
+                &layout,
+                &layout_inputs,
+                &atom_table,
+                &sym_table,
+                Some(&synthetic_plan),
+                icf_redirects,
+            )?;
+            if next_plan == thunk_plan {
+                thunk_converged = true;
+                break;
+            }
+            let extra_sections = next_plan
+                .as_ref()
+                .map_or_else(Vec::new, |plan| plan.output_sections());
             layout = Layout::build_with_synthetics_and_extra_filtered(
                 opts.kind,
                 &layout_inputs,
@@ -572,15 +587,19 @@ impl Linker {
                 0,
                 Some(&synthetic_plan),
                 kept_atoms,
-                &plan.output_sections(),
+                &extra_sections,
             );
+            thunk_plan = next_plan;
+        }
+        if !thunk_converged {
+            return Err(LinkError::ThunkPlanningDidNotConverge);
         }
         let linkedit_context = macho::writer::LinkEditContext {
             layout_inputs: &layout_inputs,
             atom_table: &atom_table,
             sym_table: &sym_table,
             synthetic_plan: &synthetic_plan,
-            icf_redirects: icf.as_ref().map(|plan| plan.redirects()),
+            icf_redirects,
         };
         let mut linkedit = None;
         for _ in 0..4 {
@@ -614,7 +633,7 @@ impl Linker {
                 synthetic_plan: Some(&synthetic_plan),
                 thunk_plan: thunk_plan.as_ref(),
                 linkedit: &linkedit,
-                icf_redirects: icf.as_ref().map(|plan| plan.redirects()),
+                icf_redirects,
             },
         )?;
         let folded_symbols = icf

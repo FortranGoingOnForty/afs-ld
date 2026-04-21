@@ -50,6 +50,15 @@ struct LocatedWord {
     insn: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiteralLoadKind {
+    W,
+    X,
+    S,
+    D,
+    Q,
+}
+
 pub fn parse_loh_blob(bytes: &[u8]) -> Result<Vec<LohEntry>, ReadError> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
@@ -105,32 +114,163 @@ pub fn relax_layout(
         return Ok(());
     }
 
-    let entries = parse_loh_blob(linkedit.loh_bytes())?;
+    let mut entries = parse_loh_blob(linkedit.loh_bytes())?;
+    entries.sort_by(|lhs, rhs| {
+        rhs.args
+            .len()
+            .cmp(&lhs.args.len())
+            .then_with(|| lhs.args.first().cmp(&rhs.args.first()))
+            .then_with(|| lhs.kind.cmp(&rhs.kind))
+    });
     let mut rewritten = HashSet::new();
     for entry in entries {
-        if entry.kind != LOH_ARM64_ADRP_ADD || entry.args.len() != 2 {
-            continue;
+        match entry.kind {
+            LOH_ARM64_ADRP_LDR => relax_adrp_ldr(layout, &entry, &mut rewritten)?,
+            LOH_ARM64_ADRP_LDR_GOT_LDR => relax_adrp_ldr_got_ldr(layout, &entry, &mut rewritten)?,
+            LOH_ARM64_ADRP_ADD => relax_adrp_add(layout, &entry, &mut rewritten)?,
+            LOH_ARM64_ADRP_LDR_GOT => relax_adrp_ldr_got(layout, &entry, &mut rewritten)?,
+            _ => {}
         }
-
-        let adrp_off = entry.args[0] as u64;
-        let add_off = entry.args[1] as u64;
-        if !rewritten.insert(adrp_off) || !rewritten.insert(add_off) {
-            continue;
-        }
-
-        let adrp = locate_word(layout, adrp_off)?;
-        let add = locate_word(layout, add_off)?;
-        let Some(target) = decode_adrp_add_target(adrp.insn, add.insn, adrp.addr) else {
-            continue;
-        };
-        let Some(adr) = encode_adr(target, adrp.addr, (adrp.insn & 0x1f) as u8) else {
-            continue;
-        };
-
-        write_word(layout, adrp, adr)?;
-        write_word(layout, add, NOP)?;
     }
     Ok(())
+}
+
+fn relax_adrp_add(
+    layout: &mut Layout,
+    entry: &LohEntry,
+    rewritten: &mut HashSet<u64>,
+) -> Result<(), LohError> {
+    if entry.args.len() != 2 {
+        return Ok(());
+    }
+    let adrp_off = entry.args[0] as u64;
+    let add_off = entry.args[1] as u64;
+    if !claim_offsets(rewritten, &[adrp_off, add_off]) {
+        return Ok(());
+    }
+    let adrp = locate_word(layout, adrp_off)?;
+    let add = locate_word(layout, add_off)?;
+    let Some(target) = decode_adrp_add_target(adrp.insn, add.insn, adrp.addr) else {
+        return Ok(());
+    };
+    let dest = (add.insn & 0x1f) as u8;
+    let Some(adr) = encode_adr(target, adrp.addr, dest) else {
+        return Ok(());
+    };
+    write_word(layout, adrp, adr)?;
+    write_word(layout, add, NOP)?;
+    Ok(())
+}
+
+fn relax_adrp_ldr(
+    layout: &mut Layout,
+    entry: &LohEntry,
+    rewritten: &mut HashSet<u64>,
+) -> Result<(), LohError> {
+    if entry.args.len() != 2 {
+        return Ok(());
+    }
+    let adrp_off = entry.args[0] as u64;
+    let ldr_off = entry.args[1] as u64;
+    if !claim_offsets(rewritten, &[adrp_off, ldr_off]) {
+        return Ok(());
+    }
+    let adrp = locate_word(layout, adrp_off)?;
+    let ldr = locate_word(layout, ldr_off)?;
+    let Some(target) = decode_adrp_ldr_target(adrp.insn, ldr.insn, adrp.addr) else {
+        return Ok(());
+    };
+    let Some(literal) = encode_ldr_literal(ldr.insn, target, ldr.addr) else {
+        return Ok(());
+    };
+    write_word(layout, adrp, NOP)?;
+    write_word(layout, ldr, literal)?;
+    Ok(())
+}
+
+fn relax_adrp_ldr_got(
+    layout: &mut Layout,
+    entry: &LohEntry,
+    rewritten: &mut HashSet<u64>,
+) -> Result<(), LohError> {
+    if entry.args.len() != 2 {
+        return Ok(());
+    }
+    let adrp_off = entry.args[0] as u64;
+    let ldr_off = entry.args[1] as u64;
+    if !claim_offsets(rewritten, &[adrp_off, ldr_off]) {
+        return Ok(());
+    }
+    let adrp = locate_word(layout, adrp_off)?;
+    let ldr = locate_word(layout, ldr_off)?;
+    let Some(got_slot_addr) = decode_adrp_ldr_target(adrp.insn, ldr.insn, adrp.addr) else {
+        return Ok(());
+    };
+    if pageoff_load_kind(ldr.insn) != Some(LiteralLoadKind::X) {
+        return Ok(());
+    }
+    let Some(local_target) = read_u64_at_addr(layout, got_slot_addr) else {
+        return Ok(());
+    };
+    if !points_into_output(layout, local_target) {
+        return Ok(());
+    }
+    let dest = (ldr.insn & 0x1f) as u8;
+    let Some(adr) = encode_adr(local_target, adrp.addr, dest) else {
+        return Ok(());
+    };
+    write_word(layout, adrp, adr)?;
+    write_word(layout, ldr, NOP)?;
+    Ok(())
+}
+
+fn relax_adrp_ldr_got_ldr(
+    layout: &mut Layout,
+    entry: &LohEntry,
+    rewritten: &mut HashSet<u64>,
+) -> Result<(), LohError> {
+    if entry.args.len() != 3 {
+        return Ok(());
+    }
+    let adrp_off = entry.args[0] as u64;
+    let got_ldr_off = entry.args[1] as u64;
+    let final_ldr_off = entry.args[2] as u64;
+    if !claim_offsets(rewritten, &[adrp_off, got_ldr_off, final_ldr_off]) {
+        return Ok(());
+    }
+    let adrp = locate_word(layout, adrp_off)?;
+    let got_ldr = locate_word(layout, got_ldr_off)?;
+    let final_ldr = locate_word(layout, final_ldr_off)?;
+    let Some(got_slot_addr) = decode_adrp_ldr_target(adrp.insn, got_ldr.insn, adrp.addr) else {
+        return Ok(());
+    };
+    if pageoff_load_kind(got_ldr.insn) != Some(LiteralLoadKind::X) {
+        return Ok(());
+    }
+    let got_dest = (got_ldr.insn & 0x1f) as u8;
+    if load_base_reg(final_ldr.insn) != Some(got_dest) {
+        return Ok(());
+    }
+    let Some(local_target) = read_u64_at_addr(layout, got_slot_addr) else {
+        return Ok(());
+    };
+    if !points_into_output(layout, local_target) {
+        return Ok(());
+    }
+    let Some(adr) = encode_adr(local_target, adrp.addr, got_dest) else {
+        return Ok(());
+    };
+    write_word(layout, adrp, adr)?;
+    write_word(layout, got_ldr, NOP)?;
+    Ok(())
+}
+
+fn claim_offsets(rewritten: &mut HashSet<u64>, offsets: &[u64]) -> bool {
+    if offsets.iter().any(|offset| rewritten.contains(offset)) {
+        return false;
+    }
+    rewritten.extend(offsets.iter().copied());
+    true
 }
 
 fn locate_word(layout: &Layout, file_offset: u64) -> Result<LocatedWord, LohError> {
@@ -194,6 +334,22 @@ fn decode_adrp_add_target(adrp: u32, add: u32, place: u64) -> Option<u64> {
     Some((adrp_base as u64) + low)
 }
 
+fn decode_adrp_ldr_target(adrp: u32, ldr: u32, place: u64) -> Option<u64> {
+    let _kind = pageoff_load_kind(ldr)?;
+    let base = ((ldr >> 5) & 0x1f) as u8;
+    let adrp_reg = (adrp & 0x1f) as u8;
+    if adrp_reg == 31 || base != adrp_reg {
+        return None;
+    }
+    let adrp_immlo = ((adrp >> 29) & 0x3) as i64;
+    let adrp_immhi = ((adrp >> 5) & 0x7ffff) as i64;
+    let adrp_pages = sign_extend_21((adrp_immhi << 2) | adrp_immlo);
+    let adrp_base = ((place as i64) & !0xfff) + (adrp_pages << 12);
+    let shift = pageoff_shift(ldr);
+    let low = (((ldr >> 10) & 0xfff) as u64) << shift;
+    Some((adrp_base as u64) + low)
+}
+
 fn encode_adr(target: u64, place: u64, reg: u8) -> Option<u32> {
     if reg == 31 {
         return None;
@@ -208,12 +364,110 @@ fn encode_adr(target: u64, place: u64, reg: u8) -> Option<u32> {
     Some(0x1000_0000 | (immlo << 29) | (immhi << 5) | reg as u32)
 }
 
+fn encode_ldr_literal(insn: u32, target: u64, place: u64) -> Option<u32> {
+    let kind = pageoff_load_kind(insn)?;
+    let delta = (target as i64).wrapping_sub(place as i64);
+    if delta & 0b11 != 0 {
+        return None;
+    }
+    let imm = delta >> 2;
+    if !fits_signed(imm, 19) {
+        return None;
+    }
+    let encoded = (imm as u32) & 0x7ffff;
+    let rt = insn & 0x1f;
+    let base = match kind {
+        LiteralLoadKind::W => 0x1800_0000,
+        LiteralLoadKind::X => 0x5800_0000,
+        LiteralLoadKind::S => 0x1c00_0000,
+        LiteralLoadKind::D => 0x5c00_0000,
+        LiteralLoadKind::Q => 0x9c00_0000,
+    };
+    Some(base | (encoded << 5) | rt)
+}
+
 fn is_adrp(insn: u32) -> bool {
     (insn & 0x9f00_0000) == 0x9000_0000
 }
 
 fn is_add_imm_64(insn: u32) -> bool {
     (insn & 0xffc0_0000) == 0x9100_0000
+}
+
+fn pageoff_load_kind(insn: u32) -> Option<LiteralLoadKind> {
+    match insn & 0xffc0_0000 {
+        0xb940_0000 => Some(LiteralLoadKind::W),
+        0xf940_0000 => Some(LiteralLoadKind::X),
+        0xbd40_0000 => Some(LiteralLoadKind::S),
+        0xfd40_0000 => Some(LiteralLoadKind::D),
+        0x3dc0_0000 => Some(LiteralLoadKind::Q),
+        _ => None,
+    }
+}
+
+fn load_base_reg(insn: u32) -> Option<u8> {
+    match insn & 0xffc0_0000 {
+        0xb940_0000 | 0xf940_0000 | 0xbd40_0000 | 0xfd40_0000 | 0x3dc0_0000 | 0x7940_0000
+        | 0x3940_0000 => Some(((insn >> 5) & 0x1f) as u8),
+        _ => None,
+    }
+}
+
+fn pageoff_shift(insn: u32) -> u64 {
+    if is_simd_fp_pageoff(insn) {
+        let size = ((insn >> 30) & 0b11) as u64;
+        let opc = ((insn >> 22) & 0b11) as u64;
+        if size == 0 && (opc & 0b10) != 0 {
+            4
+        } else {
+            size
+        }
+    } else {
+        ((insn >> 30) & 0b11) as u64
+    }
+}
+
+fn is_simd_fp_pageoff(insn: u32) -> bool {
+    ((insn >> 24) & 0b111) == 0b101
+}
+
+fn points_into_output(layout: &Layout, addr: u64) -> bool {
+    layout
+        .sections
+        .iter()
+        .any(|section| section.addr <= addr && addr < section.addr + section.size)
+}
+
+fn read_u64_at_addr(layout: &Layout, addr: u64) -> Option<u64> {
+    let bytes = read_bytes_at_addr(layout, addr, 8)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_bytes_at_addr(layout: &Layout, addr: u64, len: usize) -> Option<Vec<u8>> {
+    for section in &layout.sections {
+        for atom in &section.atoms {
+            let start = section.addr + atom.offset;
+            let end = start + atom.data.len() as u64;
+            if start <= addr && addr + len as u64 <= end {
+                let word_off = (addr - start) as usize;
+                return Some(atom.data.get(word_off..word_off + len)?.to_vec());
+            }
+        }
+        if !section.synthetic_data.is_empty() {
+            let start = section.addr + section.synthetic_offset;
+            let end = start + section.synthetic_data.len() as u64;
+            if start <= addr && addr + len as u64 <= end {
+                let word_off = (addr - start) as usize;
+                return Some(
+                    section
+                        .synthetic_data
+                        .get(word_off..word_off + len)?
+                        .to_vec(),
+                );
+            }
+        }
+    }
+    None
 }
 
 fn fits_signed(value: i64, bits: u32) -> bool {
@@ -277,6 +531,22 @@ mod tests {
         let immlo = ((adr >> 29) & 0x3) as i64;
         let immhi = ((adr >> 5) & 0x7ffff) as i64;
         let delta = sign_extend_21((immhi << 2) | immlo);
+        assert_eq!(place.wrapping_add_signed(delta), target);
+    }
+
+    #[test]
+    fn encode_ldr_literal_round_trips_x_load() {
+        let place = 0x1_0000_2004;
+        let target = place + 0x1fc;
+        let insn = 0xf940_0005u32;
+        let literal = encode_ldr_literal(insn, target, place).unwrap();
+        assert_eq!(literal & 0x1f, 5);
+        let imm = ((literal >> 5) & 0x7ffff) as i64;
+        let delta = if imm & (1 << 18) != 0 {
+            (imm | !0x7ffff) << 2
+        } else {
+            imm << 2
+        };
         assert_eq!(place.wrapping_add_signed(delta), target);
     }
 }

@@ -9,7 +9,10 @@ use std::process::Command;
 mod common;
 
 use afs_ld::leb::read_uleb;
-use afs_ld::loh::{parse_loh_blob, LOH_ARM64_ADRP_ADD};
+use afs_ld::loh::{
+    parse_loh_blob, LOH_ARM64_ADRP_ADD, LOH_ARM64_ADRP_LDR, LOH_ARM64_ADRP_LDR_GOT,
+    LOH_ARM64_ADRP_LDR_GOT_LDR,
+};
 use afs_ld::macho::constants::{
     BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DONE, BIND_OPCODE_DO_BIND,
     BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED, BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB,
@@ -1819,10 +1822,27 @@ fn is_add_imm_64(insn: u32) -> bool {
     (insn & 0xffc0_0000) == 0x9100_0000
 }
 
+fn is_ldr_literal(insn: u32) -> bool {
+    matches!(
+        insn & 0xff00_0000,
+        0x1800_0000 | 0x5800_0000 | 0x1c00_0000 | 0x5c00_0000 | 0x9c00_0000
+    )
+}
+
 fn decode_adr_target(insn: u32, place: u64) -> u64 {
     let immlo = ((insn >> 29) & 0x3) as i64;
     let immhi = ((insn >> 5) & 0x7ffff) as i64;
     let delta = sign_extend_21((immhi << 2) | immlo);
+    place.wrapping_add_signed(delta)
+}
+
+fn decode_ldr_literal_target(insn: u32, place: u64) -> u64 {
+    let imm19 = ((insn >> 5) & 0x7ffff) as i64;
+    let delta = if imm19 & (1 << 18) != 0 {
+        (imm19 | !0x7ffff) << 2
+    } else {
+        imm19 << 2
+    };
     place.wrapping_add_signed(delta)
 }
 
@@ -2169,6 +2189,247 @@ fn linker_run_no_loh_keeps_adrp_add_unrelaxed() {
         decode_page_reference(&text, text_addr, 0, &PageRefKind::Add).unwrap(),
         target_addr
     );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_relaxes_adrp_ldr_loh_when_target_is_near() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+
+    let obj = scratch("loh-adrp-ldr-near.o");
+    let out = scratch("loh-adrp-ldr-near.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        .globl _target
+        _main:
+        Lloh0:
+            adrp x0, _target@PAGE
+        Lloh1:
+            ldr x1, [x0, _target@PAGEOFF]
+            mov w0, #0
+            ret
+            .p2align 3
+        _target:
+            .quad 0x1122334455667788
+        .loh AdrpLdr Lloh0, Lloh1
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let loh = decode_loh(&bytes);
+    assert_eq!(loh[0].kind, LOH_ARM64_ADRP_LDR);
+    let target_addr = symbol_values(&bytes)["_target"];
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let first = read_insn(&text, 0).unwrap();
+    let second = read_insn(&text, 4).unwrap();
+    assert_eq!(first, 0xd503_201f, "expected NOP after AdrpLdr relaxation");
+    assert!(
+        is_ldr_literal(second),
+        "expected literal LDR, got {second:#010x}"
+    );
+    assert_eq!(
+        decode_ldr_literal_target(second, text_addr + 4),
+        target_addr
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_keeps_adrp_ldr_loh_when_target_is_far() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+
+    let obj = scratch("loh-adrp-ldr-far.o");
+    let out = scratch("loh-adrp-ldr-far.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        .globl _target
+        _main:
+        Lloh0:
+            adrp x0, _target@PAGE
+        Lloh1:
+            ldr x1, [x0, _target@PAGEOFF]
+            mov w0, #0
+            ret
+            .space 0x200000
+            .p2align 3
+        _target:
+            .quad 0x1122334455667788
+        .loh AdrpLdr Lloh0, Lloh1
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let target_addr = symbol_values(&bytes)["_target"];
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let first = read_insn(&text, 0).unwrap();
+    let second = read_insn(&text, 4).unwrap();
+    assert!(is_adrp(first), "far AdrpLdr pair should stay ADRP");
+    assert!(
+        !is_ldr_literal(second),
+        "far AdrpLdr pair should stay pageoff load, got literal {second:#010x}"
+    );
+    assert_eq!(
+        decode_page_reference(&text, text_addr, 0, &PageRefKind::Load).unwrap(),
+        target_addr
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_relaxes_adrp_ldr_got_loh_when_target_is_local() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+
+    let obj = scratch("loh-adrp-ldr-got.o");
+    let out = scratch("loh-adrp-ldr-got.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        .globl _value
+        _main:
+        Lloh0:
+            adrp x8, _value@GOTPAGE
+        Lloh1:
+            ldr x8, [x8, _value@GOTPAGEOFF]
+            mov w0, #0
+            ret
+
+        .section __DATA,__data
+        .p2align 2
+        _value:
+            .long 7
+        .loh AdrpLdrGot Lloh0, Lloh1
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let loh = decode_loh(&bytes);
+    assert_eq!(loh[0].kind, LOH_ARM64_ADRP_LDR_GOT);
+    let target_addr = symbol_values(&bytes)["_value"];
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let first = read_insn(&text, 0).unwrap();
+    let second = read_insn(&text, 4).unwrap();
+    assert!(is_adr(first), "expected ADR after AdrpLdrGot relaxation");
+    assert_eq!(
+        second, 0xd503_201f,
+        "expected NOP after AdrpLdrGot relaxation"
+    );
+    assert_eq!(decode_adr_target(first, text_addr), target_addr);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_relaxes_adrp_ldr_got_ldr_loh_when_target_is_local() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+
+    let obj = scratch("loh-adrp-ldr-got-ldr.o");
+    let out = scratch("loh-adrp-ldr-got-ldr.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        .globl _value
+        _main:
+        Lloh0:
+            adrp x8, _value@GOTPAGE
+        Lloh1:
+            ldr x8, [x8, _value@GOTPAGEOFF]
+        Lloh2:
+            ldr w0, [x8]
+            ret
+
+        .section __DATA,__data
+        .p2align 2
+        _value:
+            .long 7
+        .loh AdrpLdrGotLdr Lloh0, Lloh1, Lloh2
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let loh = decode_loh(&bytes);
+    assert_eq!(loh[0].kind, LOH_ARM64_ADRP_LDR_GOT_LDR);
+    let target_addr = symbol_values(&bytes)["_value"];
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let first = read_insn(&text, 0).unwrap();
+    let second = read_insn(&text, 4).unwrap();
+    let third = read_insn(&text, 8).unwrap();
+    assert!(is_adr(first), "expected ADR after AdrpLdrGotLdr relaxation");
+    assert_eq!(
+        second, 0xd503_201f,
+        "expected NOP after AdrpLdrGotLdr relaxation"
+    );
+    assert_eq!(decode_adr_target(first, text_addr), target_addr);
+    assert_eq!(third, 0xb9400100, "expected final load to remain intact");
+    assert_eq!(Command::new(&out).status().unwrap().code(), Some(7));
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);

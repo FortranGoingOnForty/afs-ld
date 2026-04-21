@@ -26,6 +26,7 @@ pub mod why_live;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use std::{fs, io};
 
 use atom::{atomize_object, backpatch_symbol_atoms, AtomTable};
@@ -205,6 +206,36 @@ pub enum LinkError {
     UnsupportedOption(String),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkPhaseTimings {
+    pub input_parsing: Duration,
+    pub symbol_resolution: Duration,
+    pub atomization: Duration,
+    pub layout: Duration,
+    pub synth_sections: Duration,
+    pub reloc_apply: Duration,
+    pub write_output: Duration,
+}
+
+impl LinkPhaseTimings {
+    pub fn accounted_total(&self) -> Duration {
+        self.input_parsing
+            + self.symbol_resolution
+            + self.atomization
+            + self.layout
+            + self.synth_sections
+            + self.reloc_apply
+            + self.write_output
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkProfile {
+    pub output: PathBuf,
+    pub phases: LinkPhaseTimings,
+    pub total_wall: Duration,
+}
+
 impl std::fmt::Display for LinkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -334,6 +365,12 @@ pub struct Linker;
 
 impl Linker {
     pub fn run(opts: &LinkOptions) -> Result<(), LinkError> {
+        Self::run_profiled(opts).map(|_| ())
+    }
+
+    pub fn run_profiled(opts: &LinkOptions) -> Result<LinkProfile, LinkError> {
+        let overall_started = Instant::now();
+        let mut phases = LinkPhaseTimings::default();
         if opts.relocatable {
             return Err(LinkError::UnsupportedOption(
                 "`-r` relocatable output is not yet supported".into(),
@@ -401,14 +438,17 @@ impl Linker {
         }
 
         let mut inputs = Inputs::new();
+        let phase_started = Instant::now();
         for (load_order, path) in load_paths.iter().enumerate() {
             if opts.trace_inputs {
                 eprintln!("afs-ld: loading {}", path.display());
             }
             register_input(&mut inputs, path, load_order)?;
         }
+        phases.input_parsing = phase_started.elapsed();
 
         let mut sym_table = SymbolTable::new();
+        let phase_started = Instant::now();
         let seed_report = seed_all(&inputs, &mut sym_table)?;
         if seed_report.has_errors() {
             let mut msg = String::new();
@@ -474,9 +514,11 @@ impl Linker {
                 &unresolved.warnings,
             ));
         }
+        phases.symbol_resolution = phase_started.elapsed();
 
         let mut atom_table = AtomTable::new();
         let mut objects = Vec::new();
+        let phase_started = Instant::now();
         for idx in 0..inputs.objects.len() {
             let input_id = resolve::InputId(idx as u32);
             let obj = inputs.object_file(input_id)?;
@@ -490,6 +532,7 @@ impl Linker {
             );
             objects.push((input_id, obj));
         }
+        phases.atomization = phase_started.elapsed();
 
         let layout_inputs: Vec<LayoutInput<'_>> = objects
             .iter()
@@ -520,6 +563,7 @@ impl Linker {
                 ordinal: dylib.ordinal,
             });
         }
+        let phase_started = Instant::now();
         let entry_symbol = find_entry_symbol_id(opts, &sym_table)?;
         let dead_strip = opts.dead_strip.then(|| {
             why_live::DeadStripAnalysis::build(
@@ -600,6 +644,7 @@ impl Linker {
         if !thunk_converged {
             return Err(LinkError::ThunkPlanningDidNotConverge);
         }
+        phases.layout = phase_started.elapsed();
         let linkedit_context = macho::writer::LinkEditContext {
             layout_inputs: &layout_inputs,
             atom_table: &atom_table,
@@ -607,6 +652,7 @@ impl Linker {
             synthetic_plan: &synthetic_plan,
             icf_redirects,
         };
+        let phase_started = Instant::now();
         let mut linkedit = None;
         for _ in 0..4 {
             let (next_layout, next_linkedit) = macho::writer::finalize_layout_with_linkedit(
@@ -630,6 +676,8 @@ impl Linker {
             }
         }
         let linkedit = linkedit.expect("finalize loop always runs at least once");
+        phases.synth_sections = phase_started.elapsed();
+        let phase_started = Instant::now();
         reloc::arm64::apply_layout(
             &mut layout,
             &layout_inputs,
@@ -642,6 +690,7 @@ impl Linker {
                 icf_redirects,
             },
         )?;
+        phases.reloc_apply = phase_started.elapsed();
         let folded_symbols = icf
             .as_ref()
             .map(|plan| plan.folded_symbols(&atom_table, &sym_table, &layout_inputs))
@@ -661,6 +710,7 @@ impl Linker {
             print!("{report}");
         }
 
+        let phase_started = Instant::now();
         let mut image = Vec::new();
         let entry_point = resolve_entry_point(opts, &sym_table)?;
         macho::writer::write_finalized_with_linkedit(
@@ -697,7 +747,12 @@ impl Linker {
             perms.set_mode(mode | ((mode & 0o444) >> 2));
             fs::set_permissions(&output, perms)?;
         }
-        Ok(())
+        phases.write_output = phase_started.elapsed();
+        Ok(LinkProfile {
+            output,
+            phases,
+            total_wall: overall_started.elapsed(),
+        })
     }
 }
 

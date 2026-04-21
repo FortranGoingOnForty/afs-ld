@@ -198,15 +198,16 @@ fn strip_eol_comment(s: &mut String) {
                 i += 2;
                 continue;
             }
-            b'#' if !in_single && !in_double => {
-                // A comment must be preceded by whitespace or be at BOL.
-                if i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t' {
-                    s.truncate(i);
-                    // Trim trailing whitespace left by the strip.
-                    let trimmed_len = s.trim_end().len();
-                    s.truncate(trimmed_len);
-                    return;
-                }
+            b'#'
+                if !in_single
+                    && !in_double
+                    && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') =>
+            {
+                s.truncate(i);
+                // Trim trailing whitespace left by the strip.
+                let trimmed_len = s.trim_end().len();
+                s.truncate(trimmed_len);
+                return;
             }
             _ => {}
         }
@@ -426,11 +427,13 @@ fn find_top_level_mapping_colon(s: &str) -> Option<usize> {
             }
             b'[' | b'{' if !in_single && !in_double => depth += 1,
             b']' | b'}' if !in_single && !in_double => depth -= 1,
-            b':' if !in_single && !in_double && depth == 0 => {
-                // Must be followed by whitespace or end of line per YAML rules.
-                if i + 1 == bytes.len() || bytes[i + 1] == b' ' || bytes[i + 1] == b'\t' {
-                    return Some(i);
-                }
+            b':'
+                if !in_single
+                    && !in_double
+                    && depth == 0
+                    && (i + 1 == bytes.len() || bytes[i + 1] == b' ' || bytes[i + 1] == b'\t') =>
+            {
+                return Some(i);
             }
             _ => {}
         }

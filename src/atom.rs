@@ -861,7 +861,9 @@ fn resolve_function_parent(
                             .map(|section| section.addr)
                             .unwrap_or(0),
                     ) as u32;
-                    atom_index.get(&(input_sym.sect_idx(), target_offset)).copied()
+                    atom_index
+                        .get(&(input_sym.sect_idx(), target_offset))
+                        .copied()
                 })
                 .flatten()
         }

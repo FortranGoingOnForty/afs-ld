@@ -268,11 +268,7 @@ pub fn format_explanations(
                 out.push('\n');
             }
             if winner != requested {
-                writeln!(
-                    &mut out,
-                    "{requested} was folded to {winner} by -icf=safe"
-                )
-                .unwrap();
+                writeln!(&mut out, "{requested} was folded to {winner} by -icf=safe").unwrap();
             }
             out.push_str(&dead_strip.format_symbol_explanation(sym_table, target));
         }
@@ -293,11 +289,7 @@ pub fn format_explanations(
             out.push('\n');
         }
         if winner != requested {
-            writeln!(
-                &mut out,
-                "{requested} was folded to {winner} by -icf=safe"
-            )
-            .unwrap();
+            writeln!(&mut out, "{requested} was folded to {winner} by -icf=safe").unwrap();
         }
         let target_name = graph.symbol_name(target);
         writeln!(&mut out, "{target_name} is live because:").unwrap();

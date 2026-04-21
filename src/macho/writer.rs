@@ -2894,12 +2894,13 @@ mod tests {
         });
 
         let by_input_section = atoms.by_input_section();
+        let atom_ranges = build_atom_range_index(&atoms, &by_input_section, None);
         assert_eq!(
-            find_containing_atom(&atoms, &by_input_section, InputId(7), 3, 4, None),
+            find_containing_atom(&atom_ranges, InputId(7), 3, 4),
             Some((first, 4))
         );
         assert_eq!(
-            find_containing_atom_range(&atoms, &by_input_section, InputId(7), 3, 10, 2, None),
+            find_containing_atom_range(&atom_ranges, InputId(7), 3, 10, 2),
             Some((second, 2))
         );
     }

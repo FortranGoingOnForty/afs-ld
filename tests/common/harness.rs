@@ -374,10 +374,13 @@ pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
         let page_ref_checks = read_page_refs(&path.join("page_refs.txt"))?;
         let command_checks = read_command_checks(&path.join("command_checks.txt"))?;
         let artifacts = read_artifacts(&path.join("artifacts.txt"))?;
-        let artifact_srcs: HashSet<&str> =
-            artifacts.iter().map(|artifact| artifact.src_name.as_str()).collect();
+        let artifact_srcs: HashSet<&str> = artifacts
+            .iter()
+            .map(|artifact| artifact.src_name.as_str())
+            .collect();
         inputs.retain(|input| {
-            input.file_name()
+            input
+                .file_name()
                 .and_then(|s| s.to_str())
                 .map(|name| !artifact_srcs.contains(name))
                 .unwrap_or(true)

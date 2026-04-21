@@ -159,9 +159,8 @@ impl StringTableBuilder {
             .iter()
             .find_map(|&idx| {
                 let existing = &self.roots[idx];
-                (existing.name.len() >= name.len() && existing.name.ends_with(name)).then(|| {
-                    existing.offset + (existing.name.len() - name.len()) as u32
-                })
+                (existing.name.len() >= name.len() && existing.name.ends_with(name))
+                    .then(|| existing.offset + (existing.name.len() - name.len()) as u32)
             })
     }
 }

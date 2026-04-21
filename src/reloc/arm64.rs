@@ -123,7 +123,10 @@ pub struct ThunkPlan {
 
 impl ThunkPlan {
     pub fn split_after_atoms(&self) -> Vec<crate::resolve::AtomId> {
-        self.islands.iter().map(|island| island.after_atom).collect()
+        self.islands
+            .iter()
+            .map(|island| island.after_atom)
+            .collect()
     }
 
     pub fn output_sections(&self) -> Vec<ExtraOutputSection> {

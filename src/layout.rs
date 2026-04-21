@@ -528,7 +528,10 @@ fn insert_extra_sections(sections: &mut Vec<OutputSection>, extra_sections: &[Ex
                 })
                 .map(|idx| idx + 1)
                 .unwrap_or_else(|| {
-                    panic!("missing anchor {:?} for synthetic section {},{}", anchor, section.segment, section.name)
+                    panic!(
+                        "missing anchor {:?} for synthetic section {},{}",
+                        anchor, section.segment, section.name
+                    )
                 });
             sections.insert(insert_at, section);
         } else {

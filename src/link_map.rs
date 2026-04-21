@@ -2,9 +2,9 @@ use std::fmt::Write as _;
 use std::io;
 use std::path::Path;
 
+use crate::icf::FoldedSymbol;
 use crate::layout::{Layout, LayoutInput};
 use crate::macho::writer::LinkEditPlan;
-use crate::icf::FoldedSymbol;
 use crate::why_live::DeadStrippedSymbol;
 use crate::LinkOptions;
 

@@ -4509,6 +4509,85 @@ fn linker_run_safe_thunks_do_not_grow_small_programs() {
 }
 
 #[test]
+fn linker_run_thunks_all_forces_shared_thunk_for_in_range_calls() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+
+    let obj = scratch("branch26-thunks-all.o");
+    let out = scratch("branch26-thunks-all.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            stp x29, x30, [sp, #-16]!
+            mov x29, sp
+            bl _helper
+            bl _helper
+            ldp x29, x30, [sp], #16
+            ret
+
+        _helper:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        thunks: afs_ld::ThunkMode::All,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let (thunks_addr, thunks) = output_section(&bytes, "__TEXT", "__thunks").unwrap();
+    assert_eq!(
+        thunks.len(),
+        12,
+        "expected both in-range calls to share one forced thunk"
+    );
+    assert_eq!(
+        decode_branch_target(&text, text_addr, 8).unwrap(),
+        thunks_addr,
+        "expected first BL to route through __thunks under -thunks=all"
+    );
+    assert_eq!(
+        decode_branch_target(&text, text_addr, 12).unwrap(),
+        thunks_addr,
+        "expected second BL to share the same thunk target"
+    );
+
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let status = Command::new(&out).status().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "expected -thunks=all executable to exit 0"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_places_thunks_in_caller_segment() {
     if !have_xcrun() || !have_tool("codesign") {
         eprintln!("skipping: xcrun or codesign unavailable");

@@ -1,0 +1,10 @@
+-arch
+arm64
+-x
+-no_fixup_chains
+-e
+_main
+-o
+@OUT@
+@INPUT:main.o@
+@ARTIFACT:libsymtab.dylib@

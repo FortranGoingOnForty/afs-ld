@@ -12,17 +12,21 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use afs_ld::leb::read_uleb;
 use afs_ld::macho::constants::{
     INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_CODE_SIGNATURE,
-    LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_LOAD_DYLIB, LC_SEGMENT_64, LC_SYMTAB, LC_UUID,
+    LC_DATA_IN_CODE, LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
+    LC_FUNCTION_STARTS, LC_LOAD_DYLIB, LC_SEGMENT_64, LC_SYMTAB, LC_UUID,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::ExportKind;
 use afs_ld::macho::reader::{
     parse_commands, parse_header, u32_le, BuildVersionCmd, DyldInfoCmd, LoadCommand,
+    Section64Header,
 };
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, SymKind};
+use afs_ld::synth::unwind::decode_unwind_info;
 
 #[derive(Debug, Clone)]
 pub struct LinkCase {
@@ -49,6 +53,12 @@ pub enum CommandCheck {
     ExportRecords,
     SymbolRecordMap,
     IndirectSymbolIdentities,
+    SymbolPartitionNames,
+    StringTableNearParity,
+    FunctionStarts,
+    NormalizedFunctionStarts,
+    DataInCode,
+    RebasedUnwindBytes,
     DyldInfoRebase,
     DyldInfoBind,
     DyldInfoWeakBind,
@@ -476,6 +486,8 @@ pub fn command_ids(bytes: &[u8]) -> Result<Vec<u32>, String> {
             LoadCommand::Dysymtab(_) => LC_DYSYMTAB,
             LoadCommand::BuildVersion(_) => LC_BUILD_VERSION,
             LoadCommand::DyldInfoOnly(_) => LC_DYLD_INFO_ONLY,
+            LoadCommand::DyldChainedFixups(_) => LC_DYLD_CHAINED_FIXUPS,
+            LoadCommand::DyldExportsTrie(_) => LC_DYLD_EXPORTS_TRIE,
             LoadCommand::Dylib(d) => d.cmd,
             LoadCommand::Raw { cmd, .. } => cmd,
             other => panic!("unexpected load command in command_ids helper: {other:?}"),
@@ -550,6 +562,59 @@ pub fn compare_command_details(
                     return Err(format!(
                         "indirect symbol identities diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
                     ));
+                }
+            }
+            CommandCheck::SymbolPartitionNames => {
+                let ours = symbol_partition_names(ours)?;
+                let theirs = symbol_partition_names(theirs)?;
+                if ours != theirs {
+                    return Err(format!(
+                        "symbol partition names diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                    ));
+                }
+            }
+            CommandCheck::StringTableNearParity => {
+                let our_len = raw_string_table(ours)?.len();
+                let their_len = raw_string_table(theirs)?.len();
+                if !string_table_within_five_percent(our_len, their_len) {
+                    return Err(format!(
+                        "string table length drifted too far from Apple ld: ours={} theirs={}",
+                        our_len, their_len
+                    ));
+                }
+            }
+            CommandCheck::FunctionStarts => {
+                let ours = decode_function_starts(ours)?;
+                let theirs = decode_function_starts(theirs)?;
+                if ours != theirs {
+                    return Err(format!(
+                        "function starts diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                    ));
+                }
+            }
+            CommandCheck::NormalizedFunctionStarts => {
+                let ours = normalize_function_start_offsets(&decode_function_starts(ours)?);
+                let theirs = normalize_function_start_offsets(&decode_function_starts(theirs)?);
+                if ours != theirs {
+                    return Err(format!(
+                        "normalized function starts diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                    ));
+                }
+            }
+            CommandCheck::DataInCode => {
+                let ours = canonical_data_in_code(ours)?;
+                let theirs = canonical_data_in_code(theirs)?;
+                if ours != theirs {
+                    return Err(format!(
+                        "canonical data-in-code records diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                    ));
+                }
+            }
+            CommandCheck::RebasedUnwindBytes => {
+                let ours = rebased_unwind_bytes(ours)?;
+                let theirs = rebased_unwind_bytes(theirs)?;
+                if ours != theirs {
+                    return Err("rebased unwind bytes diverged".to_string());
                 }
             }
             CommandCheck::DyldInfoRebase => {
@@ -633,6 +698,34 @@ pub fn output_section(bytes: &[u8], segname: &str, sectname: &str) -> Option<(u6
                     };
                     return Some((section.addr, data));
                 }
+            }
+        }
+    }
+    None
+}
+
+fn output_section_header(bytes: &[u8], segname: &str, sectname: &str) -> Option<Section64Header> {
+    let header = parse_header(bytes).ok()?;
+    let commands = parse_commands(&header, bytes).ok()?;
+    for cmd in commands {
+        if let LoadCommand::Segment64(seg) = cmd {
+            for section in seg.sections {
+                if section.segname_str() == segname && section.sectname_str() == sectname {
+                    return Some(section);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn segment_vmaddr(bytes: &[u8], segname: &str) -> Option<u64> {
+    let header = parse_header(bytes).ok()?;
+    let commands = parse_commands(&header, bytes).ok()?;
+    for cmd in commands {
+        if let LoadCommand::Segment64(seg) = cmd {
+            if seg.segname_str() == segname {
+                return Some(seg.vmaddr);
             }
         }
     }
@@ -1136,6 +1229,12 @@ fn parse_command_check(name: &str) -> Result<CommandCheck, String> {
         "export_records" => Ok(CommandCheck::ExportRecords),
         "symbol_record_map" => Ok(CommandCheck::SymbolRecordMap),
         "indirect_symbol_identities" => Ok(CommandCheck::IndirectSymbolIdentities),
+        "symbol_partition_names" => Ok(CommandCheck::SymbolPartitionNames),
+        "string_table_near_parity" => Ok(CommandCheck::StringTableNearParity),
+        "function_starts" => Ok(CommandCheck::FunctionStarts),
+        "normalized_function_starts" => Ok(CommandCheck::NormalizedFunctionStarts),
+        "data_in_code" => Ok(CommandCheck::DataInCode),
+        "rebased_unwind_bytes" => Ok(CommandCheck::RebasedUnwindBytes),
         "dyld_info_rebase" => Ok(CommandCheck::DyldInfoRebase),
         "dyld_info_bind" => Ok(CommandCheck::DyldInfoBind),
         "dyld_info_weak_bind" => Ok(CommandCheck::DyldInfoWeakBind),
@@ -1448,6 +1547,37 @@ fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExportRecord>, 
     Ok(out)
 }
 
+fn symbol_partition_names(bytes: &[u8]) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
+    let (symtab, dysymtab) = symtab_and_dysymtab(bytes)?;
+    let symbols =
+        parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).map_err(|e| e.to_string())?;
+    let strings =
+        StringTable::from_file(bytes, symtab.stroff, symtab.strsize).map_err(|e| e.to_string())?;
+    let names_for = |start: u32, count: u32| -> Vec<String> {
+        symbols[start as usize..(start + count) as usize]
+            .iter()
+            .map(|symbol| strings.get(symbol.strx()).unwrap().to_string())
+            .collect()
+    };
+    Ok((
+        names_for(dysymtab.ilocalsym, dysymtab.nlocalsym),
+        names_for(dysymtab.iextdefsym, dysymtab.nextdefsym),
+        names_for(dysymtab.iundefsym, dysymtab.nundefsym),
+    ))
+}
+
+fn raw_string_table(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let (symtab, _) = symtab_and_dysymtab(bytes)?;
+    let start = symtab.stroff as usize;
+    let end = start + symtab.strsize as usize;
+    Ok(bytes[start..end].to_vec())
+}
+
+fn string_table_within_five_percent(ours: usize, theirs: usize) -> bool {
+    let delta = ours.abs_diff(theirs);
+    delta * 20 <= theirs
+}
+
 fn indirect_symbol_table(bytes: &[u8]) -> Result<Vec<u32>, String> {
     let (_, dysymtab) = symtab_and_dysymtab(bytes)?;
     if dysymtab.nindirectsyms == 0 {
@@ -1484,6 +1614,158 @@ fn indirect_symbol_identities(bytes: &[u8]) -> Result<Vec<String>, String> {
             }
         })
         .collect())
+}
+
+fn raw_linkedit_data_cmd(bytes: &[u8], expected_cmd: u32) -> Result<(u32, u32), String> {
+    let header = parse_header(bytes).map_err(|e| e.to_string())?;
+    let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
+    for cmd in commands {
+        match cmd {
+            LoadCommand::Raw { cmd, data, .. } if cmd == expected_cmd => {
+                return Ok((u32_le(&data[0..4]), u32_le(&data[4..8])));
+            }
+            LoadCommand::LinkerOptimizationHint(linkedit)
+                if expected_cmd == afs_ld::macho::constants::LC_LINKER_OPTIMIZATION_HINT =>
+            {
+                return Ok((linkedit.dataoff, linkedit.datasize));
+            }
+            _ => {}
+        }
+    }
+    Err(format!("missing raw linkedit command 0x{expected_cmd:x}"))
+}
+
+fn linkedit_payload(bytes: &[u8], cmd: u32) -> Result<Vec<u8>, String> {
+    let (dataoff, datasize) = raw_linkedit_data_cmd(bytes, cmd)?;
+    if datasize == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(bytes[dataoff as usize..(dataoff + datasize) as usize].to_vec())
+}
+
+fn decode_function_starts(bytes: &[u8]) -> Result<Vec<u64>, String> {
+    let payload = linkedit_payload(bytes, LC_FUNCTION_STARTS)?;
+    let mut offsets = Vec::new();
+    let mut cursor = 0usize;
+    let mut current = 0u64;
+    while cursor < payload.len() {
+        let (delta, used) = read_uleb(&payload[cursor..]).map_err(|e| e.to_string())?;
+        cursor += used;
+        if delta == 0 {
+            break;
+        }
+        current += delta;
+        offsets.push(current);
+    }
+    Ok(offsets)
+}
+
+fn normalize_function_start_offsets(starts: &[u64]) -> Vec<u64> {
+    let Some(&base) = starts.first() else {
+        return Vec::new();
+    };
+    starts.iter().map(|offset| offset - base).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DataInCodeRecord {
+    offset: u32,
+    length: u16,
+    kind: u16,
+}
+
+fn decode_data_in_code(bytes: &[u8]) -> Result<Vec<DataInCodeRecord>, String> {
+    let payload = linkedit_payload(bytes, LC_DATA_IN_CODE)?;
+    Ok(payload
+        .chunks_exact(8)
+        .map(|chunk| DataInCodeRecord {
+            offset: u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
+            length: u16::from_le_bytes(chunk[4..6].try_into().unwrap()),
+            kind: u16::from_le_bytes(chunk[6..8].try_into().unwrap()),
+        })
+        .collect())
+}
+
+fn canonical_data_in_code(bytes: &[u8]) -> Result<Vec<DataInCodeRecord>, String> {
+    let text = output_section_header(bytes, "__TEXT", "__text")
+        .ok_or_else(|| "missing __TEXT,__text section".to_string())?;
+    Ok(decode_data_in_code(bytes)?
+        .into_iter()
+        .map(|record| DataInCodeRecord {
+            offset: record.offset - text.offset,
+            length: record.length,
+            kind: record.kind,
+        })
+        .collect())
+}
+
+fn rebased_unwind_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let header_base = segment_vmaddr(bytes, "__TEXT").unwrap_or(0);
+    let text_base = output_section(bytes, "__TEXT", "__text")
+        .ok_or_else(|| "missing __TEXT,__text section".to_string())?
+        .0
+        - header_base;
+    let got_range = output_section(bytes, "__DATA_CONST", "__got")
+        .map(|(addr, data)| (addr - header_base, addr - header_base + data.len() as u64));
+    let lsda_base =
+        output_section(bytes, "__TEXT", "__gcc_except_tab").map(|(addr, _)| addr - header_base);
+    let (_, unwind) = output_section(bytes, "__TEXT", "__unwind_info")
+        .ok_or_else(|| "missing __TEXT,__unwind_info section".to_string())?;
+    let mut out = unwind;
+    if out.len() < 28 {
+        return Ok(out);
+    }
+
+    let personalities_offset = u32_le(&out[12..16]) as usize;
+    let personalities_count = u32_le(&out[16..20]) as usize;
+    let indices_offset = u32_le(&out[20..24]) as usize;
+    let indices_count = u32_le(&out[24..28]) as usize;
+
+    for idx in 0..personalities_count {
+        let off = personalities_offset + idx * 4;
+        let value = u32_le(&out[off..off + 4]) as u64;
+        let rebased = if let Some((got_start, got_end)) = got_range {
+            if got_start <= value && value < got_end {
+                value - got_start
+            } else if value >= text_base {
+                value - text_base
+            } else {
+                value
+            }
+        } else if value >= text_base {
+            value - text_base
+        } else {
+            value
+        };
+        out[off..off + 4].copy_from_slice(&(rebased as u32).to_le_bytes());
+    }
+
+    let mut lsda_offsets = Vec::with_capacity(indices_count);
+    for idx in 0..indices_count {
+        let entry_off = indices_offset + idx * 12;
+        let function_offset = u32_le(&out[entry_off..entry_off + 4]) as u64;
+        let rebased = function_offset.saturating_sub(text_base);
+        out[entry_off..entry_off + 4].copy_from_slice(&(rebased as u32).to_le_bytes());
+        lsda_offsets.push(u32_le(&out[entry_off + 8..entry_off + 12]) as usize);
+    }
+
+    if let (Some(lsda_base), Some(&start), Some(&end)) =
+        (lsda_base, lsda_offsets.first(), lsda_offsets.last())
+    {
+        let mut entry_off = start;
+        while entry_off < end {
+            let function_offset = u32_le(&out[entry_off..entry_off + 4]) as u64;
+            let lsda_offset = u32_le(&out[entry_off + 4..entry_off + 8]) as u64;
+            out[entry_off..entry_off + 4]
+                .copy_from_slice(&(function_offset.saturating_sub(text_base) as u32).to_le_bytes());
+            out[entry_off + 4..entry_off + 8]
+                .copy_from_slice(&(lsda_offset.saturating_sub(lsda_base) as u32).to_le_bytes());
+            entry_off += 8;
+        }
+    }
+
+    let _ = decode_unwind_info(&out).map_err(|e| format!("decode unwind info: {e}"))?;
+    Ok(out)
 }
 
 fn symtab_and_dysymtab(

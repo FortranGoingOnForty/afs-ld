@@ -27,9 +27,10 @@ fn parity_corpus() {
         .join("parity_corpus");
     let cases = load_corpus(&root).expect("load parity corpus");
     assert!(
-        !cases.is_empty(),
-        "expected at least one parity corpus case under {}",
-        root.display()
+        cases.len() >= 50,
+        "expected at least 50 parity corpus cases under {}, found {}",
+        root.display(),
+        cases.len()
     );
 
     let artifact_dir = std::env::var_os("PARITY_MATRIX_ARTIFACT_DIR").map(PathBuf::from);

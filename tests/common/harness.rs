@@ -14,17 +14,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_ld::leb::{read_sleb, read_uleb};
 use afs_ld::macho::constants::{
-    BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND,
+    BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DONE, BIND_OPCODE_DO_BIND,
     BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED, BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB,
-    BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_DONE, BIND_OPCODE_MASK,
-    BIND_OPCODE_SET_ADDEND_SLEB, BIND_OPCODE_SET_DYLIB_ORDINAL_IMM,
-    BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB, BIND_OPCODE_SET_DYLIB_SPECIAL_IMM,
-    BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
-    BIND_OPCODE_SET_TYPE_IMM, BIND_SYMBOL_FLAGS_WEAK_IMPORT, BIND_TYPE_POINTER,
-    INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_CODE_SIGNATURE,
-    LC_DATA_IN_CODE, LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
-    LC_FUNCTION_STARTS, LC_ID_DYLIB, LC_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB, LC_LOAD_WEAK_DYLIB,
-    LC_REEXPORT_DYLIB, LC_SEGMENT_64, LC_SYMTAB, LC_UUID, N_TYPE, N_UNDF,
+    BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_MASK, BIND_OPCODE_SET_ADDEND_SLEB,
+    BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
+    BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
+    BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, BIND_TYPE_POINTER, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL,
+    LC_BUILD_VERSION, LC_CODE_SIGNATURE, LC_DATA_IN_CODE, LC_DYLD_CHAINED_FIXUPS,
+    LC_DYLD_EXPORTS_TRIE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS, LC_ID_DYLIB,
+    LC_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_SEGMENT_64,
+    LC_SYMTAB, LC_UUID, N_TYPE, N_UNDF,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::ExportKind;
@@ -1788,9 +1788,21 @@ fn symbol_partition_names(bytes: &[u8]) -> Result<(Vec<String>, Vec<String>, Vec
 }
 
 fn has_optional_dyld_stub_binder(bytes: &[u8]) -> Result<bool, String> {
-    Ok(canonical_symbol_records(bytes)?
-        .into_iter()
-        .any(|record| record.name == "dyld_stub_binder"))
+    let (symtab, _) = symtab_and_dysymtab(bytes)?;
+    let symbols =
+        parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).map_err(|e| e.to_string())?;
+    let strings =
+        StringTable::from_file(bytes, symtab.stroff, symtab.strsize).map_err(|e| e.to_string())?;
+    Ok(symbols.iter().any(|symbol| {
+        strings
+            .get(symbol.strx())
+            .map(|name| {
+                name == "dyld_stub_binder"
+                    && (symbol.raw.n_type & N_TYPE) == N_UNDF
+                    && symbol.raw.n_sect == 0
+            })
+            .unwrap_or(false)
+    }))
 }
 
 fn raw_string_table(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -2277,7 +2289,10 @@ fn canonical_bind_location(
 ) -> Result<CanonicalBindLocation, String> {
     let segments = segment_regions(bytes)?;
     let sections = section_regions(bytes)?;
-    let Some(segment) = segments.iter().find(|segment| segment.index == segment_index) else {
+    let Some(segment) = segments
+        .iter()
+        .find(|segment| segment.index == segment_index)
+    else {
         return Ok(CanonicalBindLocation::Segment {
             segment_index,
             segment_offset,
@@ -2471,7 +2486,9 @@ fn decode_stub_target(bytes: &[u8], stub_addr: u64) -> Result<u64, String> {
         return Err(format!("stub at 0x{stub_addr:x} does not start with ADRP"));
     }
     if (ldr & 0xffc0_0000) != 0xf940_0000 {
-        return Err(format!("stub at 0x{stub_addr:x} does not use LDR (unsigned)"));
+        return Err(format!(
+            "stub at 0x{stub_addr:x} does not use LDR (unsigned)"
+        ));
     }
     if (br & 0xffff_fc1f) != 0xd61f_0000 {
         return Err(format!("stub at 0x{stub_addr:x} does not end with BR"));

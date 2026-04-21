@@ -16,7 +16,9 @@ use afs_ld::macho::constants::{
     LC_BUILD_VERSION, LC_CODE_SIGNATURE, LC_DYSYMTAB, LC_DYLD_INFO_ONLY, LC_LOAD_DYLIB,
     LC_SEGMENT_64, LC_SYMTAB, LC_UUID,
 };
-use afs_ld::macho::reader::{parse_commands, parse_header, u32_le, LoadCommand};
+use afs_ld::macho::reader::{parse_commands, parse_header, u32_le, BuildVersionCmd, LoadCommand};
+use afs_ld::string_table::StringTable;
+use afs_ld::symbol::parse_nlist_table;
 
 #[derive(Debug, Clone)]
 pub struct LinkCase {
@@ -25,9 +27,33 @@ pub struct LinkCase {
     pub inputs: Vec<PathBuf>,
     pub args: Vec<String>,
     pub section_checks: Vec<(String, String)>,
+    pub page_ref_checks: Vec<PageRefCheck>,
+    pub command_checks: Vec<CommandCheck>,
     pub ignored_load_commands: Vec<u32>,
+    pub absent_load_commands: Vec<u32>,
     pub runtime_args: Vec<String>,
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandCheck {
+    BuildVersion,
+    LoadDylibNames,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageRefCheck {
+    pub segname: String,
+    pub sectname: String,
+    pub site_offset: u64,
+    pub kind: PageRefKind,
+    pub symbol: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageRefKind {
+    Add,
+    Load,
 }
 
 pub struct LinkOutputs {
@@ -71,6 +97,8 @@ pub struct ProgramOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
+
+type NormalizedBuildVersion = (u32, u32, u32, Vec<u32>);
 
 pub fn have_xcrun() -> bool {
     Command::new("xcrun")
@@ -185,7 +213,12 @@ pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
 
         let args = read_tokens(&path.join("args.txt"))?;
         let section_checks = read_sections(&path.join("sections.txt"))?;
-        let ignored_load_commands = read_load_command_names(&path.join("ignored_load_commands.txt"))?;
+        let page_ref_checks = read_page_refs(&path.join("page_refs.txt"))?;
+        let command_checks = read_command_checks(&path.join("command_checks.txt"))?;
+        let ignored_load_commands =
+            read_load_command_names(&path.join("ignored_load_commands.txt"))?;
+        let absent_load_commands =
+            read_load_command_names(&path.join("absent_load_commands.txt"))?;
         let runtime_args = read_tokens_if_present(&path.join("runtime.txt"))?;
         let notes = fs::read_to_string(path.join("notes.md")).ok();
 
@@ -195,7 +228,10 @@ pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
             inputs,
             args,
             section_checks,
+            page_ref_checks,
+            command_checks,
             ignored_load_commands,
+            absent_load_commands,
             runtime_args,
             notes,
         });
@@ -307,6 +343,49 @@ pub fn compare_command_ids(ours: &[u8], theirs: &[u8], ignored: &[u32]) -> Resul
     Ok(())
 }
 
+pub fn compare_command_details(
+    ours: &[u8],
+    theirs: &[u8],
+    checks: &[CommandCheck],
+) -> Result<(), String> {
+    for check in checks {
+        match check {
+            CommandCheck::BuildVersion => {
+                let ours = normalized_build_version(ours)?;
+                let theirs = normalized_build_version(theirs)?;
+                if ours != theirs {
+                    return Err(format!(
+                        "LC_BUILD_VERSION diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                    ));
+                }
+            }
+            CommandCheck::LoadDylibNames => {
+                let ours = load_dylib_names(ours)?;
+                let theirs = load_dylib_names(theirs)?;
+                if ours != theirs {
+                    return Err(format!(
+                        "LC_LOAD_DYLIB names diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn ensure_absent_load_commands(bytes: &[u8], commands: &[u32], side: &str) -> Result<(), String> {
+    let ids = command_ids(bytes)?;
+    for command in commands {
+        if ids.contains(command) {
+            return Err(format!(
+                "{side} unexpectedly emitted {}",
+                load_command_name(*command)
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn output_section(bytes: &[u8], segname: &str, sectname: &str) -> Option<(u64, Vec<u8>)> {
     let header = parse_header(bytes).ok()?;
     let commands = parse_commands(&header, bytes).ok()?;
@@ -344,6 +423,43 @@ pub fn compare_sections(
             return Err(format!(
                 "section bytes differ for {segname},{sectname}: {:#?}",
                 diff.critical
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn compare_page_refs(ours: &[u8], theirs: &[u8], checks: &[PageRefCheck]) -> Result<(), String> {
+    if checks.is_empty() {
+        return Ok(());
+    }
+    let our_symbols = symbol_values(ours)?;
+    let their_symbols = symbol_values(theirs)?;
+    for check in checks {
+        let (our_addr, our_bytes) = output_section(ours, &check.segname, &check.sectname)
+            .ok_or_else(|| format!("missing section {},{} in afs-ld output", check.segname, check.sectname))?;
+        let (their_addr, their_bytes) = output_section(theirs, &check.segname, &check.sectname)
+            .ok_or_else(|| format!("missing section {},{} in Apple output", check.segname, check.sectname))?;
+        let our_target = decode_page_reference(&our_bytes, our_addr, check.site_offset, check.kind)?;
+        let their_target =
+            decode_page_reference(&their_bytes, their_addr, check.site_offset, check.kind)?;
+        let expected_ours = *our_symbols
+            .get(&check.symbol)
+            .ok_or_else(|| format!("missing symbol {} in afs-ld output", check.symbol))?;
+        let expected_theirs = *their_symbols
+            .get(&check.symbol)
+            .ok_or_else(|| format!("missing symbol {} in Apple output", check.symbol))?;
+        if our_target != expected_ours || their_target != expected_theirs {
+            return Err(format!(
+                "page ref {},{}+0x{:x} -> {} diverged: ours=0x{:x} expected=0x{:x}; theirs=0x{:x} expected=0x{:x}",
+                check.segname,
+                check.sectname,
+                check.site_offset,
+                check.symbol,
+                our_target,
+                expected_ours,
+                their_target,
+                expected_theirs,
             ));
         }
     }
@@ -510,6 +626,9 @@ fn read_sections(path: &Path) -> Result<Vec<(String, String)>, String> {
 }
 
 fn read_load_command_names(path: &Path) -> Result<Vec<u32>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
     let mut commands = Vec::new();
     for line in read_tokens(path)? {
         commands.push(parse_load_command_name(&line)?);
@@ -517,12 +636,99 @@ fn read_load_command_names(path: &Path) -> Result<Vec<u32>, String> {
     Ok(commands)
 }
 
+fn read_command_checks(path: &Path) -> Result<Vec<CommandCheck>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut checks = Vec::new();
+    for line in read_tokens(path)? {
+        checks.push(parse_command_check(&line)?);
+    }
+    Ok(checks)
+}
+
+fn read_page_refs(path: &Path) -> Result<Vec<PageRefCheck>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut checks = Vec::new();
+    for line in read_tokens(path)? {
+        let mut parts = line.split_whitespace();
+        let segname = parts
+            .next()
+            .ok_or_else(|| format!("missing segment name in {}", path.display()))?;
+        let sectname = parts
+            .next()
+            .ok_or_else(|| format!("missing section name in {}", path.display()))?;
+        let site_offset = parts
+            .next()
+            .ok_or_else(|| format!("missing site offset in {}", path.display()))?;
+        let kind = parts
+            .next()
+            .ok_or_else(|| format!("missing page-ref kind in {}", path.display()))?;
+        let symbol = parts
+            .next()
+            .ok_or_else(|| format!("missing symbol name in {}", path.display()))?;
+        if parts.next().is_some() {
+            return Err(format!(
+                "too many fields in page-ref spec `{line}` from {}",
+                path.display()
+            ));
+        }
+        checks.push(PageRefCheck {
+            segname: segname.to_string(),
+            sectname: sectname.to_string(),
+            site_offset: parse_u64(site_offset)?,
+            kind: parse_page_ref_kind(kind)?,
+            symbol: symbol.to_string(),
+        });
+    }
+    Ok(checks)
+}
+
+fn parse_command_check(name: &str) -> Result<CommandCheck, String> {
+    match name {
+        "build_version" => Ok(CommandCheck::BuildVersion),
+        "load_dylib_names" => Ok(CommandCheck::LoadDylibNames),
+        other => Err(format!("unknown command check `{other}`")),
+    }
+}
+
+fn parse_page_ref_kind(kind: &str) -> Result<PageRefKind, String> {
+    match kind {
+        "add" => Ok(PageRefKind::Add),
+        "load" => Ok(PageRefKind::Load),
+        other => Err(format!("unknown page-ref kind `{other}`")),
+    }
+}
+
 fn parse_load_command_name(name: &str) -> Result<u32, String> {
     match name {
         "LC_LOAD_DYLIB" => Ok(LC_LOAD_DYLIB),
         "LC_UUID" => Ok(LC_UUID),
         "LC_CODE_SIGNATURE" => Ok(LC_CODE_SIGNATURE),
+        "LC_LINKER_OPTIMIZATION_HINT" => Ok(afs_ld::macho::constants::LC_LINKER_OPTIMIZATION_HINT),
         other => Err(format!("unknown load command name `{other}`")),
+    }
+}
+
+fn load_command_name(cmd: u32) -> &'static str {
+    match cmd {
+        LC_LOAD_DYLIB => "LC_LOAD_DYLIB",
+        LC_UUID => "LC_UUID",
+        LC_CODE_SIGNATURE => "LC_CODE_SIGNATURE",
+        afs_ld::macho::constants::LC_LINKER_OPTIMIZATION_HINT => "LC_LINKER_OPTIMIZATION_HINT",
+        _ => "unknown load command",
+    }
+}
+
+fn parse_u64(value: &str) -> Result<u64, String> {
+    if let Some(hex) = value.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).map_err(|e| format!("parse hex `{value}`: {e}"))
+    } else {
+        value
+            .parse::<u64>()
+            .map_err(|e| format!("parse integer `{value}`: {e}"))
     }
 }
 
@@ -620,5 +826,100 @@ fn mark_range(mask: &mut [Option<&'static str>], start: usize, end: usize, reaso
     let end = end.min(mask.len());
     for slot in &mut mask[start..end] {
         *slot = Some(reason);
+    }
+}
+
+fn build_version_command(bytes: &[u8]) -> Result<Option<BuildVersionCmd>, String> {
+    let header = parse_header(bytes).map_err(|e| e.to_string())?;
+    let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
+    Ok(commands.into_iter().find_map(|cmd| match cmd {
+        LoadCommand::BuildVersion(cmd) => Some(cmd),
+        _ => None,
+    }))
+}
+
+fn normalized_build_version(bytes: &[u8]) -> Result<Option<NormalizedBuildVersion>, String> {
+    Ok(build_version_command(bytes)?.map(|cmd| {
+        (
+            cmd.platform,
+            cmd.minos,
+            cmd.sdk,
+            cmd.tools.into_iter().map(|tool| tool.tool).collect(),
+        )
+    }))
+}
+
+fn load_dylib_names(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let header = parse_header(bytes).map_err(|e| e.to_string())?;
+    let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
+    Ok(commands
+        .into_iter()
+        .filter_map(|cmd| match cmd {
+            LoadCommand::Dylib(cmd) if cmd.cmd == LC_LOAD_DYLIB => Some(cmd.name),
+            _ => None,
+        })
+        .collect())
+}
+
+fn symbol_values(bytes: &[u8]) -> Result<BTreeMap<String, u64>, String> {
+    let header = parse_header(bytes).map_err(|e| e.to_string())?;
+    let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
+    let symtab = commands
+        .iter()
+        .find_map(|cmd| match cmd {
+            LoadCommand::Symtab(cmd) => Some(*cmd),
+            _ => None,
+        })
+        .ok_or_else(|| "missing LC_SYMTAB".to_string())?;
+    let symbols = parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).map_err(|e| e.to_string())?;
+    let strings =
+        StringTable::from_file(bytes, symtab.stroff, symtab.strsize).map_err(|e| e.to_string())?;
+    let mut out = BTreeMap::new();
+    for symbol in symbols {
+        let Ok(name) = strings.get(symbol.strx()) else {
+            continue;
+        };
+        out.insert(name.to_string(), symbol.value());
+    }
+    Ok(out)
+}
+
+fn decode_page_reference(
+    bytes: &[u8],
+    section_addr: u64,
+    site_offset: u64,
+    kind: PageRefKind,
+) -> Result<u64, String> {
+    let start = site_offset as usize;
+    let adrp = read_insn(bytes, start)?;
+    let second = read_insn(bytes, start + 4)?;
+    let place = section_addr + site_offset;
+    let adrp_immlo = ((adrp >> 29) & 0x3) as i64;
+    let adrp_immhi = ((adrp >> 5) & 0x7ffff) as i64;
+    let adrp_pages = sign_extend_21((adrp_immhi << 2) | adrp_immlo);
+    let adrp_base = ((place as i64) & !0xfff) + (adrp_pages << 12);
+    let low = match kind {
+        PageRefKind::Add => ((second >> 10) & 0xfff) as u64,
+        PageRefKind::Load => {
+            let shift = ((second >> 30) & 0b11) as u64;
+            (((second >> 10) & 0xfff) as u64) << shift
+        }
+    };
+    Ok((adrp_base as u64) + low)
+}
+
+fn read_insn(bytes: &[u8], start: usize) -> Result<u32, String> {
+    let end = start + 4;
+    let slice = bytes
+        .get(start..end)
+        .ok_or_else(|| format!("instruction read OOB at 0x{start:x}"))?;
+    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn sign_extend_21(value: i64) -> i64 {
+    if value & (1 << 20) != 0 {
+        value | !0x1f_ffff
+    } else {
+        value
     }
 }

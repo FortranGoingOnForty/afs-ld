@@ -9,8 +9,9 @@ mod common;
 use std::path::PathBuf;
 
 use common::harness::{
-    compare_command_ids, compare_runtime, compare_sections, have_xcrun, have_xcrun_tool,
-    link_both, load_corpus,
+    compare_command_details, compare_command_ids, compare_runtime, compare_sections,
+    compare_page_refs, ensure_absent_load_commands, have_xcrun, have_xcrun_tool, link_both,
+    load_corpus,
 };
 
 #[test]
@@ -41,8 +42,16 @@ fn parity_corpus() {
         });
         compare_command_ids(&outputs.ours, &outputs.theirs, &case.ignored_load_commands)
             .unwrap_or_else(|e| panic!("{}: load-command parity failed:\n{}", case.name, e));
+        compare_command_details(&outputs.ours, &outputs.theirs, &case.command_checks)
+            .unwrap_or_else(|e| panic!("{}: command detail parity failed:\n{}", case.name, e));
+        ensure_absent_load_commands(&outputs.ours, &case.absent_load_commands, "afs-ld")
+            .unwrap_or_else(|e| panic!("{}: unexpected afs-ld command:\n{}", case.name, e));
+        ensure_absent_load_commands(&outputs.theirs, &case.absent_load_commands, "Apple ld")
+            .unwrap_or_else(|e| panic!("{}: unexpected Apple ld command:\n{}", case.name, e));
         compare_sections(&outputs.ours, &outputs.theirs, &case.section_checks)
             .unwrap_or_else(|e| panic!("{}: section parity failed:\n{}", case.name, e));
+        compare_page_refs(&outputs.ours, &outputs.theirs, &case.page_ref_checks)
+            .unwrap_or_else(|e| panic!("{}: page-ref parity failed:\n{}", case.name, e));
         if !case.runtime_args.is_empty() || case.dir.join("runtime.txt").exists() {
             compare_runtime(&outputs.our_path, &outputs.their_path, &case.runtime_args)
                 .unwrap_or_else(|e| panic!("{}: runtime parity failed:\n{}", case.name, e));

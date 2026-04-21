@@ -16,7 +16,9 @@ use afs_ld::macho::constants::{
     LC_BUILD_VERSION, LC_CODE_SIGNATURE, LC_DYSYMTAB, LC_DYLD_INFO_ONLY, LC_LOAD_DYLIB,
     LC_SEGMENT_64, LC_SYMTAB, LC_UUID,
 };
-use afs_ld::macho::reader::{parse_commands, parse_header, u32_le, BuildVersionCmd, LoadCommand};
+use afs_ld::macho::reader::{
+    parse_commands, parse_header, u32_le, BuildVersionCmd, DyldInfoCmd, LoadCommand,
+};
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::ExportKind;
 use afs_ld::string_table::StringTable;
@@ -31,6 +33,7 @@ pub struct LinkCase {
     pub section_checks: Vec<(String, String)>,
     pub page_ref_checks: Vec<PageRefCheck>,
     pub command_checks: Vec<CommandCheck>,
+    artifacts: Vec<ArtifactSpec>,
     pub ignored_load_commands: Vec<u32>,
     pub absent_load_commands: Vec<u32>,
     pub runtime_args: Vec<String>,
@@ -43,6 +46,10 @@ pub enum CommandCheck {
     LoadDylibNames,
     ExportRecords,
     SymbolRecordMap,
+    DyldInfoRebase,
+    DyldInfoBind,
+    DyldInfoWeakBind,
+    DyldInfoLazyBind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +65,18 @@ pub struct PageRefCheck {
 pub enum PageRefKind {
     Add,
     Load,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactSpec {
+    src_name: String,
+    out_name: String,
+    kind: ArtifactKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactKind {
+    ClangDylib,
 }
 
 pub struct LinkOutputs {
@@ -180,6 +199,56 @@ pub fn assemble(src: &str, out: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+pub fn compile_c(src: &str, out: &PathBuf) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "afs-ld-parity-{}-{}.c",
+        std::process::id(),
+        out.file_stem().and_then(|s| s.to_str()).unwrap_or("t")
+    ));
+    fs::write(&tmp, src).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    let output = Command::new("xcrun")
+        .args(["--sdk", "macosx", "clang", "-arch", "arm64", "-c"])
+        .arg(&tmp)
+        .arg("-o")
+        .arg(out)
+        .output()
+        .map_err(|e| format!("spawn xcrun clang: {e}"))?;
+    let _ = fs::remove_file(&tmp);
+    if !output.status.success() {
+        return Err(format!(
+            "xcrun clang failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn compile_dylib_c(src: &str, out: &PathBuf) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "afs-ld-parity-{}-{}.c",
+        std::process::id(),
+        out.file_stem().and_then(|s| s.to_str()).unwrap_or("lib")
+    ));
+    fs::write(&tmp, src).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    let install_name = out.to_string_lossy().to_string();
+    let output = Command::new("xcrun")
+        .args(["--sdk", "macosx", "clang", "-arch", "arm64", "-dynamiclib"])
+        .arg(&tmp)
+        .arg(format!("-Wl,-install_name,{install_name}"))
+        .arg("-o")
+        .arg(out)
+        .output()
+        .map_err(|e| format!("spawn xcrun clang dylib: {e}"))?;
+    let _ = fs::remove_file(&tmp);
+    if !output.status.success() {
+        return Err(format!(
+            "xcrun clang dylib failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
 pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
     let mut cases = Vec::new();
     let entries =
@@ -203,14 +272,15 @@ pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
         for input in input_entries {
             let input = input.map_err(|e| format!("read input entry for {}: {e}", name))?;
             let input_path = input.path();
-            if input_path.extension().and_then(|s| s.to_str()) == Some("s") {
-                inputs.push(input_path);
+            match input_path.extension().and_then(|s| s.to_str()) {
+                Some("s") | Some("c") => inputs.push(input_path),
+                _ => {}
             }
         }
         inputs.sort();
         if inputs.is_empty() {
             return Err(format!(
-                "parity corpus case {} has no .s inputs",
+                "parity corpus case {} has no supported source inputs",
                 path.display()
             ));
         }
@@ -219,6 +289,7 @@ pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
         let section_checks = read_sections(&path.join("sections.txt"))?;
         let page_ref_checks = read_page_refs(&path.join("page_refs.txt"))?;
         let command_checks = read_command_checks(&path.join("command_checks.txt"))?;
+        let artifacts = read_artifacts(&path.join("artifacts.txt"))?;
         let ignored_load_commands =
             read_load_command_names(&path.join("ignored_load_commands.txt"))?;
         let absent_load_commands =
@@ -234,6 +305,7 @@ pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
             section_checks,
             page_ref_checks,
             command_checks,
+            artifacts,
             ignored_load_commands,
             absent_load_commands,
             runtime_args,
@@ -252,6 +324,7 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
     let work_dir = unique_temp_dir(&case.name)?;
     let mut compiled = BTreeMap::new();
     let mut sidecars = BTreeMap::new();
+    let mut artifacts = BTreeMap::new();
     for input in &case.inputs {
         let stem = input
             .file_stem()
@@ -259,9 +332,25 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
             .ok_or_else(|| format!("invalid input stem {}", input.display()))?;
         let src = fs::read_to_string(input)
             .map_err(|e| format!("read parity input {}: {e}", input.display()))?;
-        let obj = work_dir.join(format!("{stem}.o"));
-        assemble(&src, &obj)?;
-        compiled.insert(format!("{stem}.o"), obj);
+        match input.extension().and_then(|s| s.to_str()) {
+            Some("s") => {
+                let obj = work_dir.join(format!("{stem}.o"));
+                assemble(&src, &obj)?;
+                compiled.insert(format!("{stem}.o"), obj);
+            }
+            Some("c") => {
+                let obj = work_dir.join(format!("{stem}.o"));
+                compile_c(&src, &obj)?;
+                compiled.insert(format!("{stem}.o"), obj);
+            }
+            other => {
+                return Err(format!(
+                    "unsupported parity input extension {:?} for {}",
+                    other,
+                    input.display()
+                ));
+            }
+        }
     }
     let files_dir = case.dir.join("files");
     if files_dir.is_dir() {
@@ -284,6 +373,16 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
             sidecars.insert(name, dst);
         }
     }
+    for artifact in &case.artifacts {
+        let src = case.dir.join("inputs").join(&artifact.src_name);
+        let src_contents =
+            fs::read_to_string(&src).map_err(|e| format!("read artifact src {}: {e}", src.display()))?;
+        let out = work_dir.join(&artifact.out_name);
+        match artifact.kind {
+            ArtifactKind::ClangDylib => compile_dylib_c(&src_contents, &out)?,
+        }
+        artifacts.insert(artifact.out_name.clone(), out);
+    }
 
     let suffix = if case.args.iter().any(|arg| arg == "-dylib") {
         "dylib"
@@ -293,8 +392,24 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
     let our_path = work_dir.join(format!("ours.{suffix}"));
     let their_path = work_dir.join(format!("apple.{suffix}"));
 
-    let our_args = expand_args(&case.args, &compiled, &sidecars, &our_path, &sdk, &sdk_ver)?;
-    let their_args = expand_args(&case.args, &compiled, &sidecars, &their_path, &sdk, &sdk_ver)?;
+    let our_args = expand_args(
+        &case.args,
+        &compiled,
+        &sidecars,
+        &artifacts,
+        &our_path,
+        &sdk,
+        &sdk_ver,
+    )?;
+    let their_args = expand_args(
+        &case.args,
+        &compiled,
+        &sidecars,
+        &artifacts,
+        &their_path,
+        &sdk,
+        &sdk_ver,
+    )?;
 
     let our_output = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
         .args(&our_args)
@@ -410,6 +525,34 @@ pub fn compare_command_details(
                     return Err(format!(
                         "canonical symbol record map diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
                     ));
+                }
+            }
+            CommandCheck::DyldInfoRebase => {
+                let ours = dyld_info_stream(ours, DyldInfoStreamKind::Rebase)?;
+                let theirs = dyld_info_stream(theirs, DyldInfoStreamKind::Rebase)?;
+                if ours != theirs {
+                    return Err("rebase stream diverged".to_string());
+                }
+            }
+            CommandCheck::DyldInfoBind => {
+                let ours = dyld_info_stream(ours, DyldInfoStreamKind::Bind)?;
+                let theirs = dyld_info_stream(theirs, DyldInfoStreamKind::Bind)?;
+                if ours != theirs {
+                    return Err("bind stream diverged".to_string());
+                }
+            }
+            CommandCheck::DyldInfoWeakBind => {
+                let ours = dyld_info_stream(ours, DyldInfoStreamKind::WeakBind)?;
+                let theirs = dyld_info_stream(theirs, DyldInfoStreamKind::WeakBind)?;
+                if ours != theirs {
+                    return Err("weak-bind stream diverged".to_string());
+                }
+            }
+            CommandCheck::DyldInfoLazyBind => {
+                let ours = dyld_info_stream(ours, DyldInfoStreamKind::LazyBind)?;
+                let theirs = dyld_info_stream(theirs, DyldInfoStreamKind::LazyBind)?;
+                if ours != theirs {
+                    return Err("lazy-bind stream diverged".to_string());
                 }
             }
         }
@@ -730,12 +873,51 @@ fn read_page_refs(path: &Path) -> Result<Vec<PageRefCheck>, String> {
     Ok(checks)
 }
 
+fn read_artifacts(path: &Path) -> Result<Vec<ArtifactSpec>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut specs = Vec::new();
+    for line in read_tokens(path)? {
+        let mut parts = line.split_whitespace();
+        let kind = parts
+            .next()
+            .ok_or_else(|| format!("missing artifact kind in {}", path.display()))?;
+        let src_name = parts
+            .next()
+            .ok_or_else(|| format!("missing artifact src in {}", path.display()))?;
+        let out_name = parts
+            .next()
+            .ok_or_else(|| format!("missing artifact output in {}", path.display()))?;
+        if parts.next().is_some() {
+            return Err(format!(
+                "too many fields in artifact spec `{line}` from {}",
+                path.display()
+            ));
+        }
+        let kind = match kind {
+            "clang_dylib" => ArtifactKind::ClangDylib,
+            other => return Err(format!("unknown artifact kind `{other}`")),
+        };
+        specs.push(ArtifactSpec {
+            src_name: src_name.to_string(),
+            out_name: out_name.to_string(),
+            kind,
+        });
+    }
+    Ok(specs)
+}
+
 fn parse_command_check(name: &str) -> Result<CommandCheck, String> {
     match name {
         "build_version" => Ok(CommandCheck::BuildVersion),
         "load_dylib_names" => Ok(CommandCheck::LoadDylibNames),
         "export_records" => Ok(CommandCheck::ExportRecords),
         "symbol_record_map" => Ok(CommandCheck::SymbolRecordMap),
+        "dyld_info_rebase" => Ok(CommandCheck::DyldInfoRebase),
+        "dyld_info_bind" => Ok(CommandCheck::DyldInfoBind),
+        "dyld_info_weak_bind" => Ok(CommandCheck::DyldInfoWeakBind),
+        "dyld_info_lazy_bind" => Ok(CommandCheck::DyldInfoLazyBind),
         other => Err(format!("unknown command check `{other}`")),
     }
 }
@@ -782,6 +964,7 @@ fn expand_args(
     args: &[String],
     compiled: &BTreeMap<String, PathBuf>,
     sidecars: &BTreeMap<String, PathBuf>,
+    artifacts: &BTreeMap<String, PathBuf>,
     out: &Path,
     sdk: &str,
     sdk_ver: &str,
@@ -798,6 +981,13 @@ fn expand_args(
         }
         if arg == "@SDK_VERSION@" {
             expanded.push(sdk_ver.to_string());
+            continue;
+        }
+        if let Some(rel) = arg
+            .strip_prefix("@SDK_TBD:")
+            .and_then(|rest| rest.strip_suffix('@'))
+        {
+            expanded.push(Path::new(sdk).join(rel).to_string_lossy().to_string());
             continue;
         }
         if let Some(name) = arg
@@ -818,6 +1008,16 @@ fn expand_args(
                 .get(name)
                 .ok_or_else(|| format!("unknown parity sidecar placeholder `{name}`"))?;
             expanded.push(file.to_string_lossy().to_string());
+            continue;
+        }
+        if let Some(name) = arg
+            .strip_prefix("@ARTIFACT:")
+            .and_then(|rest| rest.strip_suffix('@'))
+        {
+            let artifact = artifacts
+                .get(name)
+                .ok_or_else(|| format!("unknown parity artifact placeholder `{name}`"))?;
+            expanded.push(artifact.to_string_lossy().to_string());
             continue;
         }
         expanded.push(arg.clone());
@@ -1062,6 +1262,45 @@ fn section_addrs(bytes: &[u8]) -> Result<Vec<u64>, String> {
         }
     }
     Ok(out)
+}
+
+#[derive(Clone, Copy)]
+enum DyldInfoStreamKind {
+    Rebase,
+    Bind,
+    WeakBind,
+    LazyBind,
+}
+
+fn dyld_info_command(bytes: &[u8]) -> Result<DyldInfoCmd, String> {
+    let header = parse_header(bytes).map_err(|e| e.to_string())?;
+    let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
+    commands
+        .into_iter()
+        .find_map(|cmd| match cmd {
+            LoadCommand::DyldInfoOnly(cmd) => Some(cmd),
+            _ => None,
+        })
+        .ok_or_else(|| "missing LC_DYLD_INFO_ONLY".to_string())
+}
+
+fn dyld_info_stream(bytes: &[u8], kind: DyldInfoStreamKind) -> Result<Vec<u8>, String> {
+    let dyld_info = dyld_info_command(bytes)?;
+    let (off, size) = match kind {
+        DyldInfoStreamKind::Rebase => (dyld_info.rebase_off, dyld_info.rebase_size),
+        DyldInfoStreamKind::Bind => (dyld_info.bind_off, dyld_info.bind_size),
+        DyldInfoStreamKind::WeakBind => (dyld_info.weak_bind_off, dyld_info.weak_bind_size),
+        DyldInfoStreamKind::LazyBind => (dyld_info.lazy_bind_off, dyld_info.lazy_bind_size),
+    };
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let start = off as usize;
+    let end = start + size as usize;
+    bytes
+        .get(start..end)
+        .map(|slice| slice.to_vec())
+        .ok_or_else(|| "dyld-info stream out of bounds".to_string())
 }
 
 fn symbol_values(bytes: &[u8]) -> Result<BTreeMap<String, u64>, String> {

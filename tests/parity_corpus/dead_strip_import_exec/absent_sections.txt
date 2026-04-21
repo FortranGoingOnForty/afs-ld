@@ -1,0 +1,4 @@
+__TEXT __stubs
+__TEXT __stub_helper
+__DATA __la_symbol_ptr
+__DATA_CONST __got

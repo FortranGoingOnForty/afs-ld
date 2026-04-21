@@ -13,8 +13,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_ld::macho::constants::{
-    LC_BUILD_VERSION, LC_CODE_SIGNATURE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_LOAD_DYLIB,
-    LC_SEGMENT_64, LC_SYMTAB, LC_UUID,
+    INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_CODE_SIGNATURE,
+    LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_LOAD_DYLIB, LC_SEGMENT_64, LC_SYMTAB, LC_UUID,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::ExportKind;
@@ -31,6 +31,7 @@ pub struct LinkCase {
     pub inputs: Vec<PathBuf>,
     pub args: Vec<String>,
     pub section_checks: Vec<(String, String)>,
+    pub absent_sections: Vec<(String, String)>,
     pub page_ref_checks: Vec<PageRefCheck>,
     pub command_checks: Vec<CommandCheck>,
     artifacts: Vec<ArtifactSpec>,
@@ -47,6 +48,7 @@ pub enum CommandCheck {
     LoadDylibNames,
     ExportRecords,
     SymbolRecordMap,
+    IndirectSymbolIdentities,
     DyldInfoRebase,
     DyldInfoBind,
     DyldInfoWeakBind,
@@ -304,6 +306,7 @@ pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
 
         let args = read_tokens(&path.join("args.txt"))?;
         let section_checks = read_sections(&path.join("sections.txt"))?;
+        let absent_sections = read_sections_if_present(&path.join("absent_sections.txt"))?;
         let page_ref_checks = read_page_refs(&path.join("page_refs.txt"))?;
         let command_checks = read_command_checks(&path.join("command_checks.txt"))?;
         let artifacts = read_artifacts(&path.join("artifacts.txt"))?;
@@ -320,6 +323,7 @@ pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
             inputs,
             args,
             section_checks,
+            absent_sections,
             page_ref_checks,
             command_checks,
             artifacts,
@@ -539,6 +543,15 @@ pub fn compare_command_details(
                     ));
                 }
             }
+            CommandCheck::IndirectSymbolIdentities => {
+                let ours = indirect_symbol_identities(ours)?;
+                let theirs = indirect_symbol_identities(theirs)?;
+                if ours != theirs {
+                    return Err(format!(
+                        "indirect symbol identities diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                    ));
+                }
+            }
             CommandCheck::DyldInfoRebase => {
                 let ours = dyld_info_stream(ours, DyldInfoStreamKind::Rebase)?;
                 let theirs = dyld_info_stream(theirs, DyldInfoStreamKind::Rebase)?;
@@ -583,6 +596,21 @@ pub fn ensure_absent_load_commands(
             return Err(format!(
                 "{side} unexpectedly emitted {}",
                 load_command_name(*command)
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn ensure_absent_sections(
+    bytes: &[u8],
+    sections: &[(String, String)],
+    side: &str,
+) -> Result<(), String> {
+    for (segname, sectname) in sections {
+        if output_section(bytes, segname, sectname).is_some() {
+            return Err(format!(
+                "{side} unexpectedly emitted section {segname},{sectname}"
             ));
         }
     }
@@ -838,9 +866,9 @@ pub fn apply_section_tolerances(
 
     let mut remaining = Vec::new();
     for chunk in diff.critical.drain(..) {
-        let tolerated = case_tolerances.iter().find(|tol| {
-            tolerance_covers_chunk(tol, segname, sectname, chunk.offset, chunk.len)
-        });
+        let tolerated = case_tolerances
+            .iter()
+            .find(|tol| tolerance_covers_chunk(tol, segname, sectname, chunk.offset, chunk.len));
         if let Some(tol) = tolerated {
             diff.tolerated.push(DiffChunk {
                 offset: chunk.offset,
@@ -888,7 +916,10 @@ fn parse_case_tolerance_line(line: &str) -> Result<CaseTolerance, String> {
     let (start, end_inclusive) = parse_tolerance_range(bytes_part.trim())?;
     let region_token = region_part.trim();
     let (segname, sectname) = match region_token.split_once(',') {
-        Some((segname, sectname)) => (segname.trim().to_string(), Some(sectname.trim().to_string())),
+        Some((segname, sectname)) => (
+            segname.trim().to_string(),
+            Some(sectname.trim().to_string()),
+        ),
         None => (region_token.to_string(), None),
     };
     if segname.is_empty() {
@@ -994,6 +1025,14 @@ fn read_sections(path: &Path) -> Result<Vec<(String, String)>, String> {
     Ok(sections)
 }
 
+fn read_sections_if_present(path: &Path) -> Result<Vec<(String, String)>, String> {
+    if path.exists() {
+        read_sections(path)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 fn read_load_command_names(path: &Path) -> Result<Vec<u32>, String> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -1096,6 +1135,7 @@ fn parse_command_check(name: &str) -> Result<CommandCheck, String> {
         "load_dylib_names" => Ok(CommandCheck::LoadDylibNames),
         "export_records" => Ok(CommandCheck::ExportRecords),
         "symbol_record_map" => Ok(CommandCheck::SymbolRecordMap),
+        "indirect_symbol_identities" => Ok(CommandCheck::IndirectSymbolIdentities),
         "dyld_info_rebase" => Ok(CommandCheck::DyldInfoRebase),
         "dyld_info_bind" => Ok(CommandCheck::DyldInfoBind),
         "dyld_info_weak_bind" => Ok(CommandCheck::DyldInfoWeakBind),
@@ -1114,6 +1154,7 @@ fn parse_page_ref_kind(kind: &str) -> Result<PageRefKind, String> {
 
 fn parse_load_command_name(name: &str) -> Result<u32, String> {
     match name {
+        "LC_SEGMENT_64" => Ok(LC_SEGMENT_64),
         "LC_LOAD_DYLIB" => Ok(LC_LOAD_DYLIB),
         "LC_UUID" => Ok(LC_UUID),
         "LC_CODE_SIGNATURE" => Ok(LC_CODE_SIGNATURE),
@@ -1124,6 +1165,7 @@ fn parse_load_command_name(name: &str) -> Result<u32, String> {
 
 fn load_command_name(cmd: u32) -> &'static str {
     match cmd {
+        LC_SEGMENT_64 => "LC_SEGMENT_64",
         LC_LOAD_DYLIB => "LC_LOAD_DYLIB",
         LC_UUID => "LC_UUID",
         LC_CODE_SIGNATURE => "LC_CODE_SIGNATURE",
@@ -1404,6 +1446,44 @@ fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExportRecord>, 
         .collect::<Vec<_>>();
     out.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
     Ok(out)
+}
+
+fn indirect_symbol_table(bytes: &[u8]) -> Result<Vec<u32>, String> {
+    let (_, dysymtab) = symtab_and_dysymtab(bytes)?;
+    if dysymtab.nindirectsyms == 0 {
+        return Ok(Vec::new());
+    }
+    let start = dysymtab.indirectsymoff as usize;
+    let end = start + dysymtab.nindirectsyms as usize * 4;
+    Ok(bytes[start..end]
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect())
+}
+
+fn indirect_symbol_identities(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let (symtab, _) = symtab_and_dysymtab(bytes)?;
+    let symbols =
+        parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).map_err(|e| e.to_string())?;
+    let strings =
+        StringTable::from_file(bytes, symtab.stroff, symtab.strsize).map_err(|e| e.to_string())?;
+    Ok(indirect_symbol_table(bytes)?
+        .into_iter()
+        .map(|index| {
+            if index & INDIRECT_SYMBOL_LOCAL != 0 {
+                if index & INDIRECT_SYMBOL_ABS != 0 {
+                    "<LOCAL|ABS>".to_string()
+                } else {
+                    "<LOCAL>".to_string()
+                }
+            } else if index & INDIRECT_SYMBOL_ABS != 0 {
+                "<ABS>".to_string()
+            } else {
+                let symbol = &symbols[index as usize];
+                strings.get(symbol.strx()).unwrap().to_string()
+            }
+        })
+        .collect())
 }
 
 fn symtab_and_dysymtab(

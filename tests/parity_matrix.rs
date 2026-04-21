@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use common::harness::{
     compare_command_details, compare_command_ids, compare_page_refs, compare_runtime,
-    compare_sections, ensure_absent_load_commands, have_xcrun, have_xcrun_tool, link_both,
-    load_corpus, LinkCase,
+    compare_sections, ensure_absent_load_commands, ensure_absent_sections, have_xcrun,
+    have_xcrun_tool, link_both, load_corpus, LinkCase,
 };
 
 #[test]
@@ -145,6 +145,18 @@ fn run_case(case: &LinkCase) -> CaseReport {
     if !report.push(
         "Apple absent commands",
         ensure_absent_load_commands(&outputs.theirs, &case.absent_load_commands, "Apple ld"),
+    ) {
+        return report;
+    }
+    if !report.push(
+        "afs-ld absent sections",
+        ensure_absent_sections(&outputs.ours, &case.absent_sections, "afs-ld"),
+    ) {
+        return report;
+    }
+    if !report.push(
+        "Apple absent sections",
+        ensure_absent_sections(&outputs.theirs, &case.absent_sections, "Apple ld"),
     ) {
         return report;
     }

@@ -12,12 +12,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use afs_ld::leb::read_uleb;
+use afs_ld::leb::{read_sleb, read_uleb};
 use afs_ld::macho::constants::{
+    BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND,
+    BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED, BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB,
+    BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_DONE, BIND_OPCODE_MASK,
+    BIND_OPCODE_SET_ADDEND_SLEB, BIND_OPCODE_SET_DYLIB_ORDINAL_IMM,
+    BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB, BIND_OPCODE_SET_DYLIB_SPECIAL_IMM,
+    BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM,
+    BIND_OPCODE_SET_TYPE_IMM, BIND_SYMBOL_FLAGS_WEAK_IMPORT, BIND_TYPE_POINTER,
     INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_CODE_SIGNATURE,
     LC_DATA_IN_CODE, LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
     LC_FUNCTION_STARTS, LC_ID_DYLIB, LC_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB, LC_LOAD_WEAK_DYLIB,
-    LC_REEXPORT_DYLIB, LC_SEGMENT_64, LC_SYMTAB, LC_UUID,
+    LC_REEXPORT_DYLIB, LC_SEGMENT_64, LC_SYMTAB, LC_UUID, N_TYPE, N_UNDF,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::ExportKind;
@@ -59,6 +66,7 @@ pub enum CommandCheck {
     FunctionStarts,
     NormalizedFunctionStarts,
     DataInCode,
+    DataInCodeIfPresent,
     RebasedUnwindBytes,
     DyldInfoRebase,
     DyldInfoBind,
@@ -712,6 +720,15 @@ pub fn compare_command_details(
                     ));
                 }
             }
+            CommandCheck::DataInCodeIfPresent => {
+                let ours = canonical_data_in_code(ours)?;
+                let theirs = canonical_data_in_code(theirs)?;
+                if !ours.is_empty() && !theirs.is_empty() && ours != theirs {
+                    return Err(format!(
+                        "canonical data-in-code records diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                    ));
+                }
+            }
             CommandCheck::RebasedUnwindBytes => {
                 let ours = rebased_unwind_bytes(ours)?;
                 let theirs = rebased_unwind_bytes(theirs)?;
@@ -727,24 +744,30 @@ pub fn compare_command_details(
                 }
             }
             CommandCheck::DyldInfoBind => {
-                let ours = dyld_info_stream(ours, DyldInfoStreamKind::Bind)?;
-                let theirs = dyld_info_stream(theirs, DyldInfoStreamKind::Bind)?;
+                let ours = canonical_bind_records(ours, DyldInfoStreamKind::Bind)?;
+                let theirs = canonical_bind_records(theirs, DyldInfoStreamKind::Bind)?;
                 if ours != theirs {
-                    return Err("bind stream diverged".to_string());
+                    return Err(format!(
+                        "bind stream diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                    ));
                 }
             }
             CommandCheck::DyldInfoWeakBind => {
-                let ours = dyld_info_stream(ours, DyldInfoStreamKind::WeakBind)?;
-                let theirs = dyld_info_stream(theirs, DyldInfoStreamKind::WeakBind)?;
+                let ours = canonical_bind_records(ours, DyldInfoStreamKind::WeakBind)?;
+                let theirs = canonical_bind_records(theirs, DyldInfoStreamKind::WeakBind)?;
                 if ours != theirs {
-                    return Err("weak-bind stream diverged".to_string());
+                    return Err(format!(
+                        "weak-bind stream diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                    ));
                 }
             }
             CommandCheck::DyldInfoLazyBind => {
-                let ours = dyld_info_stream(ours, DyldInfoStreamKind::LazyBind)?;
-                let theirs = dyld_info_stream(theirs, DyldInfoStreamKind::LazyBind)?;
+                let ours = canonical_bind_records(ours, DyldInfoStreamKind::LazyBind)?;
+                let theirs = canonical_bind_records(theirs, DyldInfoStreamKind::LazyBind)?;
                 if ours != theirs {
-                    return Err("lazy-bind stream diverged".to_string());
+                    return Err(format!(
+                        "lazy-bind stream diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                    ));
                 }
             }
         }
@@ -841,6 +864,16 @@ pub fn compare_sections(
     case_tolerances: &[CaseTolerance],
 ) -> Result<(), String> {
     for (segname, sectname) in sections {
+        if segname == "__TEXT" && sectname == "__stubs" {
+            let ours = canonical_stub_targets(ours)?;
+            let theirs = canonical_stub_targets(theirs)?;
+            if ours != theirs {
+                return Err(format!(
+                    "canonical stub targets diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
+                ));
+            }
+            continue;
+        }
         let (_, our_bytes) = output_section(ours, segname, sectname)
             .ok_or_else(|| format!("missing section {segname},{sectname} in afs-ld output"))?;
         let (_, their_bytes) = output_section(theirs, segname, sectname)
@@ -1364,6 +1397,7 @@ fn parse_command_check(name: &str) -> Result<CommandCheck, String> {
         "function_starts" => Ok(CommandCheck::FunctionStarts),
         "normalized_function_starts" => Ok(CommandCheck::NormalizedFunctionStarts),
         "data_in_code" => Ok(CommandCheck::DataInCode),
+        "data_in_code_if_present" => Ok(CommandCheck::DataInCodeIfPresent),
         "rebased_unwind_bytes" => Ok(CommandCheck::RebasedUnwindBytes),
         "dyld_info_rebase" => Ok(CommandCheck::DyldInfoRebase),
         "dyld_info_bind" => Ok(CommandCheck::DyldInfoBind),
@@ -1636,7 +1670,14 @@ fn canonical_symbol_records(bytes: &[u8]) -> Result<Vec<CanonicalSymbolRecord>, 
                 value,
             }
         })
+        .filter(|record| !is_optional_dyld_stub_binder_record(record))
         .collect())
+}
+
+fn is_optional_dyld_stub_binder_record(record: &CanonicalSymbolRecord) -> bool {
+    record.name == "dyld_stub_binder"
+        && (record.n_type & N_TYPE) == N_UNDF
+        && record.n_sect == 0
 }
 
 fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExportRecord>, String> {
@@ -1835,6 +1876,146 @@ fn canonical_data_in_code(bytes: &[u8]) -> Result<Vec<DataInCodeRecord>, String>
         .collect())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalBindRecord {
+    segment_index: u8,
+    segment_offset: u64,
+    ordinal: i32,
+    symbol: String,
+    weak_import: bool,
+    bind_type: u8,
+    addend: i64,
+}
+
+fn canonical_bind_records(
+    bytes: &[u8],
+    kind: DyldInfoStreamKind,
+) -> Result<Vec<CanonicalBindRecord>, String> {
+    let stream = dyld_info_stream(bytes, kind)?;
+    let mut cursor = 0usize;
+    let mut segment_index = 0u8;
+    let mut segment_offset = 0u64;
+    let mut ordinal = 0i32;
+    let mut symbol = String::new();
+    let mut weak_import = false;
+    let mut bind_type = BIND_TYPE_POINTER;
+    let mut addend = 0i64;
+    let mut out = Vec::new();
+
+    while cursor < stream.len() {
+        let byte = stream[cursor];
+        cursor += 1;
+        let opcode = byte & BIND_OPCODE_MASK;
+        let imm = byte & BIND_IMMEDIATE_MASK;
+        match opcode {
+            BIND_OPCODE_DONE => break,
+            BIND_OPCODE_SET_DYLIB_ORDINAL_IMM => ordinal = imm as i32,
+            BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB => {
+                let (value, used) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("bind uleb: {e}"))?;
+                cursor += used;
+                ordinal = value as i32;
+            }
+            BIND_OPCODE_SET_DYLIB_SPECIAL_IMM => {
+                ordinal = if imm == 0 {
+                    0
+                } else {
+                    (((imm as i8) << 4) >> 4) as i32
+                };
+            }
+            BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM => {
+                let (value, used) = read_c_string(&stream[cursor..])?;
+                cursor += used;
+                symbol = value;
+                weak_import = (imm & BIND_SYMBOL_FLAGS_WEAK_IMPORT) != 0;
+            }
+            BIND_OPCODE_SET_TYPE_IMM => bind_type = imm,
+            BIND_OPCODE_SET_ADDEND_SLEB => {
+                let (value, used) =
+                    read_sleb(&stream[cursor..]).map_err(|e| format!("bind sleb: {e}"))?;
+                cursor += used;
+                addend = value;
+            }
+            BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
+                let (value, used) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("bind uleb: {e}"))?;
+                cursor += used;
+                segment_index = imm;
+                segment_offset = value;
+            }
+            BIND_OPCODE_ADD_ADDR_ULEB => {
+                let (value, used) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("bind uleb: {e}"))?;
+                cursor += used;
+                segment_offset += value;
+            }
+            BIND_OPCODE_DO_BIND => {
+                out.push(CanonicalBindRecord {
+                    segment_index,
+                    segment_offset,
+                    ordinal,
+                    symbol: symbol.clone(),
+                    weak_import,
+                    bind_type,
+                    addend,
+                });
+                segment_offset += 8;
+            }
+            BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB => {
+                let (value, used) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("bind uleb: {e}"))?;
+                cursor += used;
+                out.push(CanonicalBindRecord {
+                    segment_index,
+                    segment_offset,
+                    ordinal,
+                    symbol: symbol.clone(),
+                    weak_import,
+                    bind_type,
+                    addend,
+                });
+                segment_offset += 8 + value;
+            }
+            BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED => {
+                out.push(CanonicalBindRecord {
+                    segment_index,
+                    segment_offset,
+                    ordinal,
+                    symbol: symbol.clone(),
+                    weak_import,
+                    bind_type,
+                    addend,
+                });
+                segment_offset += 8 + (imm as u64) * 8;
+            }
+            BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB => {
+                let (count, count_used) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("bind uleb: {e}"))?;
+                cursor += count_used;
+                let (skip, skip_used) =
+                    read_uleb(&stream[cursor..]).map_err(|e| format!("bind uleb: {e}"))?;
+                cursor += skip_used;
+                for _ in 0..count {
+                    out.push(CanonicalBindRecord {
+                        segment_index,
+                        segment_offset,
+                        ordinal,
+                        symbol: symbol.clone(),
+                        weak_import,
+                        bind_type,
+                        addend,
+                    });
+                    segment_offset += 8 + skip;
+                }
+            }
+            other => return Err(format!("unsupported bind opcode 0x{other:02x}")),
+        }
+    }
+
+    out.sort();
+    Ok(out)
+}
+
 fn rebased_unwind_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let header_base = segment_vmaddr(bytes, "__TEXT").unwrap_or(0);
     let text_base = output_section(bytes, "__TEXT", "__text")
@@ -1981,6 +2162,76 @@ fn dyld_info_stream(bytes: &[u8], kind: DyldInfoStreamKind) -> Result<Vec<u8>, S
         .get(start..end)
         .map(|slice| slice.to_vec())
         .ok_or_else(|| "dyld-info stream out of bounds".to_string())
+}
+
+fn read_c_string(bytes: &[u8]) -> Result<(String, usize), String> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| "unterminated C string".to_string())?;
+    let value = std::str::from_utf8(&bytes[..end])
+        .map_err(|e| format!("utf-8 in C string: {e}"))?
+        .to_string();
+    Ok((value, end + 1))
+}
+
+fn canonical_stub_targets(bytes: &[u8]) -> Result<Vec<u64>, String> {
+    let header = output_section_header(bytes, "__TEXT", "__stubs")
+        .ok_or_else(|| "missing __TEXT,__stubs section".to_string())?;
+    let (section_addr, section_bytes) = output_section(bytes, "__TEXT", "__stubs")
+        .ok_or_else(|| "missing __TEXT,__stubs section".to_string())?;
+    if section_bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stub_size = usize::try_from(header.reserved2)
+        .ok()
+        .filter(|size| *size > 0)
+        .unwrap_or(12);
+    if section_bytes.len() % stub_size != 0 {
+        return Err(format!(
+            "__TEXT,__stubs size {} is not a multiple of stub size {}",
+            section_bytes.len(),
+            stub_size
+        ));
+    }
+    let mut out = Vec::new();
+    for (idx, chunk) in section_bytes.chunks_exact(stub_size).enumerate() {
+        out.push(decode_stub_target(
+            chunk,
+            section_addr + (idx * stub_size) as u64,
+        )?);
+    }
+    Ok(out)
+}
+
+fn decode_stub_target(bytes: &[u8], stub_addr: u64) -> Result<u64, String> {
+    let adrp = read_insn(bytes, 0)?;
+    let ldr = read_insn(bytes, 4)?;
+    let br = read_insn(bytes, 8)?;
+    if (adrp & 0x9f00_0000) != 0x9000_0000 {
+        return Err(format!("stub at 0x{stub_addr:x} does not start with ADRP"));
+    }
+    if (ldr & 0xffc0_0000) != 0xf940_0000 {
+        return Err(format!("stub at 0x{stub_addr:x} does not use LDR (unsigned)"));
+    }
+    if (br & 0xffff_fc1f) != 0xd61f_0000 {
+        return Err(format!("stub at 0x{stub_addr:x} does not end with BR"));
+    }
+    let adrp_reg = (adrp & 0x1f) as u8;
+    let ldr_base = ((ldr >> 5) & 0x1f) as u8;
+    let ldr_reg = (ldr & 0x1f) as u8;
+    let br_reg = ((br >> 5) & 0x1f) as u8;
+    if adrp_reg != ldr_base || adrp_reg != ldr_reg || adrp_reg != br_reg {
+        return Err(format!(
+            "stub at 0x{stub_addr:x} uses inconsistent scratch regs: adrp=x{adrp_reg}, ldr base=x{ldr_base}, ldr rt=x{ldr_reg}, br=x{br_reg}"
+        ));
+    }
+    let adrp_immlo = ((adrp >> 29) & 0x3) as i64;
+    let adrp_immhi = ((adrp >> 5) & 0x7ffff) as i64;
+    let adrp_pages = sign_extend_21((adrp_immhi << 2) | adrp_immlo);
+    let adrp_base = ((stub_addr as i64) & !0xfff) + (adrp_pages << 12);
+    let scaled = ((ldr >> 10) & 0xfff) as u64;
+    Ok((adrp_base as u64) + scaled * 8)
 }
 
 fn symbol_values(bytes: &[u8]) -> Result<BTreeMap<String, u64>, String> {

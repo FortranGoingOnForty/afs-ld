@@ -98,8 +98,15 @@ impl StringTable {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StringTableBuilder {
-    roots: Vec<(String, u32)>,
+    roots: Vec<RootString>,
+    roots_by_last_byte: HashMap<u8, Vec<usize>>,
     offsets: HashMap<String, u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootString {
+    name: String,
+    offset: u32,
 }
 
 impl StringTableBuilder {
@@ -125,7 +132,17 @@ impl StringTableBuilder {
             let offset = raw.len() as u32;
             raw.extend_from_slice(name.as_bytes());
             raw.push(0);
-            self.roots.push((name.clone(), offset));
+            let root_index = self.roots.len();
+            self.roots.push(RootString {
+                name: name.clone(),
+                offset,
+            });
+            if let Some(&last_byte) = name.as_bytes().last() {
+                self.roots_by_last_byte
+                    .entry(last_byte)
+                    .or_default()
+                    .push(root_index);
+            }
             self.offsets.insert(name, offset);
         }
 
@@ -136,13 +153,16 @@ impl StringTableBuilder {
     }
 
     fn find_suffix_offset(&self, name: &str) -> Option<u32> {
-        self.roots.iter().find_map(|(existing, offset)| {
-            if existing.ends_with(name) {
-                Some(*offset + (existing.len() - name.len()) as u32)
-            } else {
-                None
-            }
-        })
+        let last_byte = *name.as_bytes().last()?;
+        self.roots_by_last_byte
+            .get(&last_byte)?
+            .iter()
+            .find_map(|&idx| {
+                let existing = &self.roots[idx];
+                (existing.name.len() >= name.len() && existing.name.ends_with(name)).then(|| {
+                    existing.offset + (existing.name.len() - name.len()) as u32
+                })
+            })
     }
 }
 
@@ -252,5 +272,18 @@ mod tests {
         assert_eq!(table.get(array).unwrap(), "_array_sum");
         assert_eq!(array, afs + 4);
         assert_eq!(table.as_bytes().len() % 8, 0);
+    }
+
+    #[test]
+    fn builder_ignores_same_last_byte_non_suffix_names() {
+        let mut builder = StringTableBuilder::new();
+        builder.insert("_alpha");
+        builder.insert("_beta");
+
+        let (bytes, offsets) = builder.finish();
+        let table = StringTable::from_bytes(bytes);
+
+        assert_eq!(table.get(offsets["_alpha"]).unwrap(), "_alpha");
+        assert_eq!(table.get(offsets["_beta"]).unwrap(), "_beta");
     }
 }

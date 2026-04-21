@@ -215,6 +215,9 @@ pub struct LinkPhaseTimings {
     pub synth_sections: Duration,
     pub synth_linkedit_finalize: Duration,
     pub synth_linkedit_symbol_plan: Duration,
+    pub synth_linkedit_symbol_plan_locals: Duration,
+    pub synth_linkedit_symbol_plan_globals: Duration,
+    pub synth_linkedit_symbol_plan_strtab: Duration,
     pub synth_linkedit_dyld_info: Duration,
     pub synth_linkedit_metadata_tables: Duration,
     pub synth_linkedit_code_signature: Duration,
@@ -666,6 +669,9 @@ impl Linker {
         let mut linkedit = None;
         let mut synth_linkedit_finalize = Duration::ZERO;
         let mut synth_linkedit_symbol_plan = Duration::ZERO;
+        let mut synth_linkedit_symbol_plan_locals = Duration::ZERO;
+        let mut synth_linkedit_symbol_plan_globals = Duration::ZERO;
+        let mut synth_linkedit_symbol_plan_strtab = Duration::ZERO;
         let mut synth_linkedit_dyld_info = Duration::ZERO;
         let mut synth_linkedit_metadata_tables = Duration::ZERO;
         let mut synth_linkedit_code_signature = Duration::ZERO;
@@ -682,6 +688,9 @@ impl Linker {
                 )?;
             synth_linkedit_finalize += phase_started.elapsed();
             synth_linkedit_symbol_plan += linkedit_timings.symbol_plan;
+            synth_linkedit_symbol_plan_locals += linkedit_timings.symbol_plan_locals;
+            synth_linkedit_symbol_plan_globals += linkedit_timings.symbol_plan_globals;
+            synth_linkedit_symbol_plan_strtab += linkedit_timings.symbol_plan_strtab;
             synth_linkedit_dyld_info += linkedit_timings.dyld_info;
             synth_linkedit_metadata_tables += linkedit_timings.metadata_tables;
             synth_linkedit_code_signature += linkedit_timings.code_signature;
@@ -703,6 +712,9 @@ impl Linker {
         let linkedit = linkedit.expect("finalize loop always runs at least once");
         phases.synth_linkedit_finalize = synth_linkedit_finalize;
         phases.synth_linkedit_symbol_plan = synth_linkedit_symbol_plan;
+        phases.synth_linkedit_symbol_plan_locals = synth_linkedit_symbol_plan_locals;
+        phases.synth_linkedit_symbol_plan_globals = synth_linkedit_symbol_plan_globals;
+        phases.synth_linkedit_symbol_plan_strtab = synth_linkedit_symbol_plan_strtab;
         phases.synth_linkedit_dyld_info = synth_linkedit_dyld_info;
         phases.synth_linkedit_metadata_tables = synth_linkedit_metadata_tables;
         phases.synth_linkedit_code_signature = synth_linkedit_code_signature;

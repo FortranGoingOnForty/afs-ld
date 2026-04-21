@@ -49,7 +49,10 @@ pub struct LinkEditContext<'a> {
     pub sym_table: &'a SymbolTable,
     pub synthetic_plan: &'a SyntheticPlan,
     pub icf_redirects: Option<&'a HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
+    pub parsed_relocs: &'a ParsedRelocCache,
 }
+
+pub type ParsedRelocCache = HashMap<(InputId, u8), Vec<Reloc>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkMapSymbol {
@@ -193,6 +196,36 @@ pub fn finalize_layout_with_linkedit(
     finalize_with_linkedit(layout, kind, opts, dylibs, Some(LinkEditInputs(context)))
 }
 
+pub fn build_parsed_reloc_cache(
+    inputs: &[LayoutInput<'_>],
+) -> Result<ParsedRelocCache, WriteError> {
+    let mut cache = HashMap::new();
+    for input in inputs {
+        for (sect_idx, section) in input.object.sections.iter().enumerate() {
+            if section.raw_relocs.is_empty() {
+                continue;
+            }
+            let section_idx = (sect_idx + 1) as u8;
+            let raws = parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(|err| {
+                WriteError::MalformedRelocations(
+                    input.object.path.clone(),
+                    section_idx,
+                    err.to_string(),
+                )
+            })?;
+            let relocs = parse_relocs(&raws).map_err(|err| {
+                WriteError::MalformedRelocations(
+                    input.object.path.clone(),
+                    section_idx,
+                    err.to_string(),
+                )
+            })?;
+            cache.insert((input.id, section_idx), relocs);
+        }
+    }
+    Ok(cache)
+}
+
 fn finalize_with_linkedit(
     layout: &Layout,
     kind: OutputKind,
@@ -208,14 +241,13 @@ fn finalize_with_linkedit(
 
     linkedit = build_linkedit_plan(&layout, kind, opts, inputs)?;
     apply_indirect_starts(&mut layout, &linkedit);
-    let sizeofcmds: u32 = build_commands(&layout, kind, opts, None, dylibs, &linkedit)?
-        .iter()
-        .map(LoadCommand::cmdsize)
-        .sum();
-    let header_size = HEADER_SIZE as u64 + sizeofcmds as u64;
-    layout.relayout(header_size);
-    linkedit = build_linkedit_plan(&layout, kind, opts, inputs)?;
-    apply_indirect_starts(&mut layout, &linkedit);
+    let exact_header_size =
+        HEADER_SIZE as u64 + exact_sizeofcmds(&layout, kind, opts, dylibs, &linkedit)? as u64;
+    if exact_header_size != header_size {
+        layout.relayout(exact_header_size);
+        linkedit = build_linkedit_plan(&layout, kind, opts, inputs)?;
+        apply_indirect_starts(&mut layout, &linkedit);
+    }
 
     let linkedit_seg = layout
         .segment_mut("__LINKEDIT")
@@ -223,6 +255,19 @@ fn finalize_with_linkedit(
     linkedit_seg.file_size = linkedit.total_size().max(1);
     linkedit_seg.vm_size = align_up(linkedit.total_size().max(1), PAGE_SIZE);
     Ok((layout, linkedit))
+}
+
+fn exact_sizeofcmds(
+    layout: &Layout,
+    kind: OutputKind,
+    opts: &LinkOptions,
+    dylibs: &[DylibDependency],
+    linkedit: &LinkEditPlan,
+) -> Result<u32, WriteError> {
+    Ok(build_commands(layout, kind, opts, None, dylibs, linkedit)?
+        .iter()
+        .map(LoadCommand::cmdsize)
+        .sum())
 }
 
 pub fn write_finalized_with_dylibs(
@@ -1128,36 +1173,12 @@ fn collect_rebase_sites(
         synthetic_plan,
         inputs.0.sym_table,
     )?);
-    let mut reloc_cache: HashMap<(InputId, u8), Vec<Reloc>> = HashMap::new();
     let input_map: HashMap<InputId, &ObjectFile> = inputs
         .0
         .layout_inputs
         .iter()
         .map(|input| (input.id, input.object))
         .collect();
-
-    for input in inputs.0.layout_inputs {
-        for (sect_idx, section) in input.object.sections.iter().enumerate() {
-            if section.raw_relocs.is_empty() {
-                continue;
-            }
-            let raws = parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(|err| {
-                WriteError::MalformedRelocations(
-                    input.object.path.clone(),
-                    (sect_idx + 1) as u8,
-                    err.to_string(),
-                )
-            })?;
-            let relocs = parse_relocs(&raws).map_err(|err| {
-                WriteError::MalformedRelocations(
-                    input.object.path.clone(),
-                    (sect_idx + 1) as u8,
-                    err.to_string(),
-                )
-            })?;
-            reloc_cache.insert((input.id, (sect_idx + 1) as u8), relocs);
-        }
-    }
 
     for section in &layout.sections {
         if !matches!(section.segment.as_str(), "__DATA" | "__DATA_CONST") {
@@ -1175,7 +1196,9 @@ fn collect_rebase_sites(
             let Some(obj) = input_map.get(&atom.origin).copied() else {
                 continue;
             };
-            let relocs = reloc_cache
+            let relocs = inputs
+                .0
+                .parsed_relocs
                 .get(&(atom.origin, atom.input_section))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);

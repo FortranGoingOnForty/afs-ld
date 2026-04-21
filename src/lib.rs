@@ -566,6 +566,9 @@ impl Linker {
             });
         }
         let phase_started = Instant::now();
+        let parsed_relocs = macho::writer::build_parsed_reloc_cache(&layout_inputs)?;
+        phases.input_parsing += phase_started.elapsed();
+        let phase_started = Instant::now();
         let entry_symbol = find_entry_symbol_id(opts, &sym_table)?;
         let dead_strip = opts.dead_strip.then(|| {
             why_live::DeadStripAnalysis::build(
@@ -653,6 +656,7 @@ impl Linker {
             sym_table: &sym_table,
             synthetic_plan: &synthetic_plan,
             icf_redirects,
+            parsed_relocs: &parsed_relocs,
         };
         let phase_started = Instant::now();
         let mut linkedit = None;

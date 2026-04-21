@@ -58,6 +58,9 @@ pub type ParsedRelocCache = HashMap<(InputId, u8), Vec<Reloc>>;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinkEditBuildTimings {
     pub symbol_plan: Duration,
+    pub symbol_plan_locals: Duration,
+    pub symbol_plan_globals: Duration,
+    pub symbol_plan_strtab: Duration,
     pub dyld_info: Duration,
     pub metadata_tables: Duration,
     pub code_signature: Duration,
@@ -66,6 +69,9 @@ pub struct LinkEditBuildTimings {
 impl std::ops::AddAssign for LinkEditBuildTimings {
     fn add_assign(&mut self, rhs: Self) {
         self.symbol_plan += rhs.symbol_plan;
+        self.symbol_plan_locals += rhs.symbol_plan_locals;
+        self.symbol_plan_globals += rhs.symbol_plan_globals;
+        self.symbol_plan_strtab += rhs.symbol_plan_strtab;
         self.dyld_info += rhs.dyld_info;
         self.metadata_tables += rhs.metadata_tables;
         self.code_signature += rhs.code_signature;
@@ -902,7 +908,7 @@ fn build_linkedit_plan_profiled(
         .map(|record| (record.symbol, record))
         .collect();
     let visibility = SymbolVisibilityPolicy::from_opts(opts)?;
-    let symbol_plan = build_output_symbols(
+    let (symbol_plan, symbol_plan_timings) = build_output_symbols_profiled(
         layout,
         kind,
         opts.dead_strip,
@@ -912,6 +918,9 @@ fn build_linkedit_plan_profiled(
         &imports,
     )?;
     timings.symbol_plan += phase_started.elapsed();
+    timings.symbol_plan_locals += symbol_plan_timings.locals;
+    timings.symbol_plan_globals += symbol_plan_timings.globals;
+    timings.symbol_plan_strtab += symbol_plan_timings.strtab;
     let mut symtab_bytes = Vec::new();
     write_nlist_table(&symbol_plan.symbols, &mut symtab_bytes);
 
@@ -1480,19 +1489,18 @@ fn build_data_in_code(
     }
 
     let atoms_by_input_section = atom_table.by_input_section();
+    let atom_ranges = build_atom_range_index(atom_table, &atoms_by_input_section, icf_redirects);
     let mut remapped = Vec::new();
     for (input_order, input) in inputs.iter().enumerate() {
         for (input_entry_index, entry) in input.object.data_in_code.iter().copied().enumerate() {
             let (section_index, section_relative) =
                 remap_data_in_code_to_section(input.object, entry)?;
             let (atom_id, atom_delta) = find_containing_atom_range(
-                atom_table,
-                &atoms_by_input_section,
+                &atom_ranges,
                 input.id,
                 section_index,
                 section_relative,
                 entry.length as u32,
-                icf_redirects,
             )
             .ok_or_else(|| {
                 WriteError::MalformedDataInCode(
@@ -1652,7 +1660,14 @@ fn collect_imports(
     Ok(out)
 }
 
-fn build_output_symbols(
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SymbolPlanBuildTimings {
+    locals: Duration,
+    globals: Duration,
+    strtab: Duration,
+}
+
+fn build_output_symbols_profiled(
     layout: &Layout,
     kind: OutputKind,
     dead_strip: bool,
@@ -1660,10 +1675,15 @@ fn build_output_symbols(
     visibility: &SymbolVisibilityPolicy,
     inputs: LinkEditInputs<'_>,
     imports: &[ImportSymbolRecord],
-) -> Result<SymbolTablePlan, WriteError> {
+) -> Result<(SymbolTablePlan, SymbolPlanBuildTimings), WriteError> {
     let sym_table = inputs.0.sym_table;
     let atom_sections = atom_section_ordinals(layout);
     let atoms_by_input_section = inputs.0.atom_table.by_input_section();
+    let atom_ranges = build_atom_range_index(
+        inputs.0.atom_table,
+        &atoms_by_input_section,
+        inputs.0.icf_redirects,
+    );
     let file_index_by_input: HashMap<InputId, usize> = inputs
         .0
         .layout_inputs
@@ -1672,6 +1692,7 @@ fn build_output_symbols(
         .map(|(idx, input)| (input.id, idx + 1))
         .collect();
     let image_base = layout.segment("__TEXT").map(|seg| seg.vm_addr).unwrap_or(0);
+    let mut timings = SymbolPlanBuildTimings::default();
     let mut locals = Vec::new();
     let mut external_defineds = Vec::new();
     let mut undefineds = Vec::with_capacity(imports.len());
@@ -1706,19 +1727,21 @@ fn build_output_symbols(
         });
     }
 
+    let phase_started = std::time::Instant::now();
     for input in inputs.0.layout_inputs {
         let ctx = LocalSymbolContext {
             atom_table: inputs.0.atom_table,
-            atoms_by_input_section: &atoms_by_input_section,
+            atom_ranges: &atom_ranges,
             atom_sections: &atom_sections,
-            icf_redirects: inputs.0.icf_redirects,
             input_id: input.id,
             file_index: file_index_by_input[&input.id],
         };
         collect_local_symbols(layout, &ctx, input.object, &mut locals)?;
     }
     collect_synthetic_local_symbols(layout, inputs.0.synthetic_plan, &mut locals)?;
+    timings.locals += phase_started.elapsed();
 
+    let phase_started = std::time::Instant::now();
     for (symbol_id, symbol) in sym_table.iter() {
         let Symbol::Defined {
             name,
@@ -1812,6 +1835,7 @@ fn build_output_symbols(
         });
     }
     undefineds.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+    timings.globals += phase_started.elapsed();
 
     let exports = if matches!(kind, OutputKind::Dylib | OutputKind::Executable) {
         external_defineds
@@ -1832,6 +1856,7 @@ fn build_output_symbols(
         Vec::new()
     };
 
+    let phase_started = std::time::Instant::now();
     let local_count = if strip_locals { 0 } else { locals.len() };
     let mut specs = Vec::with_capacity(local_count + external_defineds.len() + undefineds.len());
     if !strip_locals {
@@ -1886,23 +1911,27 @@ fn build_output_symbols(
             symbol_indices.insert(symbol, idx as u32);
         }
     }
+    timings.strtab += phase_started.elapsed();
 
-    Ok(SymbolTablePlan {
-        symbols,
-        map_symbols,
-        strtab_bytes,
-        symbol_indices,
-        exports,
-        dysymtab: DysymtabCmd {
-            ilocalsym: 0,
-            nlocalsym,
-            iextdefsym: nlocalsym,
-            nextdefsym,
-            iundefsym: nlocalsym + nextdefsym,
-            nundefsym,
-            ..DysymtabCmd::default()
+    Ok((
+        SymbolTablePlan {
+            symbols,
+            map_symbols,
+            strtab_bytes,
+            symbol_indices,
+            exports,
+            dysymtab: DysymtabCmd {
+                ilocalsym: 0,
+                nlocalsym,
+                iextdefsym: nlocalsym,
+                nextdefsym,
+                iundefsym: nlocalsym + nextdefsym,
+                nundefsym,
+                ..DysymtabCmd::default()
+            },
         },
-    })
+        timings,
+    ))
 }
 
 fn sort_local_symbols(locals: &mut [OutputSymbolSpec]) {
@@ -1971,12 +2000,10 @@ fn collect_local_symbols(
                     .expect("section symbol without section");
                 let offset = input_sym.value().saturating_sub(section.addr) as u32;
                 let (atom_id, delta) = find_containing_atom(
-                    ctx.atom_table,
-                    ctx.atoms_by_input_section,
+                    ctx.atom_ranges,
                     ctx.input_id,
                     input_sym.sect_idx(),
                     offset,
-                    ctx.icf_redirects,
                 )
                 .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
                 let addr =
@@ -2023,57 +2050,72 @@ fn collect_local_symbols(
 
 struct LocalSymbolContext<'a> {
     atom_table: &'a AtomTable,
-    atoms_by_input_section: &'a HashMap<(InputId, u8), Vec<crate::resolve::AtomId>>,
+    atom_ranges: &'a AtomRangeIndex,
     atom_sections: &'a HashMap<crate::resolve::AtomId, u8>,
-    icf_redirects: Option<&'a HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
     input_id: InputId,
     file_index: usize,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct AtomRange {
+    atom: crate::resolve::AtomId,
+    start: u32,
+    end: u32,
+}
+
+type AtomRangeIndex = HashMap<(InputId, u8), Vec<AtomRange>>;
 
 fn is_assembler_temporary_symbol(name: &str) -> bool {
     name.starts_with('L') || name.starts_with("ltmp")
 }
 
-fn find_containing_atom(
+fn build_atom_range_index(
     atom_table: &AtomTable,
     atoms_by_input_section: &HashMap<(InputId, u8), Vec<crate::resolve::AtomId>>,
+    icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
+) -> AtomRangeIndex {
+    let mut out = HashMap::with_capacity(atoms_by_input_section.len());
+    for (&key, ids) in atoms_by_input_section {
+        let mut ranges = Vec::with_capacity(ids.len());
+        for atom_id in ids {
+            let atom = atom_table.get(*atom_id);
+            ranges.push(AtomRange {
+                atom: canonical_atom(*atom_id, icf_redirects),
+                start: atom.input_offset,
+                end: atom.input_offset.saturating_add(atom.size),
+            });
+        }
+        ranges.sort_by(|lhs, rhs| {
+            lhs.start
+                .cmp(&rhs.start)
+                .then_with(|| lhs.end.cmp(&rhs.end))
+        });
+        out.insert(key, ranges);
+    }
+    out
+}
+
+fn find_containing_atom(
+    atom_ranges: &AtomRangeIndex,
     input_id: InputId,
     input_section: u8,
     offset: u32,
-    icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
 ) -> Option<(crate::resolve::AtomId, u32)> {
-    find_containing_atom_range(
-        atom_table,
-        atoms_by_input_section,
-        input_id,
-        input_section,
-        offset,
-        1,
-        icf_redirects,
-    )
+    find_containing_atom_range(atom_ranges, input_id, input_section, offset, 1)
 }
 
 fn find_containing_atom_range(
-    atom_table: &AtomTable,
-    atoms_by_input_section: &HashMap<(InputId, u8), Vec<crate::resolve::AtomId>>,
+    atom_ranges: &AtomRangeIndex,
     input_id: InputId,
     input_section: u8,
     offset: u32,
     len: u32,
-    icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
 ) -> Option<(crate::resolve::AtomId, u32)> {
-    atoms_by_input_section
-        .get(&(input_id, input_section))
-        .and_then(|ids| {
-            ids.iter().find_map(|atom_id| {
-                let atom = atom_table.get(*atom_id);
-                let start = atom.input_offset;
-                let end = atom.input_offset.saturating_add(atom.size);
-                let range_end = offset.checked_add(len)?;
-                (start <= offset && range_end <= end)
-                    .then_some((canonical_atom(*atom_id, icf_redirects), offset - start))
-            })
-        })
+    let ranges = atom_ranges.get(&(input_id, input_section))?;
+    let range_end = offset.checked_add(len)?;
+    let idx = ranges.partition_point(|range| range.start <= offset);
+    let range = idx.checked_sub(1).and_then(|idx| ranges.get(idx))?;
+    (range.start <= offset && range_end <= range.end).then_some((range.atom, offset - range.start))
 }
 
 fn canonical_atom(

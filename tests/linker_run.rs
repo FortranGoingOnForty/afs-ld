@@ -220,6 +220,36 @@ fn output_section(bytes: &[u8], segname: &str, sectname: &str) -> Option<(u64, V
     None
 }
 
+fn output_sections(bytes: &[u8], segname: &str, sectname: &str) -> Vec<(u64, Vec<u8>)> {
+    let Ok(header) = parse_header(bytes) else {
+        return Vec::new();
+    };
+    let Ok(commands) = parse_commands(&header, bytes) else {
+        return Vec::new();
+    };
+    let mut matches = Vec::new();
+    for cmd in commands {
+        if let LoadCommand::Segment64(seg) = cmd {
+            for section in seg.sections {
+                if section.segname_str() == segname && section.sectname_str() == sectname {
+                    let data = if section.offset == 0 {
+                        Vec::new()
+                    } else {
+                        let start = section.offset as usize;
+                        let end = start + section.size as usize;
+                        let Some(bytes) = bytes.get(start..end) else {
+                            continue;
+                        };
+                        bytes.to_vec()
+                    };
+                    matches.push((section.addr, data));
+                }
+            }
+        }
+    }
+    matches
+}
+
 fn output_section_header(bytes: &[u8], segname: &str, sectname: &str) -> Option<Section64Header> {
     let header = parse_header(bytes).ok()?;
     let commands = parse_commands(&header, bytes).ok()?;
@@ -4608,6 +4638,96 @@ fn linker_run_replans_thunks_until_layout_converges() {
         actual_targets,
         [thunks_addr, thunks_addr + 12],
         "expected both branches to redirect through the two thunk slots"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_uses_multiple_thunk_islands_within_text_segment() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+
+    let obj = scratch("branch26-multi-island.o");
+    let out = scratch("branch26-multi-island.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            bl _midcaller
+            mov w0, #0
+            ret
+
+        .zerofill __TEXT,__apad1,_gap1,0x9000000,2
+
+        .section __TEXT,__bmid,regular,pure_instructions
+        .globl _midcaller
+        _midcaller:
+            stp x29, x30, [sp, #-16]!
+            mov x29, sp
+            bl _helper
+            ldp x29, x30, [sp], #16
+            ret
+
+        .zerofill __TEXT,__cpad2,_gap2,0x9000000,2
+
+        .section __TEXT,__dlate,regular,pure_instructions
+        .globl _helper
+        _helper:
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let thunk_sections = output_sections(&bytes, "__TEXT", "__thunks");
+    assert_eq!(
+        thunk_sections.len(),
+        2,
+        "expected one thunk island after __text and one after __mid"
+    );
+    assert!(
+        thunk_sections.iter().all(|(_, bytes)| bytes.len() == 12),
+        "expected one thunk per island"
+    );
+
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let (mid_addr, mid) = output_section(&bytes, "__TEXT", "__bmid").unwrap();
+    let mut actual_targets = [
+        decode_branch_target(&text, text_addr, 0).unwrap(),
+        decode_branch_target(&mid, mid_addr, 8).unwrap(),
+    ];
+    actual_targets.sort_unstable();
+    let mut expected_targets = [thunk_sections[0].0, thunk_sections[1].0];
+    expected_targets.sort_unstable();
+    assert_eq!(
+        actual_targets, expected_targets,
+        "expected the two call sites to route through the two thunk islands"
+    );
+
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
     );
 
     let _ = fs::remove_file(obj);

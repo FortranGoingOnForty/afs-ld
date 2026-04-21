@@ -48,6 +48,18 @@ struct SectionKey {
     name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExtraSectionAnchor {
+    pub segment: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraOutputSection {
+    pub after_section: Option<ExtraSectionAnchor>,
+    pub section: OutputSection,
+}
+
 fn output_section_key(input_section: &InputSection) -> SectionKey {
     match (
         input_section.segname.as_str(),
@@ -122,7 +134,7 @@ impl Layout {
         header_size: u64,
         synthetic_plan: Option<&SyntheticPlan>,
         live_atoms: Option<&HashSet<AtomId>>,
-        extra_sections: &[OutputSection],
+        extra_sections: &[ExtraOutputSection],
     ) -> Self {
         let input_map: HashMap<InputId, LayoutInput<'_>> =
             inputs.iter().map(|input| (input.id, *input)).collect();
@@ -201,16 +213,6 @@ impl Layout {
                 }
             }
         }
-        for synthetic in extra_sections.iter().cloned() {
-            if let Some(existing) = sections.iter_mut().find(|section| {
-                section.segment == synthetic.segment && section.name == synthetic.name
-            }) {
-                merge_synthetic_section(existing, synthetic);
-            } else {
-                sections.push(synthetic);
-            }
-        }
-
         sections.sort_by(|a, b| {
             segment_rank(kind, &a.segment)
                 .cmp(&segment_rank(kind, &b.segment))
@@ -220,6 +222,8 @@ impl Layout {
                 .then_with(|| a.segment.cmp(&b.segment))
                 .then_with(|| a.name.cmp(&b.name))
         });
+
+        insert_extra_sections(&mut sections, extra_sections);
 
         for section in &mut sections {
             section.atoms.sort_by(|a, b| {
@@ -433,6 +437,29 @@ impl Layout {
             } else {
                 seg_file_end
             };
+        }
+    }
+}
+
+fn insert_extra_sections(sections: &mut Vec<OutputSection>, extra_sections: &[ExtraOutputSection]) {
+    for extra in extra_sections {
+        let section = extra.section.clone();
+        if let Some(anchor) = &extra.after_section {
+            let insert_at = sections
+                .iter()
+                .rposition(|candidate| {
+                    candidate.segment == anchor.segment && candidate.name == anchor.name
+                })
+                .map(|idx| idx + 1)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing anchor section {},{} for synthetic section {},{}",
+                        anchor.segment, anchor.name, section.segment, section.name
+                    )
+                });
+            sections.insert(insert_at, section);
+        } else {
+            sections.push(section);
         }
     }
 }

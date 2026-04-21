@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::atom::{Atom, AtomSection, AtomTable};
 use crate::input::ObjectFile;
-use crate::layout::{Layout, LayoutInput};
+use crate::layout::{ExtraOutputSection, ExtraSectionAnchor, Layout, LayoutInput};
 use crate::macho::writer::LinkEditPlan;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
 use crate::resolve::{InputId, Symbol, SymbolId, SymbolTable};
@@ -96,54 +96,77 @@ enum BranchTargetKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ThunkBucketKey {
-    segment: String,
+    island: usize,
     target: BranchTargetKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ThunkEntry {
+struct ThunkIsland {
     segment: String,
-    slot_in_segment: usize,
+    after_section: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThunkEntry {
+    island: usize,
+    slot_in_island: usize,
     target: BranchTargetKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ThunkPlan {
     redirects: HashMap<(crate::resolve::AtomId, u32), usize>,
+    islands: Vec<ThunkIsland>,
     entries: Vec<ThunkEntry>,
 }
 
 impl ThunkPlan {
-    pub fn output_sections(&self) -> Vec<OutputSection> {
+    pub fn output_sections(&self) -> Vec<ExtraOutputSection> {
         if self.entries.is_empty() {
             return Vec::new();
         }
-        let mut counts = HashMap::new();
+        let mut counts: HashMap<usize, usize> = HashMap::new();
         for entry in &self.entries {
-            *counts.entry(entry.segment.clone()).or_insert(0usize) += 1;
+            *counts.entry(entry.island).or_insert(0usize) += 1;
         }
         let mut sections: Vec<_> = counts
             .into_iter()
-            .map(|(segment, count)| OutputSection {
-                segment,
-                name: "__thunks".into(),
-                kind: SectionKind::Text,
-                align_pow2: 2,
-                flags: crate::macho::constants::S_REGULAR
-                    | crate::macho::constants::S_ATTR_PURE_INSTRUCTIONS
-                    | crate::macho::constants::S_ATTR_SOME_INSTRUCTIONS,
-                reserved1: 0,
-                reserved2: 0,
-                reserved3: 0,
-                atoms: Vec::new(),
-                synthetic_offset: 0,
-                synthetic_data: vec![0; count * THUNK_SIZE as usize],
-                addr: 0,
-                size: (count as u64) * THUNK_SIZE,
-                file_off: 0,
+            .map(|(island, count)| {
+                let island_desc = &self.islands[island];
+                ExtraOutputSection {
+                    after_section: Some(ExtraSectionAnchor {
+                        segment: island_desc.segment.clone(),
+                        name: island_desc.after_section.clone(),
+                    }),
+                    section: OutputSection {
+                        segment: island_desc.segment.clone(),
+                        name: "__thunks".into(),
+                        kind: SectionKind::Text,
+                        align_pow2: 2,
+                        flags: crate::macho::constants::S_REGULAR
+                            | crate::macho::constants::S_ATTR_PURE_INSTRUCTIONS
+                            | crate::macho::constants::S_ATTR_SOME_INSTRUCTIONS,
+                        reserved1: 0,
+                        reserved2: 0,
+                        reserved3: 0,
+                        atoms: Vec::new(),
+                        synthetic_offset: 0,
+                        synthetic_data: vec![0; count * THUNK_SIZE as usize],
+                        addr: 0,
+                        size: (count as u64) * THUNK_SIZE,
+                        file_off: 0,
+                    },
+                }
             })
             .collect();
-        sections.sort_by(|a, b| a.segment.cmp(&b.segment));
+        sections.sort_by(|a, b| {
+            a.section.segment.cmp(&b.section.segment).then_with(|| {
+                a.after_section
+                    .as_ref()
+                    .map(|anchor| anchor.name.as_str())
+                    .cmp(&b.after_section.as_ref().map(|anchor| anchor.name.as_str()))
+            })
+        });
         sections
     }
 
@@ -152,20 +175,23 @@ impl ThunkPlan {
     }
 
     fn thunk_addrs(&self, layout: &Layout) -> HashMap<usize, u64> {
-        let bases: HashMap<_, _> = layout
-            .sections
+        let bases: HashMap<_, _> = self
+            .islands
             .iter()
-            .filter(|section| section.name == "__thunks")
-            .map(|section| (section.segment.clone(), section.addr))
+            .enumerate()
+            .filter_map(|(island_idx, island)| {
+                find_thunk_section_index(layout, island)
+                    .map(|section_idx| (island_idx, layout.sections[section_idx].addr))
+            })
             .collect();
         self.entries
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
                 bases
-                    .get(&entry.segment)
+                    .get(&entry.island)
                     .copied()
-                    .map(|base| (index, base + (entry.slot_in_segment as u64) * THUNK_SIZE))
+                    .map(|base| (index, base + (entry.slot_in_island as u64) * THUNK_SIZE))
             })
             .collect()
     }
@@ -398,6 +424,16 @@ fn atom_output_segment_map(layout: &Layout) -> HashMap<crate::resolve::AtomId, S
     out
 }
 
+fn atom_output_section_map(layout: &Layout) -> HashMap<crate::resolve::AtomId, (String, String)> {
+    let mut out = HashMap::new();
+    for section in &layout.sections {
+        for placed in &section.atoms {
+            out.insert(placed.atom, (section.segment.clone(), section.name.clone()));
+        }
+    }
+    out
+}
+
 fn synthetic_address_maps(
     layout: &Layout,
     synthetic_plan: Option<&SyntheticPlan>,
@@ -533,6 +569,7 @@ pub fn plan_thunks(
 
     let atom_addrs = atom_address_map(layout);
     let atom_segments = atom_output_segment_map(layout);
+    let atom_sections = atom_output_section_map(layout);
     let atoms_by_input_section = atoms.by_input_section();
     let section_addrs = input_section_address_map(layout, atoms);
     let synth_addrs = synthetic_address_maps(layout, synthetic_plan);
@@ -552,7 +589,9 @@ pub fn plan_thunks(
     };
 
     let mut redirects = HashMap::new();
+    let mut island_index: HashMap<(String, String), usize> = HashMap::new();
     let mut index: HashMap<ThunkBucketKey, usize> = HashMap::new();
+    let mut islands: Vec<ThunkIsland> = Vec::new();
     let mut entries: Vec<ThunkEntry> = Vec::new();
     for (atom_id, atom) in atoms.iter() {
         let Some(obj) = input_map.get(&atom.origin) else {
@@ -573,6 +612,9 @@ pub fn plan_thunks(
             let Some(caller_segment) = atom_segments.get(&atom.id).cloned() else {
                 continue;
             };
+            let Some((_, caller_section)) = atom_sections.get(&atom.id).cloned() else {
+                continue;
+            };
             let place = place + local_offset as u64;
             let target_key = resolve_branch_target_key(obj, atom, reloc, &resolve)?;
             let target = resolve_branch_target_from_key(obj, atom, reloc, target_key, &resolve)?;
@@ -584,21 +626,34 @@ pub fn plan_thunks(
             if !needs_thunk {
                 continue;
             }
+            let island = if let Some(&existing) =
+                island_index.get(&(caller_segment.clone(), caller_section.clone()))
+            {
+                existing
+            } else {
+                let next = islands.len();
+                islands.push(ThunkIsland {
+                    segment: caller_segment.clone(),
+                    after_section: caller_section.clone(),
+                });
+                island_index.insert((caller_segment.clone(), caller_section.clone()), next);
+                next
+            };
             let bucket_key = ThunkBucketKey {
-                segment: caller_segment.clone(),
+                island,
                 target: target_key,
             };
             let thunk_index = if let Some(&existing) = index.get(&bucket_key) {
                 existing
             } else {
                 let next = entries.len();
-                let slot_in_segment = entries
+                let slot_in_island = entries
                     .iter()
-                    .filter(|entry| entry.segment == caller_segment)
+                    .filter(|entry| entry.island == island)
                     .count();
                 entries.push(ThunkEntry {
-                    segment: caller_segment.clone(),
-                    slot_in_segment,
+                    island,
+                    slot_in_island,
                     target: target_key,
                 });
                 index.insert(bucket_key, next);
@@ -611,7 +666,11 @@ pub fn plan_thunks(
     if entries.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(ThunkPlan { redirects, entries }))
+        Ok(Some(ThunkPlan {
+            redirects,
+            islands,
+            entries,
+        }))
     }
 }
 
@@ -951,35 +1010,43 @@ fn synthesize_thunk_section(
     plan: &ThunkPlan,
     resolve: &ResolveView<'_>,
 ) -> Result<(), RelocError> {
-    let mut counts = HashMap::new();
+    let mut counts: HashMap<usize, usize> = HashMap::new();
     for entry in &plan.entries {
-        *counts.entry(entry.segment.as_str()).or_insert(0usize) += 1;
+        *counts.entry(entry.island).or_insert(0usize) += 1;
     }
-    for section in layout
-        .sections
-        .iter_mut()
-        .filter(|section| section.name == "__thunks")
-    {
-        let expected_len =
-            counts.get(section.segment.as_str()).copied().unwrap_or(0) * THUNK_SIZE as usize;
+    for (island_idx, island) in plan.islands.iter().enumerate() {
+        let expected_len = counts.get(&island_idx).copied().unwrap_or(0) * THUNK_SIZE as usize;
+        let section_idx = find_thunk_section_index(layout, island).ok_or_else(|| RelocError {
+            input: PathBuf::from("<synthetic thunks>"),
+            atom: crate::resolve::AtomId(0),
+            atom_offset: (island_idx as u32) * THUNK_SIZE as u32,
+            kind: RelocKind::Branch26,
+            referent: "thunk section".to_string(),
+            detail: format!(
+                "missing thunk section for island after {},{}",
+                island.segment, island.after_section
+            ),
+        })?;
+        let section = &mut layout.sections[section_idx];
         if section.synthetic_data.len() != expected_len {
             section.synthetic_data.resize(expected_len, 0);
         }
     }
     for (idx, entry) in plan.entries.iter().enumerate() {
-        let section = layout
-            .sections
-            .iter_mut()
-            .find(|section| section.segment == entry.segment && section.name == "__thunks")
-            .ok_or_else(|| RelocError {
-                input: PathBuf::from("<synthetic thunks>"),
-                atom: crate::resolve::AtomId(0),
-                atom_offset: (idx as u32) * THUNK_SIZE as u32,
-                kind: RelocKind::Branch26,
-                referent: "thunk section".to_string(),
-                detail: format!("missing thunk section for segment {}", entry.segment),
-            })?;
-        let thunk_addr = section.addr + (entry.slot_in_segment as u64) * THUNK_SIZE;
+        let island = &plan.islands[entry.island];
+        let section_idx = find_thunk_section_index(layout, island).ok_or_else(|| RelocError {
+            input: PathBuf::from("<synthetic thunks>"),
+            atom: crate::resolve::AtomId(0),
+            atom_offset: (idx as u32) * THUNK_SIZE as u32,
+            kind: RelocKind::Branch26,
+            referent: "thunk section".to_string(),
+            detail: format!(
+                "missing thunk section for island after {},{}",
+                island.segment, island.after_section
+            ),
+        })?;
+        let section = &mut layout.sections[section_idx];
+        let thunk_addr = section.addr + (entry.slot_in_island as u64) * THUNK_SIZE;
         let target = match entry.target {
             BranchTargetKey::Symbol(symbol_id) => match resolve.sym_table.get(symbol_id) {
                 Symbol::Defined { atom, value, .. } => resolve
@@ -1006,12 +1073,28 @@ fn synthesize_thunk_section(
         })?;
         let adrp = encode_adrp_reg(16, thunk_addr, target, "thunk target")?;
         let add = encode_add_x_reg_pageoff(16, target, "thunk target")?;
-        let start = entry.slot_in_segment * THUNK_SIZE as usize;
+        let start = entry.slot_in_island * THUNK_SIZE as usize;
         section.synthetic_data[start..start + 4].copy_from_slice(&adrp.to_le_bytes());
         section.synthetic_data[start + 4..start + 8].copy_from_slice(&add.to_le_bytes());
         section.synthetic_data[start + 8..start + 12].copy_from_slice(&BR_X16.to_le_bytes());
     }
     Ok(())
+}
+
+fn find_thunk_section_index(layout: &Layout, island: &ThunkIsland) -> Option<usize> {
+    layout
+        .sections
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(idx, section)| {
+            let prev = &layout.sections[idx - 1];
+            (prev.segment == island.segment
+                && prev.name == island.after_section
+                && section.segment == island.segment
+                && section.name == "__thunks")
+                .then_some(idx)
+        })
 }
 
 fn resolve_got_target(

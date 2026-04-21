@@ -1,5 +1,12 @@
 -arch
 arm64
+-platform_version
+macos
+@SDK_VERSION@
+@SDK_VERSION@
+-syslibroot
+@SDK_PATH@
+-lSystem
 -no_fixup_chains
 -e
 _main

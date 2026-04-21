@@ -426,7 +426,14 @@ impl Linker {
             );
         }
 
-        let mut load_paths = opts.inputs.clone();
+        let mut load_paths = Vec::new();
+        let mut positional_dylibs = Vec::new();
+        for path in &opts.inputs {
+            match path.extension().and_then(|ext| ext.to_str()) {
+                Some("dylib" | "tbd") => positional_dylibs.push(path.clone()),
+                _ => load_paths.push(path.clone()),
+            }
+        }
         let mut dylib_load_kinds = std::collections::HashMap::new();
         for name in &opts.library_names {
             let path = resolve_library_input(opts, name)?;
@@ -445,6 +452,7 @@ impl Linker {
             );
             load_paths.push(path);
         }
+        load_paths.extend(positional_dylibs);
 
         let mut inputs = Inputs::new();
         let phase_started = Instant::now();

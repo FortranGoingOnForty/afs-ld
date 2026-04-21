@@ -1,0 +1,4 @@
+load_dylib_names
+symbol_record_map
+symbol_partition_names
+string_table_near_parity

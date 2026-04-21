@@ -134,6 +134,8 @@ opaque_id!(
 #[derive(Debug)]
 pub struct ObjectInput {
     pub path: PathBuf,
+    pub load_order: usize,
+    pub archive_member_offset: Option<u32>,
     /// Raw bytes; `ObjectFile::parse` re-runs cheaply against this on
     /// demand. We don't cache a parsed view because `ObjectFile` copies
     /// the fields it needs on construction, so re-parse is idempotent.
@@ -143,6 +145,7 @@ pub struct ObjectInput {
 #[derive(Debug)]
 pub struct ArchiveInput {
     pub path: PathBuf,
+    pub load_order: usize,
     pub bytes: Vec<u8>,
     /// Members we've already fetched (keyed by `ar_hdr` offset). Prevents
     /// the fixed-point loop from re-ingesting the same object twice —
@@ -157,8 +160,27 @@ pub struct DylibInput {
     /// Parsed `DylibFile`. `DylibFile` owns its data (no borrow into
     /// `bytes`), so we keep it pre-parsed for O(1) export-trie walks.
     pub file: DylibFile,
-    /// 1-based two-level-namespace ordinal. Matches command-line order
-    /// of `LC_LOAD_DYLIB`-style entries.
+    /// Install name surfaced in the output's `LC_LOAD_DYLIB` list.
+    ///
+    /// Multi-document TBD inputs may seed exports from several sibling
+    /// documents while still canonicalizing them back to one umbrella load
+    /// command (e.g. `libSystem.tbd`).
+    pub load_install_name: String,
+    /// Current-version field surfaced in the output `LC_LOAD_DYLIB`.
+    pub load_current_version: u32,
+    /// Compatibility-version field surfaced in the output `LC_LOAD_DYLIB`.
+    pub load_compatibility_version: u32,
+    /// 1-based two-level-namespace ordinal encoded into undefined symbols and
+    /// bind opcodes. Matches the output's `LC_LOAD_DYLIB` ordering, so several
+    /// parsed TBD documents from one umbrella input may legitimately share it.
+    pub ordinal: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct DylibLoadMeta {
+    pub install_name: String,
+    pub current_version: u32,
+    pub compatibility_version: u32,
     pub ordinal: u16,
 }
 
@@ -206,11 +228,21 @@ impl Inputs {
     /// Register an `.o` file. Validates the Mach-O header by parsing once,
     /// then keeps only the raw bytes (re-parsing on demand is cheap and
     /// sidesteps borrow-lifetime headaches).
-    pub fn add_object(&mut self, path: PathBuf, bytes: Vec<u8>) -> Result<InputId, InputAddError> {
+    pub fn add_object(
+        &mut self,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        load_order: usize,
+    ) -> Result<InputId, InputAddError> {
         // Validate now — we'd rather catch a bad object at the add site.
         ObjectFile::parse(&path, &bytes)?;
         let id = InputId(self.objects.len() as u32);
-        self.objects.push(ObjectInput { path, bytes });
+        self.objects.push(ObjectInput {
+            path,
+            load_order,
+            archive_member_offset: None,
+            bytes,
+        });
         Ok(id)
     }
 
@@ -219,11 +251,13 @@ impl Inputs {
         &mut self,
         path: PathBuf,
         bytes: Vec<u8>,
+        load_order: usize,
     ) -> Result<ArchiveId, InputAddError> {
         Archive::open(&path, &bytes)?; // validate
         let id = ArchiveId(self.archives.len() as u32);
         self.archives.push(ArchiveInput {
             path,
+            load_order,
             bytes,
             fetched: std::collections::HashSet::new(),
         });
@@ -234,10 +268,13 @@ impl Inputs {
     /// [`Inputs::add_dylib_from_tbd`].
     pub fn add_dylib(&mut self, path: PathBuf, bytes: Vec<u8>) -> Result<DylibId, InputAddError> {
         let file = DylibFile::parse(&path, &bytes)?;
-        let ordinal = (self.dylibs.len() + 1) as u16;
+        let ordinal = self.next_dylib_ordinal();
         let id = DylibId(self.dylibs.len() as u32);
         self.dylibs.push(DylibInput {
             path,
+            load_install_name: file.install_name.clone(),
+            load_current_version: file.current_version,
+            load_compatibility_version: file.compatibility_version,
             file,
             ordinal,
         });
@@ -248,14 +285,41 @@ impl Inputs {
     /// via `DylibFile::from_tbd(path, tbd, target)` so the target filter
     /// is explicit.
     pub fn add_dylib_from_file(&mut self, path: PathBuf, file: DylibFile) -> DylibId {
-        let ordinal = (self.dylibs.len() + 1) as u16;
+        let ordinal = self.next_dylib_ordinal();
+        let load = DylibLoadMeta {
+            install_name: file.install_name.clone(),
+            current_version: file.current_version,
+            compatibility_version: file.compatibility_version,
+            ordinal,
+        };
+        self.add_dylib_from_file_with_meta(path, file, load)
+    }
+
+    pub fn add_dylib_from_file_with_meta(
+        &mut self,
+        path: PathBuf,
+        file: DylibFile,
+        load: DylibLoadMeta,
+    ) -> DylibId {
         let id = DylibId(self.dylibs.len() as u32);
         self.dylibs.push(DylibInput {
             path,
+            load_install_name: load.install_name,
+            load_current_version: load.current_version,
+            load_compatibility_version: load.compatibility_version,
             file,
-            ordinal,
+            ordinal: load.ordinal,
         });
         id
+    }
+
+    pub fn next_dylib_ordinal(&self) -> u16 {
+        self.dylibs
+            .iter()
+            .map(|dylib| dylib.ordinal)
+            .max()
+            .unwrap_or(0)
+            + 1
     }
 
     // ---- accessors ----
@@ -623,9 +687,9 @@ impl SymbolTable {
                 first: existing_id,
                 second: Box::new(new.clone()),
             }),
-            (false, true) => Ok(Action::Replace),     // strong over weak
-            (true, false) => Ok(Action::Keep),        // strong keeps its seat
-            (false, false) => Ok(Action::Keep),       // first weak wins
+            (false, true) => Ok(Action::Replace), // strong over weak
+            (true, false) => Ok(Action::Keep),    // strong keeps its seat
+            (false, false) => Ok(Action::Keep),   // first weak wins
         }
     }
 
@@ -660,7 +724,9 @@ impl SymbolTable {
                 InsertOutcome::CommonCoalesced { id }
             }
             Action::PendingArchiveFetch => {
-                let Symbol::LazyArchive { archive, member, .. } = self.symbols[id.0 as usize]
+                let Symbol::LazyArchive {
+                    archive, member, ..
+                } = self.symbols[id.0 as usize]
                 else {
                     unreachable!("PendingArchiveFetch requires LazyArchive in slot")
                 };
@@ -671,8 +737,7 @@ impl SymbolTable {
                 }
             }
             Action::PendingObjectLoad => {
-                let Symbol::LazyObject { origin, .. } = self.symbols[id.0 as usize]
-                else {
+                let Symbol::LazyObject { origin, .. } = self.symbols[id.0 as usize] else {
                     unreachable!("PendingObjectLoad requires LazyObject in slot")
                 };
                 InsertOutcome::PendingObjectLoad { id, origin }
@@ -698,9 +763,7 @@ impl SymbolTable {
             unreachable!("coalesce_common requires two Common entries");
         };
         if let Symbol::Common {
-            size,
-            align_pow2,
-            ..
+            size, align_pow2, ..
         } = slot
         {
             *size = a_size.max(b_size);
@@ -826,7 +889,7 @@ pub struct PendingFetch {
 /// Tracks which inputs reference each external name. A single name can
 /// appear as a Defined, Undefined, or Common in multiple inputs; we keep
 /// one entry per (name, origin) pair in insertion order.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ReferrerLog {
     entries: HashMap<Istr, Vec<InputId>>,
 }
@@ -844,10 +907,15 @@ impl ReferrerLog {
     }
 
     pub fn get(&self, name: Istr) -> &[InputId] {
-        self.entries
-            .get(&name)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        self.entries.get(&name).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    pub fn extend_from(&mut self, other: &ReferrerLog) {
+        for (&name, origins) in &other.entries {
+            for &origin in origins {
+                self.add(name, origin);
+            }
+        }
     }
 }
 
@@ -981,11 +1049,7 @@ pub fn seed_dylib(
     report: &mut SeedReport,
 ) -> Result<(), SeedError> {
     let di = inputs.dylib(dylib_id);
-    let entries = di
-        .file
-        .exports
-        .entries()
-        .map_err(SeedError::Read)?;
+    let entries = di.file.exports.entries().map_err(SeedError::Read)?;
     for entry in entries {
         let name = table.intern(&entry.name);
         let sym = Symbol::DylibImport {
@@ -1071,7 +1135,9 @@ impl From<SeedError> for FetchError {
 #[derive(Debug, Default)]
 pub struct DrainReport {
     pub fetched_members: usize,
+    pub loaded_paths: Vec<PathBuf>,
     pub duplicates: Vec<InsertError>,
+    pub referrers: ReferrerLog,
 }
 
 /// Shared ingest: copy one archive member's body into a fresh
@@ -1084,6 +1150,7 @@ fn ingest_member_bytes(
     member_id: MemberId,
     report: &mut DrainReport,
 ) -> Result<Vec<PendingFetch>, FetchError> {
+    let archive_load_order = inputs.archives[archive_id.0 as usize].load_order;
     let ai = &inputs.archives[archive_id.0 as usize];
     if ai.fetched.contains(&member_id.0) {
         return Ok(Vec::new());
@@ -1092,13 +1159,12 @@ fn ingest_member_bytes(
     // Extract owned data before mutating the registry.
     let (logical_path, member_bytes) = {
         let archive = Archive::open(&ai.path, &ai.bytes)?;
-        let member =
-            archive
-                .member_at_offset(member_id.0)
-                .ok_or(FetchError::MemberNotFound {
-                    archive: archive_id,
-                    member: member_id,
-                })?;
+        let member = archive
+            .member_at_offset(member_id.0)
+            .ok_or(FetchError::MemberNotFound {
+                archive: archive_id,
+                member: member_id,
+            })?;
         let logical = format!("{}({})", ai.path.display(), member.name);
         (logical, member.body.to_vec())
     };
@@ -1109,13 +1175,19 @@ fn ingest_member_bytes(
     let input_id = InputId(inputs.objects.len() as u32);
     inputs.objects.push(ObjectInput {
         path: PathBuf::from(logical_path),
+        load_order: archive_load_order,
+        archive_member_offset: Some(member_id.0),
         bytes: member_bytes,
     });
     report.fetched_members += 1;
+    report
+        .loaded_paths
+        .push(inputs.objects[input_id.0 as usize].path.clone());
 
     let mut sub_report = SeedReport::default();
     seed_object(inputs, input_id, table, &mut sub_report)?;
     report.duplicates.extend(sub_report.duplicates);
+    report.referrers.extend_from(&sub_report.referrers);
     Ok(sub_report.pending_fetches)
 }
 
@@ -1154,13 +1226,7 @@ pub fn force_load_archive(
     };
     let mut queue: Vec<PendingFetch> = Vec::new();
     for offset in member_offsets {
-        let new = ingest_member_bytes(
-            inputs,
-            table,
-            archive_id,
-            MemberId(offset),
-            report,
-        )?;
+        let new = ingest_member_bytes(inputs, table, archive_id, MemberId(offset), report)?;
         queue.extend(new);
     }
     while let Some(p) = queue.pop() {
@@ -1230,9 +1296,11 @@ impl DylibId {
 pub struct ClassificationReport {
     /// Strong undefineds that triggered errors under `Error` treatment.
     pub errors: Vec<Unresolved>,
-    /// Strong undefineds that produced warnings under `Warning` treatment.
+    /// Strong undefineds that produced warnings under `Warning` treatment and
+    /// were promoted to flat-lookup imports for final emission.
     pub warnings: Vec<Unresolved>,
-    /// Strong undefineds that were silently accepted under `Suppress`.
+    /// Strong undefineds that were silently accepted under `Suppress` and
+    /// were promoted to flat-lookup imports for final emission.
     pub suppressed: Vec<Unresolved>,
     /// Undefineds promoted to flat-lookup DylibImport entries.
     pub promoted_to_dynamic: Vec<SymbolId>,
@@ -1267,9 +1335,7 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
         row[0] = i + 1;
         for (j, cb) in b.iter().enumerate() {
             let cost = if ca == cb { 0 } else { 1 };
-            let new_val = (row[j + 1] + 1)
-                .min(row[j] + 1)
-                .min(prev + cost);
+            let new_val = (row[j + 1] + 1).min(row[j] + 1).min(prev + cost);
             prev = row[j + 1];
             row[j + 1] = new_val;
         }
@@ -1308,16 +1374,17 @@ pub fn did_you_mean(table: &SymbolTable, query: &str, budget: usize, max: usize)
 /// Format the full undefined-symbol diagnostic block, one entry per
 /// unresolved name: the error line, every referrer, and an optional
 /// did-you-mean hint.
-pub fn format_undefined_diagnostic(
+fn format_undefined_diagnostic_with_level(
     table: &SymbolTable,
     inputs: &Inputs,
     referrers: &ReferrerLog,
     unresolved: &[Unresolved],
+    level: &str,
 ) -> String {
     let mut out = String::new();
     for u in unresolved {
         let name = table.interner.resolve(u.name);
-        out.push_str(&format!("afs-ld: error: undefined symbol: {name}\n"));
+        out.push_str(&format!("afs-ld: {level}: undefined symbol: {name}\n"));
         for origin in referrers.get(u.name) {
             if let Some(oi) = inputs.objects.get(origin.0 as usize) {
                 out.push_str(&format!("      referenced by {}\n", oi.path.display()));
@@ -1336,6 +1403,24 @@ pub fn format_undefined_diagnostic(
         }
     }
     out
+}
+
+pub fn format_undefined_diagnostic(
+    table: &SymbolTable,
+    inputs: &Inputs,
+    referrers: &ReferrerLog,
+    unresolved: &[Unresolved],
+) -> String {
+    format_undefined_diagnostic_with_level(table, inputs, referrers, unresolved, "error")
+}
+
+pub fn format_undefined_warning_diagnostic(
+    table: &SymbolTable,
+    inputs: &Inputs,
+    referrers: &ReferrerLog,
+    unresolved: &[Unresolved],
+) -> String {
+    format_undefined_diagnostic_with_level(table, inputs, referrers, unresolved, "warning")
 }
 
 /// Format a `DuplicateStrong` insertion error for user consumption. Needs
@@ -1378,13 +1463,26 @@ pub fn classify_unresolved(
 ) -> ClassificationReport {
     let mut report = ClassificationReport::default();
 
+    fn promote_to_flat_lookup(table: &mut SymbolTable, id: SymbolId, name: Istr) {
+        table.symbols[id.0 as usize] = Symbol::DylibImport {
+            name,
+            dylib: DylibId::INVALID,
+            ordinal: FLAT_LOOKUP_ORDINAL,
+            weak_import: true,
+        };
+        table.transitions.push(Transition {
+            id,
+            from: SymbolKindTag::Undefined,
+            to: SymbolKindTag::DylibImport,
+            cause: TransitionCause::Replaced,
+        });
+    }
+
     // Collect undefineds before mutating — avoids double-borrow grief.
     let undefs: Vec<(SymbolId, Istr, bool)> = table
         .iter()
         .filter_map(|(id, s)| match s {
-            Symbol::Undefined {
-                name, weak_ref, ..
-            } => Some((id, *name, *weak_ref)),
+            Symbol::Undefined { name, weak_ref, .. } => Some((id, *name, *weak_ref)),
             _ => None,
         })
         .collect();
@@ -1400,23 +1498,16 @@ pub fn classify_unresolved(
             }
             UndefinedTreatment::Warning => {
                 report.warnings.push(Unresolved { name, id });
+                promote_to_flat_lookup(table, id, name);
+                report.promoted_to_dynamic.push(id);
             }
             UndefinedTreatment::Suppress => {
                 report.suppressed.push(Unresolved { name, id });
+                promote_to_flat_lookup(table, id, name);
+                report.promoted_to_dynamic.push(id);
             }
             UndefinedTreatment::DynamicLookup => {
-                table.symbols[id.0 as usize] = Symbol::DylibImport {
-                    name,
-                    dylib: DylibId::INVALID,
-                    ordinal: FLAT_LOOKUP_ORDINAL,
-                    weak_import: true,
-                };
-                table.transitions.push(Transition {
-                    id,
-                    from: SymbolKindTag::Undefined,
-                    to: SymbolKindTag::DylibImport,
-                    cause: TransitionCause::Replaced,
-                });
+                promote_to_flat_lookup(table, id, name);
                 report.promoted_to_dynamic.push(id);
             }
         }
@@ -1960,7 +2051,9 @@ mod tests {
         t.insert(lazy).unwrap();
         let want = undef(&mut t, "_hidden");
         match t.insert(want).unwrap() {
-            InsertOutcome::PendingArchiveFetch { archive, member, .. } => {
+            InsertOutcome::PendingArchiveFetch {
+                archive, member, ..
+            } => {
                 assert_eq!(archive, ArchiveId(7));
                 assert_eq!(member, MemberId(42));
             }

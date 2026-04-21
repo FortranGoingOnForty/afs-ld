@@ -67,7 +67,11 @@ pub struct YamlError {
 
 impl fmt::Display for YamlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "YAML error at line {}, col {}: {}", self.line, self.col, self.msg)
+        write!(
+            f,
+            "YAML error at line {}, col {}: {}",
+            self.line, self.col, self.msg
+        )
     }
 }
 
@@ -237,10 +241,7 @@ fn flow_unbalanced(s: &str) -> bool {
 fn parse_tag(rest: &str) -> Option<String> {
     let rest = rest.trim_start();
     if let Some(tag) = rest.strip_prefix('!') {
-        let end = tag
-            .chars()
-            .take_while(|c| !c.is_whitespace())
-            .count();
+        let end = tag.chars().take_while(|c| !c.is_whitespace()).count();
         Some(format!("!{}", &tag[..end]))
     } else {
         None
@@ -438,11 +439,7 @@ fn find_top_level_mapping_colon(s: &str) -> Option<usize> {
     None
 }
 
-fn split_key(
-    content: &str,
-    line_no: usize,
-    col: usize,
-) -> Result<(String, String), YamlError> {
+fn split_key(content: &str, line_no: usize, col: usize) -> Result<(String, String), YamlError> {
     let colon = find_top_level_mapping_colon(content).ok_or(YamlError {
         line: line_no,
         col: col + 1,
@@ -626,9 +623,7 @@ mod tests {
 
     #[test]
     fn nested_mapping_via_indentation() {
-        let doc = parse_one(
-            "a:\n  b: 1\n  c: 2\n",
-        );
+        let doc = parse_one("a:\n  b: 1\n  c: 2\n");
         let a = doc.root.get("a").unwrap();
         let m = a.as_mapping().unwrap();
         assert_eq!(m[0], ("b".into(), Value::Scalar("1".into())));
@@ -684,9 +679,8 @@ mod tests {
 
     #[test]
     fn block_sequence_entries_with_flow_values() {
-        let doc = parse_one(
-            "exports:\n  - targets: [ arm64-macos ]\n    symbols: [ _foo, _bar ]\n",
-        );
+        let doc =
+            parse_one("exports:\n  - targets: [ arm64-macos ]\n    symbols: [ _foo, _bar ]\n");
         let e = doc.root.get("exports").unwrap().as_sequence().unwrap();
         let entry = e[0].as_mapping().unwrap();
         assert_eq!(

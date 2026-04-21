@@ -89,10 +89,7 @@ fn atomize_splits_text_at_symbol_boundaries_and_backpatches_symbols() {
         .subsections_via_symbols
     "#;
 
-    let obj_path = std::env::temp_dir().join(format!(
-        "afs-ld-atom-{}-test.o",
-        std::process::id()
-    ));
+    let obj_path = std::env::temp_dir().join(format!("afs-ld-atom-{}-test.o", std::process::id()));
     if let Err(e) = assemble(src, &obj_path) {
         eprintln!("skipping: assemble failed: {e}");
         return;
@@ -100,7 +97,7 @@ fn atomize_splits_text_at_symbol_boundaries_and_backpatches_symbols() {
 
     let bytes = fs::read(&obj_path).unwrap();
     let mut inputs = Inputs::new();
-    let input_id = inputs.add_object(obj_path.clone(), bytes).unwrap();
+    let input_id = inputs.add_object(obj_path.clone(), bytes, 0).unwrap();
 
     // Seed the symbol table (produces Defined entries with AtomId(0)
     // placeholders).
@@ -111,7 +108,13 @@ fn atomize_splits_text_at_symbol_boundaries_and_backpatches_symbols() {
     let obj = inputs.object_file(input_id).unwrap();
     let mut atom_table = AtomTable::new();
     let atomization = atomize_object(input_id, &obj, &mut atom_table);
-    backpatch_symbol_atoms(&atomization, input_id, &obj, &mut sym_table, &mut atom_table);
+    backpatch_symbol_atoms(
+        &atomization,
+        input_id,
+        &obj,
+        &mut sym_table,
+        &mut atom_table,
+    );
 
     // At least one atom per defined function plus one for data_global.
     assert!(
@@ -192,10 +195,8 @@ fn atomize_cstring_splits_at_null_terminators() {
         .subsections_via_symbols
     "#;
 
-    let obj_path = std::env::temp_dir().join(format!(
-        "afs-ld-atom-{}-cstrings.o",
-        std::process::id()
-    ));
+    let obj_path =
+        std::env::temp_dir().join(format!("afs-ld-atom-{}-cstrings.o", std::process::id()));
     if let Err(e) = assemble(src, &obj_path) {
         eprintln!("skipping: assemble failed: {e}");
         return;
@@ -203,7 +204,7 @@ fn atomize_cstring_splits_at_null_terminators() {
 
     let bytes = fs::read(&obj_path).unwrap();
     let mut inputs = Inputs::new();
-    let input_id = inputs.add_object(obj_path.clone(), bytes).unwrap();
+    let input_id = inputs.add_object(obj_path.clone(), bytes, 0).unwrap();
     let mut sym_table = SymbolTable::new();
     let _ = seed_all(&inputs, &mut sym_table).expect("seed_all");
     let obj = inputs.object_file(input_id).unwrap();

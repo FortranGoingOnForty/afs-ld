@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use crate::input::ObjectFile;
 use crate::macho::constants::MH_SUBSECTIONS_VIA_SYMBOLS;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent};
-use crate::resolve::{AtomId, InputId, SymbolTable, SymbolId};
+use crate::resolve::{AtomId, InputId, SymbolId, SymbolTable};
 use crate::section::{InputSection, SectionKind};
 use crate::symbol::{InputSymbol, SymKind};
 
@@ -68,6 +68,7 @@ impl AtomSection {
             SectionKind::ThreadLocalRegular => AtomSection::ThreadLocalData,
             SectionKind::ThreadLocalZeroFill => AtomSection::ThreadLocalBss,
             SectionKind::ThreadLocalVariables => AtomSection::ThreadLocalVariables,
+            SectionKind::ThreadLocalVariablePointers => AtomSection::ThreadLocalVariables,
             SectionKind::ThreadLocalInitPointers => AtomSection::ThreadLocalInitPointers,
             SectionKind::Coalesced => AtomSection::Coalesced,
             SectionKind::CompactUnwind => AtomSection::CompactUnwind,
@@ -80,10 +81,7 @@ impl AtomSection {
     }
 
     pub fn is_zerofill(self) -> bool {
-        matches!(
-            self,
-            AtomSection::ZeroFill | AtomSection::ThreadLocalBss
-        )
+        matches!(self, AtomSection::ZeroFill | AtomSection::ThreadLocalBss)
     }
 
     pub fn is_literal(self) -> bool {
@@ -223,7 +221,9 @@ impl AtomTable {
     pub fn by_input_section(&self) -> HashMap<(InputId, u8), Vec<AtomId>> {
         let mut out: HashMap<(InputId, u8), Vec<AtomId>> = HashMap::new();
         for (id, atom) in self.iter() {
-            out.entry((atom.origin, atom.input_section)).or_default().push(id);
+            out.entry((atom.origin, atom.input_section))
+                .or_default()
+                .push(id);
         }
         out
     }
@@ -297,9 +297,10 @@ pub fn atomize_object(
         );
     }
 
-    // Post-pass: wire `parent_of` for every `__compact_unwind` atom to the
-    // function atom that its `function_start` reloc references.
+    // Post-pass: wire metadata atoms to the function atoms whose lifetime
+    // they track, so dead-strip can prune unwind surfaces precisely.
     link_unwind_parents(input_id, obj, table, &out);
+    link_eh_frame_parents(input_id, obj, table, &out);
 
     out
 }
@@ -486,6 +487,11 @@ fn atomize_regular_section(
         return;
     }
 
+    if atom_section == AtomSection::EhFrame {
+        atomize_eh_frame(input_id, section_idx, sect, atom_section, table, out);
+        return;
+    }
+
     // With subsections_via_symbols and at least one split point, walk the
     // sorted symbols and emit one atom per non-alt_entry boundary.
     if syms.is_empty() {
@@ -581,15 +587,36 @@ fn atomize_literal_section(
         AtomSection::CStringLiterals => {
             atomize_cstring(input_id, section_idx, sect, syms, atom_section, table, out)
         }
-        AtomSection::Literal4 => {
-            atomize_fixed_literal(input_id, section_idx, sect, syms, 4, atom_section, table, out)
-        }
-        AtomSection::Literal8 => {
-            atomize_fixed_literal(input_id, section_idx, sect, syms, 8, atom_section, table, out)
-        }
-        AtomSection::Literal16 => {
-            atomize_fixed_literal(input_id, section_idx, sect, syms, 16, atom_section, table, out)
-        }
+        AtomSection::Literal4 => atomize_fixed_literal(
+            input_id,
+            section_idx,
+            sect,
+            syms,
+            4,
+            atom_section,
+            table,
+            out,
+        ),
+        AtomSection::Literal8 => atomize_fixed_literal(
+            input_id,
+            section_idx,
+            sect,
+            syms,
+            8,
+            atom_section,
+            table,
+            out,
+        ),
+        AtomSection::Literal16 => atomize_fixed_literal(
+            input_id,
+            section_idx,
+            sect,
+            syms,
+            16,
+            atom_section,
+            table,
+            out,
+        ),
         _ => unreachable!("atomize_literal_section called with non-literal kind"),
     }
 }
@@ -614,9 +641,7 @@ fn atomize_cstring(
         let data = sect.data[offset..end].to_vec();
         let size = (end - offset) as u32;
 
-        let owner_entry = syms
-            .iter()
-            .find(|(_, _, off)| *off as usize == offset);
+        let owner_entry = syms.iter().find(|(_, _, off)| *off as usize == offset);
         let owner_idx = owner_entry.map(|(i, _, _)| *i);
 
         let mut flags = AtomFlags::default().with(AtomFlags::LITERAL);
@@ -670,9 +695,7 @@ fn atomize_fixed_literal(
         };
         let size = (end - offset) as u32;
 
-        let owner_entry = syms
-            .iter()
-            .find(|(_, _, off)| *off as usize == offset);
+        let owner_entry = syms.iter().find(|(_, _, off)| *off as usize == offset);
         let owner_idx = owner_entry.map(|(i, _, _)| *i);
 
         let mut flags = AtomFlags::default().with(AtomFlags::LITERAL);
@@ -749,6 +772,154 @@ fn atomize_compact_unwind(
         }
         offset = end;
     }
+}
+
+/// Split `__eh_frame` into DWARF CFI records so dead-strip can retain only
+/// the live FDEs and their shared CIEs.
+fn atomize_eh_frame(
+    input_id: InputId,
+    section_idx: u8,
+    sect: &InputSection,
+    atom_section: AtomSection,
+    table: &mut AtomTable,
+    out: &mut ObjectAtomization,
+) {
+    let mut offset = 0usize;
+    while offset < sect.data.len() {
+        let Some(size) = eh_frame_record_size(&sect.data, offset) else {
+            let atom = build_section_atom(input_id, section_idx, sect, atom_section);
+            let id = table.push(atom);
+            out.atoms.push(id);
+            return;
+        };
+
+        let end = (offset + size).min(sect.data.len());
+        let atom = Atom {
+            id: AtomId(0),
+            origin: input_id,
+            input_section: section_idx,
+            section: atom_section,
+            input_offset: offset as u32,
+            size: (end - offset) as u32,
+            align_pow2: (sect.align_pow2 as u8).min(2),
+            owner: None,
+            alt_entries: Vec::new(),
+            data: sect.data[offset..end].to_vec(),
+            flags: AtomFlags::default(),
+            parent_of: None,
+        };
+        let id = table.push(atom);
+        out.atoms.push(id);
+        offset = end;
+    }
+}
+
+fn eh_frame_record_size(data: &[u8], offset: usize) -> Option<usize> {
+    let length_end = offset.checked_add(4)?;
+    let length_bytes: [u8; 4] = data.get(offset..length_end)?.try_into().ok()?;
+    let length = u32::from_le_bytes(length_bytes);
+    if length == 0 {
+        return Some(4);
+    }
+    if length == u32::MAX {
+        return None;
+    }
+    let size = 4usize.checked_add(length as usize)?;
+    (offset + size <= data.len()).then_some(size)
+}
+
+fn eh_frame_cie_pointer(atom: &Atom) -> Option<u32> {
+    (atom.section == AtomSection::EhFrame && atom.data.len() >= 8).then(|| {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(&atom.data[4..8]);
+        u32::from_le_bytes(buf)
+    })
+}
+
+fn resolve_function_parent(
+    obj: &ObjectFile,
+    atom: &Atom,
+    reloc: crate::reloc::Reloc,
+    atom_index: &HashMap<(u8, u32), AtomId>,
+    field_offset: usize,
+) -> Option<AtomId> {
+    match reloc.referent {
+        Referent::Section(sect_idx) => {
+            let end = field_offset.checked_add(8)?;
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(atom.data.get(field_offset..end)?);
+            let target_offset = u64::from_le_bytes(buf) as u32;
+            atom_index.get(&(sect_idx, target_offset)).copied()
+        }
+        Referent::Symbol(sym_idx) => {
+            let input_sym = obj.symbols.get(sym_idx as usize)?;
+            (input_sym.kind() == SymKind::Sect)
+                .then(|| {
+                    let target_offset = input_sym.value().saturating_sub(
+                        obj.sections
+                            .get(input_sym.sect_idx().saturating_sub(1) as usize)
+                            .map(|section| section.addr)
+                            .unwrap_or(0),
+                    ) as u32;
+                    atom_index
+                        .get(&(input_sym.sect_idx(), target_offset))
+                        .copied()
+                })
+                .flatten()
+        }
+    }
+}
+
+fn link_eh_frame_parents(
+    input_id: InputId,
+    obj: &ObjectFile,
+    table: &mut AtomTable,
+    out: &ObjectAtomization,
+) {
+    let Some((eh_idx_zero, eh_sect)) = obj
+        .sections
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.kind == SectionKind::EhFrame)
+    else {
+        return;
+    };
+    let eh_idx_one = (eh_idx_zero + 1) as u8;
+
+    let raws = match parse_raw_relocs(&eh_sect.raw_relocs, 0, eh_sect.nreloc) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let fused = match parse_relocs(&raws) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let mut atom_index: HashMap<(u8, u32), AtomId> = HashMap::new();
+    for id in &out.atoms {
+        let a = table.get(*id);
+        atom_index.insert((a.input_section, a.input_offset), *id);
+    }
+
+    for id in &out.atoms {
+        let atom = table.get(*id);
+        if atom.input_section != eh_idx_one {
+            continue;
+        }
+        let Some(cie_pointer) = eh_frame_cie_pointer(atom) else {
+            continue;
+        };
+        if cie_pointer == 0 {
+            continue;
+        }
+        let Some(reloc) = fused.iter().find(|r| r.offset == atom.input_offset + 8) else {
+            continue;
+        };
+        if let Some(parent_id) = resolve_function_parent(obj, atom, *reloc, &atom_index, 8) {
+            table.get_mut(*id).parent_of = Some(parent_id);
+        }
+    }
+    let _ = input_id;
 }
 
 fn atomize_zerofill(

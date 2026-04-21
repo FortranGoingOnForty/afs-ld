@@ -16,7 +16,10 @@ fn find_runtime_archive() -> Option<PathBuf> {
     // .../armfortas/target/.
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     for profile in ["debug", "release"] {
-        let candidate = workspace.join("target").join(profile).join("libarmfortas_rt.a");
+        let candidate = workspace
+            .join("target")
+            .join(profile)
+            .join("libarmfortas_rt.a");
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -38,7 +41,9 @@ fn libarmfortas_rt_archive_walks_cleanly() {
     let members: Vec<_> = ar.object_members().collect();
     assert!(!members.is_empty(), "runtime archive has no object members");
 
-    let idx = ar.symbol_index().expect("runtime archive has a BSD symbol index");
+    let idx = ar
+        .symbol_index()
+        .expect("runtime archive has a BSD symbol index");
     assert!(!idx.is_empty(), "runtime archive symbol index is empty");
 
     // Pick a symbol we're confident the runtime exports. `_afs_program_init`
@@ -63,9 +68,7 @@ fn libarmfortas_rt_archive_walks_cleanly() {
         .symbols
         .iter()
         .find(|s| {
-            obj.symbol_name(s)
-                .map(|n| n == target)
-                .unwrap_or(false)
+            obj.symbol_name(s).map(|n| n == target).unwrap_or(false)
                 && s.kind() == SymKind::Sect
                 && s.is_ext()
         })
@@ -84,6 +87,11 @@ fn libarmfortas_rt_archive_walks_cleanly() {
 }
 
 fn panic_with_index(msg: &str, idx: &SymbolIndex) -> ! {
-    let preview: Vec<&str> = idx.entries.iter().take(10).map(|e| e.name.as_str()).collect();
+    let preview: Vec<&str> = idx
+        .entries
+        .iter()
+        .take(10)
+        .map(|e| e.name.as_str())
+        .collect();
     panic!("{msg}\nfirst 10 symbols: {preview:?}");
 }

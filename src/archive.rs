@@ -37,13 +37,20 @@ pub const AR_HDR_SIZE: usize = 60;
 #[derive(Debug)]
 pub enum ArchiveError {
     /// The input buffer is shorter than the next structure we need to read.
-    Truncated { need: usize, have: usize, context: &'static str },
+    Truncated {
+        need: usize,
+        have: usize,
+        context: &'static str,
+    },
     /// The 8-byte magic is neither `!<arch>\n` nor `!<thin>\n`.
     BadMagic { got: [u8; 8] },
     /// A header footer (`fmag`) wasn't `` `\n ``.
     BadEntryFooter { at_offset: usize },
     /// An ASCII decimal field (size/date/uid/gid/mode) didn't parse.
-    BadAsciiField { at_offset: usize, field: &'static str },
+    BadAsciiField {
+        at_offset: usize,
+        field: &'static str,
+    },
     /// A member's claimed size would overrun the archive.
     MemberOverrun { at_offset: usize, size: u64 },
     /// A `/NNN` long-name offset didn't land inside the `//` table.
@@ -229,7 +236,9 @@ impl<'a> Archive<'a> {
     /// Return every non-special member (skips symbol indexes and long-name
     /// tables).
     pub fn object_members(&self) -> impl Iterator<Item = &Member<'a>> {
-        self.members.iter().filter(|m| m.special == SpecialMember::None)
+        self.members
+            .iter()
+            .filter(|m| m.special == SpecialMember::None)
     }
 
     /// Find the first member whose `ar_hdr` begins at `header_offset`. The
@@ -266,10 +275,7 @@ impl<'a> Archive<'a> {
     /// Resolve `name` to its defining member, then parse that member as an
     /// `ObjectFile`. Returns `None` when the symbol is absent; `Some(Err(_))`
     /// when the member exists but fails to parse.
-    pub fn fetch_object_defining(
-        &self,
-        name: &str,
-    ) -> Option<Result<ObjectFile, FetchError>> {
+    pub fn fetch_object_defining(&self, name: &str) -> Option<Result<ObjectFile, FetchError>> {
         let member = self.first_member_defining(name)?;
         Some(self.parse_member_object(member))
     }
@@ -349,15 +355,8 @@ fn parse_members<'a>(
             });
         }
         let raw_name = hdr.raw_name_str();
-        let (real_name, body_offset, body, special) = decode_member(
-            raw_name,
-            data,
-            body_start,
-            size,
-            flavor,
-            long_names,
-            cursor,
-        )?;
+        let (real_name, body_offset, body, special) =
+            decode_member(raw_name, data, body_start, size, flavor, long_names, cursor)?;
 
         // Opportunistic flavor refinement. The sole unambiguous signal for
         // Sysv is the presence of `/` or `//` members — BSD never emits
@@ -383,10 +382,12 @@ fn parse_members<'a>(
         // Advance past body + 1-byte alignment pad for odd sizes (GNU-thin
         // members have zero-byte bodies so this collapses to a no-op).
         let advance = AR_HDR_SIZE + size + (size & 1);
-        cursor = cursor.checked_add(advance).ok_or(ArchiveError::MemberOverrun {
-            at_offset: cursor,
-            size: hdr.size,
-        })?;
+        cursor = cursor
+            .checked_add(advance)
+            .ok_or(ArchiveError::MemberOverrun {
+                at_offset: cursor,
+                size: hdr.size,
+            })?;
     }
 
     Ok((out, flavor))
@@ -405,7 +406,12 @@ fn decode_member<'a>(
     // GNU-thin: body is zero bytes; name field is the external path.
     if flavor == Flavor::GnuThin {
         let name = raw_name.trim_end_matches('/').to_string();
-        return Ok((name, body_start, &data[body_start..body_start], SpecialMember::None));
+        return Ok((
+            name,
+            body_start,
+            &data[body_start..body_start],
+            SpecialMember::None,
+        ));
     }
 
     // BSD extended: "#1/<N>" — first N bytes of the body are the real name.
@@ -576,9 +582,11 @@ fn parse_bsd_symbol_index(body: &[u8]) -> Result<SymbolIndex, ArchiveError> {
             reason: "__.SYMDEF ranlib byte count not a multiple of 8",
         });
     }
-    let ranlib_end = 4usize.checked_add(ranlib_bytes).ok_or(ArchiveError::BadSymbolIndex {
-        reason: "__.SYMDEF ranlib region overflows",
-    })?;
+    let ranlib_end = 4usize
+        .checked_add(ranlib_bytes)
+        .ok_or(ArchiveError::BadSymbolIndex {
+            reason: "__.SYMDEF ranlib region overflows",
+        })?;
     if ranlib_end + 4 > body.len() {
         return Err(ArchiveError::BadSymbolIndex {
             reason: "__.SYMDEF ranlib + stringsize region overruns member",
@@ -587,11 +595,12 @@ fn parse_bsd_symbol_index(body: &[u8]) -> Result<SymbolIndex, ArchiveError> {
     let stringsize =
         u32::from_le_bytes(body[ranlib_end..ranlib_end + 4].try_into().unwrap()) as usize;
     let strings_start = ranlib_end + 4;
-    let strings_end = strings_start
-        .checked_add(stringsize)
-        .ok_or(ArchiveError::BadSymbolIndex {
-            reason: "__.SYMDEF strings region overflows",
-        })?;
+    let strings_end =
+        strings_start
+            .checked_add(stringsize)
+            .ok_or(ArchiveError::BadSymbolIndex {
+                reason: "__.SYMDEF strings region overflows",
+            })?;
     if strings_end > body.len() {
         return Err(ArchiveError::BadSymbolIndex {
             reason: "__.SYMDEF strings region overruns member",
@@ -686,11 +695,7 @@ fn parse_sysv_symbol_index(body: &[u8]) -> Result<SymbolIndex, ArchiveError> {
     Ok(SymbolIndex { entries })
 }
 
-fn decode_long_name(
-    table: &[u8],
-    strx: u32,
-    at_offset: usize,
-) -> Result<String, ArchiveError> {
+fn decode_long_name(table: &[u8], strx: u32, at_offset: usize) -> Result<String, ArchiveError> {
     let start = strx as usize;
     if start >= table.len() {
         return Err(ArchiveError::LongNameOob { at_offset, strx });
@@ -703,7 +708,11 @@ fn decode_long_name(
         .map(|i| start + i)
         .unwrap_or(table.len());
     // Strip a trailing slash that GNU appends before the newline.
-    let trimmed_end = if end > 0 && table[end - 1] == b'/' { end - 1 } else { end };
+    let trimmed_end = if end > 0 && table[end - 1] == b'/' {
+        end - 1
+    } else {
+        end
+    };
     str::from_utf8(&table[start..trimmed_end])
         .map(|s| s.to_string())
         .map_err(|_| ArchiveError::BadName { at_offset })
@@ -792,12 +801,13 @@ mod tests {
         let mut buf = Vec::with_capacity(AR_HDR_SIZE);
         let name_bytes = name.as_bytes();
         let mut name_field = [b' '; 16];
-        name_field[..name_bytes.len().min(16)].copy_from_slice(&name_bytes[..name_bytes.len().min(16)]);
+        name_field[..name_bytes.len().min(16)]
+            .copy_from_slice(&name_bytes[..name_bytes.len().min(16)]);
         buf.extend_from_slice(&name_field);
         buf.extend_from_slice(&[b' '; 12]); // date
-        buf.extend_from_slice(&[b' '; 6]);  // uid
-        buf.extend_from_slice(&[b' '; 6]);  // gid
-        buf.extend_from_slice(&[b' '; 8]);  // mode
+        buf.extend_from_slice(&[b' '; 6]); // uid
+        buf.extend_from_slice(&[b' '; 6]); // gid
+        buf.extend_from_slice(&[b' '; 8]); // mode
         let mut size_field = [b' '; 10];
         let size_str = size.to_string();
         let bytes = size_str.as_bytes();
@@ -840,7 +850,10 @@ mod tests {
         let short = vec![0u8; 30];
         assert!(matches!(
             ArHeader::parse(&short, 0).unwrap_err(),
-            ArchiveError::Truncated { need: AR_HDR_SIZE, .. }
+            ArchiveError::Truncated {
+                need: AR_HDR_SIZE,
+                ..
+            }
         ));
     }
 
@@ -901,7 +914,10 @@ mod tests {
     fn bsd_extended_name_splits_body() {
         let mut buf = Vec::new();
         buf.extend_from_slice(AR_MAGIC);
-        buf.extend_from_slice(&encode_bsd_extended("long_filename_with_many_chars.o", b"CONT"));
+        buf.extend_from_slice(&encode_bsd_extended(
+            "long_filename_with_many_chars.o",
+            b"CONT",
+        ));
         let ar = Archive::open("/tmp/bsd_ext.a", &buf).unwrap();
         assert_eq!(ar.members()[0].name, "long_filename_with_many_chars.o");
         assert_eq!(ar.members()[0].body, b"CONT");

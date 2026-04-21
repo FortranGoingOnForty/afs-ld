@@ -1,0 +1,16 @@
+-arch
+arm64
+-platform_version
+macos
+@SDK_VERSION@
+@SDK_VERSION@
+-syslibroot
+@SDK_PATH@
+-no_fixup_chains
+-e
+_main
+-o
+@OUT@
+@INPUT:main.o@
+@SDK_TBD:usr/lib/libSystem.tbd@
+@ARTIFACT:libdirect.dylib@

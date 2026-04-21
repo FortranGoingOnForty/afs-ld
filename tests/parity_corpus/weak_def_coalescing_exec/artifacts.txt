@@ -1,0 +1,2 @@
+clang_dylib weak_a.c libweak_a.dylib
+clang_dylib weak_b.c libweak_b.dylib

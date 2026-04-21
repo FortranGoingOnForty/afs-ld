@@ -144,3 +144,21 @@ afs-ld: loading /usr/lib/libSystem.tbd
 - `-why_live` produces a coherent chain on fixtures with dead-strip enabled.
 - Unknown-flag errors include a did-you-mean suggestion.
 - CLI surface passes a snapshot test against the `--help` output.
+
+## Remaining Flag Slices
+- [x] `-exported_symbols_list <file>`
+- [x] `-unexported_symbols_list <file>`
+- [x] `-exported_symbol <sym>`
+- [x] `-unexported_symbol <sym>`
+- [x] `-r` / `-bundle` explicit deferred errors
+- [x] `-S`
+- [x] `-no_uuid`
+- [x] `-dead_strip`
+- [x] `-icf=safe` / `-icf=none`
+- [x] `-fixup_chains` / `-no_fixup_chains`
+- [x] `-Wl,<comma-separated>` normalization
+- [x] `-map <path>`
+- [x] `-t` / `-trace`
+- [x] `-v` / `--version`
+- [x] `-h` / `--help`
+- [x] `-why_live <symbol>`

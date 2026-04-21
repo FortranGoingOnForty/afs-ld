@@ -1,0 +1,3 @@
+build_version
+load_dylib_names
+dyld_info_rebase

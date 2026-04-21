@@ -42,15 +42,12 @@ For each scenario, compare:
 
 ### 3. Tolerated-diff rules
 
-```rust
-pub enum ToleratedDiff {
-    UuidBytes,
-    Timestamp,
-    PathHashInString(&'static str),      // e.g. temp path in stabs
-    StringTableSuffixDedupVariance,
-    CodeSignatureHashes,
-}
-```
+Current Sprint 27 allowlist is intentionally small and explicit:
+- UUID load-command bytes.
+- Dylib timestamp fields.
+- Code-signature load-command/blob bytes.
+- Case-specific section-byte ranges declared in `notes.md`.
+- String-table length drift within 5% for suffix-dedup variance.
 
 Each tolerance has a precise predicate — no loose "any byte in __LINKEDIT". Unknown diffs fail.
 

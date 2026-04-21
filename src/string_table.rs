@@ -9,6 +9,8 @@
 //! via its suffix-dedup sort. The walker here handles any strx that lands
 //! between nulls, not just those aligned to the start of a name.
 
+use std::collections::HashMap;
+
 use crate::macho::reader::ReadError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,11 +24,13 @@ impl StringTable {
     /// from `LC_SYMTAB`.
     pub fn from_file(file_bytes: &[u8], stroff: u32, strsize: u32) -> Result<Self, ReadError> {
         let start = stroff as usize;
-        let end = start.checked_add(strsize as usize).ok_or(ReadError::Truncated {
-            need: usize::MAX,
-            have: file_bytes.len(),
-            context: "string table (stroff + strsize overflows)",
-        })?;
+        let end = start
+            .checked_add(strsize as usize)
+            .ok_or(ReadError::Truncated {
+                need: usize::MAX,
+                have: file_bytes.len(),
+                context: "string table (stroff + strsize overflows)",
+            })?;
         if end > file_bytes.len() {
             return Err(ReadError::Truncated {
                 need: end,
@@ -73,21 +77,107 @@ impl StringTable {
                 reason: "strx out of bounds",
             });
         }
-        let end = start + self.raw[start..]
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or(ReadError::BadCmdsize {
-                cmd: 0,
-                cmdsize: 0,
-                at_offset: start,
-                reason: "unterminated string (no null byte before end)",
-            })?;
+        let end = start
+            + self.raw[start..]
+                .iter()
+                .position(|&b| b == 0)
+                .ok_or(ReadError::BadCmdsize {
+                    cmd: 0,
+                    cmdsize: 0,
+                    at_offset: start,
+                    reason: "unterminated string (no null byte before end)",
+                })?;
         std::str::from_utf8(&self.raw[start..end]).map_err(|_| ReadError::BadCmdsize {
             cmd: 0,
             cmdsize: 0,
             at_offset: start,
             reason: "non-UTF-8 bytes in symbol name",
         })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StringTableBuilder {
+    roots: Vec<RootString>,
+    roots_by_last_byte: HashMap<u8, Vec<usize>>,
+    offsets: HashMap<String, u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootString {
+    name: String,
+    offset: u32,
+}
+
+impl StringTableBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, name: &str) {
+        self.offsets.entry(name.to_string()).or_insert(0);
+    }
+
+    pub fn finish(mut self) -> (Vec<u8>, HashMap<String, u32>) {
+        let mut names: Vec<String> = self.offsets.keys().cloned().collect();
+        names.sort_by(|lhs, rhs| reverse_suffix_order(lhs, rhs));
+
+        let mut raw = vec![0u8];
+        for name in names {
+            if let Some(offset) = self.find_suffix_offset(&name) {
+                self.offsets.insert(name, offset);
+                continue;
+            }
+
+            let offset = raw.len() as u32;
+            raw.extend_from_slice(name.as_bytes());
+            raw.push(0);
+            let root_index = self.roots.len();
+            self.roots.push(RootString {
+                name: name.clone(),
+                offset,
+            });
+            if let Some(&last_byte) = name.as_bytes().last() {
+                self.roots_by_last_byte
+                    .entry(last_byte)
+                    .or_default()
+                    .push(root_index);
+            }
+            self.offsets.insert(name, offset);
+        }
+
+        while !raw.len().is_multiple_of(8) {
+            raw.push(0);
+        }
+        (raw, self.offsets)
+    }
+
+    fn find_suffix_offset(&self, name: &str) -> Option<u32> {
+        let last_byte = *name.as_bytes().last()?;
+        self.roots_by_last_byte
+            .get(&last_byte)?
+            .iter()
+            .find_map(|&idx| {
+                let existing = &self.roots[idx];
+                (existing.name.len() >= name.len() && existing.name.ends_with(name))
+                    .then(|| existing.offset + (existing.name.len() - name.len()) as u32)
+            })
+    }
+}
+
+fn reverse_suffix_order(lhs: &str, rhs: &str) -> std::cmp::Ordering {
+    let mut lhs_rev = lhs.bytes().rev();
+    let mut rhs_rev = rhs.bytes().rev();
+    loop {
+        match (lhs_rev.next(), rhs_rev.next()) {
+            (Some(a), Some(b)) => match a.cmp(&b) {
+                std::cmp::Ordering::Equal => continue,
+                other => return other,
+            },
+            (Some(_), None) => return std::cmp::Ordering::Less,
+            (None, Some(_)) => return std::cmp::Ordering::Greater,
+            (None, None) => return lhs.cmp(rhs),
+        }
     }
 }
 
@@ -128,14 +218,18 @@ mod tests {
     fn out_of_bounds_strx_errors() {
         let t = tbl(b"\0a\0");
         let err = t.get(100).unwrap_err();
-        assert!(matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("out of bounds")));
+        assert!(
+            matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("out of bounds"))
+        );
     }
 
     #[test]
     fn unterminated_string_errors() {
         let t = tbl(b"\0abcdef"); // no trailing null
         let err = t.get(1).unwrap_err();
-        assert!(matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("unterminated")));
+        assert!(
+            matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("unterminated"))
+        );
     }
 
     #[test]
@@ -160,5 +254,35 @@ mod tests {
         let t = StringTable::from_file(&file, 8, 7).unwrap();
         assert_eq!(t.as_bytes(), b"\0_main\0");
         assert_eq!(t.get(1).unwrap(), "_main");
+    }
+
+    #[test]
+    fn builder_dedups_suffix_names() {
+        let mut builder = StringTableBuilder::new();
+        builder.insert("_array_sum");
+        builder.insert("_afs_array_sum");
+
+        let (bytes, offsets) = builder.finish();
+        let table = StringTable::from_bytes(bytes);
+        let afs = offsets["_afs_array_sum"];
+        let array = offsets["_array_sum"];
+
+        assert_eq!(table.get(afs).unwrap(), "_afs_array_sum");
+        assert_eq!(table.get(array).unwrap(), "_array_sum");
+        assert_eq!(array, afs + 4);
+        assert_eq!(table.as_bytes().len() % 8, 0);
+    }
+
+    #[test]
+    fn builder_ignores_same_last_byte_non_suffix_names() {
+        let mut builder = StringTableBuilder::new();
+        builder.insert("_alpha");
+        builder.insert("_beta");
+
+        let (bytes, offsets) = builder.finish();
+        let table = StringTable::from_bytes(bytes);
+
+        assert_eq!(table.get(offsets["_alpha"]).unwrap(), "_alpha");
+        assert_eq!(table.get(offsets["_beta"]).unwrap(), "_beta");
     }
 }

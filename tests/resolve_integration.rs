@@ -53,9 +53,7 @@ fn assemble(src_text: &str, out: &PathBuf) -> Result<(), String> {
     let tmp = std::env::temp_dir().join(format!(
         "afs-ld-resolve-{}-{}.s",
         std::process::id(),
-        out.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("t")
+        out.file_stem().and_then(|s| s.to_str()).unwrap_or("t")
     ));
     fs::write(&tmp, src_text).map_err(|e| format!("write .s: {e}"))?;
     let status = Command::new("xcrun")
@@ -93,11 +91,7 @@ fn pack_archive(members: &[&PathBuf], out: &PathBuf) -> Result<(), String> {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "afs-ld-resolve-{}-{}",
-        std::process::id(),
-        name
-    ))
+    std::env::temp_dir().join(format!("afs-ld-resolve-{}-{}", std::process::id(), name))
 }
 
 #[test]
@@ -152,13 +146,13 @@ fn resolve_pipeline_pulls_archive_member_and_flags_missing() {
     // Register the inputs with the resolver.
     let mut inputs = Inputs::new();
     let a_id = inputs
-        .add_object(a_o.clone(), fs::read(&a_o).unwrap())
+        .add_object(a_o.clone(), fs::read(&a_o).unwrap(), 0)
         .unwrap();
     inputs
-        .add_object(b_o.clone(), fs::read(&b_o).unwrap())
+        .add_object(b_o.clone(), fs::read(&b_o).unwrap(), 1)
         .unwrap();
     let archive_id = inputs
-        .add_archive(libtest.clone(), fs::read(&libtest).unwrap())
+        .add_archive(libtest.clone(), fs::read(&libtest).unwrap(), 2)
         .unwrap();
     let _ = archive_id;
 
@@ -170,8 +164,8 @@ fn resolve_pipeline_pulls_archive_member_and_flags_missing() {
         "unexpected duplicates in seeding: {:?}",
         seed_report.duplicates
     );
-    let drain_report = drain_fetches(&mut inputs, &mut table, seed_report.pending_fetches)
-        .expect("drain_fetches");
+    let drain_report =
+        drain_fetches(&mut inputs, &mut table, seed_report.pending_fetches).expect("drain_fetches");
     assert!(
         drain_report.fetched_members >= 1,
         "expected at least one archive member fetched; got {}",

@@ -7,9 +7,11 @@
 
 use std::path::PathBuf;
 
+use crate::loh::{parse_loh_blob, LohEntry};
+use crate::macho::constants::LC_DATA_IN_CODE;
 use crate::macho::reader::{
-    parse_commands, parse_header, DysymtabCmd, LoadCommand, MachHeader64, ReadError, SymtabCmd,
-    HEADER_SIZE,
+    parse_commands, parse_header, DysymtabCmd, LinkEditDataCmd, LoadCommand, MachHeader64,
+    ReadError, SymtabCmd, HEADER_SIZE,
 };
 use crate::section::InputSection;
 use crate::string_table::StringTable;
@@ -27,6 +29,32 @@ pub struct ObjectFile {
     pub strings: StringTable,
     pub symtab: Option<SymtabCmd>,
     pub dysymtab: Option<DysymtabCmd>,
+    pub loh: Vec<LohEntry>,
+    pub data_in_code: Vec<DataInCodeEntry>,
+}
+
+/// One `data_in_code_entry` preserved from an input object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataInCodeEntry {
+    /// File offset from the input Mach-O header.
+    pub offset: u32,
+    pub length: u16,
+    pub kind: u16,
+}
+
+impl DataInCodeEntry {
+    const SIZE: usize = 8;
+
+    fn parse_payload(payload: &[u8]) -> Vec<Self> {
+        payload
+            .chunks_exact(Self::SIZE)
+            .map(|chunk| DataInCodeEntry {
+                offset: u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
+                length: u16::from_le_bytes(chunk[4..6].try_into().unwrap()),
+                kind: u16::from_le_bytes(chunk[6..8].try_into().unwrap()),
+            })
+            .collect()
+    }
 }
 
 impl ObjectFile {
@@ -64,6 +92,8 @@ impl ObjectFile {
             ),
             None => (Vec::new(), StringTable::from_bytes(Vec::new())),
         };
+        let loh = parse_loh(&commands, file_bytes)?;
+        let data_in_code = parse_data_in_code(&commands, file_bytes)?;
 
         Ok(ObjectFile {
             path,
@@ -74,6 +104,8 @@ impl ObjectFile {
             strings,
             symtab,
             dysymtab,
+            loh,
+            data_in_code,
         })
     }
 
@@ -99,8 +131,76 @@ impl ObjectFile {
         if sym.sect_idx() == 0 {
             return None;
         }
-        self.sections.get((sym.sect_idx() as usize).saturating_sub(1))
+        self.sections
+            .get((sym.sect_idx() as usize).saturating_sub(1))
     }
+}
+
+fn parse_loh(commands: &[LoadCommand], file_bytes: &[u8]) -> Result<Vec<LohEntry>, ReadError> {
+    let mut out = Vec::new();
+    for command in commands {
+        let LoadCommand::LinkerOptimizationHint(linkedit) = command else {
+            continue;
+        };
+        let start = linkedit.dataoff as usize;
+        let end = start
+            .checked_add(linkedit.datasize as usize)
+            .ok_or(ReadError::Truncated {
+                need: usize::MAX,
+                have: file_bytes.len(),
+                context: "LC_LINKER_OPTIMIZATION_HINT payload (offset + size overflows)",
+            })?;
+        if end > file_bytes.len() {
+            return Err(ReadError::Truncated {
+                need: end,
+                have: file_bytes.len(),
+                context: "LC_LINKER_OPTIMIZATION_HINT payload",
+            });
+        }
+        out.extend(parse_loh_blob(&file_bytes[start..end])?);
+    }
+    Ok(out)
+}
+
+fn parse_data_in_code(
+    commands: &[LoadCommand],
+    file_bytes: &[u8],
+) -> Result<Vec<DataInCodeEntry>, ReadError> {
+    let mut out = Vec::new();
+    for command in commands {
+        let LoadCommand::Raw { cmd, cmdsize, data } = command else {
+            continue;
+        };
+        if *cmd != LC_DATA_IN_CODE {
+            continue;
+        }
+        let linkedit = LinkEditDataCmd::parse(*cmd, *cmdsize, data)?;
+        if !(linkedit.datasize as usize).is_multiple_of(DataInCodeEntry::SIZE) {
+            return Err(ReadError::BadCmdsize {
+                cmd: *cmd,
+                cmdsize: linkedit.datasize,
+                at_offset: 0,
+                reason: "LC_DATA_IN_CODE payload size is not a multiple of 8",
+            });
+        }
+        let start = linkedit.dataoff as usize;
+        let end = start
+            .checked_add(linkedit.datasize as usize)
+            .ok_or(ReadError::Truncated {
+                need: usize::MAX,
+                have: file_bytes.len(),
+                context: "LC_DATA_IN_CODE payload (offset + size overflows)",
+            })?;
+        if end > file_bytes.len() {
+            return Err(ReadError::Truncated {
+                need: end,
+                have: file_bytes.len(),
+                context: "LC_DATA_IN_CODE payload",
+            });
+        }
+        out.extend(DataInCodeEntry::parse_payload(&file_bytes[start..end]));
+    }
+    Ok(out)
 }
 
 /// Total `sizeofcmds` region, exposed for callers doing byte-level round-trip
@@ -112,8 +212,11 @@ pub fn header_and_cmds_end(header: &MachHeader64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loh::{write_loh_blob, LOH_ARM64_ADRP_ADD};
     use crate::macho::constants::*;
-    use crate::macho::reader::{write_commands, write_header, Segment64, Section64Header};
+    use crate::macho::reader::{
+        write_commands, write_header, LinkEditDataCmd, LoadCommand, Section64Header, Segment64,
+    };
     use crate::symbol::{RawNlist, NLIST_SIZE};
 
     fn name16(s: &str) -> [u8; 16] {
@@ -217,6 +320,199 @@ mod tests {
         image
     }
 
+    fn synth_image_with_data_in_code() -> Vec<u8> {
+        let text_sect = Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: 0,
+            size: 8,
+            offset: 0,
+            align: 2,
+            reloff: 0,
+            nreloc: 0,
+            flags: S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        };
+        let seg = Segment64 {
+            segname: name16(""),
+            vmaddr: 0,
+            vmsize: 8,
+            fileoff: 0,
+            filesize: 8,
+            maxprot: 7,
+            initprot: 7,
+            flags: 0,
+            sections: vec![text_sect],
+        };
+        let strtab = b"\0_main\0";
+        let nsyms = 1u32;
+        let sym = RawNlist {
+            strx: 1,
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        };
+        let dic_blob = [
+            0u32.to_le_bytes().as_slice(),
+            4u16.to_le_bytes().as_slice(),
+            DICE_KIND_DATA.to_le_bytes().as_slice(),
+        ]
+        .concat();
+        let hdr_size = HEADER_SIZE;
+        let seg_size = seg.wire_size() as usize;
+        let dic_size = LinkEditDataCmd::WIRE_SIZE as usize;
+        let symtab_size = SymtabCmd::WIRE_SIZE as usize;
+        let sizeofcmds = (seg_size + dic_size + symtab_size) as u32;
+
+        let section_offset = (hdr_size + sizeofcmds as usize) as u32;
+        let data_in_code_off = section_offset + 8;
+        let symoff = data_in_code_off + dic_blob.len() as u32;
+        let stroff = symoff + NLIST_SIZE as u32 * nsyms;
+        let seg = Segment64 {
+            sections: vec![Section64Header {
+                offset: section_offset,
+                ..seg.sections[0]
+            }],
+            fileoff: section_offset as u64,
+            ..seg
+        };
+        let header = MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: 0,
+            filetype: MH_OBJECT,
+            ncmds: 3,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        };
+        let symtab_cmd = SymtabCmd {
+            symoff,
+            nsyms,
+            stroff,
+            strsize: strtab.len() as u32,
+        };
+        let dic_cmd = LoadCommand::Raw {
+            cmd: LC_DATA_IN_CODE,
+            cmdsize: LinkEditDataCmd::WIRE_SIZE,
+            data: [
+                data_in_code_off.to_le_bytes().as_slice(),
+                (dic_blob.len() as u32).to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        };
+
+        let mut image = Vec::new();
+        write_header(&header, &mut image);
+        let cmds = vec![
+            LoadCommand::Segment64(seg),
+            dic_cmd,
+            LoadCommand::Symtab(symtab_cmd),
+        ];
+        write_commands(&cmds, &mut image);
+        image.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
+        image.extend_from_slice(&dic_blob);
+        sym.write(&mut image);
+        image.extend_from_slice(strtab);
+        image
+    }
+
+    fn synth_image_with_loh() -> Vec<u8> {
+        let text_sect = Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: 0,
+            size: 8,
+            offset: 0,
+            align: 2,
+            reloff: 0,
+            nreloc: 0,
+            flags: S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        };
+        let seg = Segment64 {
+            segname: name16(""),
+            vmaddr: 0,
+            vmsize: 8,
+            fileoff: 0,
+            filesize: 8,
+            maxprot: 7,
+            initprot: 7,
+            flags: 0,
+            sections: vec![text_sect],
+        };
+        let strtab = b"\0_main\0";
+        let nsyms = 1u32;
+        let sym = RawNlist {
+            strx: 1,
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        };
+        let loh_blob = write_loh_blob(&[LohEntry {
+            kind: LOH_ARM64_ADRP_ADD,
+            args: vec![0, 4],
+        }]);
+        let hdr_size = HEADER_SIZE;
+        let seg_size = seg.wire_size() as usize;
+        let loh_size = LinkEditDataCmd::WIRE_SIZE as usize;
+        let symtab_size = SymtabCmd::WIRE_SIZE as usize;
+        let sizeofcmds = (seg_size + loh_size + symtab_size) as u32;
+
+        let section_offset = (hdr_size + sizeofcmds as usize) as u32;
+        let loh_off = section_offset + 8;
+        let symoff = loh_off + loh_blob.len() as u32;
+        let stroff = symoff + NLIST_SIZE as u32 * nsyms;
+        let seg = Segment64 {
+            sections: vec![Section64Header {
+                offset: section_offset,
+                ..seg.sections[0]
+            }],
+            fileoff: section_offset as u64,
+            ..seg
+        };
+        let header = MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: 0,
+            filetype: MH_OBJECT,
+            ncmds: 3,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        };
+        let symtab_cmd = SymtabCmd {
+            symoff,
+            nsyms,
+            stroff,
+            strsize: strtab.len() as u32,
+        };
+        let loh_cmd = LoadCommand::LinkerOptimizationHint(LinkEditDataCmd {
+            dataoff: loh_off,
+            datasize: loh_blob.len() as u32,
+        });
+
+        let mut image = Vec::new();
+        write_header(&header, &mut image);
+        let cmds = vec![
+            LoadCommand::Segment64(seg),
+            loh_cmd,
+            LoadCommand::Symtab(symtab_cmd),
+        ];
+        write_commands(&cmds, &mut image);
+        image.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
+        image.extend_from_slice(&loh_blob);
+        sym.write(&mut image);
+        image.extend_from_slice(strtab);
+        image
+    }
+
     #[test]
     fn parse_synth_object_end_to_end() {
         let image = synth_image();
@@ -237,6 +533,33 @@ mod tests {
         assert!(sym.is_ext());
         let sect = obj.section_for_symbol(sym).expect("n_sect=1 resolves");
         assert_eq!(sect.sectname, "__text");
+    }
+
+    #[test]
+    fn parse_preserves_data_in_code_entries() {
+        let image = synth_image_with_data_in_code();
+        let obj = ObjectFile::parse("/tmp/synth-dic.o", &image).unwrap();
+        assert_eq!(
+            obj.data_in_code,
+            vec![DataInCodeEntry {
+                offset: 0,
+                length: 4,
+                kind: DICE_KIND_DATA,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_preserves_loh_entries() {
+        let image = synth_image_with_loh();
+        let obj = ObjectFile::parse("/tmp/synth-loh.o", &image).unwrap();
+        assert_eq!(
+            obj.loh,
+            vec![LohEntry {
+                kind: LOH_ARM64_ADRP_ADD,
+                args: vec![0, 4],
+            }]
+        );
     }
 
     #[test]
@@ -262,6 +585,8 @@ mod tests {
             strings: strtab,
             symtab: None,
             dysymtab: None,
+            loh: Vec::new(),
+            data_in_code: Vec::new(),
         };
         let alias = InputSymbol::from_raw(RawNlist {
             strx: 1,

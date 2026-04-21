@@ -11,9 +11,11 @@
 //! - scanning every document's exports reveals _malloc / _free
 //!   somewhere in the re-export chain (libsystem_malloc / libsystem_c).
 //!
-//! Note: `_dyld_stub_binder` is **not** in any TBD file — it's a
-//! dyld-private symbol that dyld itself provides at runtime; Sprint 12
-//! (stubs + lazy pointers) handles it as a special import.
+//! Note: the SDK surfaces `dyld_stub_binder` in libSystem's re-export chain
+//! (via the libdyld sub-document), not as a direct export of the main
+//! libSystem umbrella document. Sprint 12 still handles it specially because
+//! stub-helper synthesis needs to pin that import to libSystem's umbrella
+//! load-command identity.
 //!
 //! Skipped if `xcrun` or `libSystem.tbd` aren't present.
 
@@ -55,6 +57,8 @@ fn libsystem_tbd_materializes_into_dylib_file() {
     let dy = DylibFile::from_tbd(&path, main, &target);
 
     assert_eq!(dy.install_name, "/usr/lib/libSystem.B.dylib");
+    assert!(dy.current_version >= (1 << 16));
+    assert_eq!(dy.compatibility_version, 1 << 16);
 
     // libSystem's main TBD doc only exposes a short list of internal
     // symbols directly; everything useful (malloc, printf, dyld binder)
@@ -116,8 +120,11 @@ fn libsystem_tbd_materializes_into_dylib_file() {
 
     // Common expected sub-dylibs we re-export — matches what `otool -L
     // libSystem.B.dylib` shows on a real macOS.
-    let install_names: Vec<&str> =
-        dy.dependencies.iter().map(|d| d.install_name.as_str()).collect();
+    let install_names: Vec<&str> = dy
+        .dependencies
+        .iter()
+        .map(|d| d.install_name.as_str())
+        .collect();
     for sub in [
         "/usr/lib/system/libsystem_c.dylib",
         "/usr/lib/system/libsystem_kernel.dylib",

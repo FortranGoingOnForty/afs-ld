@@ -1,32 +1,50 @@
 //! afs-ld — standalone ARM64 Mach-O linker.
 //!
-//! Sprints 0-9 built the reader, archive loader, dylib/TBD readers,
-//! symbol table, fixed-point resolution substrate, and atomization model.
-//! Linking still stops before layout / relocation application / writing,
-//! but the driver now executes real input loading and name resolution.
+//! Sprint 0 scaffolding: public surface is declared but every link attempt
+//! returns `LinkError::NotYetImplemented`. Subsequent sprints fill in the
+//! reader, resolver, layout, reloc, synth, writer, and signing paths.
 
 pub mod archive;
 pub mod args;
 pub mod atom;
 pub mod diag;
 pub mod dump;
+pub mod icf;
 pub mod input;
+pub mod layout;
 pub mod leb;
+pub mod link_map;
+pub mod loh;
 pub mod macho;
 pub mod reloc;
 pub mod resolve;
 pub mod section;
 pub mod string_table;
 pub mod symbol;
+pub mod synth;
+pub mod why_live;
 
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use std::{fs, io};
 
-use macho::dylib::DylibFile;
-use macho::reader::DylibCmd;
-use macho::tbd::{parse_tbd, Arch, Platform, Target};
+use atom::{atomize_object, backpatch_symbol_atoms, AtomTable};
+use icf::IcfError;
+use layout::{ExtraLayoutSections, Layout, LayoutInput};
+use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
+use macho::reader::ReadError;
+use macho::tbd::{parse_tbd, parse_version, Arch, Platform, Target};
+use reloc::arm64::RelocError;
 use resolve::{
-    format_duplicate_diagnostic, format_undefined_diagnostic, InputId, Inputs, SymbolTable,
+    classify_unresolved, drain_fetches, find_archive_by_path, force_load_all, force_load_archive,
+    format_duplicate_diagnostic, format_undefined_diagnostic, format_undefined_warning_diagnostic,
+    seed_all, DrainReport, DylibLoadMeta, InputAddError, Inputs, Symbol, SymbolTable,
+    UndefinedTreatment,
 };
+
+const DEFAULT_TBD_VERSION: u32 = 1 << 16;
+const THUNK_PLAN_MAX_ITERATIONS: usize = 16;
 
 /// What kind of Mach-O file the linker is producing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,21 +53,72 @@ pub enum OutputKind {
     Dylib,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcfMode {
+    None,
+    Safe,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThunkMode {
+    None,
+    Safe,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformVersion {
+    pub minos: u32,
+    pub sdk: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameworkSpec {
+    pub name: String,
+    pub weak: bool,
+}
+
 /// User-facing linker configuration, populated by the CLI parser.
 #[derive(Debug, Clone)]
 pub struct LinkOptions {
     pub inputs: Vec<PathBuf>,
+    pub library_names: Vec<String>,
+    pub frameworks: Vec<FrameworkSpec>,
+    pub search_paths: Vec<PathBuf>,
+    pub syslibroot: Option<PathBuf>,
+    pub platform_version: Option<PlatformVersion>,
+    pub undefined_treatment: UndefinedTreatment,
+    pub rpaths: Vec<String>,
+    pub install_name: Option<String>,
+    pub current_version: Option<u32>,
+    pub compatibility_version: Option<u32>,
+    pub exported_symbols_lists: Vec<PathBuf>,
+    pub unexported_symbols_lists: Vec<PathBuf>,
+    pub exported_symbols: Vec<String>,
+    pub unexported_symbols: Vec<String>,
+    pub map: Option<PathBuf>,
+    pub why_live: Vec<String>,
+    pub trace_inputs: bool,
+    pub show_version: bool,
+    pub show_help: bool,
     pub output: Option<PathBuf>,
     pub entry: Option<String>,
     pub arch: Option<String>,
-    pub kind: OutputKind,
+    pub relocatable: bool,
+    pub bundle: bool,
+    pub objc_force_load: bool,
+    pub strip_locals: bool,
+    pub strip_debug: bool,
+    pub emit_uuid: bool,
+    pub dead_strip: bool,
+    pub no_loh: bool,
+    pub icf_mode: IcfMode,
+    pub thunks: ThunkMode,
+    pub fixup_chains: bool,
     pub all_load: bool,
-    pub force_load: Vec<PathBuf>,
-    pub undefined_treatment: resolve::UndefinedTreatment,
-    pub syslibroots: Vec<PathBuf>,
-    pub library_search_paths: Vec<PathBuf>,
-    pub framework_search_paths: Vec<PathBuf>,
-    pub rpaths: Vec<String>,
+    pub force_load_archives: Vec<PathBuf>,
+    pub kind: OutputKind,
     /// When set, afs-ld operates in dump mode and prints the given file's
     /// header + load commands instead of linking.
     pub dump: Option<PathBuf>,
@@ -65,17 +134,42 @@ impl Default for LinkOptions {
     fn default() -> Self {
         Self {
             inputs: Vec::new(),
+            library_names: Vec::new(),
+            frameworks: Vec::new(),
+            search_paths: Vec::new(),
+            syslibroot: None,
+            platform_version: None,
+            undefined_treatment: UndefinedTreatment::Error,
+            rpaths: Vec::new(),
+            install_name: None,
+            current_version: None,
+            compatibility_version: None,
+            exported_symbols_lists: Vec::new(),
+            unexported_symbols_lists: Vec::new(),
+            exported_symbols: Vec::new(),
+            unexported_symbols: Vec::new(),
+            map: None,
+            why_live: Vec::new(),
+            trace_inputs: false,
+            show_version: false,
+            show_help: false,
             output: None,
             entry: None,
             arch: None,
-            kind: OutputKind::Executable,
+            relocatable: false,
+            bundle: false,
+            objc_force_load: false,
+            strip_locals: false,
+            strip_debug: false,
+            emit_uuid: true,
+            dead_strip: false,
+            no_loh: false,
+            icf_mode: IcfMode::None,
+            thunks: ThunkMode::Safe,
+            fixup_chains: false,
             all_load: false,
-            force_load: Vec::new(),
-            undefined_treatment: resolve::UndefinedTreatment::Error,
-            syslibroots: Vec::new(),
-            library_search_paths: Vec::new(),
-            framework_search_paths: Vec::new(),
-            rpaths: Vec::new(),
+            force_load_archives: Vec::new(),
+            kind: OutputKind::Executable,
             dump: None,
             dump_archive: None,
             dump_dylib: None,
@@ -88,34 +182,189 @@ impl Default for LinkOptions {
 pub enum LinkError {
     /// No input files were provided on the command line.
     NoInputs,
-    Io {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    Input {
-        path: PathBuf,
-        reason: String,
-    },
-    Resolution(resolve::ResolutionError),
-    Atomize(String),
+    Io(io::Error),
+    Input(InputAddError),
+    Seed(resolve::SeedError),
+    Fetch(resolve::FetchError),
     Write(macho::writer::WriteError),
-    Diagnostics(String),
-    /// Path to this sprint's incomplete functionality.
-    NotYetImplemented(&'static str),
+    Tbd(macho::tbd::TbdError),
+    Reloc(RelocError),
+    Synth(synth::SynthError),
+    Unwind(synth::unwind::UnwindError),
+    Icf(IcfError),
+    Loh(loh::LohError),
+    DuplicateSymbols(String),
+    UndefinedSymbols(String),
+    UnsupportedArch(String),
+    NoTbdDocument(PathBuf),
+    EntrySymbolNotFound(String),
+    ForceLoadNotArchive(PathBuf),
+    LibraryNotFound(String),
+    FrameworkNotFound(String),
+    ThunkPlanningDidNotConverge,
+    WhyLive(String),
+    UnsupportedOption(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkPhaseTimings {
+    pub input_parsing: Duration,
+    pub symbol_resolution: Duration,
+    pub atomization: Duration,
+    pub layout: Duration,
+    pub synth_sections: Duration,
+    pub synth_linkedit_finalize: Duration,
+    pub synth_linkedit_symbol_plan: Duration,
+    pub synth_linkedit_symbol_plan_locals: Duration,
+    pub synth_linkedit_symbol_plan_globals: Duration,
+    pub synth_linkedit_symbol_plan_strtab: Duration,
+    pub synth_linkedit_dyld_info: Duration,
+    pub synth_linkedit_metadata_tables: Duration,
+    pub synth_linkedit_code_signature: Duration,
+    pub synth_unwind: Duration,
+    pub reloc_apply: Duration,
+    pub write_output: Duration,
+}
+
+impl LinkPhaseTimings {
+    pub fn accounted_total(&self) -> Duration {
+        self.input_parsing
+            + self.symbol_resolution
+            + self.atomization
+            + self.layout
+            + self.synth_sections
+            + self.reloc_apply
+            + self.write_output
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkProfile {
+    pub output: PathBuf,
+    pub phases: LinkPhaseTimings,
+    pub total_wall: Duration,
 }
 
 impl std::fmt::Display for LinkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LinkError::NoInputs => write!(f, "no input files"),
-            LinkError::Io { path, source } => write!(f, "{}: {}", path.display(), source),
-            LinkError::Input { path, reason } => write!(f, "{}: {}", path.display(), reason),
-            LinkError::Resolution(e) => write!(f, "{e}"),
-            LinkError::Atomize(text) => write!(f, "{text}"),
+            LinkError::Io(e) => write!(f, "{e}"),
+            LinkError::Input(e) => write!(f, "{e}"),
+            LinkError::Seed(e) => write!(f, "{e}"),
+            LinkError::Fetch(e) => write!(f, "{e}"),
             LinkError::Write(e) => write!(f, "{e}"),
-            LinkError::Diagnostics(text) => write!(f, "{text}"),
-            LinkError::NotYetImplemented(what) => write!(f, "not yet implemented: {what}"),
+            LinkError::Tbd(e) => write!(f, "{e}"),
+            LinkError::Reloc(e) => write!(f, "{e}"),
+            LinkError::Synth(e) => write!(f, "{e}"),
+            LinkError::Unwind(e) => write!(f, "{e}"),
+            LinkError::Icf(e) => write!(f, "{e}"),
+            LinkError::Loh(e) => write!(f, "{e}"),
+            LinkError::DuplicateSymbols(msg) | LinkError::UndefinedSymbols(msg) => {
+                write!(f, "{msg}")
+            }
+            LinkError::UnsupportedArch(arch) => {
+                write!(f, "unsupported arch `{arch}` (afs-ld requires arm64)")
+            }
+            LinkError::NoTbdDocument(path) => {
+                write!(f, "{}: no arm64-macos TBD document found", path.display())
+            }
+            LinkError::EntrySymbolNotFound(name) => {
+                write!(f, "entry symbol `{name}` was not found in linked objects")
+            }
+            LinkError::ForceLoadNotArchive(path) => {
+                write!(
+                    f,
+                    "{}: -force_load requires a path that is also present as an archive input",
+                    path.display()
+                )
+            }
+            LinkError::LibraryNotFound(name) => {
+                write!(f, "unable to find library `{name}`")
+            }
+            LinkError::FrameworkNotFound(name) => {
+                write!(f, "unable to find framework `{name}`")
+            }
+            LinkError::ThunkPlanningDidNotConverge => {
+                write!(f, "thunk planning did not converge")
+            }
+            LinkError::WhyLive(msg) => write!(f, "{msg}"),
+            LinkError::UnsupportedOption(msg) => write!(f, "{msg}"),
         }
+    }
+}
+
+impl std::error::Error for LinkError {}
+
+impl From<io::Error> for LinkError {
+    fn from(value: io::Error) -> Self {
+        LinkError::Io(value)
+    }
+}
+
+impl From<InputAddError> for LinkError {
+    fn from(value: InputAddError) -> Self {
+        LinkError::Input(value)
+    }
+}
+
+impl From<ReadError> for LinkError {
+    fn from(value: ReadError) -> Self {
+        LinkError::Input(InputAddError::from(value))
+    }
+}
+
+impl From<resolve::SeedError> for LinkError {
+    fn from(value: resolve::SeedError) -> Self {
+        LinkError::Seed(value)
+    }
+}
+
+impl From<resolve::FetchError> for LinkError {
+    fn from(value: resolve::FetchError) -> Self {
+        LinkError::Fetch(value)
+    }
+}
+
+impl From<macho::writer::WriteError> for LinkError {
+    fn from(value: macho::writer::WriteError) -> Self {
+        LinkError::Write(value)
+    }
+}
+
+impl From<macho::tbd::TbdError> for LinkError {
+    fn from(value: macho::tbd::TbdError) -> Self {
+        LinkError::Tbd(value)
+    }
+}
+
+impl From<RelocError> for LinkError {
+    fn from(value: RelocError) -> Self {
+        LinkError::Reloc(value)
+    }
+}
+
+impl From<synth::SynthError> for LinkError {
+    fn from(value: synth::SynthError) -> Self {
+        LinkError::Synth(value)
+    }
+}
+
+impl From<synth::unwind::UnwindError> for LinkError {
+    fn from(value: synth::unwind::UnwindError) -> Self {
+        LinkError::Unwind(value)
+    }
+}
+
+impl From<IcfError> for LinkError {
+    fn from(value: IcfError) -> Self {
+        LinkError::Icf(value)
+    }
+}
+
+impl From<loh::LohError> for LinkError {
+    fn from(value: loh::LohError) -> Self {
+        LinkError::Loh(value)
     }
 }
 
@@ -125,228 +374,603 @@ pub struct Linker;
 
 impl Linker {
     pub fn run(opts: &LinkOptions) -> Result<(), LinkError> {
-        if opts.inputs.is_empty() {
+        Self::run_profiled(opts).map(|_| ())
+    }
+
+    pub fn run_profiled(opts: &LinkOptions) -> Result<LinkProfile, LinkError> {
+        let overall_started = Instant::now();
+        let mut phases = LinkPhaseTimings::default();
+        if opts.relocatable {
+            return Err(LinkError::UnsupportedOption(
+                "`-r` relocatable output is not yet supported".into(),
+            ));
+        }
+        if opts.bundle {
+            return Err(LinkError::UnsupportedOption(
+                "`-bundle` output is not yet supported".into(),
+            ));
+        }
+        if opts.fixup_chains {
+            return Err(LinkError::UnsupportedOption(
+                "`-fixup_chains` is not yet supported".into(),
+            ));
+        }
+        if opts.icf_mode == IcfMode::All {
+            return Err(LinkError::UnsupportedOption(
+                "`-icf=all` is not yet supported; use `-icf=safe` or `-icf=none`".into(),
+            ));
+        }
+        if opts.inputs.is_empty() && opts.library_names.is_empty() && opts.frameworks.is_empty() {
             return Err(LinkError::NoInputs);
         }
 
-        let mut inputs = Inputs::new();
-        for path in &opts.inputs {
-            load_input(&mut inputs, path, opts)?;
-        }
-
-        let mut table = SymbolTable::new();
-        let report =
-            resolve::resolve(&mut inputs, &mut table, opts).map_err(LinkError::Resolution)?;
-
-        if !report.duplicates.is_empty() {
-            let mut text = String::new();
-            for duplicate in &report.duplicates {
-                text.push_str(&format_duplicate_diagnostic(&table, &inputs, duplicate));
+        if let Some(arch) = &opts.arch {
+            if arch != "arm64" {
+                return Err(LinkError::UnsupportedArch(arch.clone()));
             }
-            return Err(LinkError::Diagnostics(text.trim_end().to_string()));
         }
 
-        if !report.classification.errors.is_empty() {
-            let text = format_undefined_diagnostic(
-                &table,
-                &inputs,
-                &report.referrers,
-                &report.classification.errors,
+        if opts.strip_debug {
+            crate::diag::warning(
+                "`-S` requested, but afs-ld does not currently emit debug symbols",
             );
-            return Err(LinkError::Diagnostics(text.trim_end().to_string()));
+        }
+        if opts.objc_force_load {
+            crate::diag::warning(
+                "`-ObjC` requested, but afs-ld does not yet scan Objective-C archive metadata; the flag currently has no effect",
+            );
+        }
+        if opts.no_loh {
+            crate::diag::warning(
+                "`-no_loh` requested, but afs-ld currently matches Apple ld by omitting final-output LOH; the flag has no effect",
+            );
         }
 
-        let mut atoms = atom::AtomTable::new();
-        for i in 0..inputs.objects.len() {
-            let input_id = InputId(i as u32);
-            let obj = inputs.object_file(input_id).map_err(|e| LinkError::Input {
-                path: inputs.object(input_id).path.clone(),
-                reason: e.to_string(),
-            })?;
-            let atomization = atom::atomize_object(input_id, &obj, &mut atoms, &table)
-                .map_err(|e| LinkError::Atomize(e.to_string()))?;
-            atom::backpatch_symbol_atoms(&atomization, input_id, &obj, &mut table, &mut atoms);
+        let mut load_paths = opts.inputs.clone();
+        let mut dylib_load_kinds = std::collections::HashMap::new();
+        for name in &opts.library_names {
+            let path = resolve_library_input(opts, name)?;
+            dylib_load_kinds.insert(path.clone(), DylibLoadKind::Normal);
+            load_paths.push(path);
+        }
+        for framework in &opts.frameworks {
+            let path = resolve_framework_input(opts, &framework.name)?;
+            dylib_load_kinds.insert(
+                path.clone(),
+                if framework.weak {
+                    DylibLoadKind::Weak
+                } else {
+                    DylibLoadKind::Normal
+                },
+            );
+            load_paths.push(path);
         }
 
-        let layout = section::build_layout(opts.kind, &atoms, &table);
-        let plan = build_write_plan(&inputs, opts);
-        let mut bytes = Vec::new();
-        macho::writer::write_with_atoms_and_plan(
-            &layout, &atoms, opts.kind, opts, &plan, &mut bytes,
+        let mut inputs = Inputs::new();
+        let phase_started = Instant::now();
+        for (load_order, path) in load_paths.iter().enumerate() {
+            if opts.trace_inputs {
+                eprintln!("afs-ld: loading {}", path.display());
+            }
+            register_input(&mut inputs, path, load_order)?;
+        }
+        phases.input_parsing = phase_started.elapsed();
+
+        let mut sym_table = SymbolTable::new();
+        let phase_started = Instant::now();
+        let seed_report = seed_all(&inputs, &mut sym_table)?;
+        if seed_report.has_errors() {
+            let mut msg = String::new();
+            for err in &seed_report.duplicates {
+                msg.push_str(&format_duplicate_diagnostic(&sym_table, &inputs, err));
+            }
+            return Err(LinkError::DuplicateSymbols(msg));
+        }
+
+        let mut force_report = DrainReport::default();
+        if opts.all_load {
+            force_load_all(&mut inputs, &mut sym_table, &mut force_report)?;
+        }
+        for archive_path in &opts.force_load_archives {
+            let Some(archive_id) = find_archive_by_path(&inputs, archive_path) else {
+                return Err(LinkError::ForceLoadNotArchive(archive_path.clone()));
+            };
+            force_load_archive(&mut inputs, &mut sym_table, archive_id, &mut force_report)?;
+        }
+        if opts.trace_inputs {
+            for path in &force_report.loaded_paths {
+                eprintln!("afs-ld: loading {}", path.display());
+            }
+        }
+        if !force_report.duplicates.is_empty() {
+            let mut msg = String::new();
+            for err in &force_report.duplicates {
+                msg.push_str(&format_duplicate_diagnostic(&sym_table, &inputs, err));
+            }
+            return Err(LinkError::DuplicateSymbols(msg));
+        }
+
+        let drain_report = drain_fetches(&mut inputs, &mut sym_table, seed_report.pending_fetches)?;
+        if opts.trace_inputs {
+            for path in &drain_report.loaded_paths {
+                eprintln!("afs-ld: loading {}", path.display());
+            }
+        }
+        if !drain_report.duplicates.is_empty() {
+            let mut msg = String::new();
+            for err in &drain_report.duplicates {
+                msg.push_str(&format_duplicate_diagnostic(&sym_table, &inputs, err));
+            }
+            return Err(LinkError::DuplicateSymbols(msg));
+        }
+        let mut referrers = seed_report.referrers.clone();
+        referrers.extend_from(&force_report.referrers);
+        referrers.extend_from(&drain_report.referrers);
+        let unresolved = classify_unresolved(&mut sym_table, opts.undefined_treatment);
+        if !unresolved.errors.is_empty() {
+            return Err(LinkError::UndefinedSymbols(format_undefined_diagnostic(
+                &sym_table,
+                &inputs,
+                &referrers,
+                &unresolved.errors,
+            )));
+        }
+        if !unresolved.warnings.is_empty() {
+            crate::diag::warning_verbatim(&format_undefined_warning_diagnostic(
+                &sym_table,
+                &inputs,
+                &referrers,
+                &unresolved.warnings,
+            ));
+        }
+        phases.symbol_resolution = phase_started.elapsed();
+
+        let mut atom_table = AtomTable::new();
+        let mut objects = Vec::new();
+        let phase_started = Instant::now();
+        for idx in 0..inputs.objects.len() {
+            let input_id = resolve::InputId(idx as u32);
+            let obj = inputs.object_file(input_id)?;
+            let atomization = atomize_object(input_id, &obj, &mut atom_table);
+            backpatch_symbol_atoms(
+                &atomization,
+                input_id,
+                &obj,
+                &mut sym_table,
+                &mut atom_table,
+            );
+            objects.push((input_id, obj));
+        }
+        phases.atomization = phase_started.elapsed();
+
+        let layout_inputs: Vec<LayoutInput<'_>> = objects
+            .iter()
+            .map(|(id, object)| {
+                let input = inputs.object(*id);
+                LayoutInput {
+                    id: *id,
+                    object,
+                    load_order: input.load_order,
+                    archive_member_offset: input.archive_member_offset,
+                }
+            })
+            .collect();
+        let mut dylib_loads = Vec::new();
+        let mut seen_ordinals = std::collections::BTreeSet::new();
+        for dylib in &inputs.dylibs {
+            if !seen_ordinals.insert(dylib.ordinal) {
+                continue;
+            }
+            dylib_loads.push(DylibDependency {
+                kind: dylib_load_kinds
+                    .get(&dylib.path)
+                    .copied()
+                    .unwrap_or(DylibLoadKind::Normal),
+                install_name: dylib.load_install_name.clone(),
+                current_version: dylib.load_current_version,
+                compatibility_version: dylib.load_compatibility_version,
+                ordinal: dylib.ordinal,
+            });
+        }
+        let phase_started = Instant::now();
+        let parsed_relocs = macho::writer::build_parsed_reloc_cache(&layout_inputs)?;
+        phases.input_parsing += phase_started.elapsed();
+        let phase_started = Instant::now();
+        let entry_symbol = find_entry_symbol_id(opts, &sym_table)?;
+        let dead_strip = opts.dead_strip.then(|| {
+            why_live::DeadStripAnalysis::build(
+                opts,
+                &layout_inputs,
+                &atom_table,
+                &sym_table,
+                entry_symbol,
+            )
+        });
+        let icf = (opts.icf_mode == IcfMode::Safe)
+            .then(|| {
+                icf::fold_safe(
+                    &layout_inputs,
+                    &mut atom_table,
+                    &mut sym_table,
+                    dead_strip.as_ref().map(|analysis| analysis.live_atoms()),
+                )
+            })
+            .transpose()?;
+        let kept_atoms = if let Some(icf) = &icf {
+            Some(icf.kept_atoms())
+        } else {
+            dead_strip.as_ref().map(|analysis| analysis.live_atoms())
+        };
+        let synthetic_plan = synth::SyntheticPlan::build_filtered(
+            &layout_inputs,
+            &atom_table,
+            &mut sym_table,
+            &inputs.dylibs,
+            kept_atoms,
+        )?;
+        let icf_redirects = icf.as_ref().map(|plan| plan.redirects());
+        let mut layout = Layout::build_with_synthetics_filtered(
+            opts.kind,
+            &layout_inputs,
+            &atom_table,
+            0,
+            Some(&synthetic_plan),
+            kept_atoms,
+        );
+        let mut thunk_plan = None;
+        let mut thunk_converged = false;
+        for _ in 0..THUNK_PLAN_MAX_ITERATIONS {
+            let next_plan = reloc::arm64::plan_thunks(
+                opts,
+                &layout,
+                &layout_inputs,
+                &atom_table,
+                &sym_table,
+                Some(&synthetic_plan),
+                icf_redirects,
+            )?;
+            if next_plan == thunk_plan {
+                thunk_converged = true;
+                break;
+            }
+            let extra_sections = next_plan
+                .as_ref()
+                .map_or_else(Vec::new, |plan| plan.output_sections());
+            let split_after_atoms = next_plan
+                .as_ref()
+                .map_or_else(Vec::new, |plan| plan.split_after_atoms());
+            layout = Layout::build_with_synthetics_and_extra_filtered(
+                opts.kind,
+                &layout_inputs,
+                &atom_table,
+                0,
+                Some(&synthetic_plan),
+                kept_atoms,
+                ExtraLayoutSections {
+                    extra_sections: &extra_sections,
+                    split_after_atoms: &split_after_atoms,
+                },
+            );
+            thunk_plan = next_plan;
+        }
+        if !thunk_converged {
+            return Err(LinkError::ThunkPlanningDidNotConverge);
+        }
+        phases.layout = phase_started.elapsed();
+        let linkedit_context = macho::writer::LinkEditContext {
+            layout_inputs: &layout_inputs,
+            atom_table: &atom_table,
+            sym_table: &sym_table,
+            synthetic_plan: &synthetic_plan,
+            icf_redirects,
+            parsed_relocs: &parsed_relocs,
+        };
+        let phase_started = Instant::now();
+        let mut linkedit = None;
+        let mut synth_linkedit_finalize = Duration::ZERO;
+        let mut synth_linkedit_symbol_plan = Duration::ZERO;
+        let mut synth_linkedit_symbol_plan_locals = Duration::ZERO;
+        let mut synth_linkedit_symbol_plan_globals = Duration::ZERO;
+        let mut synth_linkedit_symbol_plan_strtab = Duration::ZERO;
+        let mut synth_linkedit_dyld_info = Duration::ZERO;
+        let mut synth_linkedit_metadata_tables = Duration::ZERO;
+        let mut synth_linkedit_code_signature = Duration::ZERO;
+        let mut synth_unwind = Duration::ZERO;
+        for _ in 0..4 {
+            let phase_started = Instant::now();
+            let (next_layout, next_linkedit, linkedit_timings) =
+                macho::writer::finalize_layout_with_linkedit(
+                    &layout,
+                    opts.kind,
+                    opts,
+                    &dylib_loads,
+                    linkedit_context,
+                )?;
+            synth_linkedit_finalize += phase_started.elapsed();
+            synth_linkedit_symbol_plan += linkedit_timings.symbol_plan;
+            synth_linkedit_symbol_plan_locals += linkedit_timings.symbol_plan_locals;
+            synth_linkedit_symbol_plan_globals += linkedit_timings.symbol_plan_globals;
+            synth_linkedit_symbol_plan_strtab += linkedit_timings.symbol_plan_strtab;
+            synth_linkedit_dyld_info += linkedit_timings.dyld_info;
+            synth_linkedit_metadata_tables += linkedit_timings.metadata_tables;
+            synth_linkedit_code_signature += linkedit_timings.code_signature;
+            layout = next_layout;
+            linkedit = Some(next_linkedit);
+            let phase_started = Instant::now();
+            let changed = synth::unwind::synthesize(
+                &mut layout,
+                &layout_inputs,
+                &atom_table,
+                &sym_table,
+                &synthetic_plan,
+            )?;
+            synth_unwind += phase_started.elapsed();
+            if !changed {
+                break;
+            }
+        }
+        let linkedit = linkedit.expect("finalize loop always runs at least once");
+        phases.synth_linkedit_finalize = synth_linkedit_finalize;
+        phases.synth_linkedit_symbol_plan = synth_linkedit_symbol_plan;
+        phases.synth_linkedit_symbol_plan_locals = synth_linkedit_symbol_plan_locals;
+        phases.synth_linkedit_symbol_plan_globals = synth_linkedit_symbol_plan_globals;
+        phases.synth_linkedit_symbol_plan_strtab = synth_linkedit_symbol_plan_strtab;
+        phases.synth_linkedit_dyld_info = synth_linkedit_dyld_info;
+        phases.synth_linkedit_metadata_tables = synth_linkedit_metadata_tables;
+        phases.synth_linkedit_code_signature = synth_linkedit_code_signature;
+        phases.synth_unwind = synth_unwind;
+        phases.synth_sections = phase_started.elapsed();
+        let phase_started = Instant::now();
+        reloc::arm64::apply_layout(
+            &mut layout,
+            &layout_inputs,
+            &atom_table,
+            &sym_table,
+            reloc::arm64::ApplyLayoutPlan {
+                synthetic_plan: Some(&synthetic_plan),
+                thunk_plan: thunk_plan.as_ref(),
+                linkedit: &linkedit,
+                icf_redirects,
+            },
+        )?;
+        phases.reloc_apply = phase_started.elapsed();
+        let folded_symbols = icf
+            .as_ref()
+            .map(|plan| plan.folded_symbols(&atom_table, &sym_table, &layout_inputs))
+            .unwrap_or_default();
+
+        if let Some(report) = why_live::format_explanations(
+            opts,
+            &layout_inputs,
+            &atom_table,
+            &sym_table,
+            entry_symbol,
+            dead_strip.as_ref(),
+            &folded_symbols,
         )
-        .map_err(LinkError::Write)?;
+        .map_err(LinkError::WhyLive)?
+        {
+            print!("{report}");
+        }
 
-        let out_path = output_path(opts);
-        std::fs::write(&out_path, &bytes).map_err(|source| LinkError::Io {
-            path: out_path,
-            source,
-        })?;
-        Ok(())
+        let phase_started = Instant::now();
+        let mut image = Vec::new();
+        let entry_point = resolve_entry_point(opts, &sym_table)?;
+        macho::writer::write_finalized_with_linkedit(
+            &layout,
+            opts.kind,
+            opts,
+            entry_point,
+            &dylib_loads,
+            &linkedit,
+            &mut image,
+        )?;
+        let output = default_output_path(opts);
+        fs::write(&output, image)?;
+        if let Some(map_path) = &opts.map {
+            let dead_stripped = dead_strip
+                .as_ref()
+                .map(|analysis| {
+                    analysis.dead_stripped_symbols(&atom_table, &sym_table, &layout_inputs)
+                })
+                .unwrap_or_default();
+            link_map::write_link_map(
+                map_path,
+                opts,
+                &layout,
+                &layout_inputs,
+                &linkedit,
+                &folded_symbols,
+                &dead_stripped,
+            )?;
+        }
+        if opts.kind == OutputKind::Executable {
+            let mut perms = fs::metadata(&output)?.permissions();
+            let mode = perms.mode();
+            perms.set_mode(mode | ((mode & 0o444) >> 2));
+            fs::set_permissions(&output, perms)?;
+        }
+        phases.write_output = phase_started.elapsed();
+        Ok(LinkProfile {
+            output,
+            phases,
+            total_wall: overall_started.elapsed(),
+        })
     }
 }
 
-fn output_path(opts: &LinkOptions) -> PathBuf {
+fn resolve_library_input(opts: &LinkOptions, name: &str) -> Result<PathBuf, LinkError> {
+    let mut search_dirs = Vec::new();
+    for dir in &opts.search_paths {
+        search_dirs.push(dir.clone());
+        if let Some(root) = &opts.syslibroot {
+            if let Ok(stripped) = dir.strip_prefix("/") {
+                search_dirs.push(root.join(stripped));
+            }
+        }
+    }
+    if let Some(root) = &opts.syslibroot {
+        search_dirs.push(root.join("usr/lib"));
+    } else {
+        search_dirs.push(PathBuf::from("/usr/lib"));
+    }
+
+    let candidates = [
+        format!("lib{name}.tbd"),
+        format!("lib{name}.dylib"),
+        format!("lib{name}.a"),
+    ];
+    for dir in search_dirs {
+        for candidate in &candidates {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+    }
+    Err(LinkError::LibraryNotFound(name.to_string()))
+}
+
+fn resolve_framework_input(opts: &LinkOptions, name: &str) -> Result<PathBuf, LinkError> {
+    let mut roots = Vec::new();
+    if let Some(root) = &opts.syslibroot {
+        roots.push(root.join("System/Library/Frameworks"));
+        roots.push(root.join("Library/Frameworks"));
+    } else {
+        roots.push(PathBuf::from("/System/Library/Frameworks"));
+        roots.push(PathBuf::from("/Library/Frameworks"));
+    }
+
+    for root in roots {
+        let framework_dir = root.join(format!("{name}.framework"));
+        for candidate in [
+            framework_dir.join(format!("{name}.tbd")),
+            framework_dir.join(name),
+        ] {
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(LinkError::FrameworkNotFound(name.to_string()))
+}
+
+fn default_output_path(opts: &LinkOptions) -> PathBuf {
     opts.output
         .clone()
         .unwrap_or_else(|| PathBuf::from("a.out"))
 }
 
-fn build_write_plan(inputs: &Inputs, opts: &LinkOptions) -> macho::writer::WritePlan {
-    let mut dylibs: Vec<DylibCmd> = inputs
-        .dylibs
-        .iter()
-        .map(|dylib| DylibCmd {
-            cmd: macho::constants::LC_LOAD_DYLIB,
-            name: dylib.file.install_name.clone(),
-            timestamp: 2,
-            current_version: dylib.file.current_version,
-            compatibility_version: dylib.file.compatibility_version,
-        })
-        .collect();
-    if !dylibs
-        .iter()
-        .any(|dylib| dylib.name == "/usr/lib/libSystem.B.dylib")
-    {
-        dylibs.push(DylibCmd {
-            cmd: macho::constants::LC_LOAD_DYLIB,
-            name: "/usr/lib/libSystem.B.dylib".into(),
-            timestamp: 2,
-            current_version: 0,
-            compatibility_version: 0,
-        });
-    }
-    let uuid = stable_output_uuid(opts, &dylibs);
-    macho::writer::WritePlan {
-        dylibs,
-        rpaths: opts.rpaths.clone(),
-        uuid: Some(uuid),
-        source_version: Some(0),
-    }
-}
-
-fn stable_output_uuid(opts: &LinkOptions, dylibs: &[DylibCmd]) -> [u8; 16] {
-    let mut hi = 0x6d9b_c4f2_3a51_17cdu64;
-    let mut lo = 0xb5e8_92d4_6f13_08a1u64;
-
-    mix_u8(
-        &mut hi,
-        &mut lo,
-        match opts.kind {
-            OutputKind::Executable => 0,
-            OutputKind::Dylib => 1,
-        },
-    );
-    if let Some(output) = &opts.output {
-        mix_bytes(&mut hi, &mut lo, output.as_os_str().as_encoded_bytes());
-    }
-    for dylib in dylibs {
-        mix_bytes(&mut hi, &mut lo, dylib.name.as_bytes());
-        mix_u32(&mut hi, &mut lo, dylib.timestamp);
-        mix_u32(&mut hi, &mut lo, dylib.current_version);
-        mix_u32(&mut hi, &mut lo, dylib.compatibility_version);
-    }
-    for rpath in &opts.rpaths {
-        mix_bytes(&mut hi, &mut lo, rpath.as_bytes());
-    }
-
-    let mut uuid = [0u8; 16];
-    uuid[..8].copy_from_slice(&hi.to_be_bytes());
-    uuid[8..].copy_from_slice(&lo.to_be_bytes());
-    uuid[6] = (uuid[6] & 0x0f) | 0x50;
-    uuid[8] = (uuid[8] & 0x3f) | 0x80;
-    uuid
-}
-
-fn mix_u8(hi: &mut u64, lo: &mut u64, value: u8) {
-    mix_bytes(hi, lo, &[value]);
-}
-
-fn mix_u32(hi: &mut u64, lo: &mut u64, value: u32) {
-    mix_bytes(hi, lo, &value.to_le_bytes());
-}
-
-fn mix_bytes(hi: &mut u64, lo: &mut u64, bytes: &[u8]) {
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    for byte in bytes {
-        *hi ^= u64::from(*byte);
-        *hi = hi.wrapping_mul(FNV_PRIME);
-
-        *lo ^= u64::from(*byte).rotate_left(1);
-        *lo = lo.wrapping_mul(FNV_PRIME.rotate_left(7));
-    }
-}
-
-fn load_input(inputs: &mut Inputs, path: &PathBuf, opts: &LinkOptions) -> Result<(), LinkError> {
-    let bytes = std::fs::read(path).map_err(|source| LinkError::Io {
-        path: path.clone(),
-        source,
-    })?;
-
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some("a") => inputs
-            .add_archive(path.clone(), bytes)
-            .map(|_| ())
-            .map_err(|e| LinkError::Input {
-                path: path.clone(),
-                reason: e.to_string(),
-            }),
-        Some("dylib") => inputs
-            .add_dylib(path.clone(), bytes)
-            .map(|_| ())
-            .map_err(|e| LinkError::Input {
-                path: path.clone(),
-                reason: e.to_string(),
-            }),
-        Some("tbd") => load_tbd(inputs, path, &bytes, opts),
-        _ => inputs
-            .add_object(path.clone(), bytes)
-            .map(|_| ())
-            .map_err(|e| LinkError::Input {
-                path: path.clone(),
-                reason: e.to_string(),
-            }),
-    }
-}
-
-fn load_tbd(
+fn register_input(
     inputs: &mut Inputs,
-    path: &Path,
-    bytes: &[u8],
-    opts: &LinkOptions,
+    path: &std::path::Path,
+    load_order: usize,
 ) -> Result<(), LinkError> {
-    let text = std::str::from_utf8(bytes).map_err(|e| LinkError::Input {
-        path: path.to_path_buf(),
-        reason: format!("TBD is not valid UTF-8: {e}"),
-    })?;
-    let docs = parse_tbd(text).map_err(|e| LinkError::Input {
-        path: path.to_path_buf(),
-        reason: e.to_string(),
-    })?;
-    let target = tbd_target(opts);
-    let doc = docs
-        .iter()
-        .find(|doc| doc.targets.iter().any(|candidate| candidate == &target))
-        .or_else(|| docs.first())
-        .ok_or_else(|| LinkError::Input {
-            path: path.to_path_buf(),
-            reason: "TBD contained no documents".into(),
-        })?;
-    let dylib =
-        DylibFile::from_tbd(path.to_path_buf(), doc, &target).map_err(|e| LinkError::Input {
-            path: path.to_path_buf(),
-            reason: e.to_string(),
-        })?;
-    inputs.add_dylib_from_file(path.to_path_buf(), dylib);
+    let bytes = fs::read(path)?;
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("a") => {
+            let _ = inputs.add_archive(path.to_path_buf(), bytes, load_order)?;
+        }
+        Some("dylib") => {
+            let _ = inputs.add_dylib(path.to_path_buf(), bytes)?;
+        }
+        Some("tbd") => {
+            let text = std::str::from_utf8(&bytes).map_err(|e| {
+                LinkError::Tbd(macho::tbd::TbdError::Schema {
+                    msg: format!("TBD input is not UTF-8: {e}"),
+                })
+            })?;
+            let docs = parse_tbd(text)?;
+            let target = Target {
+                arch: Arch::Arm64,
+                platform: Platform::MacOs,
+            };
+            let canonical = docs
+                .iter()
+                .find(|doc| doc.parent_umbrella.is_empty())
+                .unwrap_or_else(|| &docs[0]);
+            let load = DylibLoadMeta {
+                install_name: canonical.install_name.clone(),
+                current_version: canonical
+                    .current_version
+                    .as_deref()
+                    .map(parse_version)
+                    .unwrap_or(DEFAULT_TBD_VERSION),
+                compatibility_version: canonical
+                    .compatibility_version
+                    .as_deref()
+                    .map(parse_version)
+                    .unwrap_or(DEFAULT_TBD_VERSION),
+                ordinal: inputs.next_dylib_ordinal(),
+            };
+            let mut loaded = false;
+            for doc in docs
+                .iter()
+                .filter(|doc| doc.targets.iter().any(|t| t.matches_requested(&target)))
+            {
+                let file = DylibFile::from_tbd(path, doc, &target);
+                let _ =
+                    inputs.add_dylib_from_file_with_meta(path.to_path_buf(), file, load.clone());
+                loaded = true;
+            }
+            if !loaded {
+                return Err(LinkError::NoTbdDocument(path.to_path_buf()));
+            }
+        }
+        _ => {
+            let _ = inputs.add_object(path.to_path_buf(), bytes, load_order)?;
+        }
+    }
     Ok(())
 }
 
-fn tbd_target(opts: &LinkOptions) -> Target {
-    let arch = match opts.arch.as_deref() {
-        Some("arm64e") => Arch::Arm64e,
-        _ => Arch::Arm64,
+fn resolve_entry_point(
+    opts: &LinkOptions,
+    sym_table: &SymbolTable,
+) -> Result<Option<macho::writer::EntryPoint>, LinkError> {
+    let Some(symbol_id) = find_entry_symbol_id(opts, sym_table)? else {
+        return Ok(None);
     };
-    Target {
-        arch,
-        platform: Platform::MacOs,
-    }
+    let Symbol::Defined { atom, value, .. } = sym_table.get(symbol_id) else {
+        let name = sym_table.interner.resolve(sym_table.get(symbol_id).name());
+        return Err(LinkError::EntrySymbolNotFound(name.to_string()));
+    };
+    Ok(Some(macho::writer::EntryPoint {
+        atom: *atom,
+        atom_value: *value,
+    }))
+}
+
+fn find_entry_symbol_id(
+    opts: &LinkOptions,
+    sym_table: &SymbolTable,
+) -> Result<Option<resolve::SymbolId>, LinkError> {
+    let name = if let Some(name) = &opts.entry {
+        name.as_str()
+    } else if opts.kind == OutputKind::Executable {
+        if symbol_defined(sym_table, "_main") {
+            "_main"
+        } else if symbol_defined(sym_table, "_start") {
+            "_start"
+        } else {
+            return Ok(None);
+        }
+    } else {
+        return Ok(None);
+    };
+    let Some((symbol_id, _)) = sym_table
+        .iter()
+        .find(|(_, symbol)| sym_table.interner.resolve(symbol.name()) == name)
+    else {
+        return Err(LinkError::EntrySymbolNotFound(name.to_string()));
+    };
+    Ok(Some(symbol_id))
+}
+
+fn symbol_defined(sym_table: &SymbolTable, name: &str) -> bool {
+    sym_table.iter().any(|(_, symbol)| {
+        sym_table.interner.resolve(symbol.name()) == name
+            && matches!(symbol, Symbol::Defined { .. })
+    })
 }

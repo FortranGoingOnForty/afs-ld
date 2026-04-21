@@ -1,0 +1,2 @@
+clang_dylib leaf.c libleaf.dylib
+clang_reexport_dylib mid.c libmid.dylib libleaf.dylib

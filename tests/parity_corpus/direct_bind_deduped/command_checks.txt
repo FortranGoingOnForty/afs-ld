@@ -1,0 +1,6 @@
+build_version
+load_dylib_names
+dyld_info_rebase
+dyld_info_bind
+dyld_info_weak_bind
+dyld_info_lazy_bind

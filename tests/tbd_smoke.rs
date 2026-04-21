@@ -19,7 +19,11 @@ fn libsystem_tbd_parses_to_many_documents() {
     let docs = parse_documents(&bytes).unwrap_or_else(|e| {
         panic!("libSystem.tbd failed to parse: {e}");
     });
-    assert!(docs.len() >= 2, "expected >=2 documents, got {}", docs.len());
+    assert!(
+        docs.len() >= 2,
+        "expected >=2 documents, got {}",
+        docs.len()
+    );
     // Every doc should carry the !tapi-tbd tag.
     for (i, d) in docs.iter().enumerate() {
         assert_eq!(d.tag.as_deref(), Some("!tapi-tbd"), "doc[{i}] tag");

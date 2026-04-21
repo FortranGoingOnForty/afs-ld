@@ -11,8 +11,12 @@ use std::path::PathBuf;
 
 use super::constants::*;
 use super::exports::{ExportEntry, ExportKind, Exports};
-use super::reader::{parse_commands, parse_header, LoadCommand, MachHeader64, ReadError, SymtabCmd};
+use super::reader::{
+    parse_commands, parse_header, LoadCommand, MachHeader64, ReadError, SymtabCmd,
+};
 use super::tbd::{parse_version, SymbolLists, Target, Tbd};
+
+const DEFAULT_TBD_VERSION: u32 = 1 << 16;
 
 /// How a consumer loaded this dylib. The filetype of the dylib itself is
 /// always `MH_DYLIB`; this kind captures the *relationship*.
@@ -32,6 +36,15 @@ impl DylibLoadKind {
             LC_REEXPORT_DYLIB => Some(DylibLoadKind::Reexport),
             LC_LOAD_UPWARD_DYLIB => Some(DylibLoadKind::Upward),
             _ => None,
+        }
+    }
+
+    pub fn load_cmd(self) -> u32 {
+        match self {
+            DylibLoadKind::Normal => LC_LOAD_DYLIB,
+            DylibLoadKind::Weak => LC_LOAD_WEAK_DYLIB,
+            DylibLoadKind::Reexport => LC_REEXPORT_DYLIB,
+            DylibLoadKind::Upward => LC_LOAD_UPWARD_DYLIB,
         }
     }
 }
@@ -132,10 +145,7 @@ impl DylibFile {
 /// `LC_DYLD_EXPORTS_TRIE` (chained-fixups era). Dylibs built by older
 /// toolchains may have no export trie; in that case return an empty
 /// `Exports::Flat(vec![])` so downstream `entries()` works uniformly.
-fn locate_exports(
-    commands: &[LoadCommand],
-    file_bytes: &[u8],
-) -> Result<Exports, ReadError> {
+fn locate_exports(commands: &[LoadCommand], file_bytes: &[u8]) -> Result<Exports, ReadError> {
     for cmd in commands {
         match cmd {
             LoadCommand::DyldInfoOnly(d) if d.export_size != 0 => {
@@ -223,12 +233,12 @@ impl DylibFile {
                 .current_version
                 .as_deref()
                 .map(parse_version)
-                .unwrap_or(0),
+                .unwrap_or(DEFAULT_TBD_VERSION),
             compatibility_version: tbd
                 .compatibility_version
                 .as_deref()
                 .map(parse_version)
-                .unwrap_or(0),
+                .unwrap_or(DEFAULT_TBD_VERSION),
             dependencies,
             rpaths: Vec::new(),
             symtab: None,
@@ -238,7 +248,7 @@ impl DylibFile {
 }
 
 fn scope_matches(targets: &[Target], wanted: &Target) -> bool {
-    targets.iter().any(|t| t == wanted)
+    targets.iter().any(|t| t.matches_requested(wanted))
 }
 
 fn append_entries(lists: &SymbolLists, out: &mut Vec<ExportEntry>) {
@@ -315,9 +325,7 @@ pub fn dependency_ordinal(deps: &[DylibDependency], install_name: &str) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macho::reader::{
-        write_commands, write_header, DylibCmd, RpathCmd,
-    };
+    use crate::macho::reader::{write_commands, write_header, DylibCmd, RpathCmd};
 
     fn make_dylib_image(commands: Vec<LoadCommand>) -> Vec<u8> {
         let sizeofcmds: u32 = commands.iter().map(|c| c.cmdsize()).sum();
@@ -404,10 +412,7 @@ mod tests {
             }),
         ]);
         let dy = DylibFile::parse("/tmp/x.dylib", &image).unwrap();
-        assert_eq!(
-            dy.rpaths,
-            vec!["@executable_path/../lib", "/opt/local/lib"]
-        );
+        assert_eq!(dy.rpaths, vec!["@executable_path/../lib", "/opt/local/lib"]);
     }
 
     // ----- DylibFile::from_tbd tests -----
@@ -447,6 +452,27 @@ mod tests {
         assert!(names.contains(&"_arm_only".to_string()));
         assert!(names.contains(&"_shared_sym".to_string()));
         assert!(!names.contains(&"_x86_only".to_string()));
+    }
+
+    #[test]
+    fn from_tbd_arm64_uses_arm64e_scopes() {
+        let src = "--- !tapi-tbd\n\
+                   tbd-version: 4\n\
+                   targets: [ arm64e-macos ]\n\
+                   install-name: '/usr/lib/libdemo.dylib'\n\
+                   exports:\n\
+                   \x20 - targets: [ arm64e-macos ]\n\
+                   \x20   symbols: [ _umbrella_only ]\n";
+        let tbd = &parse_tbd(src).unwrap()[0];
+        let dy = DylibFile::from_tbd("/stub/libdemo.tbd", tbd, &arm64_macos());
+        let names: Vec<String> = dy
+            .exports
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["_umbrella_only".to_string()]);
     }
 
     #[test]

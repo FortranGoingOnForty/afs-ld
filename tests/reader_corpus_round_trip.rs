@@ -13,10 +13,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use afs_ld::input::ObjectFile;
-use afs_ld::macho::reader::{parse_commands, parse_header, write_commands, write_header, HEADER_SIZE};
+use afs_ld::macho::reader::{
+    parse_commands, parse_header, write_commands, write_header, HEADER_SIZE,
+};
 use afs_ld::reloc::{
-    parse_raw_relocs, parse_relocs, validate_relocs, write_raw_relocs, write_relocs,
-    RAW_RELOC_SIZE,
+    parse_raw_relocs, parse_relocs, validate_relocs, write_raw_relocs, write_relocs, RAW_RELOC_SIZE,
 };
 use afs_ld::symbol::{write_nlist_table, NLIST_SIZE};
 
@@ -79,7 +80,9 @@ fn every_afs_as_corpus_s_round_trips() {
         fixture_count += 1;
         let obj_name = format!(
             "{}.o",
-            src.file_stem().and_then(|s| s.to_str()).unwrap_or("fixture")
+            src.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("fixture")
         );
         let obj = scratch.join(&obj_name);
 
@@ -126,7 +129,11 @@ fn every_afs_as_corpus_s_round_trips() {
         }
     }
 
-    assert!(fixture_count > 0, "no .s fixtures found in {}", corpus.display());
+    assert!(
+        fixture_count > 0,
+        "no .s fixtures found in {}",
+        corpus.display()
+    );
     assert!(
         failures.is_empty(),
         "{} of {} corpus fixtures failed:\n{}",
@@ -166,7 +173,9 @@ fn every_afs_as_corpus_object_parses_fully() {
         fixture_count += 1;
         let obj_path = scratch.join(format!(
             "{}.o",
-            src.file_stem().and_then(|s| s.to_str()).unwrap_or("fixture")
+            src.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("fixture")
         ));
 
         if let Err(e) = assemble(&src, &obj_path) {
@@ -208,8 +217,7 @@ fn every_afs_as_corpus_object_parses_fully() {
             if sym.stab_kind().is_some() {
                 continue; // stab n_sect has a different meaning
             }
-            if sym.kind() == afs_ld::symbol::SymKind::Sect
-                && obj.section_for_symbol(sym).is_none()
+            if sym.kind() == afs_ld::symbol::SymKind::Sect && obj.section_for_symbol(sym).is_none()
             {
                 failures.push(format!(
                     "{}: symbol[{i}] has SECT kind but n_sect={} is out of range ({} sections)",
@@ -225,8 +233,8 @@ fn every_afs_as_corpus_object_parses_fully() {
         if let Some(symtab) = obj.symtab {
             let mut reemitted = Vec::with_capacity(obj.symbols.len() * NLIST_SIZE);
             write_nlist_table(&obj.symbols, &mut reemitted);
-            let want = &bytes
-                [symtab.symoff as usize..symtab.symoff as usize + symtab.nsyms as usize * NLIST_SIZE];
+            let want = &bytes[symtab.symoff as usize
+                ..symtab.symoff as usize + symtab.nsyms as usize * NLIST_SIZE];
             if reemitted != want {
                 failures.push(format!(
                     "{}: nlist region re-emit mismatch (symoff=0x{:x} nsyms={})",
@@ -238,8 +246,8 @@ fn every_afs_as_corpus_object_parses_fully() {
             }
 
             // Byte-level equality of the string-table blob.
-            let strtab_want = &bytes
-                [symtab.stroff as usize..symtab.stroff as usize + symtab.strsize as usize];
+            let strtab_want =
+                &bytes[symtab.stroff as usize..symtab.stroff as usize + symtab.strsize as usize];
             if obj.strings.as_bytes() != strtab_want {
                 failures.push(format!(
                     "{}: strtab byte mismatch (stroff=0x{:x} strsize={})",
@@ -293,7 +301,9 @@ fn every_afs_as_corpus_section_relocs_round_trip() {
         fixture_count += 1;
         let obj_path = scratch.join(format!(
             "{}.o",
-            src.file_stem().and_then(|s| s.to_str()).unwrap_or("fixture")
+            src.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("fixture")
         ));
         if let Err(e) = assemble(&src, &obj_path) {
             failures.push(format!("{}: assemble: {e}", src.display()));
@@ -401,7 +411,10 @@ fn every_afs_as_corpus_section_relocs_round_trip() {
 }
 
 fn first_diff(a: &[u8], b: &[u8]) -> usize {
-    a.iter().zip(b.iter()).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()))
+    a.iter()
+        .zip(b.iter())
+        .position(|(x, y)| x != y)
+        .unwrap_or(a.len().min(b.len()))
 }
 
 fn tempdir() -> PathBuf {
@@ -410,11 +423,7 @@ fn tempdir() -> PathBuf {
     // Each caller gets a unique dir so cargo's parallel tests don't step on
     // one another's .o files.
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let base = std::env::temp_dir().join(format!(
-        "afs-ld-corpus-{}-{}",
-        std::process::id(),
-        seq
-    ));
+    let base = std::env::temp_dir().join(format!("afs-ld-corpus-{}-{}", std::process::id(), seq));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).expect("create scratch dir");
     base

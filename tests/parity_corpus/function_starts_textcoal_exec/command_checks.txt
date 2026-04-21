@@ -1,0 +1,3 @@
+build_version
+load_dylib_names
+normalized_function_starts

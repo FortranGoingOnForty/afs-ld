@@ -8,13 +8,9 @@
 //! Later sprints layer `InputSection` (atomized content) and
 //! `OutputSection` / `OutputSegment` (layout model) on top of this module.
 
-use std::collections::HashMap;
-
-use crate::atom::{AtomSection, AtomTable};
 use crate::macho::constants::*;
 use crate::macho::reader::{name16_str, ReadError, Section64Header};
-use crate::resolve::{AtomId, SymbolId, SymbolTable};
-use crate::OutputKind;
+use crate::resolve::AtomId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SectionKind {
@@ -22,7 +18,7 @@ pub enum SectionKind {
     Text,
     /// Regular data (`S_REGULAR` with none of the attribute markers).
     Data,
-    /// `__TEXT,__const` — immutable data.
+    /// Immutable data such as `__TEXT,__const` or `__DATA_CONST,__const`.
     ConstData,
     /// `__TEXT,__cstring` (`S_CSTRING_LITERALS`).
     CStringLiterals,
@@ -41,6 +37,8 @@ pub enum SectionKind {
     ThreadLocalZeroFill,
     /// TLV descriptors (`S_THREAD_LOCAL_VARIABLES`).
     ThreadLocalVariables,
+    /// TLV descriptor pointer slots (`S_THREAD_LOCAL_VARIABLE_POINTERS`).
+    ThreadLocalVariablePointers,
     /// TLV init function pointers.
     ThreadLocalInitPointers,
     /// `__TEXT,__compact_unwind` (`S_REGULAR` + `S_ATTR_DEBUG`).
@@ -82,6 +80,7 @@ pub fn classify_section(segname: &str, sectname: &str, flags: u32) -> SectionKin
         S_THREAD_LOCAL_REGULAR => SectionKind::ThreadLocalRegular,
         S_THREAD_LOCAL_ZEROFILL => SectionKind::ThreadLocalZeroFill,
         S_THREAD_LOCAL_VARIABLES => SectionKind::ThreadLocalVariables,
+        S_THREAD_LOCAL_VARIABLE_POINTERS => SectionKind::ThreadLocalVariablePointers,
         S_THREAD_LOCAL_INIT_FUNCTION_POINTERS => SectionKind::ThreadLocalInitPointers,
         S_REGULAR => classify_regular(segname, sectname, flags),
         _ => SectionKind::Unknown(ty as u8),
@@ -95,7 +94,7 @@ fn classify_regular(segname: &str, sectname: &str, flags: u32) -> SectionKind {
     if flags & S_ATTR_PURE_INSTRUCTIONS != 0 {
         return SectionKind::Text;
     }
-    if segname == "__TEXT" && sectname == "__const" {
+    if sectname == "__const" && matches!(segname, "__TEXT" | "__DATA" | "__DATA_CONST") {
         return SectionKind::ConstData;
     }
     SectionKind::Data
@@ -223,51 +222,35 @@ impl InputSection {
 }
 
 // ---------------------------------------------------------------------------
-// Output layout model — Sprint 10.
+// Output layout model — populated by Sprint 10's layout pass.
 // ---------------------------------------------------------------------------
-
-pub const PAGE_SIZE: u64 = 16 * 1024;
-pub const PAGEZERO_SIZE: u64 = 0x1_0000_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OutputSectionId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Prot {
-    bits: u32,
-}
+pub struct Prot(u32);
 
 impl Prot {
-    pub const NONE: Self = Self { bits: 0 };
-    pub const READ: Self = Self { bits: 1 };
-    pub const WRITE: Self = Self { bits: 2 };
-    pub const EXECUTE: Self = Self { bits: 4 };
+    pub const NONE: Prot = Prot(0);
+    pub const READ: Prot = Prot(1);
+    pub const WRITE: Prot = Prot(2);
+    pub const EXECUTE: Prot = Prot(4);
+    pub const READ_ONLY: Prot = Prot(Self::READ.0);
+    pub const READ_WRITE: Prot = Prot(Self::READ.0 | Self::WRITE.0);
+    pub const READ_EXECUTE: Prot = Prot(Self::READ.0 | Self::EXECUTE.0);
 
     pub fn bits(self) -> u32 {
-        self.bits
-    }
-}
-
-impl std::ops::BitOr for Prot {
-    type Output = Self;
-
-    fn bitor(self, rhs: Self) -> Self::Output {
-        Self {
-            bits: self.bits | rhs.bits,
-        }
+        self.0
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutputSegment {
-    pub name: String,
-    pub sections: Vec<OutputSectionId>,
-    pub vm_addr: u64,
-    pub vm_size: u64,
-    pub file_off: u64,
-    pub file_size: u64,
-    pub init_prot: Prot,
-    pub max_prot: Prot,
+pub struct OutputAtom {
+    pub atom: AtomId,
+    pub offset: u64,
+    pub size: u64,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,454 +263,37 @@ pub struct OutputSection {
     pub reserved1: u32,
     pub reserved2: u32,
     pub reserved3: u32,
-    pub atoms: Vec<AtomId>,
+    pub atoms: Vec<OutputAtom>,
+    /// Byte offset within the section where `synthetic_data` begins.
+    pub synthetic_offset: u64,
+    pub synthetic_data: Vec<u8>,
     pub addr: u64,
     pub size: u64,
     pub file_off: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Layout {
-    pub kind: OutputKind,
-    pub segments: Vec<OutputSegment>,
-    pub sections: Vec<OutputSection>,
+pub struct OutputSegment {
+    pub name: String,
+    pub sections: Vec<OutputSectionId>,
+    pub vm_addr: u64,
+    pub vm_size: u64,
+    pub file_off: u64,
+    pub file_size: u64,
+    pub init_prot: Prot,
+    pub max_prot: Prot,
+    pub flags: u32,
 }
 
-pub fn build_empty_layout(kind: OutputKind) -> Layout {
-    build_layout(kind, &AtomTable::new(), &SymbolTable::new())
-}
-
-pub fn build_layout(kind: OutputKind, atoms: &AtomTable, symbols: &SymbolTable) -> Layout {
-    let mut groups = Vec::<SectionBuildGroup>::new();
-    let mut by_key = HashMap::<(&'static str, &'static str), usize>::new();
-
-    for (atom_id, atom) in atoms.iter() {
-        let spec = output_section_spec(atom.section);
-        let idx = *by_key.entry((spec.segment, spec.name)).or_insert_with(|| {
-            groups.push(SectionBuildGroup {
-                spec,
-                atoms: Vec::new(),
-            });
-            groups.len() - 1
-        });
-        groups[idx].atoms.push(atom_id);
-    }
-
-    for group in &mut groups {
-        group
-            .atoms
-            .sort_by(|a, b| compare_atoms(*a, *b, atoms, symbols));
-    }
-
-    groups.sort_by(|a, b| {
-        (
-            a.spec.segment_order,
-            a.spec.section_order,
-            a.spec.segment,
-            a.spec.name,
-        )
-            .cmp(&(
-                b.spec.segment_order,
-                b.spec.section_order,
-                b.spec.segment,
-                b.spec.name,
-            ))
-    });
-
-    let mut sections = Vec::with_capacity(groups.len());
-    for group in groups {
-        let (align_pow2, size) = measure_output_section(&group.atoms, atoms);
-        sections.push(OutputSection {
-            segment: group.spec.segment.to_string(),
-            name: group.spec.name.to_string(),
-            kind: group.spec.kind,
-            align_pow2,
-            flags: group.spec.flags,
-            reserved1: group.spec.reserved1,
-            reserved2: group.spec.reserved2,
-            reserved3: group.spec.reserved3,
-            atoms: group.atoms,
-            addr: 0,
-            size,
-            file_off: 0,
-        });
-    }
-
-    let segments = build_output_segments(kind, &sections);
-    Layout {
-        kind,
-        segments,
-        sections,
-    }
-}
-
-pub fn assign_layout(layout: &mut Layout, header_and_cmds_size: u64, linkedit_size: u64) {
-    let mut next_vm = if layout.kind == OutputKind::Executable {
-        PAGEZERO_SIZE
-    } else {
-        0
-    };
-    let mut next_file = 0u64;
-
-    for segment in &mut layout.segments {
-        match segment.name.as_str() {
-            "__PAGEZERO" => {
-                segment.vm_addr = 0;
-                segment.vm_size = PAGEZERO_SIZE;
-                segment.file_off = 0;
-                segment.file_size = 0;
-            }
-            "__LINKEDIT" => {
-                segment.vm_addr = align_to(next_vm, PAGE_SIZE);
-                segment.file_off = align_to(next_file, PAGE_SIZE);
-                segment.vm_size = if linkedit_size == 0 {
-                    0
-                } else {
-                    align_to(linkedit_size, PAGE_SIZE)
-                };
-                segment.file_size = linkedit_size;
-                next_vm = segment.vm_addr + segment.vm_size;
-                next_file = segment.file_off + segment.file_size;
-            }
-            _ => {
-                segment.vm_addr = next_vm;
-                segment.file_off = next_file;
-
-                let prefix = if segment.name == "__TEXT" {
-                    header_and_cmds_size
-                } else {
-                    0
-                };
-                let mut vm_cursor = prefix;
-                let mut file_cursor = prefix;
-
-                for sec_id in &segment.sections {
-                    let section = &mut layout.sections[sec_id.0 as usize];
-                    let align = 1u64 << section.align_pow2;
-                    vm_cursor = align_to(vm_cursor, align);
-                    section.addr = segment.vm_addr + vm_cursor;
-
-                    if is_zerofill(section.kind) {
-                        section.file_off = segment.file_off + file_cursor;
-                        vm_cursor += section.size;
-                    } else {
-                        file_cursor = align_to(file_cursor, align);
-                        vm_cursor = vm_cursor.max(file_cursor);
-                        section.file_off = segment.file_off + file_cursor;
-                        vm_cursor += section.size;
-                        file_cursor += section.size;
-                    }
-                }
-
-                segment.file_size = prefix.max(file_cursor);
-                segment.vm_size = if prefix.max(vm_cursor) == 0 {
-                    0
-                } else {
-                    align_to(prefix.max(vm_cursor), PAGE_SIZE)
-                };
-                next_vm = align_to(segment.vm_addr + segment.vm_size, PAGE_SIZE);
-                next_file = align_to(segment.file_off + segment.file_size, PAGE_SIZE);
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct OutputSectionSpec {
-    segment: &'static str,
-    name: &'static str,
-    kind: SectionKind,
-    flags: u32,
-    reserved1: u32,
-    reserved2: u32,
-    reserved3: u32,
-    segment_order: u8,
-    section_order: u8,
-}
-
-impl OutputSectionSpec {
-    fn new(
-        segment: &'static str,
-        name: &'static str,
-        kind: SectionKind,
-        flags: u32,
-        segment_order: u8,
-        section_order: u8,
-    ) -> Self {
-        Self {
-            segment,
-            name,
-            kind,
-            flags,
-            reserved1: 0,
-            reserved2: 0,
-            reserved3: 0,
-            segment_order,
-            section_order,
-        }
-    }
-
-    fn with_reserved(mut self, reserved1: u32, reserved2: u32, reserved3: u32) -> Self {
-        self.reserved1 = reserved1;
-        self.reserved2 = reserved2;
-        self.reserved3 = reserved3;
-        self
-    }
-}
-
-#[derive(Debug)]
-struct SectionBuildGroup {
-    spec: OutputSectionSpec,
-    atoms: Vec<AtomId>,
-}
-
-fn build_output_segments(kind: OutputKind, sections: &[OutputSection]) -> Vec<OutputSegment> {
-    let mut ids_by_segment: HashMap<&str, Vec<OutputSectionId>> = HashMap::new();
-    for (idx, section) in sections.iter().enumerate() {
-        ids_by_segment
-            .entry(section.segment.as_str())
-            .or_default()
-            .push(OutputSectionId(idx as u32));
-    }
-
-    let mut out = Vec::new();
-    if kind == OutputKind::Executable {
-        out.push(OutputSegment {
-            name: "__PAGEZERO".into(),
-            sections: Vec::new(),
-            vm_addr: 0,
-            vm_size: 0,
-            file_off: 0,
-            file_size: 0,
-            init_prot: Prot::NONE,
-            max_prot: Prot::NONE,
-        });
-    }
-
-    for (name, init_prot, max_prot, always_present) in [
-        (
-            "__TEXT",
-            Prot::READ | Prot::EXECUTE,
-            Prot::READ | Prot::EXECUTE,
-            true,
-        ),
-        ("__DATA_CONST", Prot::READ, Prot::READ | Prot::WRITE, false),
-        (
-            "__DATA",
-            Prot::READ | Prot::WRITE,
-            Prot::READ | Prot::WRITE,
-            false,
-        ),
-        ("__LINKEDIT", Prot::READ, Prot::READ, true),
-    ] {
-        let sections = ids_by_segment.remove(name).unwrap_or_default();
-        if !always_present && sections.is_empty() {
-            continue;
-        }
-        out.push(OutputSegment {
-            name: name.into(),
-            sections,
-            vm_addr: 0,
-            vm_size: 0,
-            file_off: 0,
-            file_size: 0,
-            init_prot,
-            max_prot,
-        });
-    }
-
-    out
-}
-
-fn compare_atoms(
-    a: AtomId,
-    b: AtomId,
-    atoms: &AtomTable,
-    symbols: &SymbolTable,
-) -> std::cmp::Ordering {
-    let a_atom = atoms.get(a);
-    let b_atom = atoms.get(b);
-    (a_atom.origin.0, a_atom.input_offset)
-        .cmp(&(b_atom.origin.0, b_atom.input_offset))
-        .then_with(|| owner_name(a_atom.owner, symbols).cmp(owner_name(b_atom.owner, symbols)))
-}
-
-fn owner_name(owner: Option<SymbolId>, symbols: &SymbolTable) -> &str {
-    match owner {
-        Some(id) => symbols.interner.resolve(symbols.get(id).name()),
-        None => "",
-    }
-}
-
-fn measure_output_section(atom_ids: &[AtomId], atoms: &AtomTable) -> (u8, u64) {
-    let mut align_pow2 = 0u8;
-    let mut size = 0u64;
-    for atom_id in atom_ids {
-        let atom = atoms.get(*atom_id);
-        align_pow2 = align_pow2.max(atom.align_pow2);
-        size = align_to(size, 1u64 << atom.align_pow2);
-        size += atom.size as u64;
-    }
-    (align_pow2, size)
-}
-
-fn output_section_spec(section: AtomSection) -> OutputSectionSpec {
-    match section {
-        AtomSection::Text | AtomSection::Coalesced => OutputSectionSpec::new(
-            "__TEXT",
-            "__text",
-            if matches!(section, AtomSection::Coalesced) {
-                SectionKind::Coalesced
-            } else {
-                SectionKind::Text
-            },
-            if matches!(section, AtomSection::Coalesced) {
-                S_COALESCED
-            } else {
-                S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
-            },
-            1,
-            0,
-        ),
-        AtomSection::SymbolStubs => OutputSectionSpec::new(
-            "__TEXT",
-            "__stubs",
-            SectionKind::SymbolStubs,
-            S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
-            1,
-            1,
-        )
-        .with_reserved(0, 12, 0),
-        AtomSection::CStringLiterals => OutputSectionSpec::new(
-            "__TEXT",
-            "__cstring",
-            SectionKind::CStringLiterals,
-            S_CSTRING_LITERALS,
-            1,
-            3,
-        ),
-        AtomSection::ConstData => {
-            OutputSectionSpec::new("__TEXT", "__const", SectionKind::ConstData, S_REGULAR, 1, 4)
-        }
-        AtomSection::Literal4 => OutputSectionSpec::new(
-            "__TEXT",
-            "__literal4",
-            SectionKind::Literal4,
-            S_4BYTE_LITERALS,
-            1,
-            5,
-        ),
-        AtomSection::Literal8 => OutputSectionSpec::new(
-            "__TEXT",
-            "__literal8",
-            SectionKind::Literal8,
-            S_8BYTE_LITERALS,
-            1,
-            6,
-        ),
-        AtomSection::Literal16 => OutputSectionSpec::new(
-            "__TEXT",
-            "__literal16",
-            SectionKind::Literal16,
-            S_16BYTE_LITERALS,
-            1,
-            7,
-        ),
-        AtomSection::CompactUnwind => OutputSectionSpec::new(
-            "__TEXT",
-            "__unwind_info",
-            SectionKind::CompactUnwind,
-            S_REGULAR | S_ATTR_DEBUG,
-            1,
-            8,
-        ),
-        AtomSection::EhFrame => OutputSectionSpec::new(
-            "__TEXT",
-            "__eh_frame",
-            SectionKind::EhFrame,
-            S_COALESCED,
-            1,
-            9,
-        ),
-        AtomSection::NonLazySymbolPointers => OutputSectionSpec::new(
-            "__DATA_CONST",
-            "__got",
-            SectionKind::NonLazySymbolPointers,
-            S_NON_LAZY_SYMBOL_POINTERS,
-            2,
-            0,
-        ),
-        AtomSection::Data | AtomSection::Other => OutputSectionSpec::new(
-            "__DATA",
-            "__data",
-            if matches!(section, AtomSection::Other) {
-                SectionKind::Regular
-            } else {
-                SectionKind::Data
-            },
-            S_REGULAR,
-            3,
-            1,
-        ),
-        AtomSection::LazySymbolPointers => OutputSectionSpec::new(
-            "__DATA",
-            "__la_symbol_ptr",
-            SectionKind::LazySymbolPointers,
-            S_LAZY_SYMBOL_POINTERS,
-            3,
-            0,
-        ),
-        AtomSection::ThreadLocalVariables => OutputSectionSpec::new(
-            "__DATA",
-            "__thread_vars",
-            SectionKind::ThreadLocalVariables,
-            S_THREAD_LOCAL_VARIABLES,
-            3,
-            2,
-        ),
-        AtomSection::ThreadLocalInitPointers => OutputSectionSpec::new(
-            "__DATA",
-            "__thread_ptrs",
-            SectionKind::ThreadLocalInitPointers,
-            S_THREAD_LOCAL_INIT_FUNCTION_POINTERS,
-            3,
-            3,
-        ),
-        AtomSection::ThreadLocalData => OutputSectionSpec::new(
-            "__DATA",
-            "__thread_data",
-            SectionKind::ThreadLocalRegular,
-            S_THREAD_LOCAL_REGULAR,
-            3,
-            4,
-        ),
-        AtomSection::ThreadLocalBss => OutputSectionSpec::new(
-            "__DATA",
-            "__thread_bss",
-            SectionKind::ThreadLocalZeroFill,
-            S_THREAD_LOCAL_ZEROFILL,
-            3,
-            5,
-        ),
-        AtomSection::ZeroFill => {
-            OutputSectionSpec::new("__DATA", "__bss", SectionKind::ZeroFill, S_ZEROFILL, 3, 6)
-        }
-    }
-}
-
-fn align_to(value: u64, align: u64) -> u64 {
-    if align <= 1 {
-        value
-    } else {
-        (value + align - 1) & !(align - 1)
+impl OutputSection {
+    pub fn is_zerofill(&self) -> bool {
+        is_zerofill(self.kind)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atom::{Atom, AtomFlags, AtomSection, AtomTable};
-    use crate::resolve::{AtomId, InputId, SymbolTable};
 
     #[test]
     fn classify_text_section() {
@@ -806,6 +372,10 @@ mod tests {
             classify_section("__DATA", "__thread_vars", S_THREAD_LOCAL_VARIABLES),
             SectionKind::ThreadLocalVariables
         );
+        assert_eq!(
+            classify_section("__DATA", "__thread_ptrs", S_THREAD_LOCAL_VARIABLE_POINTERS),
+            SectionKind::ThreadLocalVariablePointers
+        );
     }
 
     #[test]
@@ -830,142 +400,6 @@ mod tests {
         assert_eq!(
             classify_section("__WEIRD", "__weird", weird),
             SectionKind::Unknown(0xFF)
-        );
-    }
-
-    fn synth_atom(origin: InputId, input_offset: u32, size: u32, section: AtomSection) -> Atom {
-        Atom {
-            id: AtomId(0),
-            origin,
-            input_section: 1,
-            section,
-            input_offset,
-            size,
-            align_pow2: 2,
-            owner: None,
-            alt_entries: Vec::new(),
-            relocs: Vec::new(),
-            data: vec![0; size as usize],
-            flags: AtomFlags::NONE,
-            parent_of: None,
-        }
-    }
-
-    #[test]
-    fn empty_executable_layout_has_pagezero_text_and_linkedit() {
-        let mut layout = build_empty_layout(OutputKind::Executable);
-        assign_layout(&mut layout, 0x300, 0);
-
-        let names: Vec<_> = layout.segments.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["__PAGEZERO", "__TEXT", "__LINKEDIT"]);
-
-        let text = layout
-            .segments
-            .iter()
-            .find(|s| s.name == "__TEXT")
-            .expect("__TEXT");
-        assert_eq!(text.vm_addr, PAGEZERO_SIZE);
-        assert_eq!(text.file_off, 0);
-        assert_eq!(text.file_size, 0x300);
-        assert_eq!(text.vm_size, PAGE_SIZE);
-    }
-
-    #[test]
-    fn empty_dylib_layout_starts_text_at_zero() {
-        let mut layout = build_empty_layout(OutputKind::Dylib);
-        assign_layout(&mut layout, 0x280, 0);
-
-        let names: Vec<_> = layout.segments.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["__TEXT", "__LINKEDIT"]);
-
-        let text = layout
-            .segments
-            .iter()
-            .find(|s| s.name == "__TEXT")
-            .expect("__TEXT");
-        assert_eq!(text.vm_addr, 0);
-        assert_eq!(text.file_off, 0);
-        assert_eq!(text.file_size, 0x280);
-    }
-
-    #[test]
-    fn build_layout_orders_atoms_by_origin_then_offset() {
-        let mut atoms = AtomTable::new();
-        let b = atoms.push(synth_atom(InputId(1), 0, 4, AtomSection::Data));
-        let c = atoms.push(synth_atom(InputId(0), 8, 4, AtomSection::Data));
-        let a = atoms.push(synth_atom(InputId(0), 0, 4, AtomSection::Data));
-
-        let layout = build_layout(OutputKind::Executable, &atoms, &SymbolTable::new());
-        let data = layout
-            .sections
-            .iter()
-            .find(|s| s.segment == "__DATA" && s.name == "__data")
-            .expect("__DATA,__data");
-
-        assert_eq!(data.atoms, vec![a, c, b]);
-        assert_eq!(data.size, 12);
-    }
-
-    #[test]
-    fn build_layout_carries_special_section_reserved_fields() {
-        let mut atoms = AtomTable::new();
-        atoms.push(synth_atom(InputId(0), 0, 12, AtomSection::SymbolStubs));
-        atoms.push(synth_atom(
-            InputId(0),
-            16,
-            8,
-            AtomSection::NonLazySymbolPointers,
-        ));
-        atoms.push(synth_atom(
-            InputId(0),
-            24,
-            8,
-            AtomSection::LazySymbolPointers,
-        ));
-        atoms.push(synth_atom(
-            InputId(0),
-            32,
-            8,
-            AtomSection::ThreadLocalInitPointers,
-        ));
-
-        let layout = build_layout(OutputKind::Executable, &atoms, &SymbolTable::new());
-        let stubs = layout
-            .sections
-            .iter()
-            .find(|section| section.segment == "__TEXT" && section.name == "__stubs")
-            .expect("__TEXT,__stubs");
-        assert_eq!(
-            (stubs.reserved1, stubs.reserved2, stubs.reserved3),
-            (0, 12, 0)
-        );
-
-        let got = layout
-            .sections
-            .iter()
-            .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
-            .expect("__DATA_CONST,__got");
-        assert_eq!((got.reserved1, got.reserved2, got.reserved3), (0, 0, 0));
-
-        let lazy = layout
-            .sections
-            .iter()
-            .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
-            .expect("__DATA,__la_symbol_ptr");
-        assert_eq!((lazy.reserved1, lazy.reserved2, lazy.reserved3), (0, 0, 0));
-
-        let thread_ptrs = layout
-            .sections
-            .iter()
-            .find(|section| section.segment == "__DATA" && section.name == "__thread_ptrs")
-            .expect("__DATA,__thread_ptrs");
-        assert_eq!(
-            (
-                thread_ptrs.reserved1,
-                thread_ptrs.reserved2,
-                thread_ptrs.reserved3
-            ),
-            (0, 0, 0)
         );
     }
 }

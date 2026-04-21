@@ -17,15 +17,27 @@ use super::constants::*;
 #[derive(Debug)]
 pub enum ReadError {
     /// Not enough bytes to decode the next field.
-    Truncated { need: usize, have: usize, context: &'static str },
+    Truncated {
+        need: usize,
+        have: usize,
+        context: &'static str,
+    },
     /// Magic number is not `MH_MAGIC_64`.
     BadMagic { got: u32 },
     /// CPU type is not `CPU_TYPE_ARM64`.
     UnsupportedCpu { got: u32 },
     /// A load command's `cmdsize` field is malformed.
-    BadCmdsize { cmd: u32, cmdsize: u32, at_offset: usize, reason: &'static str },
+    BadCmdsize {
+        cmd: u32,
+        cmdsize: u32,
+        at_offset: usize,
+        reason: &'static str,
+    },
     /// A relocation entry or pairing is structurally invalid.
-    BadRelocation { at_offset: u32, reason: &'static str },
+    BadRelocation {
+        at_offset: u32,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for ReadError {
@@ -144,7 +156,11 @@ pub enum LoadCommand {
     DyldChainedFixups(LinkEditDataCmd),
     /// A load command whose payload we haven't decoded yet. Preserves bytes
     /// verbatim for byte-level round-trip.
-    Raw { cmd: u32, cmdsize: u32, data: Vec<u8> },
+    Raw {
+        cmd: u32,
+        cmdsize: u32,
+        data: Vec<u8>,
+    },
 }
 
 impl LoadCommand {
@@ -357,17 +373,15 @@ impl Section64Header {
 /// Parse the `header.ncmds` load commands that follow a `mach_header_64`.
 /// The slice must cover the full file (or at least through `sizeofcmds`);
 /// offsets are always relative to the start of the mach-o image.
-pub fn parse_commands(
-    header: &MachHeader64,
-    bytes: &[u8],
-) -> Result<Vec<LoadCommand>, ReadError> {
-    let cmds_end = HEADER_SIZE
-        .checked_add(header.sizeofcmds as usize)
-        .ok_or(ReadError::Truncated {
-            need: usize::MAX,
-            have: bytes.len(),
-            context: "load-command region (sizeofcmds overflows)",
-        })?;
+pub fn parse_commands(header: &MachHeader64, bytes: &[u8]) -> Result<Vec<LoadCommand>, ReadError> {
+    let cmds_end =
+        HEADER_SIZE
+            .checked_add(header.sizeofcmds as usize)
+            .ok_or(ReadError::Truncated {
+                need: usize::MAX,
+                have: bytes.len(),
+                context: "load-command region (sizeofcmds overflows)",
+            })?;
     if bytes.len() < cmds_end {
         return Err(ReadError::Truncated {
             need: cmds_end,
@@ -439,13 +453,12 @@ fn decode_command(cmd: u32, cmdsize: u32, payload: &[u8]) -> Result<LoadCommand,
         LC_LINKER_OPTIMIZATION_HINT => Ok(LoadCommand::LinkerOptimizationHint(
             LinkEditDataCmd::parse(LC_LINKER_OPTIMIZATION_HINT, cmdsize, payload)?,
         )),
-        LC_ID_DYLIB
-        | LC_LOAD_DYLIB
-        | LC_LOAD_WEAK_DYLIB
-        | LC_REEXPORT_DYLIB
+        LC_ID_DYLIB | LC_LOAD_DYLIB | LC_LOAD_WEAK_DYLIB | LC_REEXPORT_DYLIB
         | LC_LOAD_UPWARD_DYLIB => Ok(LoadCommand::Dylib(DylibCmd::parse(cmd, cmdsize, payload)?)),
         LC_RPATH => Ok(LoadCommand::Rpath(RpathCmd::parse(cmdsize, payload)?)),
-        LC_DYLD_INFO_ONLY => Ok(LoadCommand::DyldInfoOnly(DyldInfoCmd::parse(cmdsize, payload)?)),
+        LC_DYLD_INFO_ONLY => Ok(LoadCommand::DyldInfoOnly(DyldInfoCmd::parse(
+            cmdsize, payload,
+        )?)),
         LC_DYLD_EXPORTS_TRIE => Ok(LoadCommand::DyldExportsTrie(LinkEditDataCmd::parse(
             LC_DYLD_EXPORTS_TRIE,
             cmdsize,
@@ -855,12 +868,15 @@ impl RpathCmd {
         }
         let start = off_in_cmd - 8;
         let bytes = &payload[start..];
-        let nul = bytes.iter().position(|&b| b == 0).ok_or(ReadError::BadCmdsize {
-            cmd: LC_RPATH,
-            cmdsize,
-            at_offset: 0,
-            reason: "rpath_command path is not null-terminated",
-        })?;
+        let nul = bytes
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(ReadError::BadCmdsize {
+                cmd: LC_RPATH,
+                cmdsize,
+                at_offset: 0,
+                reason: "rpath_command path is not null-terminated",
+            })?;
         let path = std::str::from_utf8(&bytes[..nul])
             .map_err(|_| ReadError::BadCmdsize {
                 cmd: LC_RPATH,
@@ -1074,7 +1090,14 @@ mod tests {
     fn truncated_header_errors_cleanly() {
         let err = parse_header(&[0u8; 10]).unwrap_err();
         assert!(
-            matches!(err, ReadError::Truncated { need: HEADER_SIZE, have: 10, .. }),
+            matches!(
+                err,
+                ReadError::Truncated {
+                    need: HEADER_SIZE,
+                    have: 10,
+                    ..
+                }
+            ),
             "unexpected: {err:?}"
         );
     }
@@ -1093,7 +1116,10 @@ mod tests {
         // Overwrite cputype with x86_64 (0x01000007).
         bytes[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
         let err = parse_header(&bytes).unwrap_err();
-        assert!(matches!(err, ReadError::UnsupportedCpu { got: 0x0100_0007 }));
+        assert!(matches!(
+            err,
+            ReadError::UnsupportedCpu { got: 0x0100_0007 }
+        ));
     }
 
     /// Synthesize a mach-o image with `n` load commands, each of size
@@ -1350,8 +1376,14 @@ mod tests {
             minos: (11 << 16) | (3 << 8),
             sdk: (14 << 16) | (2 << 8),
             tools: vec![
-                BuildTool { tool: 3, version: 0x0001_0002 },
-                BuildTool { tool: 4, version: 0x0002_0003 },
+                BuildTool {
+                    tool: 3,
+                    version: 0x0001_0002,
+                },
+                BuildTool {
+                    tool: 4,
+                    version: 0x0002_0003,
+                },
             ],
         };
         let mut wire2 = Vec::new();
@@ -1367,7 +1399,10 @@ mod tests {
             platform: PLATFORM_MACOS,
             minos: (11 << 16),
             sdk: (14 << 16),
-            tools: vec![BuildTool { tool: 3, version: 1 }],
+            tools: vec![BuildTool {
+                tool: 3,
+                version: 1,
+            }],
         };
         let mut wire = Vec::new();
         cmd.write(&mut wire);
@@ -1491,7 +1526,9 @@ mod tests {
         payload.extend_from_slice(&0u32.to_le_bytes());
         payload.extend_from_slice(&0u32.to_le_bytes());
         let err = DylibCmd::parse(LC_LOAD_DYLIB, 32, &payload).unwrap_err();
-        assert!(matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("name offset")));
+        assert!(
+            matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("name offset"))
+        );
     }
 
     #[test]
@@ -1504,8 +1541,12 @@ mod tests {
         cmd.write(LC_LINKER_OPTIMIZATION_HINT, &mut wire);
         assert_eq!(wire.len(), LinkEditDataCmd::WIRE_SIZE as usize);
 
-        let decoded =
-            LinkEditDataCmd::parse(LC_LINKER_OPTIMIZATION_HINT, LinkEditDataCmd::WIRE_SIZE, &wire[8..]).unwrap();
+        let decoded = LinkEditDataCmd::parse(
+            LC_LINKER_OPTIMIZATION_HINT,
+            LinkEditDataCmd::WIRE_SIZE,
+            &wire[8..],
+        )
+        .unwrap();
         assert_eq!(decoded, cmd);
 
         let hdr = MachHeader64 {
@@ -1563,7 +1604,13 @@ mod tests {
         let parsed_hdr = parse_header(&image).unwrap();
         let cmds = parse_commands(&parsed_hdr, &image).unwrap();
         assert!(matches!(cmds[0], LoadCommand::Segment64(_)));
-        assert!(matches!(cmds[1], LoadCommand::Raw { cmd: 0xCAFE_F00D, .. }));
+        assert!(matches!(
+            cmds[1],
+            LoadCommand::Raw {
+                cmd: 0xCAFE_F00D,
+                ..
+            }
+        ));
 
         let mut out = Vec::new();
         write_header(&parsed_hdr, &mut out);

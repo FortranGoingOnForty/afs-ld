@@ -2,10 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use afs_ld::layout::Layout;
 use afs_ld::macho::constants::{LC_ID_DYLIB, MH_DYLIB, MH_EXECUTE};
 use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand};
 use afs_ld::macho::writer::write;
-use afs_ld::section::build_empty_layout;
 use afs_ld::{LinkOptions, OutputKind};
 
 fn have_tool(name: &str) -> bool {
@@ -57,7 +57,7 @@ fn run_file(path: &Path) -> Result<String, String> {
 
 #[test]
 fn empty_executable_writer_emits_parseable_macho() {
-    let layout = build_empty_layout(OutputKind::Executable);
+    let layout = Layout::empty(OutputKind::Executable, 0);
     let opts = LinkOptions::default();
     let mut bytes = Vec::new();
     write(&layout, OutputKind::Executable, &opts, &mut bytes).expect("write executable");
@@ -85,7 +85,7 @@ fn empty_executable_writer_emits_parseable_macho() {
 
 #[test]
 fn empty_dylib_writer_emits_parseable_macho() {
-    let layout = build_empty_layout(OutputKind::Dylib);
+    let layout = Layout::empty(OutputKind::Dylib, 0);
     let mut opts = LinkOptions {
         kind: OutputKind::Dylib,
         ..LinkOptions::default()

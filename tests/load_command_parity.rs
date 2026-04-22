@@ -23,6 +23,26 @@ fn have_clang() -> bool {
         .unwrap_or(false)
 }
 
+fn have_ld() -> bool {
+    Command::new("xcrun")
+        .arg("-f")
+        .arg("ld")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn sdk_path() -> Option<String> {
+    Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
 fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-load-order-{}-{name}", std::process::id()))
 }
@@ -141,14 +161,18 @@ fn normalize(ids: &[u32]) -> Vec<&'static str> {
 
 #[test]
 fn executable_load_command_order_matches_apple_for_common_surface() {
-    if !have_xcrun() || !have_clang() {
-        eprintln!("skipping: xcrun as / clang unavailable");
+    if !have_xcrun() || !have_ld() {
+        eprintln!("skipping: xcrun as / ld unavailable");
         return;
     }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
 
     let obj = scratch("main.o");
     let ours = scratch("ours-exec");
-    let theirs = scratch("clang-exec");
+    let theirs = scratch("apple-exec");
     assemble(
         r#"
             .section __TEXT,__text,regular,pure_instructions
@@ -159,15 +183,32 @@ fn executable_load_command_order_matches_apple_for_common_surface() {
         &obj,
     )
     .expect("assemble");
-    link_with_afs_ld(&[obj.to_str().unwrap(), "-o", ours.to_str().unwrap()]).expect("afs-ld");
+    link_with_afs_ld(&[
+        "-syslibroot",
+        &sdk,
+        "-lSystem",
+        obj.to_str().unwrap(),
+        "-o",
+        ours.to_str().unwrap(),
+    ])
+    .expect("afs-ld");
     let status = Command::new("xcrun")
-        .args(["--sdk", "macosx", "clang", "-arch", "arm64"])
-        .arg(&obj)
-        .arg("-o")
+        .args([
+            "ld",
+            "-arch",
+            "arm64",
+            "-syslibroot",
+            &sdk,
+            "-lSystem",
+            "-e",
+            "_main",
+            "-o",
+        ])
         .arg(&theirs)
+        .arg(&obj)
         .status()
-        .expect("spawn clang");
-    assert!(status.success(), "clang link failed");
+        .expect("spawn ld");
+    assert!(status.success(), "ld link failed");
 
     assert_eq!(
         normalize(&command_ids(&ours)),
@@ -181,14 +222,18 @@ fn executable_load_command_order_matches_apple_for_common_surface() {
 
 #[test]
 fn dylib_load_command_order_matches_apple_for_common_surface() {
-    if !have_xcrun() || !have_clang() {
-        eprintln!("skipping: xcrun as / clang unavailable");
+    if !have_xcrun() || !have_ld() {
+        eprintln!("skipping: xcrun as / ld unavailable");
         return;
     }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
 
     let obj = scratch("lib.o");
     let ours = scratch("ours.dylib");
-    let theirs = scratch("clang.dylib");
+    let theirs = scratch("apple.dylib");
     assemble(
         r#"
             .section __TEXT,__text,regular,pure_instructions
@@ -201,21 +246,32 @@ fn dylib_load_command_order_matches_apple_for_common_surface() {
     .expect("assemble");
     link_with_afs_ld(&[
         "-dylib",
+        "-syslibroot",
+        &sdk,
+        "-lSystem",
         obj.to_str().unwrap(),
         "-o",
         ours.to_str().unwrap(),
     ])
     .expect("afs-ld dylib");
     let status = Command::new("xcrun")
-        .args(["--sdk", "macosx", "clang", "-shared", "-arch", "arm64"])
-        .arg(&obj)
-        .arg("-install_name")
-        .arg("@rpath/libparity.dylib")
-        .arg("-o")
+        .args([
+            "ld",
+            "-dylib",
+            "-arch",
+            "arm64",
+            "-syslibroot",
+            &sdk,
+            "-lSystem",
+            "-install_name",
+            "@rpath/libparity.dylib",
+            "-o",
+        ])
         .arg(&theirs)
+        .arg(&obj)
         .status()
-        .expect("spawn clang");
-    assert!(status.success(), "clang dylib link failed");
+        .expect("spawn ld");
+    assert!(status.success(), "ld dylib link failed");
 
     assert_eq!(
         normalize(&command_ids(&ours)),
@@ -229,15 +285,19 @@ fn dylib_load_command_order_matches_apple_for_common_surface() {
 
 #[test]
 fn executable_load_command_order_with_dependency_and_rpath_matches_common_surface() {
-    if !have_xcrun() || !have_clang() {
-        eprintln!("skipping: xcrun as / clang unavailable");
+    if !have_xcrun() || !have_clang() || !have_ld() {
+        eprintln!("skipping: xcrun as / clang / ld unavailable");
         return;
     }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
 
     let obj = scratch("dep-main.o");
     let dep = scratch("dep.dylib");
     let ours = scratch("ours-dep");
-    let theirs = scratch("clang-dep");
+    let theirs = scratch("apple-dep");
     assemble(
         r#"
             .section __TEXT,__text,regular,pure_instructions
@@ -251,6 +311,9 @@ fn executable_load_command_order_with_dependency_and_rpath_matches_common_surfac
     build_test_dylib("int dep(void) { return 1; }\n", &dep, "@rpath/libdep.dylib")
         .expect("build dylib");
     link_with_afs_ld(&[
+        "-syslibroot",
+        &sdk,
+        "-lSystem",
         obj.to_str().unwrap(),
         dep.to_str().unwrap(),
         "-rpath",
@@ -261,15 +324,25 @@ fn executable_load_command_order_with_dependency_and_rpath_matches_common_surfac
     .expect("afs-ld with dep");
 
     let status = Command::new("xcrun")
-        .args(["--sdk", "macosx", "clang", "-arch", "arm64"])
+        .args([
+            "ld",
+            "-arch",
+            "arm64",
+            "-syslibroot",
+            &sdk,
+            "-lSystem",
+            "-e",
+            "_main",
+            "-o",
+        ])
+        .arg(&theirs)
         .arg(&obj)
         .arg(&dep)
-        .arg("-Wl,-rpath,@executable_path/../lib")
-        .arg("-o")
-        .arg(&theirs)
+        .arg("-rpath")
+        .arg("@executable_path/../lib")
         .status()
-        .expect("spawn clang");
-    assert!(status.success(), "clang dep link failed");
+        .expect("spawn ld");
+    assert!(status.success(), "ld dep link failed");
 
     assert_eq!(
         normalize(&command_ids(&ours)),

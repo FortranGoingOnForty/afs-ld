@@ -477,12 +477,6 @@ fn build_commands(
         }
     }
 
-    for rpath in &opts.rpaths {
-        commands.push(LoadCommand::Rpath(RpathCmd {
-            path: rpath.clone(),
-        }));
-    }
-
     for dylib in dylibs {
         commands.push(LoadCommand::Dylib(DylibCmd {
             cmd: dylib.kind.load_cmd(),
@@ -490,6 +484,12 @@ fn build_commands(
             timestamp: 2,
             current_version: dylib.current_version,
             compatibility_version: dylib.compatibility_version,
+        }));
+    }
+
+    for rpath in &opts.rpaths {
+        commands.push(LoadCommand::Rpath(RpathCmd {
+            path: rpath.clone(),
         }));
     }
 

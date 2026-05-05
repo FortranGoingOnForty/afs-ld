@@ -1718,6 +1718,7 @@ fn build_output_symbols_profiled(
 ) -> Result<(SymbolTablePlan, SymbolPlanBuildTimings), WriteError> {
     let sym_table = inputs.0.sym_table;
     let atom_sections = atom_section_ordinals(layout);
+    let atom_addrs = atom_addresses(layout);
     let atoms_by_input_section = inputs.0.atom_table.by_input_section();
     let atom_ranges = build_atom_range_index(
         inputs.0.atom_table,
@@ -1773,10 +1774,11 @@ fn build_output_symbols_profiled(
             atom_table: inputs.0.atom_table,
             atom_ranges: &atom_ranges,
             atom_sections: &atom_sections,
+            atom_addrs: &atom_addrs,
             input_id: input.id,
             file_index: file_index_by_input[&input.id],
         };
-        collect_local_symbols(layout, &ctx, input.object, &mut locals)?;
+        collect_local_symbols(&ctx, input.object, &mut locals)?;
     }
     collect_synthetic_local_symbols(layout, inputs.0.synthetic_plan, &mut locals)?;
     timings.locals += phase_started.elapsed();
@@ -1804,12 +1806,12 @@ fn build_output_symbols_profiled(
         let (n_type, n_sect, n_value) = if atom.0 == 0 {
             (absolute_symbol_type(hidden), NO_SECT, *value)
         } else {
-            if dead_strip && layout.atom_addr(*atom).is_none() {
-                continue;
-            }
-            let addr = layout
-                .atom_addr(*atom)
-                .ok_or(WriteError::DefinedSymbolAtomMissing(symbol_id, *atom))?;
+            let Some(addr) = atom_addrs.get(atom).copied() else {
+                if dead_strip {
+                    continue;
+                }
+                return Err(WriteError::DefinedSymbolAtomMissing(symbol_id, *atom));
+            };
             let sect = *atom_sections
                 .get(atom)
                 .ok_or(WriteError::DefinedSymbolSectionMissing(symbol_id, *atom))?;
@@ -2017,7 +2019,6 @@ fn collect_synthetic_local_symbols(
 }
 
 fn collect_local_symbols(
-    layout: &Layout,
     ctx: &LocalSymbolContext<'_>,
     object: &ObjectFile,
     out: &mut Vec<OutputSymbolSpec>,
@@ -2046,14 +2047,9 @@ fn collect_local_symbols(
                     offset,
                 )
                 .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
-                let addr =
-                    layout
-                        .atom_addr(atom_id)
-                        .ok_or(WriteError::DefinedSymbolAtomMissing(
-                            SymbolId(u32::MAX),
-                            atom_id,
-                        ))?
-                        + delta as u64;
+                let addr = ctx.atom_addrs.get(&atom_id).copied().ok_or(
+                    WriteError::DefinedSymbolAtomMissing(SymbolId(u32::MAX), atom_id),
+                )? + delta as u64;
                 let n_sect = *ctx.atom_sections.get(&atom_id).ok_or(
                     WriteError::DefinedSymbolSectionMissing(SymbolId(u32::MAX), atom_id),
                 )?;
@@ -2092,6 +2088,7 @@ struct LocalSymbolContext<'a> {
     atom_table: &'a AtomTable,
     atom_ranges: &'a AtomRangeIndex,
     atom_sections: &'a HashMap<crate::resolve::AtomId, u8>,
+    atom_addrs: &'a HashMap<crate::resolve::AtomId, u64>,
     input_id: InputId,
     file_index: usize,
 }
@@ -2196,6 +2193,16 @@ fn atom_section_ordinals(layout: &Layout) -> HashMap<crate::resolve::AtomId, u8>
         let ordinal = (idx + 1) as u8;
         for placed in &section.atoms {
             out.insert(placed.atom, ordinal);
+        }
+    }
+    out
+}
+
+fn atom_addresses(layout: &Layout) -> HashMap<AtomId, u64> {
+    let mut out = HashMap::new();
+    for section in &layout.sections {
+        for placed in &section.atoms {
+            out.insert(placed.atom, section.addr + placed.offset);
         }
     }
     out

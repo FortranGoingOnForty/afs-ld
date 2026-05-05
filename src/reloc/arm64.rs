@@ -84,6 +84,7 @@ struct InputSectionResolveCtx<'a> {
 
 const THUNK_SIZE: u64 = 12;
 const BR_X16: u32 = 0xd61f_0200;
+const BRANCH26_MAX_FORWARD_DELTA_BYTES: u64 = ((1u64 << 25) - 1) * 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BranchTargetKey {
@@ -509,6 +510,10 @@ pub fn plan_thunks(
         icf_redirects,
         parsed_relocs,
     } = ctx;
+
+    if opts.thunks == ThunkMode::Safe && layout_fits_branch26_span(layout) {
+        return Ok(None);
+    }
 
     let input_map: HashMap<InputId, &ObjectFile> = inputs
         .iter()
@@ -942,6 +947,19 @@ fn resolve_branch_target_from_key(
 fn branch26_in_range(place: u64, target: u64) -> bool {
     let delta = target.wrapping_sub(place) as i64;
     delta & 0b11 == 0 && fits_signed(delta >> 2, 26)
+}
+
+fn layout_fits_branch26_span(layout: &Layout) -> bool {
+    let mut min_addr = u64::MAX;
+    let mut max_addr = 0u64;
+    for section in &layout.sections {
+        if section.segment == "__LINKEDIT" || section.size == 0 {
+            continue;
+        }
+        min_addr = min_addr.min(section.addr);
+        max_addr = max_addr.max(section.addr.saturating_add(section.size));
+    }
+    min_addr == u64::MAX || max_addr.saturating_sub(min_addr) <= BRANCH26_MAX_FORWARD_DELTA_BYTES
 }
 
 fn synthesize_thunk_section(
@@ -2656,6 +2674,35 @@ mod tests {
     }
 
     #[test]
+    fn branch26_span_fast_path_rejects_only_large_non_linkedit_images() {
+        let small = Layout {
+            kind: OutputKind::Executable,
+            segments: Vec::new(),
+            sections: vec![
+                output_section("__TEXT", "__text", 0x1_0000_0000, 0x100),
+                output_section("__DATA", "__data", 0x1_0001_0000, 0x100),
+                output_section("__LINKEDIT", "__linkedit", 0x1_8000_0000, 0x1000),
+            ],
+        };
+        assert!(layout_fits_branch26_span(&small));
+
+        let large = Layout {
+            kind: OutputKind::Executable,
+            segments: Vec::new(),
+            sections: vec![
+                output_section("__TEXT", "__text", 0x1_0000_0000, 0x100),
+                output_section(
+                    "__DATA",
+                    "__data",
+                    0x1_0000_0000 + BRANCH26_MAX_FORWARD_DELTA_BYTES + 1,
+                    0x100,
+                ),
+            ],
+        };
+        assert!(!layout_fits_branch26_span(&large));
+    }
+
+    #[test]
     fn thunk_plan_splits_monolithic_text_section_into_multiple_islands() {
         let gap = 0x0900_0000u32;
         let caller2_offset = 4 + gap;
@@ -2802,6 +2849,25 @@ mod tests {
         let mut out = Vec::new();
         write_raw_relocs(&raws, &mut out);
         out
+    }
+
+    fn output_section(segment: &str, name: &str, addr: u64, size: u64) -> OutputSection {
+        OutputSection {
+            segment: segment.into(),
+            name: name.into(),
+            kind: SectionKind::Text,
+            align_pow2: 2,
+            flags: 0,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            atoms: Vec::new(),
+            synthetic_offset: 0,
+            synthetic_data: Vec::new(),
+            addr,
+            size,
+            file_off: 0,
+        }
     }
 
     fn thunk_test_object(raw_relocs: Vec<u8>, target_offset: u64, section_size: u64) -> ObjectFile {

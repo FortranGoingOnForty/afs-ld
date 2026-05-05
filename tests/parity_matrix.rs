@@ -8,6 +8,8 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use common::harness::{
@@ -40,19 +42,17 @@ fn parity_corpus() {
         fs::create_dir_all(dir).expect("create parity artifact dir");
     }
 
-    let mut case_reports = Vec::new();
     let mut failures = Vec::new();
+    let case_reports = run_cases(cases);
 
-    for case in cases {
-        let report = run_case(&case);
+    for (case, report) in &case_reports {
         if let Some(dir) = artifact_dir.as_ref() {
-            write_case_artifact(dir, &case, &report).expect("write case artifact");
+            write_case_artifact(dir, case, report).expect("write case artifact");
         }
         if let Some(error) = report.error_message(&case.name) {
             eprintln!("parity failure:\n{error}\n");
             failures.push(error);
         }
-        case_reports.push((case, report));
     }
     print_timing_summary(started.elapsed(), &case_reports);
 
@@ -76,6 +76,47 @@ fn parity_corpus() {
             limit
         );
     }
+}
+
+fn run_cases(cases: Vec<LinkCase>) -> Vec<(LinkCase, CaseReport)> {
+    let job_count = parity_matrix_jobs(cases.len());
+    if job_count <= 1 || cases.len() <= 1 {
+        return cases
+            .into_iter()
+            .map(|case| {
+                let report = run_case(&case);
+                (case, report)
+            })
+            .collect();
+    }
+
+    let queue = Arc::new(Mutex::new(cases.into_iter().enumerate()));
+    let (tx, rx) = mpsc::channel();
+    thread::scope(|scope| {
+        for _ in 0..job_count {
+            let queue = Arc::clone(&queue);
+            let tx = tx.clone();
+            scope.spawn(move || loop {
+                let Some((index, case)) = queue
+                    .lock()
+                    .expect("parity case queue mutex poisoned")
+                    .next()
+                else {
+                    break;
+                };
+                let report = run_case(&case);
+                tx.send((index, case, report))
+                    .expect("parity result receiver should stay live");
+            });
+        }
+        drop(tx);
+        let mut reports: Vec<_> = rx.into_iter().collect();
+        reports.sort_by_key(|(index, _, _)| *index);
+        reports
+            .into_iter()
+            .map(|(_, case, report)| (case, report))
+            .collect()
+    })
 }
 
 #[derive(Debug)]
@@ -383,6 +424,22 @@ fn parity_matrix_time_limit() -> Option<Duration> {
     let raw = std::env::var("PARITY_MATRIX_MAX_SECONDS").ok()?;
     let seconds = raw.parse::<u64>().ok()?;
     Some(Duration::from_secs(seconds))
+}
+
+fn parity_matrix_jobs(case_count: usize) -> usize {
+    if case_count == 0 {
+        return 1;
+    }
+    let requested = std::env::var("PARITY_MATRIX_JOBS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|jobs| *jobs > 0)
+        .unwrap_or_else(|| {
+            thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+        });
+    requested.min(case_count).max(1)
 }
 
 fn format_duration(duration: Duration) -> String {

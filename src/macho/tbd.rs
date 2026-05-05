@@ -123,17 +123,636 @@ pub fn parse_tbd(input: &str) -> Result<Vec<Tbd>, TbdError> {
     let docs = parse_documents(input)?;
     let mut out = Vec::with_capacity(docs.len());
     for d in docs {
-        out.push(decode_document(&d)?);
+        out.push(decode_document(d)?);
     }
     Ok(out)
 }
 
-fn decode_document(doc: &Document) -> Result<Tbd, TbdError> {
-    let m = doc
-        .root
-        .as_mapping()
-        .ok_or_else(|| schema("top level of a TBD document must be a mapping"))?;
+/// Parse a TBD for the linker hot path, keeping only documents and scoped
+/// symbol lists that can satisfy `target`.
+///
+/// The fast path handles Apple's emitted TAPI v4 shape directly and avoids
+/// constructing the generic YAML `Value` tree for the thousands of symbols in
+/// libSystem.tbd. If it sees a shape outside that subset, it falls back to the
+/// generic decoder and applies the same target filter afterward.
+pub fn parse_tbd_for_target(input: &str, target: &Target) -> Result<Vec<Tbd>, TbdError> {
+    match parse_tbd_for_target_direct(input, target, true) {
+        Ok(docs) => Ok(docs),
+        Err(_) => {
+            let docs = parse_tbd(input)?;
+            Ok(filter_docs_for_target(docs, target))
+        }
+    }
+}
 
+/// Parse only load-command-relevant TBD metadata for `target`.
+///
+/// This is used for links that have no unresolved dylib symbols; emitting the
+/// requested `LC_LOAD_DYLIB` does not require materializing libSystem's full
+/// export surface.
+pub fn parse_tbd_metadata_for_target(input: &str, target: &Target) -> Result<Vec<Tbd>, TbdError> {
+    match parse_tbd_for_target_direct(input, target, false) {
+        Ok(docs) => Ok(docs),
+        Err(_) => {
+            let docs = parse_tbd(input)?;
+            Ok(filter_docs_for_target_metadata(docs, target))
+        }
+    }
+}
+
+fn filter_docs_for_target(mut docs: Vec<Tbd>, target: &Target) -> Vec<Tbd> {
+    docs.retain(|doc| targets_match(&doc.targets, target));
+    for doc in &mut docs {
+        doc.parent_umbrella
+            .retain(|scoped| targets_match(&scoped.targets, target));
+        doc.allowable_clients
+            .retain(|scoped| targets_match(&scoped.targets, target));
+        doc.reexported_libraries
+            .retain(|scoped| targets_match(&scoped.targets, target));
+        doc.exports
+            .retain(|scoped| targets_match(&scoped.targets, target));
+        doc.reexports
+            .retain(|scoped| targets_match(&scoped.targets, target));
+    }
+    docs
+}
+
+fn filter_docs_for_target_metadata(docs: Vec<Tbd>, target: &Target) -> Vec<Tbd> {
+    let mut docs = filter_docs_for_target(docs, target);
+    for doc in &mut docs {
+        doc.reexported_libraries.clear();
+        doc.exports.clear();
+        doc.reexports.clear();
+    }
+    docs
+}
+
+fn parse_tbd_for_target_direct(
+    input: &str,
+    target: &Target,
+    include_exports: bool,
+) -> Result<Vec<Tbd>, TbdError> {
+    let lines: Vec<&str> = input.lines().collect();
+    let mut docs = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let Some(trimmed) = direct_trimmed(lines[i]) else {
+            i += 1;
+            continue;
+        };
+        if trimmed.starts_with("%YAML") || trimmed.starts_with("...") {
+            i += 1;
+            continue;
+        }
+        if trimmed.starts_with("---") {
+            i += 1;
+        }
+
+        let (doc, next) = parse_direct_document(&lines, i, target, include_exports)?;
+        i = next;
+        if doc.install_name.is_empty() && doc.targets.is_empty() {
+            continue;
+        }
+        if targets_match(&doc.targets, target) {
+            docs.push(doc);
+        }
+    }
+    Ok(docs)
+}
+
+fn parse_direct_document(
+    lines: &[&str],
+    mut i: usize,
+    target: &Target,
+    include_exports: bool,
+) -> Result<(Tbd, usize), TbdError> {
+    let mut tbd = Tbd::default();
+    while i < lines.len() {
+        let Some(trimmed) = direct_trimmed(lines[i]) else {
+            i += 1;
+            continue;
+        };
+        if trimmed.starts_with("---") || trimmed.starts_with("...") {
+            break;
+        }
+        if direct_indent(lines[i]) != 0 {
+            return Err(schema("unexpected nested TBD line at document root"));
+        }
+        let (key, rest) =
+            direct_key_value(trimmed).ok_or_else(|| schema("expected top-level TBD key"))?;
+        match key {
+            "tbd-version" => {
+                tbd.version = parse_direct_scalar(rest)
+                    .parse()
+                    .map_err(|_| schema(&format!("tbd-version must parse as a u32: {rest:?}")))?;
+                i += 1;
+            }
+            "targets" => {
+                let (targets, next) = parse_direct_targets(lines, i, rest)?;
+                tbd.targets = targets;
+                i = next;
+            }
+            "install-name" => {
+                tbd.install_name = parse_direct_scalar(rest);
+                i += 1;
+            }
+            "current-version" => {
+                tbd.current_version = Some(parse_direct_scalar(rest));
+                i += 1;
+            }
+            "compatibility-version" => {
+                tbd.compatibility_version = Some(parse_direct_scalar(rest));
+                i += 1;
+            }
+            "parent-umbrella" => {
+                let (value, next) = parse_direct_scoped_scalars(lines, i + 1, target, "umbrella")?;
+                tbd.parent_umbrella = value;
+                i = next;
+            }
+            "allowable-clients" => {
+                let (value, next) = parse_direct_scoped_lists(lines, i + 1, target, "clients")?;
+                tbd.allowable_clients = value;
+                i = next;
+            }
+            "reexported-libraries" if include_exports => {
+                let (value, next) = parse_direct_scoped_lists(lines, i + 1, target, "libraries")?;
+                tbd.reexported_libraries = value;
+                i = next;
+            }
+            "reexported-libraries" => {
+                i = skip_direct_value(lines, i + 1);
+            }
+            "exports" if include_exports => {
+                let (value, next) = parse_direct_scoped_symbols(lines, i + 1, target)?;
+                tbd.exports = value;
+                i = next;
+            }
+            "exports" => {
+                i = skip_direct_value(lines, i + 1);
+            }
+            "reexports" if include_exports => {
+                let (value, next) = parse_direct_scoped_symbols(lines, i + 1, target)?;
+                tbd.reexports = value;
+                i = next;
+            }
+            "reexports" => {
+                i = skip_direct_value(lines, i + 1);
+            }
+            _ => {
+                i = skip_direct_value(lines, i + 1);
+            }
+        }
+    }
+
+    if !tbd.install_name.is_empty() || !tbd.targets.is_empty() {
+        if tbd.install_name.is_empty() {
+            return Err(schema("TBD document missing required 'install-name'"));
+        }
+        if tbd.targets.is_empty() {
+            return Err(schema("TBD document missing required 'targets'"));
+        }
+    }
+    Ok((tbd, i))
+}
+
+fn parse_direct_scoped_scalars(
+    lines: &[&str],
+    mut i: usize,
+    target: &Target,
+    value_key: &str,
+) -> Result<(Vec<Scoped<String>>, usize), TbdError> {
+    let mut out = Vec::new();
+    let ctx = DirectCtx { lines, target };
+    while let Some(entry) = direct_entry_start(lines, i) {
+        let mut state = DirectScopeState::default();
+        let mut value = None;
+        let (key, rest) = entry?;
+        apply_direct_scalar_pair((key, rest), ctx, &mut i, &mut state, value_key, &mut value)?;
+        while let Some((key, rest)) = direct_nested_pair(lines, i) {
+            apply_direct_scalar_pair((key, rest), ctx, &mut i, &mut state, value_key, &mut value)?;
+        }
+        if state.include == Some(true) {
+            out.push(Scoped {
+                targets: state
+                    .targets
+                    .ok_or_else(|| schema("missing required key \"targets\""))?,
+                value: value.unwrap_or_default(),
+            });
+        }
+    }
+    Ok((out, i))
+}
+
+type DirectScopedList = Vec<Scoped<Vec<String>>>;
+type DirectScopedListResult = Result<(DirectScopedList, usize), TbdError>;
+
+#[derive(Clone, Copy)]
+struct DirectCtx<'a, 't> {
+    lines: &'a [&'a str],
+    target: &'t Target,
+}
+
+#[derive(Default)]
+struct DirectScopeState {
+    targets: Option<Vec<Target>>,
+    include: Option<bool>,
+}
+
+fn parse_direct_scoped_lists(
+    lines: &[&str],
+    mut i: usize,
+    target: &Target,
+    value_key: &str,
+) -> DirectScopedListResult {
+    let mut out = Vec::new();
+    let ctx = DirectCtx { lines, target };
+    while let Some(entry) = direct_entry_start(lines, i) {
+        let mut state = DirectScopeState::default();
+        let mut value = Vec::new();
+        let (key, rest) = entry?;
+        apply_direct_list_pair((key, rest), ctx, &mut i, &mut state, value_key, &mut value)?;
+        while let Some((key, rest)) = direct_nested_pair(lines, i) {
+            apply_direct_list_pair((key, rest), ctx, &mut i, &mut state, value_key, &mut value)?;
+        }
+        if state.include == Some(true) {
+            out.push(Scoped {
+                targets: state
+                    .targets
+                    .ok_or_else(|| schema("missing required key \"targets\""))?,
+                value,
+            });
+        }
+    }
+    Ok((out, i))
+}
+
+fn parse_direct_scoped_symbols(
+    lines: &[&str],
+    mut i: usize,
+    target: &Target,
+) -> Result<(Vec<Scoped<SymbolLists>>, usize), TbdError> {
+    let mut out = Vec::new();
+    let ctx = DirectCtx { lines, target };
+    while let Some(entry) = direct_entry_start(lines, i) {
+        let mut state = DirectScopeState::default();
+        let mut lists = SymbolLists::default();
+        let (key, rest) = entry?;
+        apply_direct_symbol_pair((key, rest), ctx, &mut i, &mut state, &mut lists)?;
+        while let Some((key, rest)) = direct_nested_pair(lines, i) {
+            apply_direct_symbol_pair((key, rest), ctx, &mut i, &mut state, &mut lists)?;
+        }
+        if state.include == Some(true) {
+            out.push(Scoped {
+                targets: state
+                    .targets
+                    .ok_or_else(|| schema("missing required key \"targets\""))?,
+                value: lists,
+            });
+        }
+    }
+    Ok((out, i))
+}
+
+fn apply_direct_scalar_pair(
+    pair: (&str, &str),
+    ctx: DirectCtx<'_, '_>,
+    i: &mut usize,
+    state: &mut DirectScopeState,
+    value_key: &str,
+    value: &mut Option<String>,
+) -> Result<(), TbdError> {
+    let (key, rest) = pair;
+    if key == "targets" {
+        let (parsed, next) = parse_direct_targets(ctx.lines, *i, rest)?;
+        state.include = Some(targets_match(&parsed, ctx.target));
+        state.targets = Some(parsed);
+        *i = next;
+    } else if key == value_key {
+        if state.include != Some(false) {
+            *value = Some(parse_direct_scalar(rest));
+        }
+        *i += 1;
+    } else {
+        *i = skip_direct_inline_value(ctx.lines, *i, rest)?;
+    }
+    Ok(())
+}
+
+fn apply_direct_list_pair(
+    pair: (&str, &str),
+    ctx: DirectCtx<'_, '_>,
+    i: &mut usize,
+    state: &mut DirectScopeState,
+    value_key: &str,
+    value: &mut Vec<String>,
+) -> Result<(), TbdError> {
+    let (key, rest) = pair;
+    if key == "targets" {
+        let (parsed, next) = parse_direct_targets(ctx.lines, *i, rest)?;
+        state.include = Some(targets_match(&parsed, ctx.target));
+        state.targets = Some(parsed);
+        *i = next;
+    } else if key == value_key {
+        if state.include == Some(false) {
+            *i = skip_direct_flow(ctx.lines, *i, rest)?;
+        } else {
+            let (parsed, next) = parse_direct_string_list(ctx.lines, *i, rest)?;
+            *value = parsed;
+            *i = next;
+        }
+    } else {
+        *i = skip_direct_inline_value(ctx.lines, *i, rest)?;
+    }
+    Ok(())
+}
+
+fn apply_direct_symbol_pair(
+    pair: (&str, &str),
+    ctx: DirectCtx<'_, '_>,
+    i: &mut usize,
+    state: &mut DirectScopeState,
+    lists: &mut SymbolLists,
+) -> Result<(), TbdError> {
+    let (key, rest) = pair;
+    if key == "targets" {
+        let (parsed, next) = parse_direct_targets(ctx.lines, *i, rest)?;
+        state.include = Some(targets_match(&parsed, ctx.target));
+        state.targets = Some(parsed);
+        *i = next;
+        return Ok(());
+    }
+
+    let slot = match key {
+        "symbols" => Some(&mut lists.symbols),
+        "weak-symbols" => Some(&mut lists.weak_symbols),
+        "thread-local-symbols" => Some(&mut lists.thread_local_symbols),
+        "objc-classes" => Some(&mut lists.objc_classes),
+        "objc-eh-types" => Some(&mut lists.objc_eh_types),
+        "objc-ivars" => Some(&mut lists.objc_ivars),
+        _ => None,
+    };
+    if let Some(slot) = slot {
+        if state.include == Some(false) {
+            *i = skip_direct_flow(ctx.lines, *i, rest)?;
+        } else {
+            let (parsed, next) = parse_direct_string_list(ctx.lines, *i, rest)?;
+            *slot = parsed;
+            *i = next;
+        }
+    } else {
+        *i = skip_direct_inline_value(ctx.lines, *i, rest)?;
+    }
+    Ok(())
+}
+
+type DirectEntry<'a> = Result<(&'a str, &'a str), TbdError>;
+
+fn direct_entry_start<'a>(lines: &'a [&str], i: usize) -> Option<DirectEntry<'a>> {
+    let trimmed = direct_trimmed(lines.get(i)?)?;
+    if trimmed.starts_with("---") || trimmed.starts_with("...") || direct_indent(lines[i]) == 0 {
+        return None;
+    }
+    if direct_indent(lines[i]) != 2 || !trimmed.starts_with('-') {
+        return Some(Err(schema("expected scoped TBD entry")));
+    }
+    let rest = trimmed.strip_prefix('-').unwrap_or("").trim_start();
+    if rest.is_empty() {
+        return Some(Err(schema("empty scoped TBD entries are not supported")));
+    }
+    Some(direct_key_value(rest).ok_or_else(|| schema("expected scoped TBD key")))
+}
+
+fn direct_nested_pair<'a>(lines: &'a [&str], i: usize) -> Option<(&'a str, &'a str)> {
+    let trimmed = direct_trimmed(lines.get(i)?)?;
+    if trimmed.starts_with("---") || trimmed.starts_with("...") {
+        return None;
+    }
+    let indent = direct_indent(lines[i]);
+    if indent <= 2 {
+        return None;
+    }
+    direct_key_value(trimmed)
+}
+
+fn parse_direct_targets(
+    lines: &[&str],
+    i: usize,
+    rest: &str,
+) -> Result<(Vec<Target>, usize), TbdError> {
+    let (items, next) = parse_direct_string_list(lines, i, rest)?;
+    let mut targets = Vec::with_capacity(items.len());
+    for item in items {
+        targets.push(parse_target(&item)?);
+    }
+    Ok((targets, next))
+}
+
+fn parse_direct_string_list(
+    lines: &[&str],
+    i: usize,
+    rest: &str,
+) -> Result<(Vec<String>, usize), TbdError> {
+    let (flow, next) = collect_direct_flow(lines, i, rest)?;
+    Ok((split_direct_flow_scalars(&flow)?, next))
+}
+
+fn collect_direct_flow(lines: &[&str], i: usize, rest: &str) -> Result<(String, usize), TbdError> {
+    let start_line = i + 1;
+    let mut flow = rest.trim().to_string();
+    if !flow.starts_with('[') {
+        return Err(schema("expected a flow sequence"));
+    }
+    let mut next_i = if direct_trimmed(lines.get(i).copied().unwrap_or_default())
+        .map(|line| line.contains(rest.trim()))
+        .unwrap_or(false)
+    {
+        i + 1
+    } else {
+        i
+    };
+    while direct_flow_unbalanced(&flow) {
+        let Some(next) = lines.get(next_i).and_then(|line| direct_trimmed(line)) else {
+            return Err(schema(&format!(
+                "unterminated flow sequence from line {} near line {}: {:?}",
+                start_line,
+                next_i + 1,
+                flow
+            )));
+        };
+        if next.starts_with("---") || next.starts_with("...") {
+            return Err(schema(&format!(
+                "unterminated flow sequence from line {} before line {}: {:?}",
+                start_line,
+                next_i + 1,
+                flow
+            )));
+        }
+        flow.push(' ');
+        flow.push_str(next);
+        next_i += 1;
+    }
+    if !flow.ends_with(']') {
+        return Err(schema("flow sequence must end with ']'"));
+    }
+    Ok((flow, next_i))
+}
+
+fn skip_direct_flow(lines: &[&str], i: usize, rest: &str) -> Result<usize, TbdError> {
+    collect_direct_flow(lines, i, rest).map(|(_, next)| next)
+}
+
+fn skip_direct_inline_value(lines: &[&str], i: usize, rest: &str) -> Result<usize, TbdError> {
+    if rest.trim_start().starts_with('[') {
+        skip_direct_flow(lines, i, rest)
+    } else {
+        Ok(i + 1)
+    }
+}
+
+fn skip_direct_value(lines: &[&str], mut i: usize) -> usize {
+    while i < lines.len() {
+        let Some(trimmed) = direct_trimmed(lines[i]) else {
+            i += 1;
+            continue;
+        };
+        if trimmed.starts_with("---") || trimmed.starts_with("...") || direct_indent(lines[i]) == 0
+        {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+fn split_direct_flow_scalars(flow: &str) -> Result<Vec<String>, TbdError> {
+    let inner = flow
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| schema("flow sequence must be bracketed"))?;
+    let bytes = inner.as_bytes();
+    let mut out = Vec::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'\\' if in_double && i + 1 < bytes.len() => {
+                i += 2;
+                continue;
+            }
+            b'[' | b'{' if !in_single && !in_double => depth += 1,
+            b']' | b'}' if !in_single && !in_double => depth -= 1,
+            b',' if !in_single && !in_double && depth == 0 => {
+                push_direct_flow_scalar(&mut out, &inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if start <= inner.len() {
+        push_direct_flow_scalar(&mut out, &inner[start..]);
+    }
+    Ok(out)
+}
+
+fn push_direct_flow_scalar(out: &mut Vec<String>, item: &str) {
+    let item = item.trim();
+    if !item.is_empty() {
+        out.push(parse_direct_scalar(item));
+    }
+}
+
+fn parse_direct_scalar(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
+        raw[1..raw.len() - 1].replace("''", "'")
+    } else if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        parse_direct_double_quoted(&raw[1..raw.len() - 1])
+    } else {
+        raw.to_string()
+    }
+}
+
+fn parse_direct_double_quoted(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let ch = match bytes[i + 1] {
+                b'n' => '\n',
+                b'r' => '\r',
+                b't' => '\t',
+                b'"' => '"',
+                b'\\' => '\\',
+                other => other as char,
+            };
+            out.push(ch);
+            i += 2;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn direct_key_value(s: &str) -> Option<(&str, &str)> {
+    let (key, rest) = s.split_once(':')?;
+    Some((key.trim(), rest.trim_start()))
+}
+
+fn direct_trimmed(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn direct_indent(line: &str) -> usize {
+    line.bytes().take_while(|b| *b == b' ').count()
+}
+
+fn direct_flow_unbalanced(s: &str) -> bool {
+    let mut depth = 0i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'\\' if in_double && i + 1 < bytes.len() => {
+                i += 2;
+                continue;
+            }
+            b'[' | b'{' if !in_single && !in_double => depth += 1,
+            b']' | b'}' if !in_single && !in_double => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth != 0
+}
+
+fn targets_match(targets: &[Target], target: &Target) -> bool {
+    targets.iter().any(|t| t.matches_requested(target))
+}
+
+fn decode_document(doc: Document) -> Result<Tbd, TbdError> {
+    let Value::Mapping(m) = doc.root else {
+        return Err(schema("top level of a TBD document must be a mapping"));
+    };
     let mut tbd = Tbd::default();
     for (k, v) in m {
         match k.as_str() {
@@ -170,16 +789,13 @@ fn decode_document(doc: &Document) -> Result<Tbd, TbdError> {
     Ok(tbd)
 }
 
-fn decode_target_list(v: &Value) -> Result<Vec<Target>, TbdError> {
-    let seq = v
-        .as_sequence()
-        .ok_or_else(|| schema("'targets' must be a sequence"))?;
+fn decode_target_list(v: Value) -> Result<Vec<Target>, TbdError> {
+    let Value::Sequence(seq) = v else {
+        return Err(schema("'targets' must be a sequence"));
+    };
     let mut out = Vec::with_capacity(seq.len());
     for item in seq {
-        let s = item
-            .as_str()
-            .ok_or_else(|| schema("target must be a scalar"))?;
-        out.push(parse_target(s)?);
+        out.push(parse_target(&scalar_string(item, "target")?)?);
     }
     Ok(out)
 }
@@ -208,17 +824,28 @@ fn parse_target(s: &str) -> Result<Target, TbdError> {
     Ok(Target { arch, platform })
 }
 
-fn decode_scoped_umbrella(v: &Value) -> Result<Vec<Scoped<String>>, TbdError> {
-    let seq = v
-        .as_sequence()
-        .ok_or_else(|| schema("'parent-umbrella' must be a sequence of scoped mappings"))?;
+fn decode_scoped_umbrella(v: Value) -> Result<Vec<Scoped<String>>, TbdError> {
+    let Value::Sequence(seq) = v else {
+        return Err(schema(
+            "'parent-umbrella' must be a sequence of scoped mappings",
+        ));
+    };
     let mut out = Vec::with_capacity(seq.len());
     for item in seq {
-        let m = item
-            .as_mapping()
-            .ok_or_else(|| schema("parent-umbrella entry must be a mapping"))?;
-        let targets = lookup_required(m, "targets").and_then(decode_target_list)?;
-        let umbrella = lookup_required(m, "umbrella").and_then(|v| scalar_string(v, "umbrella"))?;
+        let Value::Mapping(m) = item else {
+            return Err(schema("parent-umbrella entry must be a mapping"));
+        };
+        let mut targets = None;
+        let mut umbrella = None;
+        for (k, v) in m {
+            match k.as_str() {
+                "targets" => targets = Some(decode_target_list(v)?),
+                "umbrella" => umbrella = Some(scalar_string(v, "umbrella")?),
+                _ => {}
+            }
+        }
+        let targets = targets.ok_or_else(|| schema("missing required key \"targets\""))?;
+        let umbrella = umbrella.ok_or_else(|| schema("missing required key \"umbrella\""))?;
         out.push(Scoped {
             targets,
             value: umbrella,
@@ -228,41 +855,46 @@ fn decode_scoped_umbrella(v: &Value) -> Result<Vec<Scoped<String>>, TbdError> {
 }
 
 fn decode_scoped_string_list(
-    v: &Value,
+    v: Value,
     inner_key: &str,
 ) -> Result<Vec<Scoped<Vec<String>>>, TbdError> {
-    let seq = v
-        .as_sequence()
-        .ok_or_else(|| schema("expected a sequence of scoped mappings"))?;
+    let Value::Sequence(seq) = v else {
+        return Err(schema("expected a sequence of scoped mappings"));
+    };
     let mut out = Vec::with_capacity(seq.len());
     for item in seq {
-        let m = item
-            .as_mapping()
-            .ok_or_else(|| schema("scoped entry must be a mapping"))?;
-        let targets = lookup_required(m, "targets").and_then(decode_target_list)?;
-        let value = match m.iter().find(|(k, _)| k == inner_key) {
-            Some((_, v)) => decode_string_list(v, inner_key)?,
-            None => Vec::new(),
+        let Value::Mapping(m) = item else {
+            return Err(schema("scoped entry must be a mapping"));
         };
+        let mut targets = None;
+        let mut value = Vec::new();
+        for (k, v) in m {
+            if k == "targets" {
+                targets = Some(decode_target_list(v)?);
+            } else if k == inner_key {
+                value = decode_string_list(v, inner_key)?;
+            }
+        }
+        let targets = targets.ok_or_else(|| schema("missing required key \"targets\""))?;
         out.push(Scoped { targets, value });
     }
     Ok(out)
 }
 
-fn decode_scoped_symbols(v: &Value) -> Result<Vec<Scoped<SymbolLists>>, TbdError> {
-    let seq = v
-        .as_sequence()
-        .ok_or_else(|| schema("'exports'/'reexports' must be a sequence"))?;
+fn decode_scoped_symbols(v: Value) -> Result<Vec<Scoped<SymbolLists>>, TbdError> {
+    let Value::Sequence(seq) = v else {
+        return Err(schema("'exports'/'reexports' must be a sequence"));
+    };
     let mut out = Vec::with_capacity(seq.len());
     for item in seq {
-        let m = item
-            .as_mapping()
-            .ok_or_else(|| schema("exports entry must be a mapping"))?;
-        let targets = lookup_required(m, "targets").and_then(decode_target_list)?;
+        let Value::Mapping(m) = item else {
+            return Err(schema("exports entry must be a mapping"));
+        };
+        let mut targets = None;
         let mut lists = SymbolLists::default();
         for (k, v) in m {
             match k.as_str() {
-                "targets" => {}
+                "targets" => targets = Some(decode_target_list(v)?),
                 "symbols" => lists.symbols = decode_string_list(v, "symbols")?,
                 "weak-symbols" => lists.weak_symbols = decode_string_list(v, "weak-symbols")?,
                 "thread-local-symbols" => {
@@ -274,6 +906,7 @@ fn decode_scoped_symbols(v: &Value) -> Result<Vec<Scoped<SymbolLists>>, TbdError
                 _ => {} // ignore unknown inner keys
             }
         }
+        let targets = targets.ok_or_else(|| schema("missing required key \"targets\""))?;
         out.push(Scoped {
             targets,
             value: lists,
@@ -282,7 +915,7 @@ fn decode_scoped_symbols(v: &Value) -> Result<Vec<Scoped<SymbolLists>>, TbdError
     Ok(out)
 }
 
-fn decode_string_list(v: &Value, context: &str) -> Result<Vec<String>, TbdError> {
+fn decode_string_list(v: Value, context: &str) -> Result<Vec<String>, TbdError> {
     match v {
         Value::Sequence(items) => {
             let mut out = Vec::with_capacity(items.len());
@@ -296,24 +929,15 @@ fn decode_string_list(v: &Value, context: &str) -> Result<Vec<String>, TbdError>
     }
 }
 
-fn lookup_required<'a>(m: &'a [(String, Value)], key: &str) -> Result<&'a Value, TbdError> {
-    m.iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v)
-        .ok_or_else(|| schema(&format!("missing required key {key:?}")))
-}
-
-fn scalar_u32(v: &Value, context: &str) -> Result<u32, TbdError> {
-    let s = v
-        .as_str()
-        .ok_or_else(|| schema(&format!("{context} must be a scalar")))?;
+fn scalar_u32(v: Value, context: &str) -> Result<u32, TbdError> {
+    let s = scalar_string(v, context)?;
     s.parse()
         .map_err(|_| schema(&format!("{context} must parse as a u32: {s:?}")))
 }
 
-fn scalar_string(v: &Value, context: &str) -> Result<String, TbdError> {
+fn scalar_string(v: Value, context: &str) -> Result<String, TbdError> {
     match v {
-        Value::Scalar(s) => Ok(s.clone()),
+        Value::Scalar(s) => Ok(s),
         _ => Err(schema(&format!("{context} must be a scalar"))),
     }
 }
@@ -372,6 +996,13 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn arm64_macos() -> Target {
+        Target {
+            arch: Arch::Arm64,
+            platform: Platform::MacOs,
+        }
+    }
 
     #[test]
     fn parses_minimal_tbd_v4() {
@@ -453,6 +1084,24 @@ mod tests {
         let tbd = &parse_tbd(src).unwrap()[0];
         assert_eq!(tbd.parent_umbrella.len(), 1);
         assert_eq!(tbd.parent_umbrella[0].value, "System");
+    }
+
+    #[test]
+    fn target_fast_path_keeps_matching_multiline_exports() {
+        let src = "--- !tapi-tbd\n\
+                   tbd-version: 4\n\
+                   targets: [ x86_64-macos, arm64e-macos ]\n\
+                   install-name: '/usr/lib/libfoo.dylib'\n\
+                   exports:\n\
+                   \x20 - targets: [ x86_64-macos ]\n\
+                   \x20   symbols: [ _x86_only ]\n\
+                   \x20 - targets: [ x86_64-macos, arm64e-macos ]\n\
+                   \x20   symbols: [ _arm_one,\n\
+                   \x20              _arm_two ]\n";
+        let docs = parse_tbd_for_target(src, &arm64_macos()).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].exports.len(), 1);
+        assert_eq!(docs[0].exports[0].value.symbols, ["_arm_one", "_arm_two"]);
     }
 
     #[test]

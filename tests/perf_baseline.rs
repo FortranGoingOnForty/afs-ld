@@ -67,6 +67,16 @@ fn assert_profile_basics(name: &str, profile: &LinkProfile) {
         profile.phases.reloc_apply,
         profile.phases.write_output,
     );
+    eprintln!(
+        "{name}: input read={:?} object={:?} archive={:?} dylib={:?} tbd_decode={:?} tbd_materialize={:?} reloc_cache={:?}",
+        profile.phases.input_read,
+        profile.phases.input_object_parse,
+        profile.phases.input_archive_parse,
+        profile.phases.input_dylib_parse,
+        profile.phases.input_tbd_decode,
+        profile.phases.input_tbd_materialize,
+        profile.phases.input_reloc_parse,
+    );
     assert!(profile.output.is_file(), "{name}: output file missing");
     assert!(
         profile.total_wall >= profile.phases.accounted_total(),
@@ -75,6 +85,17 @@ fn assert_profile_basics(name: &str, profile: &LinkProfile) {
     assert!(
         profile.phases.accounted_total() > Duration::ZERO,
         "{name}: all phase timings were zero"
+    );
+    assert!(
+        profile.phases.input_parsing
+            >= profile.phases.input_read
+                + profile.phases.input_object_parse
+                + profile.phases.input_archive_parse
+                + profile.phases.input_dylib_parse
+                + profile.phases.input_tbd_decode
+                + profile.phases.input_tbd_materialize
+                + profile.phases.input_reloc_parse,
+        "{name}: input subphases exceeded input total"
     );
     assert!(
         profile.phases.layout

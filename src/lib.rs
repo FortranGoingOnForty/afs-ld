@@ -34,14 +34,17 @@ use icf::IcfError;
 use layout::{ExtraLayoutSections, Layout, LayoutInput};
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
 use macho::reader::ReadError;
-use macho::tbd::{parse_tbd, parse_version, Arch, Platform, Target};
+use macho::tbd::{
+    parse_tbd_for_target, parse_tbd_metadata_for_target, parse_version, Arch, Platform, Target,
+};
 use reloc::arm64::RelocError;
 use resolve::{
     classify_unresolved, drain_fetches, find_archive_by_path, force_load_all, force_load_archive,
     format_duplicate_diagnostic, format_undefined_diagnostic, format_undefined_warning_diagnostic,
-    seed_all, DrainReport, DylibLoadMeta, InputAddError, Inputs, Symbol, SymbolTable,
+    seed_all, DrainReport, DylibLoadMeta, InputAddError, InputId, Inputs, Symbol, SymbolTable,
     UndefinedTreatment,
 };
+use symbol::SymKind;
 
 const DEFAULT_TBD_VERSION: u32 = 1 << 16;
 const THUNK_PLAN_MAX_ITERATIONS: usize = 16;
@@ -209,6 +212,13 @@ pub enum LinkError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LinkPhaseTimings {
     pub input_parsing: Duration,
+    pub input_read: Duration,
+    pub input_object_parse: Duration,
+    pub input_archive_parse: Duration,
+    pub input_dylib_parse: Duration,
+    pub input_tbd_decode: Duration,
+    pub input_tbd_materialize: Duration,
+    pub input_reloc_parse: Duration,
     pub symbol_resolution: Duration,
     pub atomization: Duration,
     pub layout: Duration,
@@ -245,6 +255,25 @@ impl LinkPhaseTimings {
             + self.reloc_apply
             + self.write_output
     }
+
+    fn add_input_load(&mut self, timings: InputLoadTimings) {
+        self.input_read += timings.read;
+        self.input_object_parse += timings.object_parse;
+        self.input_archive_parse += timings.archive_parse;
+        self.input_dylib_parse += timings.dylib_parse;
+        self.input_tbd_decode += timings.tbd_decode;
+        self.input_tbd_materialize += timings.tbd_materialize;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct InputLoadTimings {
+    read: Duration,
+    object_parse: Duration,
+    archive_parse: Duration,
+    dylib_parse: Duration,
+    tbd_decode: Duration,
+    tbd_materialize: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,12 +493,29 @@ impl Linker {
         load_paths.extend(positional_dylibs);
 
         let mut inputs = Inputs::new();
+        let mut deferred_dylibs = Vec::new();
         let phase_started = Instant::now();
         for (load_order, path) in load_paths.iter().enumerate() {
+            if matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("dylib" | "tbd")
+            ) {
+                deferred_dylibs.push((load_order, path.clone()));
+                continue;
+            }
             if opts.trace_inputs {
                 eprintln!("afs-ld: loading {}", path.display());
             }
-            register_input(&mut inputs, path, load_order)?;
+            let timings = register_input(&mut inputs, path, load_order, true)?;
+            phases.add_input_load(timings);
+        }
+        let include_tbd_exports = inputs_may_need_dylib_exports(&inputs)?;
+        for (load_order, path) in &deferred_dylibs {
+            if opts.trace_inputs {
+                eprintln!("afs-ld: loading {}", path.display());
+            }
+            let timings = register_input(&mut inputs, path, *load_order, include_tbd_exports)?;
+            phases.add_input_load(timings);
         }
         phases.input_parsing = phase_started.elapsed();
 
@@ -591,7 +637,9 @@ impl Linker {
         }
         let phase_started = Instant::now();
         let parsed_relocs = macho::writer::build_parsed_reloc_cache(&layout_inputs)?;
-        phases.input_parsing += phase_started.elapsed();
+        let elapsed = phase_started.elapsed();
+        phases.input_reloc_parse += elapsed;
+        phases.input_parsing += elapsed;
         let layout_started = Instant::now();
         let phase_started = Instant::now();
         let entry_symbol = find_entry_symbol_id(opts, &sym_table)?;
@@ -911,26 +959,45 @@ fn register_input(
     inputs: &mut Inputs,
     path: &std::path::Path,
     load_order: usize,
-) -> Result<(), LinkError> {
+    include_tbd_exports: bool,
+) -> Result<InputLoadTimings, LinkError> {
+    let mut timings = InputLoadTimings::default();
+    let phase_started = Instant::now();
     let bytes = fs::read(path)?;
+    timings.read = phase_started.elapsed();
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("a") => {
+            let phase_started = Instant::now();
             let _ = inputs.add_archive(path.to_path_buf(), bytes, load_order)?;
+            timings.archive_parse = phase_started.elapsed();
         }
         Some("dylib") => {
+            let phase_started = Instant::now();
             let _ = inputs.add_dylib(path.to_path_buf(), bytes)?;
+            timings.dylib_parse = phase_started.elapsed();
         }
         Some("tbd") => {
+            let phase_started = Instant::now();
             let text = std::str::from_utf8(&bytes).map_err(|e| {
                 LinkError::Tbd(macho::tbd::TbdError::Schema {
                     msg: format!("TBD input is not UTF-8: {e}"),
                 })
             })?;
-            let docs = parse_tbd(text)?;
             let target = Target {
                 arch: Arch::Arm64,
                 platform: Platform::MacOs,
             };
+            let docs = if include_tbd_exports {
+                parse_tbd_for_target(text, &target)?
+            } else {
+                parse_tbd_metadata_for_target(text, &target)?
+            };
+            timings.tbd_decode = phase_started.elapsed();
+
+            let phase_started = Instant::now();
+            if docs.is_empty() {
+                return Err(LinkError::NoTbdDocument(path.to_path_buf()));
+            }
             let canonical = docs
                 .iter()
                 .find(|doc| doc.parent_umbrella.is_empty())
@@ -949,25 +1016,39 @@ fn register_input(
                     .unwrap_or(DEFAULT_TBD_VERSION),
                 ordinal: inputs.next_dylib_ordinal(),
             };
-            let mut loaded = false;
-            for doc in docs
-                .iter()
-                .filter(|doc| doc.targets.iter().any(|t| t.matches_requested(&target)))
-            {
+            for doc in &docs {
                 let file = DylibFile::from_tbd(path, doc, &target);
                 let _ =
                     inputs.add_dylib_from_file_with_meta(path.to_path_buf(), file, load.clone());
-                loaded = true;
             }
-            if !loaded {
-                return Err(LinkError::NoTbdDocument(path.to_path_buf()));
-            }
+            timings.tbd_materialize = phase_started.elapsed();
         }
         _ => {
+            let phase_started = Instant::now();
             let _ = inputs.add_object(path.to_path_buf(), bytes, load_order)?;
+            timings.object_parse = phase_started.elapsed();
         }
     }
-    Ok(())
+    Ok(timings)
+}
+
+fn inputs_may_need_dylib_exports(inputs: &Inputs) -> Result<bool, LinkError> {
+    if !inputs.archives.is_empty() {
+        return Ok(true);
+    }
+    for i in 0..inputs.objects.len() {
+        let input_id = InputId(i as u32);
+        let object = inputs.object_file(input_id)?;
+        if object.symbols.iter().any(|sym| {
+            sym.stab_kind().is_none()
+                && (sym.is_ext() || sym.is_private_ext())
+                && sym.kind() == SymKind::Undef
+                && !sym.is_common()
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn resolve_entry_point(

@@ -20,7 +20,7 @@
 //! Skipped if `xcrun` or `libSystem.tbd` aren't present.
 
 use afs_ld::macho::dylib::{DylibFile, DylibLoadKind};
-use afs_ld::macho::tbd::{parse_tbd, Arch, Platform, Target};
+use afs_ld::macho::tbd::{parse_tbd, parse_tbd_for_target, Arch, Platform, Target};
 
 fn sdk_path() -> Option<String> {
     let out = std::process::Command::new("xcrun")
@@ -54,6 +54,12 @@ fn libsystem_tbd_materializes_into_dylib_file() {
         arch: Arch::Arm64,
         platform: Platform::MacOs,
     };
+    let fast_docs = parse_tbd_for_target(&src, &target)
+        .unwrap_or_else(|e| panic!("libSystem.tbd fast path failed to parse: {e}"));
+    assert!(
+        !fast_docs.is_empty(),
+        "fast path did not keep any arm64-compatible documents"
+    );
     let dy = DylibFile::from_tbd(&path, main, &target);
 
     assert_eq!(dy.install_name, "/usr/lib/libSystem.B.dylib");
@@ -105,6 +111,31 @@ fn libsystem_tbd_materializes_into_dylib_file() {
         found.contains("_free"),
         "_free not found anywhere in libSystem's TBD re-export chain"
     );
+
+    let mut fast_found = std::collections::HashSet::<&str>::new();
+    for doc in &fast_docs {
+        let sub = DylibFile::from_tbd(&path, doc, &target);
+        for entry in sub.exports.entries().unwrap() {
+            match entry.name.as_str() {
+                "_atexit" => {
+                    fast_found.insert("_atexit");
+                }
+                "_write" => {
+                    fast_found.insert("_write");
+                }
+                "__Unwind_Backtrace" => {
+                    fast_found.insert("__Unwind_Backtrace");
+                }
+                _ => {}
+            }
+        }
+    }
+    for expected in ["_atexit", "_write", "__Unwind_Backtrace"] {
+        assert!(
+            fast_found.contains(expected),
+            "{expected} not found by libSystem fast path; got {fast_found:?}"
+        );
+    }
 
     // libSystem re-exports most actual libc symbols (malloc, free, etc.) from
     // sub-dylibs. They come from the `reexported-libraries`, not from

@@ -63,6 +63,10 @@ impl StringInterner {
         Istr(id)
     }
 
+    pub fn get(&self, s: &str) -> Option<Istr> {
+        self.index.get(s).copied().map(Istr)
+    }
+
     pub fn resolve(&self, i: Istr) -> &str {
         &self.strings[i.0 as usize]
     }
@@ -552,6 +556,10 @@ impl SymbolTable {
 
     pub fn lookup(&self, name: Istr) -> Option<SymbolId> {
         self.by_name.get(&name).copied()
+    }
+
+    pub fn lookup_str(&self, name: &str) -> Option<SymbolId> {
+        self.interner.get(name).and_then(|name| self.lookup(name))
     }
 
     pub fn get(&self, id: SymbolId) -> &Symbol {

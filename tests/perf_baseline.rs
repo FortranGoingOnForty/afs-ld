@@ -39,12 +39,18 @@ fn executable_opts(inputs: Vec<PathBuf>, output: PathBuf) -> LinkOptions {
 
 fn assert_profile_basics(name: &str, profile: &LinkProfile) {
     eprintln!(
-        "{name}: total={:?} parse={:?} resolve={:?} atomize={:?} layout={:?} synth={:?} (linkedit={:?}: symbols={:?} [locals={:?} globals={:?} strtab={:?}] dyld={:?} metadata={:?} codesig={:?}; unwind={:?}) reloc={:?} write={:?}",
+        "{name}: total={:?} parse={:?} resolve={:?} atomize={:?} layout={:?} (entry={:?} dead={:?} icf={:?} synth_plan={:?} build={:?} thunks={:?}) synth={:?} (linkedit={:?}: symbols={:?} [locals={:?} globals={:?} strtab={:?}] dyld={:?} metadata={:?} codesig={:?}; unwind={:?}) reloc={:?} write={:?}",
         profile.total_wall,
         profile.phases.input_parsing,
         profile.phases.symbol_resolution,
         profile.phases.atomization,
         profile.phases.layout,
+        profile.phases.layout_entry_lookup,
+        profile.phases.layout_dead_strip,
+        profile.phases.layout_icf,
+        profile.phases.layout_synthetic_plan,
+        profile.phases.layout_build,
+        profile.phases.layout_thunk_plan,
         profile.phases.synth_sections,
         profile.phases.synth_linkedit_finalize,
         profile.phases.synth_linkedit_symbol_plan,
@@ -66,6 +72,16 @@ fn assert_profile_basics(name: &str, profile: &LinkProfile) {
     assert!(
         profile.phases.accounted_total() > Duration::ZERO,
         "{name}: all phase timings were zero"
+    );
+    assert!(
+        profile.phases.layout
+            >= profile.phases.layout_entry_lookup
+                + profile.phases.layout_dead_strip
+                + profile.phases.layout_icf
+                + profile.phases.layout_synthetic_plan
+                + profile.phases.layout_build
+                + profile.phases.layout_thunk_plan,
+        "{name}: layout subphases exceeded layout total"
     );
     assert!(
         profile.phases.synth_sections

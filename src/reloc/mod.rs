@@ -17,8 +17,11 @@
 
 pub mod arm64;
 
+use std::collections::HashMap;
+
 use crate::macho::constants::*;
 use crate::macho::reader::{u32_le, ReadError};
+use crate::resolve::InputId;
 
 /// Size of one `relocation_info` on the wire.
 pub const RAW_RELOC_SIZE: usize = 8;
@@ -184,6 +187,8 @@ pub struct Reloc {
     /// Only set when `kind == Subtractor`.
     pub subtrahend: Option<Referent>,
 }
+
+pub type ParsedRelocCache = HashMap<(InputId, u8), Vec<Reloc>>;
 
 fn referent_from(raw: &RawRelocation) -> Result<Referent, ReadError> {
     if raw.r_extern {

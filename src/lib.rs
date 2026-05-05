@@ -212,6 +212,12 @@ pub struct LinkPhaseTimings {
     pub symbol_resolution: Duration,
     pub atomization: Duration,
     pub layout: Duration,
+    pub layout_entry_lookup: Duration,
+    pub layout_dead_strip: Duration,
+    pub layout_icf: Duration,
+    pub layout_synthetic_plan: Duration,
+    pub layout_build: Duration,
+    pub layout_thunk_plan: Duration,
     pub synth_sections: Duration,
     pub synth_linkedit_finalize: Duration,
     pub synth_linkedit_symbol_plan: Duration,
@@ -583,8 +589,11 @@ impl Linker {
         let phase_started = Instant::now();
         let parsed_relocs = macho::writer::build_parsed_reloc_cache(&layout_inputs)?;
         phases.input_parsing += phase_started.elapsed();
+        let layout_started = Instant::now();
         let phase_started = Instant::now();
         let entry_symbol = find_entry_symbol_id(opts, &sym_table)?;
+        phases.layout_entry_lookup = phase_started.elapsed();
+        let phase_started = Instant::now();
         let dead_strip = opts.dead_strip.then(|| {
             why_live::DeadStripAnalysis::build(
                 opts,
@@ -594,6 +603,8 @@ impl Linker {
                 entry_symbol,
             )
         });
+        phases.layout_dead_strip = phase_started.elapsed();
+        let phase_started = Instant::now();
         let icf = (opts.icf_mode == IcfMode::Safe)
             .then(|| {
                 icf::fold_safe(
@@ -604,19 +615,24 @@ impl Linker {
                 )
             })
             .transpose()?;
+        phases.layout_icf = phase_started.elapsed();
         let kept_atoms = if let Some(icf) = &icf {
             Some(icf.kept_atoms())
         } else {
             dead_strip.as_ref().map(|analysis| analysis.live_atoms())
         };
-        let synthetic_plan = synth::SyntheticPlan::build_filtered(
+        let phase_started = Instant::now();
+        let synthetic_plan = synth::SyntheticPlan::build_filtered_with_relocs(
             &layout_inputs,
             &atom_table,
             &mut sym_table,
             &inputs.dylibs,
             kept_atoms,
+            &parsed_relocs,
         )?;
+        phases.layout_synthetic_plan = phase_started.elapsed();
         let icf_redirects = icf.as_ref().map(|plan| plan.redirects());
+        let phase_started = Instant::now();
         let mut layout = Layout::build_with_synthetics_filtered(
             opts.kind,
             &layout_inputs,
@@ -625,18 +641,24 @@ impl Linker {
             Some(&synthetic_plan),
             kept_atoms,
         );
+        phases.layout_build += phase_started.elapsed();
         let mut thunk_plan = None;
         let mut thunk_converged = false;
         for _ in 0..THUNK_PLAN_MAX_ITERATIONS {
+            let phase_started = Instant::now();
             let next_plan = reloc::arm64::plan_thunks(
                 opts,
-                &layout,
-                &layout_inputs,
-                &atom_table,
-                &sym_table,
-                Some(&synthetic_plan),
-                icf_redirects,
+                reloc::arm64::ThunkPlanningContext {
+                    layout: &layout,
+                    inputs: &layout_inputs,
+                    atoms: &atom_table,
+                    sym_table: &sym_table,
+                    synthetic_plan: Some(&synthetic_plan),
+                    icf_redirects,
+                    parsed_relocs: &parsed_relocs,
+                },
             )?;
+            phases.layout_thunk_plan += phase_started.elapsed();
             if next_plan == thunk_plan {
                 thunk_converged = true;
                 break;
@@ -647,6 +669,7 @@ impl Linker {
             let split_after_atoms = next_plan
                 .as_ref()
                 .map_or_else(Vec::new, |plan| plan.split_after_atoms());
+            let phase_started = Instant::now();
             layout = Layout::build_with_synthetics_and_extra_filtered(
                 opts.kind,
                 &layout_inputs,
@@ -659,12 +682,13 @@ impl Linker {
                     split_after_atoms: &split_after_atoms,
                 },
             );
+            phases.layout_build += phase_started.elapsed();
             thunk_plan = next_plan;
         }
         if !thunk_converged {
             return Err(LinkError::ThunkPlanningDidNotConverge);
         }
-        phases.layout = phase_started.elapsed();
+        phases.layout = layout_started.elapsed();
         let linkedit_context = macho::writer::LinkEditContext {
             layout_inputs: &layout_inputs,
             atom_table: &atom_table,
@@ -739,6 +763,7 @@ impl Linker {
                 thunk_plan: thunk_plan.as_ref(),
                 linkedit: &linkedit,
                 icf_redirects,
+                parsed_relocs: &parsed_relocs,
             },
         )?;
         phases.reloc_apply = phase_started.elapsed();

@@ -20,7 +20,9 @@ use crate::macho::reader::{
     LinkEditDataCmd, LoadCommand, MachHeader64, RpathCmd, Section64Header, Segment64, SymtabCmd,
     HEADER_SIZE,
 };
-use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
+use crate::reloc::{
+    parse_raw_relocs, parse_relocs, ParsedRelocCache, Referent, Reloc, RelocKind, RelocLength,
+};
 use crate::resolve::InputId;
 use crate::resolve::{Symbol, SymbolId, SymbolTable};
 use crate::section::is_executable;
@@ -52,8 +54,6 @@ pub struct LinkEditContext<'a> {
     pub icf_redirects: Option<&'a HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
     pub parsed_relocs: &'a ParsedRelocCache,
 }
-
-pub type ParsedRelocCache = HashMap<(InputId, u8), Vec<Reloc>>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinkEditBuildTimings {

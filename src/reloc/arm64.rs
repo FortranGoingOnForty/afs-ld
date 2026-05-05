@@ -6,7 +6,7 @@ use crate::atom::{Atom, AtomSection, AtomTable};
 use crate::input::ObjectFile;
 use crate::layout::{ExtraOutputSection, ExtraSectionAnchor, Layout, LayoutInput};
 use crate::macho::writer::LinkEditPlan;
-use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
+use crate::reloc::{ParsedRelocCache, Referent, Reloc, RelocKind, RelocLength};
 use crate::resolve::{InputId, Symbol, SymbolId, SymbolTable};
 use crate::section::{OutputSection, SectionKind};
 use crate::symbol::{InputSymbol, SymKind};
@@ -72,6 +72,7 @@ pub struct ApplyLayoutPlan<'a> {
     pub thunk_plan: Option<&'a ThunkPlan>,
     pub linkedit: &'a LinkEditPlan,
     pub icf_redirects: Option<&'a HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
+    pub parsed_relocs: &'a ParsedRelocCache,
 }
 
 struct InputSectionResolveCtx<'a> {
@@ -206,36 +207,6 @@ pub fn apply_layout(
         .iter()
         .map(|input| (input.id, input.object))
         .collect();
-    let mut reloc_cache: HashMap<(InputId, u8), Vec<Reloc>> = HashMap::new();
-    for input in inputs {
-        for (sect_idx, section) in input.object.sections.iter().enumerate() {
-            let relocs = if section.nreloc == 0 {
-                Vec::new()
-            } else {
-                let raws =
-                    parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(|err| {
-                        RelocError {
-                            input: input.object.path.clone(),
-                            atom: crate::resolve::AtomId(0),
-                            atom_offset: 0,
-                            kind: RelocKind::Unsigned,
-                            referent: format!("section {},{}", section.segname, section.sectname),
-                            detail: err.to_string(),
-                        }
-                    })?;
-                parse_relocs(&raws).map_err(|err| RelocError {
-                    input: input.object.path.clone(),
-                    atom: crate::resolve::AtomId(0),
-                    atom_offset: 0,
-                    kind: RelocKind::Unsigned,
-                    referent: format!("section {},{}", section.segname, section.sectname),
-                    detail: err.to_string(),
-                })?
-            };
-            reloc_cache.insert((input.id, (sect_idx + 1) as u8), relocs);
-        }
-    }
-
     let atom_addrs = atom_address_map(layout);
     let atoms_by_input_section = atoms.by_input_section();
     let section_addrs = input_section_address_map(layout, atoms);
@@ -277,7 +248,8 @@ pub fn apply_layout(
                 )
             })?;
             patch_eh_frame_cie_pointer(&mut placed.data, atom, &resolve)?;
-            let relocs = reloc_cache
+            let relocs = plan
+                .parsed_relocs
                 .get(&(atom.origin, atom.input_section))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
@@ -305,7 +277,7 @@ pub fn apply_layout(
             synthetic_plan,
             atoms,
             &input_map,
-            &reloc_cache,
+            plan.parsed_relocs,
             &resolve,
         )?;
         synthesize_got_section(layout, synthetic_plan, &resolve)?;
@@ -510,53 +482,38 @@ fn synthetic_address_maps(
     }
 }
 
+pub struct ThunkPlanningContext<'a> {
+    pub layout: &'a Layout,
+    pub inputs: &'a [LayoutInput<'a>],
+    pub atoms: &'a AtomTable,
+    pub sym_table: &'a SymbolTable,
+    pub synthetic_plan: Option<&'a SyntheticPlan>,
+    pub icf_redirects: Option<&'a HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
+    pub parsed_relocs: &'a ParsedRelocCache,
+}
+
 pub fn plan_thunks(
     opts: &LinkOptions,
-    layout: &Layout,
-    inputs: &[LayoutInput<'_>],
-    atoms: &AtomTable,
-    sym_table: &SymbolTable,
-    synthetic_plan: Option<&SyntheticPlan>,
-    icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
+    ctx: ThunkPlanningContext<'_>,
 ) -> Result<Option<ThunkPlan>, RelocError> {
     if opts.thunks == ThunkMode::None {
         return Ok(None);
     }
 
+    let ThunkPlanningContext {
+        layout,
+        inputs,
+        atoms,
+        sym_table,
+        synthetic_plan,
+        icf_redirects,
+        parsed_relocs,
+    } = ctx;
+
     let input_map: HashMap<InputId, &ObjectFile> = inputs
         .iter()
         .map(|input| (input.id, input.object))
         .collect();
-    let mut reloc_cache: HashMap<(InputId, u8), Vec<Reloc>> = HashMap::new();
-    for input in inputs {
-        for (sect_idx, section) in input.object.sections.iter().enumerate() {
-            let relocs = if section.nreloc == 0 {
-                Vec::new()
-            } else {
-                let raws =
-                    parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(|err| {
-                        RelocError {
-                            input: input.object.path.clone(),
-                            atom: crate::resolve::AtomId(0),
-                            atom_offset: 0,
-                            kind: RelocKind::Unsigned,
-                            referent: format!("section {},{}", section.segname, section.sectname),
-                            detail: err.to_string(),
-                        }
-                    })?;
-                parse_relocs(&raws).map_err(|err| RelocError {
-                    input: input.object.path.clone(),
-                    atom: crate::resolve::AtomId(0),
-                    atom_offset: 0,
-                    kind: RelocKind::Unsigned,
-                    referent: format!("section {},{}", section.segname, section.sectname),
-                    detail: err.to_string(),
-                })?
-            };
-            reloc_cache.insert((input.id, (sect_idx + 1) as u8), relocs);
-        }
-    }
-
     let atom_addrs = atom_address_map(layout);
     let atom_segments = atom_output_segment_map(layout);
     let atoms_by_input_section = atoms.by_input_section();
@@ -588,7 +545,7 @@ pub fn plan_thunks(
         let Some(obj) = input_map.get(&atom.origin) else {
             continue;
         };
-        let relocs = reloc_cache
+        let relocs = parsed_relocs
             .get(&(atom.origin, atom.input_section))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
@@ -2739,9 +2696,21 @@ mod tests {
             ..LinkOptions::default()
         };
         let base_layout = Layout::build(OutputKind::Executable, &inputs, &atoms, 0);
-        let plan = plan_thunks(&opts, &base_layout, &inputs, &atoms, &sym_table, None, None)
-            .unwrap()
-            .unwrap();
+        let parsed_relocs = crate::macho::writer::build_parsed_reloc_cache(&inputs).unwrap();
+        let plan = plan_thunks(
+            &opts,
+            ThunkPlanningContext {
+                layout: &base_layout,
+                inputs: &inputs,
+                atoms: &atoms,
+                sym_table: &sym_table,
+                synthetic_plan: None,
+                icf_redirects: None,
+                parsed_relocs: &parsed_relocs,
+            },
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(
             plan.redirect_for(caller1, 0),
@@ -2795,9 +2764,20 @@ mod tests {
             vec!["__text", "__thunks", "__text", "__thunks", "__text"]
         );
 
-        let replan = plan_thunks(&opts, &rebuilt, &inputs, &atoms, &sym_table, None, None)
-            .unwrap()
-            .unwrap();
+        let replan = plan_thunks(
+            &opts,
+            ThunkPlanningContext {
+                layout: &rebuilt,
+                inputs: &inputs,
+                atoms: &atoms,
+                sym_table: &sym_table,
+                synthetic_plan: None,
+                icf_redirects: None,
+                parsed_relocs: &parsed_relocs,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             replan, plan,
             "expected thunk planning to converge once the intra-section islands exist"

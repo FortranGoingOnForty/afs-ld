@@ -54,6 +54,7 @@ fn parity_corpus() {
         }
         case_reports.push((case, report));
     }
+    print_timing_summary(started.elapsed(), &case_reports);
 
     if let Some(dir) = artifact_dir.as_ref() {
         write_index_artifact(dir, &case_reports).expect("write parity index");
@@ -80,24 +81,40 @@ fn parity_corpus() {
 #[derive(Debug)]
 struct CaseStep {
     name: &'static str,
+    duration: Duration,
     error: Option<String>,
 }
 
 #[derive(Debug, Default)]
 struct CaseReport {
     steps: Vec<CaseStep>,
+    elapsed: Duration,
 }
 
 impl CaseReport {
     fn push(&mut self, name: &'static str, result: Result<(), String>) -> bool {
+        self.push_timed(name, Duration::ZERO, result)
+    }
+
+    fn push_timed(
+        &mut self,
+        name: &'static str,
+        duration: Duration,
+        result: Result<(), String>,
+    ) -> bool {
         match result {
             Ok(()) => {
-                self.steps.push(CaseStep { name, error: None });
+                self.steps.push(CaseStep {
+                    name,
+                    duration,
+                    error: None,
+                });
                 true
             }
             Err(error) => {
                 self.steps.push(CaseStep {
                     name,
+                    duration,
                     error: Some(error),
                 });
                 false
@@ -105,15 +122,32 @@ impl CaseReport {
         }
     }
 
+    fn measure<F>(&mut self, name: &'static str, action: F) -> bool
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        let started = Instant::now();
+        let result = action();
+        self.push_timed(name, started.elapsed(), result)
+    }
+
+    fn finish(&mut self, elapsed: Duration) {
+        self.elapsed = elapsed;
+    }
+
     fn passed(&self) -> bool {
         self.steps.iter().all(|step| step.error.is_none())
     }
 
+    fn slowest_step(&self) -> Option<&CaseStep> {
+        self.steps.iter().max_by_key(|step| step.duration)
+    }
+
     fn error_message(&self, case_name: &str) -> Option<String> {
         self.steps.iter().find_map(|step| {
-            step.error.as_ref().map(|error| {
-                format!("[{case_name}] {} failed:\n{}", step.name, error)
-            })
+            step.error
+                .as_ref()
+                .map(|error| format!("[{case_name}] {} failed:\n{}", step.name, error))
         })
     }
 }
@@ -132,85 +166,84 @@ fn case_report_error_message_includes_case_name() {
 }
 
 fn run_case(case: &LinkCase) -> CaseReport {
+    let case_started = Instant::now();
     let mut report = CaseReport::default();
+    let link_started = Instant::now();
     let outputs = match link_both(case) {
         Ok(outputs) => {
-            report.push("link", Ok(()));
+            report.push_timed("link", link_started.elapsed(), Ok(()));
             outputs
         }
         Err(error) => {
-            report.push(
+            report.push_timed(
                 "link",
+                link_started.elapsed(),
                 Err(format!(
                     "failed to link parity case from {}:\n{}",
                     case.dir.display(),
                     error
                 )),
             );
-            return report;
+            return finish_case(report, case_started);
         }
     };
 
-    if !report.push(
-        "load-command ids",
-        compare_command_ids(&outputs.ours, &outputs.theirs, &case.ignored_load_commands),
-    ) {
-        return report;
+    if !report.measure("load-command ids", || {
+        compare_command_ids(&outputs.ours, &outputs.theirs, &case.ignored_load_commands)
+    }) {
+        return finish_case(report, case_started);
     }
-    if !report.push(
-        "command details",
-        compare_command_details(&outputs.ours, &outputs.theirs, &case.command_checks),
-    ) {
-        return report;
+    if !report.measure("command details", || {
+        compare_command_details(&outputs.ours, &outputs.theirs, &case.command_checks)
+    }) {
+        return finish_case(report, case_started);
     }
-    if !report.push(
-        "afs-ld absent commands",
-        ensure_absent_load_commands(&outputs.ours, &case.absent_load_commands, "afs-ld"),
-    ) {
-        return report;
+    if !report.measure("afs-ld absent commands", || {
+        ensure_absent_load_commands(&outputs.ours, &case.absent_load_commands, "afs-ld")
+    }) {
+        return finish_case(report, case_started);
     }
-    if !report.push(
-        "Apple absent commands",
-        ensure_absent_load_commands(&outputs.theirs, &case.absent_load_commands, "Apple ld"),
-    ) {
-        return report;
+    if !report.measure("Apple absent commands", || {
+        ensure_absent_load_commands(&outputs.theirs, &case.absent_load_commands, "Apple ld")
+    }) {
+        return finish_case(report, case_started);
     }
-    if !report.push(
-        "afs-ld absent sections",
-        ensure_absent_sections(&outputs.ours, &case.absent_sections, "afs-ld"),
-    ) {
-        return report;
+    if !report.measure("afs-ld absent sections", || {
+        ensure_absent_sections(&outputs.ours, &case.absent_sections, "afs-ld")
+    }) {
+        return finish_case(report, case_started);
     }
-    if !report.push(
-        "Apple absent sections",
-        ensure_absent_sections(&outputs.theirs, &case.absent_sections, "Apple ld"),
-    ) {
-        return report;
+    if !report.measure("Apple absent sections", || {
+        ensure_absent_sections(&outputs.theirs, &case.absent_sections, "Apple ld")
+    }) {
+        return finish_case(report, case_started);
     }
-    if !report.push(
-        "section parity",
+    if !report.measure("section parity", || {
         compare_sections(
             &outputs.ours,
             &outputs.theirs,
             &case.section_checks,
             &case.case_tolerances,
-        ),
-    ) {
-        return report;
+        )
+    }) {
+        return finish_case(report, case_started);
     }
-    if !report.push(
-        "page-ref parity",
-        compare_page_refs(&outputs.ours, &outputs.theirs, &case.page_ref_checks),
-    ) {
-        return report;
+    if !report.measure("page-ref parity", || {
+        compare_page_refs(&outputs.ours, &outputs.theirs, &case.page_ref_checks)
+    }) {
+        return finish_case(report, case_started);
     }
     if !case.runtime_args.is_empty() || case.dir.join("runtime.txt").exists() {
-        report.push(
-            "runtime parity",
-            compare_runtime(&outputs.our_path, &outputs.their_path, &case.runtime_args),
-        );
+        report.measure("runtime parity", || {
+            compare_runtime(&outputs.our_path, &outputs.their_path, &case.runtime_args)
+        });
     }
 
+    finish_case(report, case_started)
+}
+
+fn finish_case(mut report: CaseReport, started: Instant) -> CaseReport {
+    report.finish(started.elapsed());
     report
 }
 
@@ -228,16 +261,22 @@ fn write_case_artifact(dir: &Path, case: &LinkCase, report: &CaseReport) -> Resu
         if report.passed() { "ok" } else { "fail" },
         if report.passed() { "PASS" } else { "FAIL" }
     ));
+    html.push_str(&format!(
+        "<p>Total: <strong>{}</strong></p>",
+        format_duration(report.elapsed)
+    ));
     html.push_str("<h2>Steps</h2><ul>");
     for step in &report.steps {
         match &step.error {
             None => html.push_str(&format!(
-                "<li><span class=\"ok\">PASS</span> {}</li>",
-                escape_html(step.name)
+                "<li><span class=\"ok\">PASS</span> {} <span class=\"time\">{}</span></li>",
+                escape_html(step.name),
+                format_duration(step.duration)
             )),
             Some(error) => html.push_str(&format!(
-                "<li><span class=\"fail\">FAIL</span> {}<pre>{}</pre></li>",
+                "<li><span class=\"fail\">FAIL</span> {} <span class=\"time\">{}</span><pre>{}</pre></li>",
                 escape_html(step.name),
+                format_duration(step.duration),
                 escape_html(error)
             )),
         }
@@ -258,21 +297,74 @@ fn write_case_artifact(dir: &Path, case: &LinkCase, report: &CaseReport) -> Resu
 fn write_index_artifact(dir: &Path, cases: &[(LinkCase, CaseReport)]) -> Result<(), String> {
     let mut html = String::new();
     html.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
-    html.push_str("<title>Parity Matrix</title><style>body{font-family:ui-monospace,Menlo,monospace;padding:2rem;} .ok{color:#0a0;} .fail{color:#a00;}</style></head><body>");
-    html.push_str("<h1>Parity Matrix</h1><ul>");
+    html.push_str("<title>Parity Matrix</title><style>body{font-family:ui-monospace,Menlo,monospace;padding:2rem;} .ok{color:#0a0;} .fail{color:#a00;} .time{color:#57606a;} table{border-collapse:collapse;margin:1rem 0;} td,th{border:1px solid #d0d7de;padding:.35rem .6rem;text-align:left;}</style></head><body>");
+    html.push_str("<h1>Parity Matrix</h1>");
+    html.push_str("<h2>Slowest Cases</h2><table><thead><tr><th>Case</th><th>Total</th><th>Slowest Step</th></tr></thead><tbody>");
+    for (case, report) in slowest_cases(cases, 10) {
+        let slowest = report
+            .slowest_step()
+            .map(|step| format!("{} {}", step.name, format_duration(step.duration)))
+            .unwrap_or_else(|| "n/a".to_string());
+        html.push_str(&format!(
+            "<tr><td><a href=\"{}.html\">{}</a></td><td>{}</td><td>{}</td></tr>",
+            slug(&case.name),
+            escape_html(&case.name),
+            format_duration(report.elapsed),
+            escape_html(&slowest)
+        ));
+    }
+    html.push_str("</tbody></table><h2>Cases</h2><ul>");
     for (case, report) in cases {
         let slug = slug(&case.name);
         html.push_str(&format!(
-            "<li><a href=\"{}.html\">{}</a> <strong class=\"{}\">{}</strong></li>",
+            "<li><a href=\"{}.html\">{}</a> <strong class=\"{}\">{}</strong> <span class=\"time\">{}</span></li>",
             slug,
             escape_html(&case.name),
             if report.passed() { "ok" } else { "fail" },
-            if report.passed() { "PASS" } else { "FAIL" }
+            if report.passed() { "PASS" } else { "FAIL" },
+            format_duration(report.elapsed)
         ));
     }
     html.push_str("</ul></body></html>");
     let path = dir.join("index.html");
     fs::write(&path, html).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+fn print_timing_summary(elapsed: Duration, cases: &[(LinkCase, CaseReport)]) {
+    eprintln!(
+        "parity matrix timing: {} case(s) in {}",
+        cases.len(),
+        format_duration(elapsed)
+    );
+    for (case, report) in slowest_cases(cases, 10) {
+        let slowest = report
+            .slowest_step()
+            .map(|step| {
+                format!(
+                    "; slowest step: {} {}",
+                    step.name,
+                    format_duration(step.duration)
+                )
+            })
+            .unwrap_or_default();
+        eprintln!(
+            "  {:>9} {}{}",
+            format_duration(report.elapsed),
+            case.name,
+            slowest
+        );
+    }
+}
+
+fn slowest_cases(cases: &[(LinkCase, CaseReport)], limit: usize) -> Vec<(&LinkCase, &CaseReport)> {
+    let mut timed: Vec<_> = cases.iter().map(|(case, report)| (case, report)).collect();
+    timed.sort_by(|a, b| {
+        b.1.elapsed
+            .cmp(&a.1.elapsed)
+            .then_with(|| a.0.name.cmp(&b.0.name))
+    });
+    timed.truncate(limit);
+    timed
 }
 
 fn slug(name: &str) -> String {
@@ -291,6 +383,15 @@ fn parity_matrix_time_limit() -> Option<Duration> {
     let raw = std::env::var("PARITY_MATRIX_MAX_SECONDS").ok()?;
     let seconds = raw.parse::<u64>().ok()?;
     Some(Duration::from_secs(seconds))
+}
+
+fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_secs_f64() * 1000.0;
+    if millis >= 1000.0 {
+        format!("{:.2}s", duration.as_secs_f64())
+    } else {
+        format!("{millis:.1}ms")
+    }
 }
 
 fn escape_html(text: &str) -> String {

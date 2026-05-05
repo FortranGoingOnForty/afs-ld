@@ -116,10 +116,12 @@ struct ArtifactSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArtifactKind {
-    ClangDylib,
-    ClangArchive,
-    ClangReexportDylib,
+    Dylib,
+    Archive,
+    ReexportDylib,
 }
+
+type SymbolPartitions = (Vec<String>, Vec<String>, Vec<String>);
 
 pub struct LinkOutputs {
     pub ours: Vec<u8>,
@@ -509,9 +511,9 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
             .map_err(|e| format!("read artifact src {}: {e}", src.display()))?;
         let out = work_dir.join(&artifact.out_name);
         match artifact.kind {
-            ArtifactKind::ClangDylib => compile_dylib_c(&src_contents, &out)?,
-            ArtifactKind::ClangArchive => compile_archive_c(&src_contents, &out)?,
-            ArtifactKind::ClangReexportDylib => {
+            ArtifactKind::Dylib => compile_dylib_c(&src_contents, &out)?,
+            ArtifactKind::Archive => compile_archive_c(&src_contents, &out)?,
+            ArtifactKind::ReexportDylib => {
                 let dep_name = artifact.dep_name.as_ref().ok_or_else(|| {
                     format!(
                         "missing reexport dependency for artifact {}",
@@ -1390,7 +1392,7 @@ fn read_artifacts(path: &Path) -> Result<Vec<ArtifactSpec>, String> {
                         path.display()
                     ));
                 }
-                (ArtifactKind::ClangDylib, None)
+                (ArtifactKind::Dylib, None)
             }
             "clang_archive" => {
                 if dep_name.is_some() {
@@ -1399,7 +1401,7 @@ fn read_artifacts(path: &Path) -> Result<Vec<ArtifactSpec>, String> {
                         path.display()
                     ));
                 }
-                (ArtifactKind::ClangArchive, None)
+                (ArtifactKind::Archive, None)
             }
             "clang_reexport_dylib" => {
                 let dep_name = dep_name.ok_or_else(|| {
@@ -1408,7 +1410,7 @@ fn read_artifacts(path: &Path) -> Result<Vec<ArtifactSpec>, String> {
                         path.display()
                     )
                 })?;
-                (ArtifactKind::ClangReexportDylib, Some(dep_name))
+                (ArtifactKind::ReexportDylib, Some(dep_name))
             }
             other => return Err(format!("unknown artifact kind `{other}`")),
         };
@@ -1592,10 +1594,10 @@ fn tolerated_mask(bytes: &[u8]) -> Vec<Option<&'static str>> {
                 }
             }
             LC_ID_DYLIB | LC_LOAD_DYLIB | LC_LOAD_WEAK_DYLIB | LC_REEXPORT_DYLIB
-            | LC_LOAD_UPWARD_DYLIB => {
-                if cmdsize >= 16 {
-                    mark_range(&mut mask, cursor + 12, cursor + 16, "dylib timestamp");
-                }
+            | LC_LOAD_UPWARD_DYLIB
+                if cmdsize >= 16 =>
+            {
+                mark_range(&mut mask, cursor + 12, cursor + 16, "dylib timestamp");
             }
             _ => {}
         }
@@ -1765,7 +1767,7 @@ fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExportRecord>, 
     Ok(out)
 }
 
-fn symbol_partition_names(bytes: &[u8]) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
+fn symbol_partition_names(bytes: &[u8]) -> Result<SymbolPartitions, String> {
     let (symtab, dysymtab) = symtab_and_dysymtab(bytes)?;
     let symbols =
         parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).map_err(|e| e.to_string())?;

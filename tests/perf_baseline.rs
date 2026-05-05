@@ -39,7 +39,7 @@ fn executable_opts(inputs: Vec<PathBuf>, output: PathBuf) -> LinkOptions {
 
 fn assert_profile_basics(name: &str, profile: &LinkProfile) {
     eprintln!(
-        "{name}: total={:?} parse={:?} resolve={:?} atomize={:?} layout={:?} (entry={:?} dead={:?} icf={:?} synth_plan={:?} build={:?} thunks={:?}) synth={:?} (linkedit={:?}: symbols={:?} [locals={:?} globals={:?} strtab={:?}] dyld={:?} metadata={:?} codesig={:?}; unwind={:?}) reloc={:?} write={:?}",
+        "{name}: total={:?} parse={:?} resolve={:?} atomize={:?} layout={:?} (entry={:?} dead={:?} icf={:?} synth_plan={:?} build={:?} thunks={:?}) synth={:?} (linkedit={:?}: symbols={:?} [locals={:?} globals={:?} strtab={:?}] dyld={:?} [bind={:?} rebase={:?} export={:?}] metadata={:?} codesig={:?}; unwind={:?}) reloc={:?} write={:?}",
         profile.total_wall,
         profile.phases.input_parsing,
         profile.phases.symbol_resolution,
@@ -58,6 +58,9 @@ fn assert_profile_basics(name: &str, profile: &LinkProfile) {
         profile.phases.synth_linkedit_symbol_plan_globals,
         profile.phases.synth_linkedit_symbol_plan_strtab,
         profile.phases.synth_linkedit_dyld_info,
+        profile.phases.synth_linkedit_dyld_bind,
+        profile.phases.synth_linkedit_dyld_rebase,
+        profile.phases.synth_linkedit_dyld_export,
         profile.phases.synth_linkedit_metadata_tables,
         profile.phases.synth_linkedit_code_signature,
         profile.phases.synth_unwind,
@@ -102,6 +105,13 @@ fn assert_profile_basics(name: &str, profile: &LinkProfile) {
                 + profile.phases.synth_linkedit_symbol_plan_globals
                 + profile.phases.synth_linkedit_symbol_plan_strtab,
         "{name}: symbol-plan subphases exceeded symbol-plan total"
+    );
+    assert!(
+        profile.phases.synth_linkedit_dyld_info
+            >= profile.phases.synth_linkedit_dyld_bind
+                + profile.phases.synth_linkedit_dyld_rebase
+                + profile.phases.synth_linkedit_dyld_export,
+        "{name}: dyld-info subphases exceeded dyld-info total"
     );
 }
 

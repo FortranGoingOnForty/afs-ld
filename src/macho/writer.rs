@@ -23,7 +23,7 @@ use crate::macho::reader::{
 use crate::reloc::{
     parse_raw_relocs, parse_relocs, ParsedRelocCache, Referent, Reloc, RelocKind, RelocLength,
 };
-use crate::resolve::InputId;
+use crate::resolve::{AtomId, InputId};
 use crate::resolve::{Symbol, SymbolId, SymbolTable};
 use crate::section::is_executable;
 use crate::string_table::StringTableBuilder;
@@ -62,6 +62,9 @@ pub struct LinkEditBuildTimings {
     pub symbol_plan_globals: Duration,
     pub symbol_plan_strtab: Duration,
     pub dyld_info: Duration,
+    pub dyld_bind: Duration,
+    pub dyld_rebase: Duration,
+    pub dyld_export: Duration,
     pub metadata_tables: Duration,
     pub code_signature: Duration,
 }
@@ -73,6 +76,9 @@ impl std::ops::AddAssign for LinkEditBuildTimings {
         self.symbol_plan_globals += rhs.symbol_plan_globals;
         self.symbol_plan_strtab += rhs.symbol_plan_strtab;
         self.dyld_info += rhs.dyld_info;
+        self.dyld_bind += rhs.dyld_bind;
+        self.dyld_rebase += rhs.dyld_rebase;
+        self.dyld_export += rhs.dyld_export;
         self.metadata_tables += rhs.metadata_tables;
         self.code_signature += rhs.code_signature;
     }
@@ -956,14 +962,20 @@ fn build_linkedit_plan_profiled(
         indirect_bytes.extend_from_slice(&index.to_le_bytes());
     }
 
+    let dyld_started = std::time::Instant::now();
     let phase_started = std::time::Instant::now();
     let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
-    let rebase_bytes = pad_dyld_info_stream(build_rebase_stream(layout, synthetic_plan, inputs)?);
     let bind_bytes = pad_dyld_info_stream(bind_streams.bind);
     let weak_bind_bytes = pad_dyld_info_stream(bind_streams.weak_bind);
     let lazy_bind_bytes = pad_dyld_info_stream(bind_streams.lazy_bind);
+    timings.dyld_bind += phase_started.elapsed();
+    let phase_started = std::time::Instant::now();
+    let rebase_bytes = pad_dyld_info_stream(build_rebase_stream(layout, synthetic_plan, inputs)?);
+    timings.dyld_rebase += phase_started.elapsed();
+    let phase_started = std::time::Instant::now();
     let export_bytes = pad_dyld_info_stream(build_export_trie(&symbol_plan.exports));
-    timings.dyld_info += phase_started.elapsed();
+    timings.dyld_export += phase_started.elapsed();
+    timings.dyld_info += dyld_started.elapsed();
 
     let phase_started = std::time::Instant::now();
     let loh_bytes = build_loh(
@@ -2384,6 +2396,7 @@ fn build_bind_streams(
     let weak_bind = Vec::new();
     let mut lazy_bind = OpcodeStream::new();
     let mut lazy_offsets = HashMap::new();
+    let layout_index = BindLayoutIndex::build(layout)?;
 
     if let Some(tlv_bootstrap) = synthetic_plan.tlv_bootstrap_symbol {
         let segment_index = segment_index(layout, "__DATA")?;
@@ -2450,29 +2463,21 @@ fn build_bind_streams(
             .get(&entry.symbol)
             .copied()
             .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
-        let atom_addr = layout
-            .atom_addr(entry.atom)
+        let placement = layout_index
+            .atoms
+            .get(&entry.atom)
             .ok_or(WriteError::DirectBindAtomMissing(entry.atom))?;
-        let section = layout
-            .sections
-            .iter()
-            .find(|section| section.atoms.iter().any(|placed| placed.atom == entry.atom))
-            .ok_or(WriteError::DirectBindSectionMissing(entry.atom))?;
-        if section.segment == "__DATA" && section.name == "__thread_vars" {
+        if placement.is_thread_vars {
             // `__thread_vars` starts are emitted through the dedicated
             // `__tlv_bootstrap` pass above. Descriptor tails are rewritten to
             // template offsets before write, so any generic direct bind landing
             // back in this section is stale and would override the TLV bind.
             continue;
         }
-        let segment_index = segment_index(layout, &section.segment)?;
-        let segment = layout
-            .segment(&section.segment)
-            .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
-        let slot_addr = atom_addr + entry.atom_offset as u64;
+        let slot_addr = placement.addr + entry.atom_offset as u64;
         bind_specs.push(BindRecordSpec {
-            segment_index,
-            segment_offset: slot_addr - segment.vm_addr,
+            segment_index: placement.segment_index,
+            segment_offset: slot_addr - placement.segment_vm_addr,
             ordinal: import.ordinal,
             name: &import.name,
             weak_import: import.weak_import,
@@ -2519,6 +2524,59 @@ fn build_bind_streams(
         lazy_bind: lazy_bind.into_vec(),
         lazy_offsets,
     })
+}
+
+struct BindLayoutIndex {
+    atoms: HashMap<AtomId, BindAtomPlacement>,
+}
+
+#[derive(Clone, Copy)]
+struct BindAtomPlacement {
+    addr: u64,
+    segment_index: u8,
+    segment_vm_addr: u64,
+    is_thread_vars: bool,
+}
+
+impl BindLayoutIndex {
+    fn build(layout: &Layout) -> Result<Self, WriteError> {
+        let mut segment_meta = HashMap::with_capacity(layout.segments.len());
+        for (idx, segment) in layout.segments.iter().enumerate() {
+            segment_meta.insert(
+                segment.name.as_str(),
+                (
+                    u8::try_from(idx).map_err(|_| WriteError::OffsetTooLarge("segment index"))?,
+                    segment.vm_addr,
+                ),
+            );
+        }
+        let atom_count: usize = layout
+            .sections
+            .iter()
+            .map(|section| section.atoms.len())
+            .sum();
+        let mut atoms = HashMap::with_capacity(atom_count);
+        for section in &layout.sections {
+            let Some((segment_index, segment_vm_addr)) =
+                segment_meta.get(section.segment.as_str()).copied()
+            else {
+                continue;
+            };
+            let is_thread_vars = section.segment == "__DATA" && section.name == "__thread_vars";
+            for placed in &section.atoms {
+                atoms.insert(
+                    placed.atom,
+                    BindAtomPlacement {
+                        addr: section.addr + placed.offset,
+                        segment_index,
+                        segment_vm_addr,
+                        is_thread_vars,
+                    },
+                );
+            }
+        }
+        Ok(Self { atoms })
+    }
 }
 
 fn segment_index(layout: &Layout, name: &str) -> Result<u8, WriteError> {

@@ -99,7 +99,6 @@ impl StringTable {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StringTableBuilder {
     roots: Vec<RootString>,
-    roots_by_last_byte: HashMap<u8, Vec<usize>>,
     offsets: HashMap<String, u32>,
 }
 
@@ -132,17 +131,10 @@ impl StringTableBuilder {
             let offset = raw.len() as u32;
             raw.extend_from_slice(name.as_bytes());
             raw.push(0);
-            let root_index = self.roots.len();
             self.roots.push(RootString {
                 name: name.clone(),
                 offset,
             });
-            if let Some(&last_byte) = name.as_bytes().last() {
-                self.roots_by_last_byte
-                    .entry(last_byte)
-                    .or_default()
-                    .push(root_index);
-            }
             self.offsets.insert(name, offset);
         }
 
@@ -153,15 +145,15 @@ impl StringTableBuilder {
     }
 
     fn find_suffix_offset(&self, name: &str) -> Option<u32> {
-        let last_byte = *name.as_bytes().last()?;
-        self.roots_by_last_byte
-            .get(&last_byte)?
-            .iter()
-            .find_map(|&idx| {
-                let existing = &self.roots[idx];
-                (existing.name.len() >= name.len() && existing.name.ends_with(name))
-                    .then(|| existing.offset + (existing.name.len() - name.len()) as u32)
-            })
+        if name.is_empty() {
+            return Some(0);
+        }
+        let insert_at = self
+            .roots
+            .partition_point(|root| reverse_suffix_order(&root.name, name).is_lt());
+        let existing = self.roots.get(insert_at.checked_sub(1)?)?;
+        (existing.name.len() >= name.len() && existing.name.ends_with(name))
+            .then(|| existing.offset + (existing.name.len() - name.len()) as u32)
     }
 }
 

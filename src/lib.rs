@@ -225,6 +225,9 @@ pub struct LinkPhaseTimings {
     pub synth_linkedit_symbol_plan_globals: Duration,
     pub synth_linkedit_symbol_plan_strtab: Duration,
     pub synth_linkedit_dyld_info: Duration,
+    pub synth_linkedit_dyld_bind: Duration,
+    pub synth_linkedit_dyld_rebase: Duration,
+    pub synth_linkedit_dyld_export: Duration,
     pub synth_linkedit_metadata_tables: Duration,
     pub synth_linkedit_code_signature: Duration,
     pub synth_unwind: Duration,
@@ -705,6 +708,9 @@ impl Linker {
         let mut synth_linkedit_symbol_plan_globals = Duration::ZERO;
         let mut synth_linkedit_symbol_plan_strtab = Duration::ZERO;
         let mut synth_linkedit_dyld_info = Duration::ZERO;
+        let mut synth_linkedit_dyld_bind = Duration::ZERO;
+        let mut synth_linkedit_dyld_rebase = Duration::ZERO;
+        let mut synth_linkedit_dyld_export = Duration::ZERO;
         let mut synth_linkedit_metadata_tables = Duration::ZERO;
         let mut synth_linkedit_code_signature = Duration::ZERO;
         let mut synth_unwind = Duration::ZERO;
@@ -724,6 +730,9 @@ impl Linker {
             synth_linkedit_symbol_plan_globals += linkedit_timings.symbol_plan_globals;
             synth_linkedit_symbol_plan_strtab += linkedit_timings.symbol_plan_strtab;
             synth_linkedit_dyld_info += linkedit_timings.dyld_info;
+            synth_linkedit_dyld_bind += linkedit_timings.dyld_bind;
+            synth_linkedit_dyld_rebase += linkedit_timings.dyld_rebase;
+            synth_linkedit_dyld_export += linkedit_timings.dyld_export;
             synth_linkedit_metadata_tables += linkedit_timings.metadata_tables;
             synth_linkedit_code_signature += linkedit_timings.code_signature;
             layout = next_layout;
@@ -748,6 +757,9 @@ impl Linker {
         phases.synth_linkedit_symbol_plan_globals = synth_linkedit_symbol_plan_globals;
         phases.synth_linkedit_symbol_plan_strtab = synth_linkedit_symbol_plan_strtab;
         phases.synth_linkedit_dyld_info = synth_linkedit_dyld_info;
+        phases.synth_linkedit_dyld_bind = synth_linkedit_dyld_bind;
+        phases.synth_linkedit_dyld_rebase = synth_linkedit_dyld_rebase;
+        phases.synth_linkedit_dyld_export = synth_linkedit_dyld_export;
         phases.synth_linkedit_metadata_tables = synth_linkedit_metadata_tables;
         phases.synth_linkedit_code_signature = synth_linkedit_code_signature;
         phases.synth_unwind = synth_unwind;

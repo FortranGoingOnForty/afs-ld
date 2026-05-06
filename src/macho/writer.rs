@@ -427,7 +427,7 @@ pub fn write_finalized_with_linkedit(
     out[stroff..end].copy_from_slice(&linkedit_plan.strtab_bytes);
     if let Some(code_signature) = &linkedit_plan.code_signature {
         let start = code_signature.dataoff as usize;
-        let bytes = code_signature.build(&out[..start]);
+        let bytes = code_signature.build_with_jobs(&out[..start], opts.parallel_jobs());
         let end = start + bytes.len();
         out[start..end].copy_from_slice(&bytes);
     }

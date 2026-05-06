@@ -1,3 +1,5 @@
+use std::thread;
+
 use crate::layout::Layout;
 use crate::section::is_executable;
 use crate::LinkOptions;
@@ -52,6 +54,10 @@ impl CodeSignaturePlan {
     }
 
     pub fn build(&self, signed_prefix: &[u8]) -> Vec<u8> {
+        self.build_with_jobs(signed_prefix, 1)
+    }
+
+    pub fn build_with_jobs(&self, signed_prefix: &[u8], parallel_jobs: usize) -> Vec<u8> {
         debug_assert_eq!(signed_prefix.len(), self.code_limit as usize);
 
         let code_slots = code_slots(self.code_limit as usize);
@@ -92,8 +98,8 @@ impl CodeSignaturePlan {
 
         out.extend_from_slice(self.identifier.as_bytes());
         out.push(0);
-        for page in signed_prefix.chunks(PAGE_SIZE) {
-            out.extend_from_slice(&sha256(page));
+        for hash in page_hashes(signed_prefix, parallel_jobs) {
+            out.extend_from_slice(&hash);
         }
         out.resize(padded_len, 0);
         out
@@ -147,6 +153,33 @@ fn code_slots(code_limit: usize) -> usize {
     } else {
         code_limit.div_ceil(PAGE_SIZE)
     }
+}
+
+fn page_hashes(data: &[u8], parallel_jobs: usize) -> Vec<[u8; 32]> {
+    let page_count = code_slots(data.len());
+    if page_count == 0 {
+        return Vec::new();
+    }
+    let parallel_jobs = parallel_jobs.max(1).min(page_count);
+    if parallel_jobs == 1 || page_count < 2 {
+        return data.chunks(PAGE_SIZE).map(sha256).collect();
+    }
+
+    let chunk_pages = page_count.div_ceil(parallel_jobs);
+    let chunk_bytes = PAGE_SIZE * chunk_pages;
+    thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in data.chunks(chunk_bytes) {
+            handles
+                .push(scope.spawn(move || chunk.chunks(PAGE_SIZE).map(sha256).collect::<Vec<_>>()));
+        }
+
+        let mut hashes = Vec::with_capacity(page_count);
+        for handle in handles {
+            hashes.extend(handle.join().expect("code-signature hash worker panicked"));
+        }
+        hashes
+    })
 }
 
 fn push_be_u32(out: &mut Vec<u8>, value: u32) {
@@ -335,5 +368,43 @@ mod tests {
         assert_eq!(read_be_u32(&blob, 48), 5);
         assert_eq!(read_be_u32(&blob, 52), 16_512);
         assert_eq!(&blob[108..114], b"apple\0");
+    }
+
+    #[test]
+    fn parallel_page_hashes_preserve_serial_order() {
+        let mut bytes = Vec::with_capacity(PAGE_SIZE * 9 + 123);
+        for index in 0..PAGE_SIZE * 9 + 123 {
+            bytes.push((index.wrapping_mul(37).wrapping_add(19) & 0xff) as u8);
+        }
+
+        let serial = page_hashes(&bytes, 1);
+        let parallel = page_hashes(&bytes, 4);
+        assert_eq!(parallel, serial);
+        assert_eq!(parallel.len(), 10);
+    }
+
+    #[test]
+    fn parallel_code_signature_matches_single_worker() {
+        let opts = LinkOptions {
+            output: Some("parallel".into()),
+            ..LinkOptions::default()
+        };
+        let code_limit = PAGE_SIZE * 11 + 777;
+        let plan = CodeSignaturePlan::new(
+            &Layout::empty(crate::OutputKind::Executable, 0),
+            &opts,
+            code_limit as u64,
+            true,
+        )
+        .unwrap();
+        let mut signed_prefix = Vec::with_capacity(code_limit);
+        for index in 0..code_limit {
+            signed_prefix.push((index.wrapping_mul(13).wrapping_add(index / 7) & 0xff) as u8);
+        }
+
+        assert_eq!(
+            plan.build_with_jobs(&signed_prefix, 8),
+            plan.build_with_jobs(&signed_prefix, 1)
+        );
     }
 }

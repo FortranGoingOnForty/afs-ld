@@ -150,6 +150,12 @@ fn repeated_parallel_archive_fetches_are_byte_identical() {
 fn assert_repeated_links_identical(inputs: Vec<PathBuf>, root: &Path, label: &str) {
     let baseline = link_once(&inputs, root, &format!("{label}-baseline"))
         .expect("baseline deterministic link");
+    let serial = link_once_with_jobs(&inputs, root, &format!("{label}-serial"), Some(1))
+        .expect("single-worker deterministic link");
+    assert_eq!(
+        serial, baseline,
+        "{label}: single-worker link differed from default parallel link"
+    );
     let run_count = determinism_run_count();
     let jobs = determinism_jobs(run_count);
     let queue = Arc::new(Mutex::new((0..run_count).collect::<VecDeque<_>>()));
@@ -200,6 +206,15 @@ fn assert_repeated_links_identical(inputs: Vec<PathBuf>, root: &Path, label: &st
 }
 
 fn link_once(inputs: &[PathBuf], root: &Path, run_name: &str) -> Result<Vec<u8>, String> {
+    link_once_with_jobs(inputs, root, run_name, None)
+}
+
+fn link_once_with_jobs(
+    inputs: &[PathBuf],
+    root: &Path,
+    run_name: &str,
+    jobs: Option<usize>,
+) -> Result<Vec<u8>, String> {
     let dir = root.join(run_name);
     fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let out = dir.join("deterministic.out");
@@ -207,6 +222,7 @@ fn link_once(inputs: &[PathBuf], root: &Path, run_name: &str) -> Result<Vec<u8>,
         inputs: inputs.to_vec(),
         output: Some(out.clone()),
         kind: OutputKind::Executable,
+        jobs,
         ..LinkOptions::default()
     };
     Linker::run(&opts).map_err(|e| format!("link {}: {e}", out.display()))?;

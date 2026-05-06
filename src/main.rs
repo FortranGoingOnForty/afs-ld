@@ -45,6 +45,7 @@ Options:
                                   Select chained fixups vs classic dyld info
   -all_load                       Force-load every archive member
   -force_load <archive>           Force-load one archive
+  -j <jobs>                       Limit parallel worker jobs (`1` disables parallelism)
   -Wl,<arg,arg,...>               Normalize comma-separated driver flags
   --dump <path>                   Dump a Mach-O file summary
   --dump-archive <path>           Dump an archive summary

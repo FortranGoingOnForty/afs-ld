@@ -125,6 +125,7 @@ pub struct LinkOptions {
     pub fixup_chains: bool,
     pub all_load: bool,
     pub force_load_archives: Vec<PathBuf>,
+    pub jobs: Option<usize>,
     pub kind: OutputKind,
     /// When set, afs-ld operates in dump mode and prints the given file's
     /// header + load commands instead of linking.
@@ -176,12 +177,25 @@ impl Default for LinkOptions {
             fixup_chains: false,
             all_load: false,
             force_load_archives: Vec::new(),
+            jobs: None,
             kind: OutputKind::Executable,
             dump: None,
             dump_archive: None,
             dump_dylib: None,
             dump_tbd: None,
         }
+    }
+}
+
+impl LinkOptions {
+    pub fn parallel_jobs(&self) -> usize {
+        self.jobs
+            .unwrap_or_else(|| {
+                thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1)
+            })
+            .max(1)
     }
 }
 
@@ -445,6 +459,7 @@ impl Linker {
         if opts.inputs.is_empty() && opts.library_names.is_empty() && opts.frameworks.is_empty() {
             return Err(LinkError::NoInputs);
         }
+        let parallel_jobs = opts.parallel_jobs();
 
         if let Some(arch) = &opts.arch {
             if arch != "arm64" {
@@ -513,7 +528,7 @@ impl Linker {
             }
             initial_loads.push((load_order, path.clone()));
         }
-        for loaded in load_initial_inputs(initial_loads)? {
+        for loaded in load_initial_inputs(initial_loads, parallel_jobs)? {
             let timings = register_loaded_initial_input(&mut inputs, loaded);
             phases.add_input_load(timings);
         }
@@ -540,13 +555,24 @@ impl Linker {
 
         let mut force_report = DrainReport::default();
         if opts.all_load {
-            force_load_all(&mut inputs, &mut sym_table, &mut force_report)?;
+            force_load_all(
+                &mut inputs,
+                &mut sym_table,
+                &mut force_report,
+                parallel_jobs,
+            )?;
         }
         for archive_path in &opts.force_load_archives {
             let Some(archive_id) = find_archive_by_path(&inputs, archive_path) else {
                 return Err(LinkError::ForceLoadNotArchive(archive_path.clone()));
             };
-            force_load_archive(&mut inputs, &mut sym_table, archive_id, &mut force_report)?;
+            force_load_archive(
+                &mut inputs,
+                &mut sym_table,
+                archive_id,
+                &mut force_report,
+                parallel_jobs,
+            )?;
         }
         if opts.trace_inputs {
             for path in &force_report.loaded_paths {
@@ -561,7 +587,12 @@ impl Linker {
             return Err(LinkError::DuplicateSymbols(msg));
         }
 
-        let drain_report = drain_fetches(&mut inputs, &mut sym_table, seed_report.pending_fetches)?;
+        let drain_report = drain_fetches(
+            &mut inputs,
+            &mut sym_table,
+            seed_report.pending_fetches,
+            parallel_jobs,
+        )?;
         if opts.trace_inputs {
             for path in &drain_report.loaded_paths {
                 eprintln!("afs-ld: loading {}", path.display());
@@ -991,7 +1022,10 @@ struct InitialLoadError {
     error: LinkError,
 }
 
-fn load_initial_inputs(loads: Vec<(usize, PathBuf)>) -> Result<Vec<LoadedInitialInput>, LinkError> {
+fn load_initial_inputs(
+    loads: Vec<(usize, PathBuf)>,
+    parallel_jobs: usize,
+) -> Result<Vec<LoadedInitialInput>, LinkError> {
     let mut results = Vec::new();
     let mut object_jobs = Vec::new();
     for (load_order, path) in loads {
@@ -1001,7 +1035,7 @@ fn load_initial_inputs(loads: Vec<(usize, PathBuf)>) -> Result<Vec<LoadedInitial
             object_jobs.push((load_order, path));
         }
     }
-    results.extend(load_objects_parallel(object_jobs));
+    results.extend(load_objects_parallel(object_jobs, parallel_jobs));
     results.sort_by_key(|result| match result {
         Ok(input) => input.load_order(),
         Err(error) => error.load_order,
@@ -1019,15 +1053,12 @@ fn load_initial_inputs(loads: Vec<(usize, PathBuf)>) -> Result<Vec<LoadedInitial
 
 fn load_objects_parallel(
     jobs: Vec<(usize, PathBuf)>,
+    parallel_jobs: usize,
 ) -> Vec<Result<LoadedInitialInput, InitialLoadError>> {
     if jobs.is_empty() {
         return Vec::new();
     }
-    let job_count = thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .min(jobs.len())
-        .max(1);
+    let job_count = parallel_jobs.max(1).min(jobs.len()).max(1);
     if job_count == 1 {
         return jobs
             .into_iter()

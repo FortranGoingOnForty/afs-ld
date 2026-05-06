@@ -164,8 +164,8 @@ fn resolve_pipeline_pulls_archive_member_and_flags_missing() {
         "unexpected duplicates in seeding: {:?}",
         seed_report.duplicates
     );
-    let drain_report =
-        drain_fetches(&mut inputs, &mut table, seed_report.pending_fetches).expect("drain_fetches");
+    let drain_report = drain_fetches(&mut inputs, &mut table, seed_report.pending_fetches, 1)
+        .expect("drain_fetches");
     assert!(
         drain_report.fetched_members >= 1,
         "expected at least one archive member fetched; got {}",

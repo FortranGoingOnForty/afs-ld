@@ -1215,16 +1215,13 @@ fn make_archive_member_jobs<'a>(
 fn load_archive_members_parallel(
     inputs: &Inputs,
     keys: Vec<ArchiveMemberKey>,
+    parallel_jobs: usize,
 ) -> Vec<(ArchiveMemberKey, Result<LoadedArchiveMember, FetchError>)> {
     let jobs = make_archive_member_jobs(inputs, keys);
     if jobs.is_empty() {
         return Vec::new();
     }
-    let job_count = thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .min(jobs.len())
-        .max(1);
+    let job_count = parallel_jobs.max(1).min(jobs.len()).max(1);
     if job_count == 1 {
         return jobs
             .into_iter()
@@ -1346,11 +1343,12 @@ fn load_and_ingest_member(
     table: &mut SymbolTable,
     key: ArchiveMemberKey,
     report: &mut DrainReport,
+    parallel_jobs: usize,
 ) -> Result<Vec<PendingFetch>, FetchError> {
     if archive_member_is_fetched(inputs, key) {
         return Ok(Vec::new());
     }
-    let loaded = load_archive_members_parallel(inputs, vec![key])
+    let loaded = load_archive_members_parallel(inputs, vec![key], parallel_jobs)
         .into_iter()
         .next()
         .expect("single archive member load should produce one result")
@@ -1366,12 +1364,19 @@ fn fetch_and_ingest_one(
     table: &mut SymbolTable,
     pending: PendingFetch,
     report: &mut DrainReport,
+    parallel_jobs: usize,
 ) -> Result<Vec<PendingFetch>, FetchError> {
     let slot_is_still_lazy = matches!(table.get(pending.id), Symbol::LazyArchive { .. });
     if !slot_is_still_lazy {
         return Ok(Vec::new());
     }
-    load_and_ingest_member(inputs, table, archive_member_key(pending), report)
+    load_and_ingest_member(
+        inputs,
+        table,
+        archive_member_key(pending),
+        report,
+        parallel_jobs,
+    )
 }
 
 /// Pull every member of one archive (bypasses demand tracking). Respects
@@ -1382,6 +1387,7 @@ pub fn force_load_archive(
     table: &mut SymbolTable,
     archive_id: ArchiveId,
     report: &mut DrainReport,
+    parallel_jobs: usize,
 ) -> Result<(), FetchError> {
     let member_offsets: Vec<u32> = {
         let ai = &inputs.archives[archive_id.0 as usize];
@@ -1399,12 +1405,12 @@ pub fn force_load_archive(
         })
         .collect();
     let mut queue: Vec<PendingFetch> = Vec::new();
-    for (_, loaded) in load_archive_members_parallel(inputs, keys) {
+    for (_, loaded) in load_archive_members_parallel(inputs, keys, parallel_jobs) {
         let new = ingest_loaded_member(inputs, table, loaded?, report)?;
         queue.extend(new);
     }
     while let Some(p) = queue.pop() {
-        let new = fetch_and_ingest_one(inputs, table, p, report)?;
+        let new = fetch_and_ingest_one(inputs, table, p, report, parallel_jobs)?;
         queue.extend(new);
     }
     Ok(())
@@ -1416,9 +1422,10 @@ pub fn force_load_all(
     inputs: &mut Inputs,
     table: &mut SymbolTable,
     report: &mut DrainReport,
+    parallel_jobs: usize,
 ) -> Result<(), FetchError> {
     for i in 0..inputs.archives.len() {
-        force_load_archive(inputs, table, ArchiveId(i as u32), report)?;
+        force_load_archive(inputs, table, ArchiveId(i as u32), report, parallel_jobs)?;
     }
     Ok(())
 }
@@ -1697,6 +1704,7 @@ pub fn drain_fetches(
     inputs: &mut Inputs,
     table: &mut SymbolTable,
     initial: Vec<PendingFetch>,
+    parallel_jobs: usize,
 ) -> Result<DrainReport, FetchError> {
     let mut queue = initial;
     let mut prepared = HashMap::new();
@@ -1711,7 +1719,7 @@ pub fn drain_fetches(
         // Parse siblings ahead of time, but only ingest the current stack
         // entry after re-checking its lazy slot. This keeps member order stable.
         if !prepared.contains_key(&key) {
-            preparse_pending_fetches(inputs, table, p, &queue, &mut prepared);
+            preparse_pending_fetches(inputs, table, p, &queue, &mut prepared, parallel_jobs);
         }
         let Some(loaded) = prepared.remove(&key) else {
             continue;
@@ -1733,6 +1741,7 @@ fn preparse_pending_fetches(
     current: PendingFetch,
     queue: &[PendingFetch],
     prepared: &mut HashMap<ArchiveMemberKey, Result<LoadedArchiveMember, FetchError>>,
+    parallel_jobs: usize,
 ) {
     let mut seen = HashSet::new();
     let mut keys = Vec::new();
@@ -1747,7 +1756,7 @@ fn preparse_pending_fetches(
         }
         keys.push(key);
     }
-    for (key, result) in load_archive_members_parallel(inputs, keys) {
+    for (key, result) in load_archive_members_parallel(inputs, keys, parallel_jobs) {
         prepared.insert(key, result);
     }
 }

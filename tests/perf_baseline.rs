@@ -1,10 +1,14 @@
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 mod common;
 
 use afs_ld::{LinkOptions, LinkProfile, Linker};
-use common::harness::{assemble, have_xcrun, have_xcrun_tool, scratch, sdk_path, sdk_version};
+use common::harness::{
+    assemble, have_tool, have_xcrun, have_xcrun_tool, scratch, sdk_path, sdk_version,
+};
 
 fn find_runtime_archive() -> Option<PathBuf> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -18,6 +22,69 @@ fn find_runtime_archive() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn runtime_archive_fixture() -> Result<PathBuf, String> {
+    if let Some(runtime) = find_runtime_archive() {
+        return Ok(runtime);
+    }
+    build_synthetic_runtime_archive()
+}
+
+fn build_synthetic_runtime_archive() -> Result<PathBuf, String> {
+    if !have_tool("libtool") {
+        return Err("libtool unavailable".into());
+    }
+
+    let members = [
+        ("init", "_afs_program_init"),
+        ("finalize", "_afs_program_finalize"),
+        ("write_i32", "_afs_write_i32"),
+        ("write_f64", "_afs_write_f64"),
+        ("write_newline", "_afs_write_newline"),
+        ("read_i32", "_afs_read_i32"),
+        ("alloc", "_afs_alloc"),
+        ("dealloc", "_afs_dealloc"),
+        ("bounds_check", "_afs_bounds_check"),
+        ("stop", "_afs_stop"),
+        ("date_and_time", "_afs_date_and_time"),
+        ("cpu_time", "_afs_cpu_time"),
+        ("random_seed", "_afs_random_seed"),
+        ("random_number", "_afs_random_number"),
+        ("open_unit", "_afs_open_unit"),
+        ("close_unit", "_afs_close_unit"),
+    ];
+    let mut objects = Vec::with_capacity(members.len());
+    for (stem, symbol) in members {
+        let obj = scratch(&format!("perf-runtime-{stem}.o"));
+        let src = format!(
+            "\
+            .text\n\
+            .globl {symbol}\n\
+            .p2align 2\n\
+            {symbol}:\n\
+                ret\n\
+            .subsections_via_symbols\n",
+        );
+        assemble(&src, &obj)?;
+        objects.push(obj);
+    }
+
+    let archive = scratch("libafs-perf-runtime.a");
+    let _ = fs::remove_file(&archive);
+    let output = Command::new("libtool")
+        .args(["-static", "-o"])
+        .arg(&archive)
+        .args(&objects)
+        .output()
+        .map_err(|e| format!("spawn libtool archive: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "libtool archive failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(archive)
 }
 
 fn executable_opts(inputs: Vec<PathBuf>, output: PathBuf) -> LinkOptions {
@@ -139,7 +206,7 @@ fn assert_profile_basics(name: &str, profile: &LinkProfile) {
 }
 
 #[test]
-fn hello_world_profile_reports_baseline_timings() {
+fn bench_hello_world_profile_reports_baseline_timings() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
         eprintln!("skipping: xcrun as/ld unavailable");
         return;
@@ -174,14 +241,17 @@ fn hello_world_profile_reports_baseline_timings() {
 }
 
 #[test]
-fn runtime_link_profile_reports_baseline_timings() {
+fn bench_runtime_link_profile_reports_baseline_timings() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
         eprintln!("skipping: xcrun as/ld unavailable");
         return;
     }
-    let Some(runtime) = find_runtime_archive() else {
-        eprintln!("skipping: libarmfortas_rt.a not built");
-        return;
+    let runtime = match runtime_archive_fixture() {
+        Ok(runtime) => runtime,
+        Err(reason) => {
+            eprintln!("skipping: {reason}");
+            return;
+        }
     };
 
     let obj = scratch("perf-runtime.o");

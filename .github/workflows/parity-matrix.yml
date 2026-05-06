@@ -26,6 +26,12 @@ jobs:
       - name: Run determinism gate
         run: cargo test --test determinism -- --nocapture
 
+      - name: Run performance budget gate
+        env:
+          AFS_LD_HELLO_BUDGET_MS: "20"
+          AFS_LD_RUNTIME_BUDGET_MS: "150"
+        run: cargo test --test perf_baseline -- --nocapture
+
       - name: Run parity matrix
         env:
           PARITY_MATRIX_ARTIFACT_DIR: ${{ github.workspace }}/parity-matrix-artifacts

@@ -4,13 +4,20 @@
 Sprint 27 — correctness gate in place; can freely refactor for speed.
 
 ## Goals
-Make afs-ld fast enough to feel like a production tool. Target: within 2× of Apple `ld`'s wall time on the fortsh link. Mold demonstrates linkers can be very fast; we don't need mold's speed, but we need to not be painful.
+Make afs-ld fast enough to feel like a production tool. Sprint 28 establishes
+the profiling surface, parallelizes the obvious hot paths, and enforces
+hello/runtime-link budgets in CI. The fortsh 2× Apple `ld` gate remains the
+production target, but Sprint 29 owns the fortsh fixture and final comparison.
+Mold demonstrates linkers can be very fast; we don't need mold's speed, but we
+need to not be painful.
 
 ## Deliverables
 
 ### 1. Baseline profile
 
-Profile the fortsh link (Sprint 29 produces the fixture). Categorize wall time:
+Profile representative hello-world and runtime-archive links in Sprint 28.
+Sprint 29 extends the same profile surface to the fortsh link once the fixture
+exists. Categorize wall time:
 
 - Input parsing (Mach-O headers, sections, symbols, relocations).
 - Symbol resolution (hash-map probes, archive lookups).
@@ -37,11 +44,17 @@ One thread per 4 KiB page. SHA-256 is inherently sequential within a page but tr
 
 ### 5. Bump allocator for ephemeral data
 
-Parser produces many small allocations (strings, reloc lists, atom descriptors). A per-input arena avoids fragmentation and makes bulk drop free. Implement as `src/arena.rs` — a std-only `Vec<Box<[u8]>>` chunker.
+Deferred. The current Sprint 28 profile work did not prove allocation churn is
+the next limiting bucket after the parallel parsing/relocation/signature and
+string-table clone fixes. If Sprint 29's fortsh profile shows parser allocation
+pressure, implement `src/arena.rs` as a std-only `Vec<Box<[u8]>>` chunker.
 
 ### 6. mmap for large inputs
 
-`std::fs::File` + `memmap2`? No — memmap2 is an external crate. Use `libc::mmap` via an unsafe `src/mmap.rs` wrapper. Input files are always read-only; mmap saves a read syscall and lets us share parse state across threads cheaply. Fall back to `fs::read` for GNU-thin archive members whose external path doesn't mmap cleanly (rare).
+Deferred. Object/archive loading still uses `fs::read`; this keeps the Sprint 28
+closeout safe and std-only. If fortsh-sized inputs show file-read overhead as a
+real bucket in Sprint 29, add an unsafe `src/mmap.rs` wrapper and keep a
+`fs::read` fallback for archive members whose external path cannot be mapped.
 
 ### 7. Symbol-table hash map
 
@@ -49,7 +62,10 @@ Profile shows std `HashMap` is fine for our scale. If not: replace with an open-
 
 ### 8. String interner
 
-Single global `StringInterner` shared across inputs. Interning cost: one hash lookup per name. Optimize by batching per-input: each input parses its strings into a local table, then merges into the global interner in one pass.
+Deferred. Sprint 28 made the global string table thread-shareable and removed
+the cloned string-table offset map during output writing. Per-input local
+interners remain a candidate if Sprint 29 identifies symbol seeding as a
+fortsh-scale bottleneck.
 
 ### 9. No-alloc hot paths
 
@@ -57,15 +73,16 @@ Reloc application and chain construction should not allocate per-reloc. Prealloc
 
 ### 10. Benchmarks
 
-`afs-ld/bench/` (or a `#[bench]` behind `cargo +nightly bench`) with:
-- `bench_hello_world`: small, measures startup overhead.
-- `bench_runtime_link`: mid, measures symbol-table & reloc-apply.
-- `bench_fortsh_link`: large, measures end-to-end throughput.
+Sprint 28 uses CI-enforced integration benchmarks in `tests/perf_baseline.rs`:
+
+- `bench_hello_world_profile_reports_baseline_timings`: small, measures startup overhead.
+- `bench_runtime_link_profile_reports_baseline_timings`: mid, measures symbol-table, archive parsing, and reloc-apply.
+- `bench_fortsh_link`: deferred to Sprint 29 with the real fortsh fixture.
 
 Budget targets:
 - hello-world: ≤ 20 ms.
 - runtime link: ≤ 150 ms.
-- fortsh link: ≤ 2× Apple `ld`'s wall time on the same machine.
+- fortsh link: ≤ 2× Apple `ld`'s wall time on the same machine, enforced in Sprint 29.
 
 ### 11. Determinism preserved
 
@@ -73,14 +90,16 @@ Parallelism must not reorder output. Each worker produces a deterministic result
 
 ## Testing Strategy
 
-- Benchmarks land as regression gates: nightly CI records throughput; > 10% regression fails.
+- Benchmark gate: CI runs `tests/perf_baseline.rs` with hello/runtime budgets on every push and PR.
+- Nightly throughput recording and a relative >10% regression gate are deferred until the fortsh fixture lands in Sprint 29.
 - Determinism: 100 parallel runs of the same input, assert byte-identical output every time.
 - Sprint 27 parity must remain green — no correctness regression.
 - Single-threaded fallback (`-j 1`) for debugging.
 
 ## Definition of Done
 
-- fortsh link wall time within 2× of `ld`'s.
+- hello/runtime performance budgets are enforced in CI.
+- fortsh 2× comparison is explicitly handed to Sprint 29 with its fixture.
 - All Sprint 27 scenarios still byte-identical.
 - Determinism bulletproof across parallelism.
 - No external dependencies added.

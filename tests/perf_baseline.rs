@@ -86,16 +86,18 @@ fn assert_profile_basics(name: &str, profile: &LinkProfile) {
         profile.phases.accounted_total() > Duration::ZERO,
         "{name}: all phase timings were zero"
     );
+    let input_subphase_total = profile.phases.input_read
+        + profile.phases.input_object_parse
+        + profile.phases.input_archive_parse
+        + profile.phases.input_dylib_parse
+        + profile.phases.input_tbd_decode
+        + profile.phases.input_tbd_materialize
+        + profile.phases.input_reloc_parse;
+    // Input subphases are summed worker-time once object parsing is parallel,
+    // so they can legitimately exceed the wall-clock input parsing bucket.
     assert!(
-        profile.phases.input_parsing
-            >= profile.phases.input_read
-                + profile.phases.input_object_parse
-                + profile.phases.input_archive_parse
-                + profile.phases.input_dylib_parse
-                + profile.phases.input_tbd_decode
-                + profile.phases.input_tbd_materialize
-                + profile.phases.input_reloc_parse,
-        "{name}: input subphases exceeded input total"
+        input_subphase_total > Duration::ZERO,
+        "{name}: all input subphase timings were zero"
     );
     assert!(
         profile.phases.layout

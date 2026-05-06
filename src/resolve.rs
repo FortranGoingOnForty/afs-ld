@@ -140,10 +140,11 @@ pub struct ObjectInput {
     pub path: PathBuf,
     pub load_order: usize,
     pub archive_member_offset: Option<u32>,
-    /// Raw bytes; `ObjectFile::parse` re-runs cheaply against this on
-    /// demand. We don't cache a parsed view because `ObjectFile` copies
-    /// the fields it needs on construction, so re-parse is idempotent.
+    /// Raw bytes retained for diagnostics and future low-level readers.
     pub bytes: Vec<u8>,
+    /// Parsed object view. It owns section/relocation/string-table buffers,
+    /// so it is safe to build off-thread and then borrow during the link.
+    pub parsed: ObjectFile,
 }
 
 #[derive(Debug)]
@@ -239,15 +240,26 @@ impl Inputs {
         load_order: usize,
     ) -> Result<InputId, InputAddError> {
         // Validate now — we'd rather catch a bad object at the add site.
-        ObjectFile::parse(&path, &bytes)?;
+        let parsed = ObjectFile::parse(&path, &bytes)?;
+        Ok(self.add_parsed_object(path, bytes, parsed, load_order))
+    }
+
+    pub fn add_parsed_object(
+        &mut self,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        parsed: ObjectFile,
+        load_order: usize,
+    ) -> InputId {
         let id = InputId(self.objects.len() as u32);
         self.objects.push(ObjectInput {
             path,
             load_order,
             archive_member_offset: None,
             bytes,
+            parsed,
         });
-        Ok(id)
+        id
     }
 
     /// Register an `.a` file.
@@ -258,6 +270,15 @@ impl Inputs {
         load_order: usize,
     ) -> Result<ArchiveId, InputAddError> {
         Archive::open(&path, &bytes)?; // validate
+        Ok(self.add_validated_archive(path, bytes, load_order))
+    }
+
+    pub fn add_validated_archive(
+        &mut self,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        load_order: usize,
+    ) -> ArchiveId {
         let id = ArchiveId(self.archives.len() as u32);
         self.archives.push(ArchiveInput {
             path,
@@ -265,7 +286,7 @@ impl Inputs {
             bytes,
             fetched: std::collections::HashSet::new(),
         });
-        Ok(id)
+        id
     }
 
     /// Register a `.dylib`. TBD-backed dylibs go through
@@ -344,11 +365,10 @@ impl Inputs {
         &self.dylibs[id.0 as usize]
     }
 
-    /// Parse an `ObjectFile` view of a registered object. Fast — `ObjectFile`
-    /// owns its buffers, so this is just the Mach-O walk cost.
-    pub fn object_file(&self, id: InputId) -> Result<ObjectFile, ReadError> {
+    /// Borrow a parsed `ObjectFile` view of a registered object.
+    pub fn object_file(&self, id: InputId) -> Result<&ObjectFile, ReadError> {
         let o = &self.objects[id.0 as usize];
-        ObjectFile::parse(&o.path, &o.bytes)
+        Ok(&o.parsed)
     }
 
     /// Open an `Archive` view, borrowing from the registry's bytes for the
@@ -1176,16 +1196,19 @@ fn ingest_member_bytes(
         let logical = format!("{}({})", ai.path.display(), member.name);
         (logical, member.body.to_vec())
     };
+    let logical_path = PathBuf::from(logical_path);
+    let parsed = ObjectFile::parse(&logical_path, &member_bytes)?;
 
     inputs.archives[archive_id.0 as usize]
         .fetched
         .insert(member_id.0);
     let input_id = InputId(inputs.objects.len() as u32);
     inputs.objects.push(ObjectInput {
-        path: PathBuf::from(logical_path),
+        path: logical_path,
         load_order: archive_load_order,
         archive_member_offset: Some(member_id.0),
         bytes: member_bytes,
+        parsed,
     });
     report.fetched_members += 1;
     report

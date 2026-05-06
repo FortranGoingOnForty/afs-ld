@@ -26,11 +26,15 @@ pub mod why_live;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
-use std::{fs, io};
+use std::{collections::VecDeque, fs, io};
 
+use archive::Archive;
 use atom::{atomize_object, backpatch_symbol_atoms, AtomTable};
 use icf::IcfError;
+use input::ObjectFile;
 use layout::{ExtraLayoutSections, Layout, LayoutInput};
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
 use macho::reader::ReadError;
@@ -494,6 +498,7 @@ impl Linker {
 
         let mut inputs = Inputs::new();
         let mut deferred_dylibs = Vec::new();
+        let mut initial_loads = Vec::new();
         let phase_started = Instant::now();
         for (load_order, path) in load_paths.iter().enumerate() {
             if matches!(
@@ -506,7 +511,10 @@ impl Linker {
             if opts.trace_inputs {
                 eprintln!("afs-ld: loading {}", path.display());
             }
-            let timings = register_input(&mut inputs, path, load_order, true)?;
+            initial_loads.push((load_order, path.clone()));
+        }
+        for loaded in load_initial_inputs(initial_loads)? {
+            let timings = register_loaded_initial_input(&mut inputs, loaded);
             phases.add_input_load(timings);
         }
         let include_tbd_exports = inputs_may_need_dylib_exports(&inputs)?;
@@ -594,14 +602,8 @@ impl Linker {
         for idx in 0..inputs.objects.len() {
             let input_id = resolve::InputId(idx as u32);
             let obj = inputs.object_file(input_id)?;
-            let atomization = atomize_object(input_id, &obj, &mut atom_table);
-            backpatch_symbol_atoms(
-                &atomization,
-                input_id,
-                &obj,
-                &mut sym_table,
-                &mut atom_table,
-            );
+            let atomization = atomize_object(input_id, obj, &mut atom_table);
+            backpatch_symbol_atoms(&atomization, input_id, obj, &mut sym_table, &mut atom_table);
             objects.push((input_id, obj));
         }
         phases.atomization = phase_started.elapsed();
@@ -953,6 +955,178 @@ fn default_output_path(opts: &LinkOptions) -> PathBuf {
     opts.output
         .clone()
         .unwrap_or_else(|| PathBuf::from("a.out"))
+}
+
+struct LoadedObjectInput {
+    path: PathBuf,
+    load_order: usize,
+    bytes: Vec<u8>,
+    parsed: ObjectFile,
+    timings: InputLoadTimings,
+}
+
+struct LoadedArchiveInput {
+    path: PathBuf,
+    load_order: usize,
+    bytes: Vec<u8>,
+    timings: InputLoadTimings,
+}
+
+enum LoadedInitialInput {
+    Object(Box<LoadedObjectInput>),
+    Archive(LoadedArchiveInput),
+}
+
+impl LoadedInitialInput {
+    fn load_order(&self) -> usize {
+        match self {
+            LoadedInitialInput::Object(input) => input.load_order,
+            LoadedInitialInput::Archive(input) => input.load_order,
+        }
+    }
+}
+
+struct InitialLoadError {
+    load_order: usize,
+    error: LinkError,
+}
+
+fn load_initial_inputs(loads: Vec<(usize, PathBuf)>) -> Result<Vec<LoadedInitialInput>, LinkError> {
+    let mut results = Vec::new();
+    let mut object_jobs = Vec::new();
+    for (load_order, path) in loads {
+        if matches!(path.extension().and_then(|ext| ext.to_str()), Some("a")) {
+            results.push(load_archive_input(path, load_order));
+        } else {
+            object_jobs.push((load_order, path));
+        }
+    }
+    results.extend(load_objects_parallel(object_jobs));
+    results.sort_by_key(|result| match result {
+        Ok(input) => input.load_order(),
+        Err(error) => error.load_order,
+    });
+
+    let mut loaded = Vec::with_capacity(results.len());
+    for result in results {
+        match result {
+            Ok(input) => loaded.push(input),
+            Err(error) => return Err(error.error),
+        }
+    }
+    Ok(loaded)
+}
+
+fn load_objects_parallel(
+    jobs: Vec<(usize, PathBuf)>,
+) -> Vec<Result<LoadedInitialInput, InitialLoadError>> {
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    let job_count = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(jobs.len())
+        .max(1);
+    if job_count == 1 {
+        return jobs
+            .into_iter()
+            .map(|(load_order, path)| load_object_input(path, load_order))
+            .collect();
+    }
+
+    let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
+    let (tx, rx) = mpsc::channel();
+    thread::scope(|scope| {
+        for _ in 0..job_count {
+            let queue = Arc::clone(&queue);
+            let tx = tx.clone();
+            scope.spawn(move || loop {
+                let Some((load_order, path)) = queue
+                    .lock()
+                    .expect("input load queue mutex poisoned")
+                    .pop_front()
+                else {
+                    break;
+                };
+                tx.send(load_object_input(path, load_order))
+                    .expect("input load receiver should stay live");
+            });
+        }
+        drop(tx);
+        rx.into_iter().collect()
+    })
+}
+
+fn load_object_input(
+    path: PathBuf,
+    load_order: usize,
+) -> Result<LoadedInitialInput, InitialLoadError> {
+    let mut timings = InputLoadTimings::default();
+    let phase_started = Instant::now();
+    let bytes = fs::read(&path).map_err(|error| InitialLoadError {
+        load_order,
+        error: LinkError::Io(error),
+    })?;
+    timings.read = phase_started.elapsed();
+
+    let phase_started = Instant::now();
+    let parsed = ObjectFile::parse(&path, &bytes).map_err(|error| InitialLoadError {
+        load_order,
+        error: LinkError::from(error),
+    })?;
+    timings.object_parse = phase_started.elapsed();
+
+    Ok(LoadedInitialInput::Object(Box::new(LoadedObjectInput {
+        path,
+        load_order,
+        bytes,
+        parsed,
+        timings,
+    })))
+}
+
+fn load_archive_input(
+    path: PathBuf,
+    load_order: usize,
+) -> Result<LoadedInitialInput, InitialLoadError> {
+    let mut timings = InputLoadTimings::default();
+    let phase_started = Instant::now();
+    let bytes = fs::read(&path).map_err(|error| InitialLoadError {
+        load_order,
+        error: LinkError::Io(error),
+    })?;
+    timings.read = phase_started.elapsed();
+
+    let phase_started = Instant::now();
+    Archive::open(&path, &bytes).map_err(|error| InitialLoadError {
+        load_order,
+        error: LinkError::from(InputAddError::from(error)),
+    })?;
+    timings.archive_parse = phase_started.elapsed();
+
+    Ok(LoadedInitialInput::Archive(LoadedArchiveInput {
+        path,
+        load_order,
+        bytes,
+        timings,
+    }))
+}
+
+fn register_loaded_initial_input(
+    inputs: &mut Inputs,
+    loaded: LoadedInitialInput,
+) -> InputLoadTimings {
+    match loaded {
+        LoadedInitialInput::Object(input) => {
+            inputs.add_parsed_object(input.path, input.bytes, input.parsed, input.load_order);
+            input.timings
+        }
+        LoadedInitialInput::Archive(input) => {
+            inputs.add_validated_archive(input.path, input.bytes, input.load_order);
+            input.timings
+        }
+    }
 }
 
 fn register_input(

@@ -27,7 +27,7 @@ use crate::resolve::{AtomId, InputId};
 use crate::resolve::{Symbol, SymbolId, SymbolTable};
 use crate::section::is_executable;
 use crate::string_table::StringTableBuilder;
-use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind};
+use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind, NLIST_SIZE};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::{
     code_sig::CodeSignaturePlan,
@@ -927,7 +927,7 @@ fn build_linkedit_plan_profiled(
     timings.symbol_plan_locals += symbol_plan_timings.locals;
     timings.symbol_plan_globals += symbol_plan_timings.globals;
     timings.symbol_plan_strtab += symbol_plan_timings.strtab;
-    let mut symtab_bytes = Vec::new();
+    let mut symtab_bytes = Vec::with_capacity(symbol_plan.symbols.len() * NLIST_SIZE);
     write_nlist_table(&symbol_plan.symbols, &mut symtab_bytes);
 
     let mut indirect_symbols = Vec::new();
@@ -1898,8 +1898,10 @@ fn build_output_symbols_profiled(
         Vec::new()
     };
 
-    let phase_started = std::time::Instant::now();
     let local_count = if strip_locals { 0 } else { locals.len() };
+    let external_defined_count = external_defineds.len();
+    let undefined_count = undefineds.len();
+    let phase_started = std::time::Instant::now();
     let mut specs = Vec::with_capacity(local_count + external_defineds.len() + undefineds.len());
     if !strip_locals {
         specs.extend(locals);
@@ -1907,27 +1909,11 @@ fn build_output_symbols_profiled(
     specs.extend(external_defineds);
     specs.extend(undefineds);
 
-    let mut strtab = StringTableBuilder::new();
-    for spec in &specs {
-        strtab.insert(&spec.name);
-    }
-    let (strtab_bytes, strx_by_name) = strtab.finish();
-
-    let nlocalsym = specs
-        .iter()
-        .filter(|spec| spec.partition == OutputSymbolPartition::Local)
-        .count() as u32;
-    let nextdefsym = specs
-        .iter()
-        .filter(|spec| spec.partition == OutputSymbolPartition::ExternalDefined)
-        .count() as u32;
-    let nundefsym = specs
-        .iter()
-        .filter(|spec| spec.partition == OutputSymbolPartition::Undefined)
-        .count() as u32;
+    let (strtab_bytes, strx_by_spec) =
+        StringTableBuilder::build_with_name_offsets(specs.iter().map(|spec| spec.name.as_str()));
 
     let mut symbols = Vec::with_capacity(specs.len());
-    let mut symbol_indices = HashMap::new();
+    let mut symbol_indices = HashMap::with_capacity(specs.len());
     let map_symbols = specs
         .iter()
         .filter(|spec| spec.partition != OutputSymbolPartition::Undefined)
@@ -1939,9 +1925,7 @@ fn build_output_symbols_profiled(
         })
         .collect();
     for (idx, spec) in specs.into_iter().enumerate() {
-        let strx = *strx_by_name
-            .get(&spec.name)
-            .expect("string table offset missing for output symbol");
+        let strx = strx_by_spec[idx];
         symbols.push(InputSymbol::from_raw(RawNlist {
             strx,
             n_type: spec.n_type,
@@ -1964,11 +1948,11 @@ fn build_output_symbols_profiled(
             exports,
             dysymtab: DysymtabCmd {
                 ilocalsym: 0,
-                nlocalsym,
-                iextdefsym: nlocalsym,
-                nextdefsym,
-                iundefsym: nlocalsym + nextdefsym,
-                nundefsym,
+                nlocalsym: local_count as u32,
+                iextdefsym: local_count as u32,
+                nextdefsym: external_defined_count as u32,
+                iundefsym: (local_count + external_defined_count) as u32,
+                nundefsym: undefined_count as u32,
                 ..DysymtabCmd::default()
             },
         },

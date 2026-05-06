@@ -17,7 +17,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -43,8 +42,8 @@ impl Istr {
 
 #[derive(Debug, Default)]
 pub struct StringInterner {
-    strings: Vec<Rc<str>>,
-    index: HashMap<Rc<str>, u32>,
+    strings: Vec<Arc<str>>,
+    index: HashMap<Arc<str>, u32>,
 }
 
 impl StringInterner {
@@ -53,12 +52,12 @@ impl StringInterner {
     }
 
     /// Intern `s`, returning the existing handle when the string was already
-    /// seen. Allocates at most one `Rc<str>` per unique name.
+    /// seen. Allocates at most one `Arc<str>` per unique name.
     pub fn intern(&mut self, s: &str) -> Istr {
         if let Some(&i) = self.index.get(s) {
             return Istr(i);
         }
-        let rc: Rc<str> = Rc::from(s);
+        let rc: Arc<str> = Arc::from(s);
         let id = self.strings.len() as u32;
         self.strings.push(rc.clone());
         self.index.insert(rc, id);

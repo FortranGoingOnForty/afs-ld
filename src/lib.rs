@@ -857,6 +857,7 @@ impl Linker {
                 linkedit: &linkedit,
                 icf_redirects,
                 parsed_relocs: &parsed_relocs,
+                parallel_jobs,
             },
         )?;
         phases.reloc_apply = phase_started.elapsed();

@@ -147,6 +147,75 @@ fn repeated_parallel_archive_fetches_are_byte_identical() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn relocation_workers_match_single_worker_for_many_atoms() {
+    if !have_xcrun() || !have_xcrun_tool("as") {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let root = unique_temp_dir("reloc-workers").expect("create relocation worker temp dir");
+    let text_obj = root.join("text.o");
+    let data_obj = root.join("data.o");
+
+    let mut asm = String::from(
+        "\
+        .section __TEXT,__text,regular,pure_instructions\n\
+        .globl _main\n\
+        _main:\n",
+    );
+    for index in 0..64 {
+        asm.push_str(&format!("            bl _helper_{index}\n"));
+    }
+    asm.push_str(
+        "\
+            adrp x8, _value@GOTPAGE\n\
+            ldr x8, [x8, _value@GOTPAGEOFF]\n\
+            ldr w0, [x8]\n\
+            ret\n\
+\n",
+    );
+    for index in 0..64 {
+        asm.push_str(&format!(
+            "\
+        .globl _helper_{index}\n\
+        _helper_{index}:\n\
+            adrp x9, _value@GOTPAGE\n\
+            ldr x9, [x9, _value@GOTPAGEOFF]\n\
+            ldr w9, [x9]\n\
+            ret\n\
+\n"
+        ));
+    }
+    asm.push_str("        .subsections_via_symbols\n");
+
+    assemble(&asm, &text_obj).expect("assemble relocation worker text fixture");
+    assemble(
+        "\
+        .section __DATA,__data\n\
+        .globl _value\n\
+        .p2align 2\n\
+        _value:\n\
+            .long 11\n\
+\n\
+        .subsections_via_symbols\n",
+        &data_obj,
+    )
+    .expect("assemble relocation worker data fixture");
+
+    let inputs = vec![text_obj, data_obj];
+    let serial =
+        link_once_with_jobs(&inputs, &root, "reloc-workers-serial", Some(1)).expect("serial link");
+    let parallel = link_once_with_jobs(&inputs, &root, "reloc-workers-parallel", Some(8))
+        .expect("parallel link");
+    assert_eq!(
+        parallel, serial,
+        "parallel relocation workers changed final output bytes"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn assert_repeated_links_identical(inputs: Vec<PathBuf>, root: &Path, label: &str) {
     let baseline = link_once(&inputs, root, &format!("{label}-baseline"))
         .expect("baseline deterministic link");

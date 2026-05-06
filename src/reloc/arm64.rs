@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::thread;
 
 use crate::atom::{Atom, AtomSection, AtomTable};
 use crate::input::ObjectFile;
@@ -8,7 +9,7 @@ use crate::layout::{ExtraOutputSection, ExtraSectionAnchor, Layout, LayoutInput}
 use crate::macho::writer::LinkEditPlan;
 use crate::reloc::{ParsedRelocCache, Referent, Reloc, RelocKind, RelocLength};
 use crate::resolve::{InputId, Symbol, SymbolId, SymbolTable};
-use crate::section::{OutputSection, SectionKind};
+use crate::section::{OutputAtom, OutputSection, SectionKind};
 use crate::symbol::{InputSymbol, SymKind};
 use crate::synth::stubs::{STUB_HELPER_ENTRY_SIZE, STUB_HELPER_HEADER_SIZE, STUB_SIZE};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
@@ -73,6 +74,7 @@ pub struct ApplyLayoutPlan<'a> {
     pub linkedit: &'a LinkEditPlan,
     pub icf_redirects: Option<&'a HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
     pub parsed_relocs: &'a ParsedRelocCache,
+    pub parallel_jobs: usize,
 }
 
 struct InputSectionResolveCtx<'a> {
@@ -80,6 +82,15 @@ struct InputSectionResolveCtx<'a> {
     atom: &'a Atom,
     kind: RelocKind,
     referent: &'a str,
+}
+
+struct RegularRelocContext<'a> {
+    input_map: &'a HashMap<InputId, &'a ObjectFile>,
+    atoms: &'a AtomTable,
+    resolve: &'a ResolveView<'a>,
+    thunk_plan: Option<&'a ThunkPlan>,
+    thunk_addrs: Option<&'a HashMap<usize, u64>>,
+    parsed_relocs: &'a ParsedRelocCache,
 }
 
 const THUNK_SIZE: u64 = 12;
@@ -232,41 +243,15 @@ pub fn apply_layout(
         .thunk_plan
         .map(|thunk_plan| thunk_plan.thunk_addrs(layout));
 
-    for out_section in &mut layout.sections {
-        for placed in &mut out_section.atoms {
-            let atom = atoms.get(placed.atom);
-            if atom.size == 0 || placed.data.is_empty() {
-                continue;
-            }
-            let obj = input_map.get(&atom.origin).ok_or_else(|| {
-                reloc_error(
-                    atom,
-                    &PathBuf::from("<missing object>"),
-                    0,
-                    RelocKind::Unsigned,
-                    "object",
-                    "missing parsed object".to_string(),
-                )
-            })?;
-            patch_eh_frame_cie_pointer(&mut placed.data, atom, &resolve)?;
-            let relocs = plan
-                .parsed_relocs
-                .get(&(atom.origin, atom.input_section))
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            for reloc in relocs_for_atom(relocs, atom) {
-                apply_one(
-                    &mut placed.data,
-                    atom,
-                    obj,
-                    reloc,
-                    &resolve,
-                    plan.thunk_plan,
-                    thunk_addrs.as_ref(),
-                )?;
-            }
-        }
-    }
+    let regular_ctx = RegularRelocContext {
+        input_map: &input_map,
+        atoms,
+        resolve: &resolve,
+        thunk_plan: plan.thunk_plan,
+        thunk_addrs: thunk_addrs.as_ref(),
+        parsed_relocs: plan.parsed_relocs,
+    };
+    apply_regular_relocs(layout, &regular_ctx, plan.parallel_jobs)?;
 
     if let Some(thunk_plan) = plan.thunk_plan {
         synthesize_thunk_section(layout, thunk_plan, &resolve)?;
@@ -287,6 +272,75 @@ pub fn apply_layout(
         synthesize_stub_helper_section(layout, synthetic_plan, &resolve, plan.linkedit)?;
     }
 
+    Ok(())
+}
+
+fn apply_regular_relocs(
+    layout: &mut Layout,
+    ctx: &RegularRelocContext<'_>,
+    parallel_jobs: usize,
+) -> Result<(), RelocError> {
+    let parallel_jobs = parallel_jobs.max(1);
+    for out_section in &mut layout.sections {
+        let atom_count = out_section.atoms.len();
+        if parallel_jobs == 1 || atom_count < 2 {
+            apply_regular_atom_chunk(&mut out_section.atoms, ctx)?;
+            continue;
+        }
+
+        let job_count = parallel_jobs.min(atom_count).max(1);
+        let chunk_size = atom_count.div_ceil(job_count);
+        thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk in out_section.atoms.chunks_mut(chunk_size) {
+                handles.push(scope.spawn(move || apply_regular_atom_chunk(chunk, ctx)));
+            }
+            for handle in handles {
+                handle.join().expect("relocation worker panicked")?;
+            }
+            Ok::<(), RelocError>(())
+        })?;
+    }
+    Ok(())
+}
+
+fn apply_regular_atom_chunk(
+    placed_atoms: &mut [OutputAtom],
+    ctx: &RegularRelocContext<'_>,
+) -> Result<(), RelocError> {
+    for placed in placed_atoms {
+        let atom = ctx.atoms.get(placed.atom);
+        if atom.size == 0 || placed.data.is_empty() {
+            continue;
+        }
+        let obj = ctx.input_map.get(&atom.origin).ok_or_else(|| {
+            reloc_error(
+                atom,
+                &PathBuf::from("<missing object>"),
+                0,
+                RelocKind::Unsigned,
+                "object",
+                "missing parsed object".to_string(),
+            )
+        })?;
+        patch_eh_frame_cie_pointer(&mut placed.data, atom, ctx.resolve)?;
+        let relocs = ctx
+            .parsed_relocs
+            .get(&(atom.origin, atom.input_section))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for reloc in relocs_for_atom(relocs, atom) {
+            apply_one(
+                &mut placed.data,
+                atom,
+                obj,
+                reloc,
+                ctx.resolve,
+                ctx.thunk_plan,
+                ctx.thunk_addrs,
+            )?;
+        }
+    }
     Ok(())
 }
 

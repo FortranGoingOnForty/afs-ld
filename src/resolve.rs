@@ -15,9 +15,11 @@
 //! happened (inserted / replaced / kept / pending archive fetch), and they
 //! drive the outer loop.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 
 use crate::archive::{Archive, ArchiveError};
 use crate::input::ObjectFile;
@@ -156,7 +158,7 @@ pub struct ArchiveInput {
     /// the fixed-point loop from re-ingesting the same object twice —
     /// important both for correctness (no duplicate-strong errors from
     /// our own symbols) and for keeping transitions deterministic.
-    pub fetched: std::collections::HashSet<u32>,
+    pub fetched: HashSet<u32>,
 }
 
 #[derive(Debug)]
@@ -1168,47 +1170,164 @@ pub struct DrainReport {
     pub referrers: ReferrerLog,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ArchiveMemberKey {
+    archive: ArchiveId,
+    member: MemberId,
+}
+
+#[derive(Clone, Copy)]
+struct ArchiveMemberLoadJob<'a> {
+    index: usize,
+    key: ArchiveMemberKey,
+    archive_path: &'a Path,
+    archive_bytes: &'a [u8],
+    archive_load_order: usize,
+}
+
+struct LoadedArchiveMember {
+    key: ArchiveMemberKey,
+    archive_load_order: usize,
+    logical_path: PathBuf,
+    bytes: Vec<u8>,
+    parsed: ObjectFile,
+}
+
+fn make_archive_member_jobs<'a>(
+    inputs: &'a Inputs,
+    keys: Vec<ArchiveMemberKey>,
+) -> Vec<ArchiveMemberLoadJob<'a>> {
+    keys.into_iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let archive = &inputs.archives[key.archive.0 as usize];
+            ArchiveMemberLoadJob {
+                index,
+                key,
+                archive_path: &archive.path,
+                archive_bytes: &archive.bytes,
+                archive_load_order: archive.load_order,
+            }
+        })
+        .collect()
+}
+
+fn load_archive_members_parallel(
+    inputs: &Inputs,
+    keys: Vec<ArchiveMemberKey>,
+) -> Vec<(ArchiveMemberKey, Result<LoadedArchiveMember, FetchError>)> {
+    let jobs = make_archive_member_jobs(inputs, keys);
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    let job_count = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(jobs.len())
+        .max(1);
+    if job_count == 1 {
+        return jobs
+            .into_iter()
+            .map(load_archive_member_job)
+            .map(|(_, key, result)| (key, result))
+            .collect();
+    }
+
+    let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
+    let (tx, rx) = mpsc::channel();
+    let mut results = thread::scope(|scope| {
+        for _ in 0..job_count {
+            let queue = Arc::clone(&queue);
+            let tx = tx.clone();
+            scope.spawn(move || loop {
+                let Some(job) = queue
+                    .lock()
+                    .expect("archive member load queue mutex poisoned")
+                    .pop_front()
+                else {
+                    break;
+                };
+                tx.send(load_archive_member_job(job))
+                    .expect("archive member load receiver should stay live");
+            });
+        }
+        drop(tx);
+        rx.into_iter().collect::<Vec<_>>()
+    });
+    results.sort_by_key(|(index, _, _)| *index);
+    results
+        .into_iter()
+        .map(|(_, key, result)| (key, result))
+        .collect()
+}
+
+fn load_archive_member_job(
+    job: ArchiveMemberLoadJob<'_>,
+) -> (
+    usize,
+    ArchiveMemberKey,
+    Result<LoadedArchiveMember, FetchError>,
+) {
+    let result = (|| {
+        let archive = Archive::open(job.archive_path, job.archive_bytes)?;
+        let member =
+            archive
+                .member_at_offset(job.key.member.0)
+                .ok_or(FetchError::MemberNotFound {
+                    archive: job.key.archive,
+                    member: job.key.member,
+                })?;
+        let logical_path =
+            PathBuf::from(format!("{}({})", job.archive_path.display(), member.name));
+        let bytes = member.body.to_vec();
+        let parsed = ObjectFile::parse(&logical_path, &bytes)?;
+        Ok(LoadedArchiveMember {
+            key: job.key,
+            archive_load_order: job.archive_load_order,
+            logical_path,
+            bytes,
+            parsed,
+        })
+    })();
+    (job.index, job.key, result)
+}
+
+fn archive_member_key(pending: PendingFetch) -> ArchiveMemberKey {
+    ArchiveMemberKey {
+        archive: pending.archive,
+        member: pending.member,
+    }
+}
+
+fn archive_member_is_fetched(inputs: &Inputs, key: ArchiveMemberKey) -> bool {
+    inputs.archives[key.archive.0 as usize]
+        .fetched
+        .contains(&key.member.0)
+}
+
 /// Shared ingest: copy one archive member's body into a fresh
 /// `ObjectInput`, mark it fetched, and seed its symbols. Callers either
 /// respond to a demand-driven `PendingFetch` or force-pull the member.
-fn ingest_member_bytes(
+fn ingest_loaded_member(
     inputs: &mut Inputs,
     table: &mut SymbolTable,
-    archive_id: ArchiveId,
-    member_id: MemberId,
+    loaded: LoadedArchiveMember,
     report: &mut DrainReport,
 ) -> Result<Vec<PendingFetch>, FetchError> {
-    let archive_load_order = inputs.archives[archive_id.0 as usize].load_order;
-    let ai = &inputs.archives[archive_id.0 as usize];
-    if ai.fetched.contains(&member_id.0) {
+    if archive_member_is_fetched(inputs, loaded.key) {
         return Ok(Vec::new());
     }
 
-    // Extract owned data before mutating the registry.
-    let (logical_path, member_bytes) = {
-        let archive = Archive::open(&ai.path, &ai.bytes)?;
-        let member = archive
-            .member_at_offset(member_id.0)
-            .ok_or(FetchError::MemberNotFound {
-                archive: archive_id,
-                member: member_id,
-            })?;
-        let logical = format!("{}({})", ai.path.display(), member.name);
-        (logical, member.body.to_vec())
-    };
-    let logical_path = PathBuf::from(logical_path);
-    let parsed = ObjectFile::parse(&logical_path, &member_bytes)?;
-
-    inputs.archives[archive_id.0 as usize]
+    inputs.archives[loaded.key.archive.0 as usize]
         .fetched
-        .insert(member_id.0);
+        .insert(loaded.key.member.0);
     let input_id = InputId(inputs.objects.len() as u32);
     inputs.objects.push(ObjectInput {
-        path: logical_path,
-        load_order: archive_load_order,
-        archive_member_offset: Some(member_id.0),
-        bytes: member_bytes,
-        parsed,
+        path: loaded.logical_path,
+        load_order: loaded.archive_load_order,
+        archive_member_offset: Some(loaded.key.member.0),
+        bytes: loaded.bytes,
+        parsed: loaded.parsed,
     });
     report.fetched_members += 1;
     report
@@ -1220,6 +1339,23 @@ fn ingest_member_bytes(
     report.duplicates.extend(sub_report.duplicates);
     report.referrers.extend_from(&sub_report.referrers);
     Ok(sub_report.pending_fetches)
+}
+
+fn load_and_ingest_member(
+    inputs: &mut Inputs,
+    table: &mut SymbolTable,
+    key: ArchiveMemberKey,
+    report: &mut DrainReport,
+) -> Result<Vec<PendingFetch>, FetchError> {
+    if archive_member_is_fetched(inputs, key) {
+        return Ok(Vec::new());
+    }
+    let loaded = load_archive_members_parallel(inputs, vec![key])
+        .into_iter()
+        .next()
+        .expect("single archive member load should produce one result")
+        .1?;
+    ingest_loaded_member(inputs, table, loaded, report)
 }
 
 /// Pull `pending`'s member only if the symbol slot is still a
@@ -1235,7 +1371,7 @@ fn fetch_and_ingest_one(
     if !slot_is_still_lazy {
         return Ok(Vec::new());
     }
-    ingest_member_bytes(inputs, table, pending.archive, pending.member, report)
+    load_and_ingest_member(inputs, table, archive_member_key(pending), report)
 }
 
 /// Pull every member of one archive (bypasses demand tracking). Respects
@@ -1255,9 +1391,16 @@ pub fn force_load_archive(
             .map(|m| m.header_offset as u32)
             .collect()
     };
+    let keys = member_offsets
+        .into_iter()
+        .map(|offset| ArchiveMemberKey {
+            archive: archive_id,
+            member: MemberId(offset),
+        })
+        .collect();
     let mut queue: Vec<PendingFetch> = Vec::new();
-    for offset in member_offsets {
-        let new = ingest_member_bytes(inputs, table, archive_id, MemberId(offset), report)?;
+    for (_, loaded) in load_archive_members_parallel(inputs, keys) {
+        let new = ingest_loaded_member(inputs, table, loaded?, report)?;
         queue.extend(new);
     }
     while let Some(p) = queue.pop() {
@@ -1556,12 +1699,57 @@ pub fn drain_fetches(
     initial: Vec<PendingFetch>,
 ) -> Result<DrainReport, FetchError> {
     let mut queue = initial;
+    let mut prepared = HashMap::new();
     let mut report = DrainReport::default();
     while let Some(p) = queue.pop() {
-        let new_pending = fetch_and_ingest_one(inputs, table, p, &mut report)?;
+        let key = archive_member_key(p);
+        let slot_is_still_lazy = matches!(table.get(p.id), Symbol::LazyArchive { .. });
+        if !slot_is_still_lazy || archive_member_is_fetched(inputs, key) {
+            prepared.remove(&key);
+            continue;
+        }
+        // Parse siblings ahead of time, but only ingest the current stack
+        // entry after re-checking its lazy slot. This keeps member order stable.
+        if !prepared.contains_key(&key) {
+            preparse_pending_fetches(inputs, table, p, &queue, &mut prepared);
+        }
+        let Some(loaded) = prepared.remove(&key) else {
+            continue;
+        };
+        let loaded = loaded?;
+        let slot_is_still_lazy = matches!(table.get(p.id), Symbol::LazyArchive { .. });
+        if !slot_is_still_lazy || archive_member_is_fetched(inputs, key) {
+            continue;
+        }
+        let new_pending = ingest_loaded_member(inputs, table, loaded, &mut report)?;
         queue.extend(new_pending);
     }
     Ok(report)
+}
+
+fn preparse_pending_fetches(
+    inputs: &Inputs,
+    table: &SymbolTable,
+    current: PendingFetch,
+    queue: &[PendingFetch],
+    prepared: &mut HashMap<ArchiveMemberKey, Result<LoadedArchiveMember, FetchError>>,
+) {
+    let mut seen = HashSet::new();
+    let mut keys = Vec::new();
+    for pending in std::iter::once(&current).chain(queue.iter().rev()) {
+        let key = archive_member_key(*pending);
+        if prepared.contains_key(&key)
+            || archive_member_is_fetched(inputs, key)
+            || !matches!(table.get(pending.id), Symbol::LazyArchive { .. })
+            || !seen.insert(key)
+        {
+            continue;
+        }
+        keys.push(key);
+    }
+    for (key, result) in load_archive_members_parallel(inputs, keys) {
+        prepared.insert(key, result);
+    }
 }
 
 /// Turn a wire-form `InputSymbol` into a resolver-side `Symbol`. Returns

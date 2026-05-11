@@ -198,10 +198,9 @@ fn strip_eol_comment(s: &mut String) {
                 i += 2;
                 continue;
             }
-            b'#'
-                if !in_single
-                    && !in_double
-                    && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') =>
+            b'#' if !in_single
+                && !in_double
+                && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') =>
             {
                 s.truncate(i);
                 // Trim trailing whitespace left by the strip.
@@ -427,11 +426,10 @@ fn find_top_level_mapping_colon(s: &str) -> Option<usize> {
             }
             b'[' | b'{' if !in_single && !in_double => depth += 1,
             b']' | b'}' if !in_single && !in_double => depth -= 1,
-            b':'
-                if !in_single
-                    && !in_double
-                    && depth == 0
-                    && (i + 1 == bytes.len() || bytes[i + 1] == b' ' || bytes[i + 1] == b'\t') =>
+            b':' if !in_single
+                && !in_double
+                && depth == 0
+                && (i + 1 == bytes.len() || bytes[i + 1] == b' ' || bytes[i + 1] == b'\t') =>
             {
                 return Some(i);
             }

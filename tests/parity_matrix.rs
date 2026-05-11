@@ -111,9 +111,9 @@ impl CaseReport {
 
     fn error_message(&self, case_name: &str) -> Option<String> {
         self.steps.iter().find_map(|step| {
-            step.error.as_ref().map(|error| {
-                format!("[{case_name}] {} failed:\n{}", step.name, error)
-            })
+            step.error
+                .as_ref()
+                .map(|error| format!("[{case_name}] {} failed:\n{}", step.name, error))
         })
     }
 }

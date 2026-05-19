@@ -45,10 +45,9 @@ impl std::error::Error for RelocError {}
 
 struct ResolveView<'a> {
     sym_table: &'a SymbolTable,
-    symbol_name_index: &'a HashMap<String, SymbolId>,
-    atom_table: &'a AtomTable,
+    symbol_name_index: &'a HashMap<&'a str, SymbolId>,
     atom_addrs: &'a HashMap<crate::resolve::AtomId, u64>,
-    atoms_by_input_section: &'a HashMap<(InputId, u8), Vec<crate::resolve::AtomId>>,
+    input_section_atoms: &'a HashMap<(InputId, u8), Vec<InputSectionAtom>>,
     section_addrs: &'a HashMap<(InputId, u8), u64>,
     stub_addrs: &'a HashMap<SymbolId, u64>,
     got_addrs: &'a HashMap<SymbolId, u64>,
@@ -66,6 +65,13 @@ struct SyntheticAddressMaps {
     stub_helper_entry_addrs: HashMap<SymbolId, u64>,
     stub_helper_header_addr: Option<u64>,
     dyld_private_addr: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InputSectionAtom {
+    atom: crate::resolve::AtomId,
+    start: u32,
+    end: u32,
 }
 
 pub struct ApplyLayoutPlan<'a> {
@@ -220,16 +226,15 @@ pub fn apply_layout(
         .map(|input| (input.id, input.object))
         .collect();
     let atom_addrs = atom_address_map(layout);
-    let atoms_by_input_section = atoms.by_input_section();
+    let input_section_atoms = input_section_atom_ranges(atoms);
     let section_addrs = input_section_address_map(layout, atoms);
     let synth_addrs = synthetic_address_maps(layout, plan.synthetic_plan);
     let symbol_name_index = build_symbol_name_index(sym_table);
     let resolve = ResolveView {
         sym_table,
         symbol_name_index: &symbol_name_index,
-        atom_table: atoms,
         atom_addrs: &atom_addrs,
-        atoms_by_input_section: &atoms_by_input_section,
+        input_section_atoms: &input_section_atoms,
         section_addrs: &section_addrs,
         stub_addrs: &synth_addrs.stub_addrs,
         got_addrs: &synth_addrs.got_addrs,
@@ -374,15 +379,10 @@ fn patch_eh_frame_cie_pointer(
             )
         })?;
     let cie_atom = resolve
-        .atoms_by_input_section
+        .input_section_atoms
         .get(&(atom.origin, atom.input_section))
-        .and_then(|atom_ids| {
-            atom_ids.iter().find_map(|atom_id| {
-                let candidate = resolve.atom_table.get(*atom_id);
-                let start = candidate.input_offset;
-                let end = candidate.input_offset.saturating_add(candidate.size);
-                (start <= cie_offset && cie_offset < end).then_some(*atom_id)
-            })
+        .and_then(|ranges| {
+            input_section_atom_at_offset(ranges, cie_offset).map(|(atom_id, _)| atom_id)
         })
         .and_then(|atom_id| resolve.atom_addrs.get(&atom_id).copied())
         .ok_or_else(|| {
@@ -441,6 +441,42 @@ fn input_section_address_map(layout: &Layout, atoms: &AtomTable) -> HashMap<(Inp
         }
     }
     out
+}
+
+fn input_section_atom_ranges(atoms: &AtomTable) -> HashMap<(InputId, u8), Vec<InputSectionAtom>> {
+    let mut out: HashMap<(InputId, u8), Vec<InputSectionAtom>> = HashMap::new();
+    for (id, atom) in atoms.iter() {
+        out.entry((atom.origin, atom.input_section))
+            .or_default()
+            .push(InputSectionAtom {
+                atom: id,
+                start: atom.input_offset,
+                end: atom.input_offset.saturating_add(atom.size),
+            });
+    }
+    for ranges in out.values_mut() {
+        ranges.sort_by_key(|range| range.start);
+    }
+    out
+}
+
+fn input_section_atom_at_offset(
+    ranges: &[InputSectionAtom],
+    input_offset: u32,
+) -> Option<(crate::resolve::AtomId, u32)> {
+    let first_possible = ranges.partition_point(|range| range.end < input_offset);
+    for range in &ranges[first_possible..] {
+        if input_offset < range.start {
+            return None;
+        }
+        if input_offset < range.end {
+            return Some((range.atom, input_offset - range.start));
+        }
+        if input_offset == range.end {
+            return Some((range.atom, range.end - range.start));
+        }
+    }
+    None
 }
 
 fn atom_output_segment_map(layout: &Layout) -> HashMap<crate::resolve::AtomId, String> {
@@ -577,16 +613,15 @@ pub fn plan_thunks(
         .collect();
     let atom_addrs = atom_address_map(layout);
     let atom_segments = atom_output_segment_map(layout);
-    let atoms_by_input_section = atoms.by_input_section();
+    let input_section_atoms = input_section_atom_ranges(atoms);
     let section_addrs = input_section_address_map(layout, atoms);
     let synth_addrs = synthetic_address_maps(layout, synthetic_plan);
     let symbol_name_index = build_symbol_name_index(sym_table);
     let resolve = ResolveView {
         sym_table,
         symbol_name_index: &symbol_name_index,
-        atom_table: atoms,
         atom_addrs: &atom_addrs,
-        atoms_by_input_section: &atoms_by_input_section,
+        input_section_atoms: &input_section_atoms,
         section_addrs: &section_addrs,
         stub_addrs: &synth_addrs.stub_addrs,
         got_addrs: &synth_addrs.got_addrs,
@@ -1261,15 +1296,10 @@ fn symbol_referent_id(
     resolve.symbol_name_index.get(name).copied()
 }
 
-fn build_symbol_name_index(sym_table: &SymbolTable) -> HashMap<String, SymbolId> {
+fn build_symbol_name_index(sym_table: &SymbolTable) -> HashMap<&str, SymbolId> {
     sym_table
         .iter()
-        .map(|(symbol_id, symbol)| {
-            (
-                sym_table.interner.resolve(symbol.name()).to_string(),
-                symbol_id,
-            )
-        })
+        .map(|(symbol_id, symbol)| (sym_table.interner.resolve(symbol.name()), symbol_id))
         .collect()
 }
 
@@ -1392,19 +1422,8 @@ fn resolve_input_section_offset(
     ctx: InputSectionResolveCtx<'_>,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
-    if let Some(atom_ids) = resolve.atoms_by_input_section.get(&(origin, input_section)) {
-        if let Some((target_atom, delta)) = atom_ids.iter().find_map(|atom_id| {
-            let candidate = resolve.atom_table.get(*atom_id);
-            let start = candidate.input_offset;
-            let end = candidate.input_offset.saturating_add(candidate.size);
-            if start <= input_offset && input_offset < end {
-                Some((*atom_id, input_offset - start))
-            } else if input_offset == end {
-                Some((*atom_id, candidate.size))
-            } else {
-                None
-            }
-        }) {
+    if let Some(ranges) = resolve.input_section_atoms.get(&(origin, input_section)) {
+        if let Some((target_atom, delta)) = input_section_atom_at_offset(ranges, input_offset) {
             let target_atom = canonical_atom(target_atom, resolve.icf_redirects);
             let atom_addr = resolve
                 .atom_addrs
@@ -1448,19 +1467,8 @@ fn resolve_input_section_offset_simple(
     input_offset: u32,
     resolve: &ResolveView<'_>,
 ) -> Option<u64> {
-    if let Some(atom_ids) = resolve.atoms_by_input_section.get(&(origin, input_section)) {
-        if let Some((target_atom, delta)) = atom_ids.iter().find_map(|atom_id| {
-            let candidate = resolve.atom_table.get(*atom_id);
-            let start = candidate.input_offset;
-            let end = candidate.input_offset.saturating_add(candidate.size);
-            if start <= input_offset && input_offset < end {
-                Some((*atom_id, input_offset - start))
-            } else if input_offset == end {
-                Some((*atom_id, candidate.size))
-            } else {
-                None
-            }
-        }) {
+    if let Some(ranges) = resolve.input_section_atoms.get(&(origin, input_section)) {
+        if let Some((target_atom, delta)) = input_section_atom_at_offset(ranges, input_offset) {
             let target_atom = canonical_atom(target_atom, resolve.icf_redirects);
             return resolve
                 .atom_addrs
@@ -2661,7 +2669,7 @@ mod tests {
     };
     use crate::macho::reader::MachHeader64;
     use crate::reloc::{write_raw_relocs, write_relocs};
-    use crate::resolve::{InsertOutcome, Symbol, SymbolTable};
+    use crate::resolve::{AtomId, InsertOutcome, Symbol, SymbolTable};
     use crate::section::InputSection;
     use crate::string_table::StringTable;
     use crate::symbol::{InputSymbol, RawNlist};
@@ -2756,6 +2764,37 @@ mod tests {
             ],
         };
         assert!(!layout_fits_branch26_span(&large));
+    }
+
+    #[test]
+    fn input_section_atom_lookup_preserves_boundary_preference() {
+        let ranges = vec![
+            InputSectionAtom {
+                atom: AtomId(1),
+                start: 0,
+                end: 4,
+            },
+            InputSectionAtom {
+                atom: AtomId(2),
+                start: 4,
+                end: 12,
+            },
+        ];
+
+        assert_eq!(
+            input_section_atom_at_offset(&ranges, 2),
+            Some((AtomId(1), 2))
+        );
+        assert_eq!(
+            input_section_atom_at_offset(&ranges, 4),
+            Some((AtomId(1), 4)),
+            "exact end offsets intentionally keep the historical previous-atom mapping"
+        );
+        assert_eq!(
+            input_section_atom_at_offset(&ranges, 5),
+            Some((AtomId(2), 1))
+        );
+        assert_eq!(input_section_atom_at_offset(&ranges, 13), None);
     }
 
     #[test]

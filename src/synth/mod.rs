@@ -16,7 +16,9 @@ use crate::macho::constants::{
     S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_LAZY_SYMBOL_POINTERS,
     S_NON_LAZY_SYMBOL_POINTERS, S_REGULAR, S_SYMBOL_STUBS, S_THREAD_LOCAL_VARIABLE_POINTERS,
 };
-use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
+use crate::reloc::{
+    parse_raw_relocs, parse_relocs, ParsedRelocCache, Referent, Reloc, RelocKind, RelocLength,
+};
 use crate::resolve::{
     AtomId, DylibId, DylibInput, InputId, InsertOutcome, Symbol, SymbolId, SymbolTable,
 };
@@ -93,36 +95,24 @@ impl SyntheticPlan {
         dylibs: &[DylibInput],
         live_atoms: Option<&HashSet<AtomId>>,
     ) -> Result<Self, SynthError> {
+        let reloc_cache = build_synthetic_reloc_cache(inputs)?;
+        Self::build_filtered_with_relocs(inputs, atoms, sym_table, dylibs, live_atoms, &reloc_cache)
+    }
+
+    pub fn build_filtered_with_relocs(
+        inputs: &[LayoutInput<'_>],
+        atoms: &AtomTable,
+        sym_table: &mut SymbolTable,
+        dylibs: &[DylibInput],
+        live_atoms: Option<&HashSet<AtomId>>,
+        parsed_relocs: &ParsedRelocCache,
+    ) -> Result<Self, SynthError> {
         let input_map: HashMap<InputId, &ObjectFile> = inputs
             .iter()
             .map(|input| (input.id, input.object))
             .collect();
-        let mut reloc_cache: HashMap<(InputId, u8), Vec<Reloc>> = HashMap::new();
-        for input in inputs {
-            for (sect_idx, section) in input.object.sections.iter().enumerate() {
-                let relocs = if section.nreloc == 0 {
-                    Vec::new()
-                } else {
-                    let raws = parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(
-                        |err| SynthError {
-                            input: input.object.path.clone(),
-                            atom: crate::resolve::AtomId(0),
-                            reloc_offset: 0,
-                            kind: RelocKind::Unsigned,
-                            detail: err.to_string(),
-                        },
-                    )?;
-                    parse_relocs(&raws).map_err(|err| SynthError {
-                        input: input.object.path.clone(),
-                        atom: crate::resolve::AtomId(0),
-                        reloc_offset: 0,
-                        kind: RelocKind::Unsigned,
-                        detail: err.to_string(),
-                    })?
-                };
-                reloc_cache.insert((input.id, (sect_idx + 1) as u8), relocs);
-            }
-        }
+        let input_symbol_index = build_input_symbol_index(inputs, sym_table, parsed_relocs);
+        let reloc_index = build_sorted_reloc_index(parsed_relocs);
 
         let mut got = GotSection::default();
         let mut stubs = StubsSection::default();
@@ -141,16 +131,19 @@ impl SyntheticPlan {
                 kind: RelocKind::Unsigned,
                 detail: "missing parsed object".to_string(),
             })?;
-            let relocs = reloc_cache
+            let relocs = reloc_index
                 .get(&(atom.origin, atom.input_section))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
+            let input_symbols = input_symbol_index.get(&atom.origin).map(Vec::as_slice);
             for reloc in relocs_for_atom(relocs, atom) {
                 if atom.section == AtomSection::CompactUnwind
                     && reloc.kind == RelocKind::Unsigned
                     && reloc.offset == atom.input_offset + COMPACT_UNWIND_PERSONALITY_FIELD_OFFSET
                 {
-                    if let Some(symbol_id) = dylib_import_referent(obj, reloc.referent, sym_table) {
+                    if let Some(symbol_id) =
+                        dylib_import_referent(obj, reloc.referent, sym_table, input_symbols)
+                    {
                         got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
                     }
                     continue;
@@ -163,7 +156,8 @@ impl SyntheticPlan {
                         if matches!(atom.section, AtomSection::ThreadLocalVariables) {
                             continue;
                         }
-                        let Some(symbol_id) = dylib_import_referent(obj, reloc.referent, sym_table)
+                        let Some(symbol_id) =
+                            dylib_import_referent(obj, reloc.referent, sym_table, input_symbols)
                         else {
                             continue;
                         };
@@ -179,7 +173,8 @@ impl SyntheticPlan {
                     RelocKind::GotLoadPage21
                     | RelocKind::GotLoadPageOff12
                     | RelocKind::PointerToGot => {
-                        let Some(symbol_id) = symbol_referent_id(obj, reloc.referent, sym_table)
+                        let Some(symbol_id) =
+                            symbol_referent_id(obj, reloc.referent, sym_table, input_symbols)
                         else {
                             continue;
                         };
@@ -198,7 +193,8 @@ impl SyntheticPlan {
                         }
                     }
                     RelocKind::Branch26 => {
-                        let Some(symbol_id) = dylib_import_referent(obj, reloc.referent, sym_table)
+                        let Some(symbol_id) =
+                            dylib_import_referent(obj, reloc.referent, sym_table, input_symbols)
                         else {
                             continue;
                         };
@@ -214,7 +210,8 @@ impl SyntheticPlan {
                         );
                     }
                     RelocKind::TlvpLoadPage21 | RelocKind::TlvpLoadPageOff12 => {
-                        if let Some(symbol_id) = symbol_referent_id(obj, reloc.referent, sym_table)
+                        if let Some(symbol_id) =
+                            symbol_referent_id(obj, reloc.referent, sym_table, input_symbols)
                         {
                             if tlv_symbol_needs_got(sym_table, symbol_id) {
                                 got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
@@ -424,12 +421,99 @@ fn sort_symbol_indexed_entries<T, F>(
     }
 }
 
+fn build_synthetic_reloc_cache(inputs: &[LayoutInput<'_>]) -> Result<ParsedRelocCache, SynthError> {
+    let mut reloc_cache = ParsedRelocCache::new();
+    for input in inputs {
+        for (sect_idx, section) in input.object.sections.iter().enumerate() {
+            let relocs = if section.nreloc == 0 {
+                Vec::new()
+            } else {
+                let raws =
+                    parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(|err| {
+                        SynthError {
+                            input: input.object.path.clone(),
+                            atom: crate::resolve::AtomId(0),
+                            reloc_offset: 0,
+                            kind: RelocKind::Unsigned,
+                            detail: err.to_string(),
+                        }
+                    })?;
+                parse_relocs(&raws).map_err(|err| SynthError {
+                    input: input.object.path.clone(),
+                    atom: crate::resolve::AtomId(0),
+                    reloc_offset: 0,
+                    kind: RelocKind::Unsigned,
+                    detail: err.to_string(),
+                })?
+            };
+            reloc_cache.insert((input.id, (sect_idx + 1) as u8), relocs);
+        }
+    }
+    Ok(reloc_cache)
+}
+
+fn build_input_symbol_index(
+    inputs: &[LayoutInput<'_>],
+    sym_table: &SymbolTable,
+    parsed_relocs: &ParsedRelocCache,
+) -> HashMap<InputId, Vec<Option<SymbolId>>> {
+    let mut referenced = HashMap::<InputId, HashSet<u32>>::new();
+    for ((input_id, _), relocs) in parsed_relocs {
+        let referenced = referenced.entry(*input_id).or_default();
+        for reloc in relocs {
+            if let Referent::Symbol(sym_idx) = reloc.referent {
+                referenced.insert(sym_idx);
+            }
+            if let Some(Referent::Symbol(sym_idx)) = reloc.subtrahend {
+                referenced.insert(sym_idx);
+            }
+        }
+    }
+
+    let mut index = HashMap::new();
+    for input in inputs {
+        let mut symbols = vec![None; input.object.symbols.len()];
+        if let Some(referenced) = referenced.get(&input.id) {
+            for sym_idx in referenced {
+                let Some(input_sym) = input.object.symbols.get(*sym_idx as usize) else {
+                    continue;
+                };
+                let Some(slot) = symbols.get_mut(*sym_idx as usize) else {
+                    continue;
+                };
+                *slot = input
+                    .object
+                    .symbol_name(input_sym)
+                    .ok()
+                    .and_then(|name| sym_table.lookup_str(name));
+            }
+        }
+        index.insert(input.id, symbols);
+    }
+    index
+}
+
+fn build_sorted_reloc_index(parsed_relocs: &ParsedRelocCache) -> ParsedRelocCache {
+    let mut index = ParsedRelocCache::new();
+    for (key, relocs) in parsed_relocs {
+        if relocs.is_empty() {
+            continue;
+        }
+        let mut sorted = relocs.clone();
+        sorted.sort_by_key(|reloc| reloc.offset);
+        index.insert(*key, sorted);
+    }
+    index
+}
+
 fn relocs_for_atom<'a>(relocs: &'a [Reloc], atom: &Atom) -> impl Iterator<Item = Reloc> + 'a {
     let start = atom.input_offset;
     let end = atom.input_offset + atom.size;
-    relocs.iter().copied().filter(move |reloc| {
+    let first = relocs.partition_point(|reloc| reloc.offset < start);
+    let last = relocs.partition_point(|reloc| reloc.offset < end);
+    relocs[first..last].iter().copied().filter(move |reloc| {
         let reloc_end = reloc.offset + reloc.width_for_planning();
-        reloc.offset >= start && reloc_end <= end
+        reloc_end <= end
     })
 }
 
@@ -455,8 +539,9 @@ fn dylib_import_referent(
     obj: &ObjectFile,
     referent: Referent,
     sym_table: &SymbolTable,
+    input_symbols: Option<&[Option<SymbolId>]>,
 ) -> Option<SymbolId> {
-    let symbol_id = symbol_referent_id(obj, referent, sym_table)?;
+    let symbol_id = symbol_referent_id(obj, referent, sym_table, input_symbols)?;
     matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. }).then_some(symbol_id)
 }
 
@@ -464,10 +549,14 @@ fn symbol_referent_id(
     obj: &ObjectFile,
     referent: Referent,
     sym_table: &SymbolTable,
+    input_symbols: Option<&[Option<SymbolId>]>,
 ) -> Option<SymbolId> {
     let Referent::Symbol(sym_idx) = referent else {
         return None;
     };
+    if let Some(symbols) = input_symbols {
+        return symbols.get(sym_idx as usize).copied().flatten();
+    }
     let input_sym = obj.symbols.get(sym_idx as usize)?;
     let name = obj.symbol_name(input_sym).ok()?;
     let (symbol_id, _) = sym_table

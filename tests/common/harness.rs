@@ -9,8 +9,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use afs_ld::leb::{read_sleb, read_uleb};
 use afs_ld::macho::constants::{
@@ -116,10 +117,12 @@ struct ArtifactSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArtifactKind {
-    ClangDylib,
-    ClangArchive,
-    ClangReexportDylib,
+    Dylib,
+    Archive,
+    ReexportDylib,
 }
+
+type SymbolPartitions = (Vec<String>, Vec<String>, Vec<String>);
 
 pub struct LinkOutputs {
     pub ours: Vec<u8>,
@@ -218,11 +221,7 @@ pub fn scratch(name: &str) -> PathBuf {
 }
 
 pub fn assemble(src: &str, out: &PathBuf) -> Result<(), String> {
-    let tmp = std::env::temp_dir().join(format!(
-        "afs-ld-parity-{}-{}.s",
-        std::process::id(),
-        out.file_stem().and_then(|s| s.to_str()).unwrap_or("t")
-    ));
+    let tmp = out.with_extension("s");
     fs::write(&tmp, src).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     let output = Command::new("xcrun")
         .args(["--sdk", "macosx", "as", "-arch", "arm64"])
@@ -242,11 +241,7 @@ pub fn assemble(src: &str, out: &PathBuf) -> Result<(), String> {
 }
 
 pub fn compile_c(src: &str, out: &PathBuf) -> Result<(), String> {
-    let tmp = std::env::temp_dir().join(format!(
-        "afs-ld-parity-{}-{}.c",
-        std::process::id(),
-        out.file_stem().and_then(|s| s.to_str()).unwrap_or("t")
-    ));
+    let tmp = out.with_extension("c");
     fs::write(&tmp, src).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     let output = Command::new("xcrun")
         .args(["--sdk", "macosx", "clang", "-arch", "arm64", "-c"])
@@ -266,11 +261,7 @@ pub fn compile_c(src: &str, out: &PathBuf) -> Result<(), String> {
 }
 
 fn compile_dylib_c(src: &str, out: &PathBuf) -> Result<(), String> {
-    let tmp = std::env::temp_dir().join(format!(
-        "afs-ld-parity-{}-{}.c",
-        std::process::id(),
-        out.file_stem().and_then(|s| s.to_str()).unwrap_or("lib")
-    ));
+    let tmp = out.with_extension("c");
     fs::write(&tmp, src).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     let install_name = out.to_string_lossy().to_string();
     let output = Command::new("xcrun")
@@ -311,13 +302,7 @@ fn compile_archive_c(src: &str, out: &PathBuf) -> Result<(), String> {
 }
 
 fn compile_reexport_dylib_c(src: &str, out: &PathBuf, dep: &Path) -> Result<(), String> {
-    let tmp = std::env::temp_dir().join(format!(
-        "afs-ld-parity-{}-{}.c",
-        std::process::id(),
-        out.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("reexport")
-    ));
+    let tmp = out.with_extension("c");
     fs::write(&tmp, src).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     let install_name = out.to_string_lossy().to_string();
     let output = Command::new("xcrun")
@@ -509,9 +494,9 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
             .map_err(|e| format!("read artifact src {}: {e}", src.display()))?;
         let out = work_dir.join(&artifact.out_name);
         match artifact.kind {
-            ArtifactKind::ClangDylib => compile_dylib_c(&src_contents, &out)?,
-            ArtifactKind::ClangArchive => compile_archive_c(&src_contents, &out)?,
-            ArtifactKind::ClangReexportDylib => {
+            ArtifactKind::Dylib => compile_dylib_c(&src_contents, &out)?,
+            ArtifactKind::Archive => compile_archive_c(&src_contents, &out)?,
+            ArtifactKind::ReexportDylib => {
                 let dep_name = artifact.dep_name.as_ref().ok_or_else(|| {
                     format!(
                         "missing reexport dependency for artifact {}",
@@ -984,20 +969,63 @@ fn resolve_page_ref_expectation(
 }
 
 pub fn run_program(path: &Path, args: &[String]) -> Result<ProgramOutput, String> {
-    let output = Command::new(path)
+    let runtime_timeout = runtime_timeout();
+
+    let mut child = Command::new(path)
         .args(args)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("run {}: {e}", path.display()))?;
-    Ok(ProgramOutput {
-        exit_code: output.status.code(),
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .map_err(|e| format!("wait for {}: {e}", path.display()))?
+            .is_some()
+        {
+            let output = child
+                .wait_with_output()
+                .map_err(|e| format!("collect output from {}: {e}", path.display()))?;
+            return Ok(ProgramOutput {
+                exit_code: output.status.code(),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            });
+        }
+        if started.elapsed() >= runtime_timeout {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .map_err(|e| format!("collect timed-out output from {}: {e}", path.display()))?;
+            return Err(format!(
+                "run {} timed out after {:?}: exit={:?} stdout={:?} stderr={:?}",
+                path.display(),
+                runtime_timeout,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 pub fn compare_runtime(our_path: &Path, their_path: &Path, args: &[String]) -> Result<(), String> {
-    let ours = run_program(our_path, args)?;
-    let theirs = run_program(their_path, args)?;
+    let our_path = our_path.to_path_buf();
+    let their_path = their_path.to_path_buf();
+    let their_args = args.to_vec();
+    let ours = thread::scope(|scope| {
+        let theirs = scope.spawn(|| run_program(&their_path, &their_args));
+        let ours = run_program(&our_path, args);
+        let theirs = theirs
+            .join()
+            .map_err(|_| "Apple runtime worker panicked".to_string())?;
+        Ok::<_, String>((ours, theirs))
+    })?;
+    let (ours, theirs) = ours;
+    let ours = ours?;
+    let theirs = theirs?;
     if ours != theirs {
         return Err(format!(
             "runtime differs:\nours: exit={:?} stdout={:?} stderr={:?}\ntheirs: exit={:?} stdout={:?} stderr={:?}",
@@ -1010,6 +1038,16 @@ pub fn compare_runtime(our_path: &Path, their_path: &Path, args: &[String]) -> R
         ));
     }
     Ok(())
+}
+
+fn runtime_timeout() -> Duration {
+    const DEFAULT_RUNTIME_TIMEOUT_SECS: u64 = 120;
+
+    std::env::var("PARITY_RUNTIME_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_RUNTIME_TIMEOUT_SECS))
 }
 
 /// Byte-level diff between two Mach-O images or section byte slices.
@@ -1390,7 +1428,7 @@ fn read_artifacts(path: &Path) -> Result<Vec<ArtifactSpec>, String> {
                         path.display()
                     ));
                 }
-                (ArtifactKind::ClangDylib, None)
+                (ArtifactKind::Dylib, None)
             }
             "clang_archive" => {
                 if dep_name.is_some() {
@@ -1399,7 +1437,7 @@ fn read_artifacts(path: &Path) -> Result<Vec<ArtifactSpec>, String> {
                         path.display()
                     ));
                 }
-                (ArtifactKind::ClangArchive, None)
+                (ArtifactKind::Archive, None)
             }
             "clang_reexport_dylib" => {
                 let dep_name = dep_name.ok_or_else(|| {
@@ -1408,7 +1446,7 @@ fn read_artifacts(path: &Path) -> Result<Vec<ArtifactSpec>, String> {
                         path.display()
                     )
                 })?;
-                (ArtifactKind::ClangReexportDylib, Some(dep_name))
+                (ArtifactKind::ReexportDylib, Some(dep_name))
             }
             other => return Err(format!("unknown artifact kind `{other}`")),
         };
@@ -1592,10 +1630,10 @@ fn tolerated_mask(bytes: &[u8]) -> Vec<Option<&'static str>> {
                 }
             }
             LC_ID_DYLIB | LC_LOAD_DYLIB | LC_LOAD_WEAK_DYLIB | LC_REEXPORT_DYLIB
-            | LC_LOAD_UPWARD_DYLIB => {
-                if cmdsize >= 16 {
-                    mark_range(&mut mask, cursor + 12, cursor + 16, "dylib timestamp");
-                }
+            | LC_LOAD_UPWARD_DYLIB
+                if cmdsize >= 16 =>
+            {
+                mark_range(&mut mask, cursor + 12, cursor + 16, "dylib timestamp");
             }
             _ => {}
         }
@@ -1765,7 +1803,7 @@ fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExportRecord>, 
     Ok(out)
 }
 
-fn symbol_partition_names(bytes: &[u8]) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
+fn symbol_partition_names(bytes: &[u8]) -> Result<SymbolPartitions, String> {
     let (symtab, dysymtab) = symtab_and_dysymtab(bytes)?;
     let symbols =
         parse_nlist_table(bytes, symtab.symoff, symtab.nsyms).map_err(|e| e.to_string())?;

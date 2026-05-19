@@ -99,13 +99,18 @@ impl StringTable {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StringTableBuilder {
     roots: Vec<RootString>,
-    roots_by_last_byte: HashMap<u8, Vec<usize>>,
     offsets: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RootString {
     name: String,
+    offset: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BorrowedRootString<'a> {
+    name: &'a str,
     offset: u32,
 }
 
@@ -116,6 +121,41 @@ impl StringTableBuilder {
 
     pub fn insert(&mut self, name: &str) {
         self.offsets.entry(name.to_string()).or_insert(0);
+    }
+
+    pub fn build_with_name_offsets<'a, I>(names: I) -> (Vec<u8>, Vec<u32>)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut entries: Vec<_> = names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| (name, index))
+            .collect();
+        let mut offsets = vec![0; entries.len()];
+        entries.sort_by(|(lhs, lhs_index), (rhs, rhs_index)| {
+            reverse_suffix_order(lhs, rhs).then_with(|| lhs_index.cmp(rhs_index))
+        });
+
+        let mut raw = vec![0u8];
+        let mut roots = Vec::new();
+        for (name, index) in entries {
+            if let Some(offset) = find_borrowed_suffix_offset(&roots, name) {
+                offsets[index] = offset;
+                continue;
+            }
+
+            let offset = raw.len() as u32;
+            raw.extend_from_slice(name.as_bytes());
+            raw.push(0);
+            roots.push(BorrowedRootString { name, offset });
+            offsets[index] = offset;
+        }
+
+        while !raw.len().is_multiple_of(8) {
+            raw.push(0);
+        }
+        (raw, offsets)
     }
 
     pub fn finish(mut self) -> (Vec<u8>, HashMap<String, u32>) {
@@ -132,17 +172,10 @@ impl StringTableBuilder {
             let offset = raw.len() as u32;
             raw.extend_from_slice(name.as_bytes());
             raw.push(0);
-            let root_index = self.roots.len();
             self.roots.push(RootString {
                 name: name.clone(),
                 offset,
             });
-            if let Some(&last_byte) = name.as_bytes().last() {
-                self.roots_by_last_byte
-                    .entry(last_byte)
-                    .or_default()
-                    .push(root_index);
-            }
             self.offsets.insert(name, offset);
         }
 
@@ -153,16 +186,26 @@ impl StringTableBuilder {
     }
 
     fn find_suffix_offset(&self, name: &str) -> Option<u32> {
-        let last_byte = *name.as_bytes().last()?;
-        self.roots_by_last_byte
-            .get(&last_byte)?
-            .iter()
-            .find_map(|&idx| {
-                let existing = &self.roots[idx];
-                (existing.name.len() >= name.len() && existing.name.ends_with(name))
-                    .then(|| existing.offset + (existing.name.len() - name.len()) as u32)
-            })
+        if name.is_empty() {
+            return Some(0);
+        }
+        let insert_at = self
+            .roots
+            .partition_point(|root| reverse_suffix_order(&root.name, name).is_lt());
+        let existing = self.roots.get(insert_at.checked_sub(1)?)?;
+        (existing.name.len() >= name.len() && existing.name.ends_with(name))
+            .then(|| existing.offset + (existing.name.len() - name.len()) as u32)
     }
+}
+
+fn find_borrowed_suffix_offset(roots: &[BorrowedRootString<'_>], name: &str) -> Option<u32> {
+    if name.is_empty() {
+        return Some(0);
+    }
+    let insert_at = roots.partition_point(|root| reverse_suffix_order(root.name, name).is_lt());
+    let existing = roots.get(insert_at.checked_sub(1)?)?;
+    (existing.name.len() >= name.len() && existing.name.ends_with(name))
+        .then(|| existing.offset + (existing.name.len() - name.len()) as u32)
 }
 
 fn reverse_suffix_order(lhs: &str, rhs: &str) -> std::cmp::Ordering {
@@ -284,5 +327,20 @@ mod tests {
 
         assert_eq!(table.get(offsets["_alpha"]).unwrap(), "_alpha");
         assert_eq!(table.get(offsets["_beta"]).unwrap(), "_beta");
+    }
+
+    #[test]
+    fn builder_returns_offsets_in_input_order_without_cloning_keys() {
+        let names = ["_helper", "_afs_helper", "_helper", ""];
+        let (bytes, offsets) = StringTableBuilder::build_with_name_offsets(names);
+        let table = StringTable::from_bytes(bytes);
+
+        assert_eq!(table.get(offsets[0]).unwrap(), "_helper");
+        assert_eq!(table.get(offsets[1]).unwrap(), "_afs_helper");
+        assert_eq!(table.get(offsets[2]).unwrap(), "_helper");
+        assert_eq!(table.get(offsets[3]).unwrap(), "");
+        assert_eq!(offsets[0], offsets[2]);
+        assert_eq!(offsets[0], offsets[1] + 4);
+        assert_eq!(table.as_bytes().len() % 8, 0);
     }
 }

@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use crate::leb::{write_sleb, write_uleb};
 use crate::macho::constants::{
     BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND,
@@ -81,25 +79,9 @@ struct BindState {
     pointer_type_set: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-struct TrieNode {
-    terminal: Option<ExportEntry>,
-    children: BTreeMap<u8, TrieNode>,
-}
-
-impl TrieNode {
-    fn insert(&mut self, name: &str, entry: ExportEntry) {
-        let mut node = self;
-        for byte in name.bytes() {
-            node = node.children.entry(byte).or_default();
-        }
-        node.terminal = Some(entry);
-    }
-}
-
 #[derive(Debug, Clone)]
 struct FlatTrieNode {
-    terminal: Option<ExportEntry>,
+    terminal_payload: Vec<u8>,
     children: Vec<(String, usize)>,
 }
 
@@ -108,17 +90,11 @@ pub fn build_export_trie(entries: &[ExportEntry]) -> Vec<u8> {
         return Vec::new();
     }
 
-    let mut sorted = entries.to_vec();
+    let mut sorted: Vec<&ExportEntry> = entries.iter().collect();
     sorted.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
 
-    let mut root = TrieNode::default();
-    for entry in sorted {
-        let name = entry.name.clone();
-        root.insert(&name, entry);
-    }
-
     let mut nodes = Vec::new();
-    flatten_trie(&root, &mut nodes);
+    flatten_sorted_export_trie(&sorted, 0, &mut nodes);
 
     let mut offsets = vec![0usize; nodes.len()];
     loop {
@@ -149,42 +125,67 @@ pub fn build_export_trie(entries: &[ExportEntry]) -> Vec<u8> {
     out
 }
 
-fn flatten_trie(node: &TrieNode, flat: &mut Vec<FlatTrieNode>) -> usize {
+fn flatten_sorted_export_trie(
+    entries: &[&ExportEntry],
+    prefix_len: usize,
+    flat: &mut Vec<FlatTrieNode>,
+) -> usize {
     let id = flat.len();
+    let mut entry_idx = 0usize;
+    let mut terminal = None;
+    while entries
+        .get(entry_idx)
+        .is_some_and(|entry| entry.name.len() == prefix_len)
+    {
+        terminal = Some(entries[entry_idx]);
+        entry_idx += 1;
+    }
+
     flat.push(FlatTrieNode {
-        terminal: node.terminal.clone(),
+        terminal_payload: terminal_payload(terminal),
         children: Vec::new(),
     });
 
-    let mut children = Vec::with_capacity(node.children.len());
-    for (&edge, child) in &node.children {
-        let (label, child_id) = flatten_edge(edge, child, flat);
+    let mut children = Vec::new();
+    while entry_idx < entries.len() {
+        let edge = entries[entry_idx].name.as_bytes()[prefix_len];
+        let group_start = entry_idx;
+        entry_idx += 1;
+        while entry_idx < entries.len() && entries[entry_idx].name.as_bytes()[prefix_len] == edge {
+            entry_idx += 1;
+        }
+        let group = &entries[group_start..entry_idx];
+        let label_end = common_prefix_len(group, prefix_len + 1);
+        let label = String::from_utf8(group[0].name.as_bytes()[prefix_len..label_end].to_vec())
+            .expect("export labels should stay UTF-8");
+        let child_id = flatten_sorted_export_trie(group, label_end, flat);
         children.push((label, child_id));
     }
     flat[id].children = children;
     id
 }
 
-fn flatten_edge(first: u8, child: &TrieNode, flat: &mut Vec<FlatTrieNode>) -> (String, usize) {
-    let mut label = vec![first];
-    let mut node = child;
-    while node.terminal.is_none() && node.children.len() == 1 {
-        let (&next, next_child) = node
-            .children
-            .iter()
-            .next()
-            .expect("single-child trie node should expose one edge");
-        label.push(next);
-        node = next_child;
+fn common_prefix_len(entries: &[&ExportEntry], start: usize) -> usize {
+    let first = entries
+        .first()
+        .expect("export trie child groups should be non-empty")
+        .name
+        .as_bytes();
+    let mut len = first.len();
+    for entry in &entries[1..] {
+        let bytes = entry.name.as_bytes();
+        len = len.min(bytes.len());
+        let mut idx = start;
+        while idx < len && first[idx] == bytes[idx] {
+            idx += 1;
+        }
+        len = idx;
     }
-    let label = String::from_utf8(label).expect("export labels should stay UTF-8");
-    let child_id = flatten_trie(node, flat);
-    (label, child_id)
+    len
 }
 
 fn trie_node_size(node: &FlatTrieNode, offsets: &[usize]) -> usize {
-    let terminal = terminal_payload(node.terminal.as_ref());
-    let mut size = uleb_size(terminal.len() as u64) + terminal.len() + 1;
+    let mut size = uleb_size(node.terminal_payload.len() as u64) + node.terminal_payload.len() + 1;
     for (edge, child) in &node.children {
         size += edge.len() + 1 + uleb_size(offsets[*child] as u64);
     }
@@ -192,10 +193,9 @@ fn trie_node_size(node: &FlatTrieNode, offsets: &[usize]) -> usize {
 }
 
 fn emit_trie_node(node: &FlatTrieNode, offsets: &[usize], out: &mut Vec<u8>) {
-    let terminal = terminal_payload(node.terminal.as_ref());
     let mut stream = OpcodeStream::new();
-    stream.uleb(terminal.len() as u64);
-    stream.bytes(&terminal);
+    stream.uleb(node.terminal_payload.len() as u64);
+    stream.bytes(&node.terminal_payload);
     stream
         .byte(u8::try_from(node.children.len()).expect("export trie node fanout should fit in u8"));
     for (edge, child) in &node.children {
@@ -252,7 +252,7 @@ pub fn emit_rebase_run(out: &mut OpcodeStream, count: usize) {
 pub fn emit_bind_records(specs: &[BindRecordSpec<'_>]) -> Vec<u8> {
     let mut out = OpcodeStream::new();
     let mut state = BindState::default();
-    let mut current_symbol: Option<String> = None;
+    let mut current_symbol: Option<&str> = None;
 
     let mut idx = 0usize;
     while idx < specs.len() {
@@ -262,14 +262,12 @@ pub fn emit_bind_records(specs: &[BindRecordSpec<'_>]) -> Vec<u8> {
             state.ordinal = Some(spec.ordinal);
         }
 
-        if current_symbol.as_deref() != Some(spec.name)
-            || state.weak_import != Some(spec.weak_import)
-        {
+        if current_symbol != Some(spec.name) || state.weak_import != Some(spec.weak_import) {
             out.byte(
                 BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | bind_symbol_flags(spec.weak_import),
             );
             out.string(spec.name);
-            current_symbol = Some(spec.name.to_string());
+            current_symbol = Some(spec.name);
             state.weak_import = Some(spec.weak_import);
         }
 

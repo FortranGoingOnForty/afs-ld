@@ -107,14 +107,8 @@ fn atomize_splits_text_at_symbol_boundaries_and_backpatches_symbols() {
     // Atomize + back-patch.
     let obj = inputs.object_file(input_id).unwrap();
     let mut atom_table = AtomTable::new();
-    let atomization = atomize_object(input_id, &obj, &mut atom_table);
-    backpatch_symbol_atoms(
-        &atomization,
-        input_id,
-        &obj,
-        &mut sym_table,
-        &mut atom_table,
-    );
+    let atomization = atomize_object(input_id, obj, &mut atom_table);
+    backpatch_symbol_atoms(&atomization, input_id, obj, &mut sym_table, &mut atom_table);
 
     // At least one atom per defined function plus one for data_global.
     assert!(
@@ -209,7 +203,7 @@ fn atomize_cstring_splits_at_null_terminators() {
     let _ = seed_all(&inputs, &mut sym_table).expect("seed_all");
     let obj = inputs.object_file(input_id).unwrap();
     let mut atom_table = AtomTable::new();
-    let _atomization = atomize_object(input_id, &obj, &mut atom_table);
+    let _atomization = atomize_object(input_id, obj, &mut atom_table);
 
     let cstring_atoms: Vec<_> = atom_table
         .iter()

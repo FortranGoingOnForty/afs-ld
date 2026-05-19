@@ -26,22 +26,29 @@ pub mod why_live;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
-use std::{fs, io};
+use std::{collections::VecDeque, fs, io};
 
+use archive::Archive;
 use atom::{atomize_object, backpatch_symbol_atoms, AtomTable};
 use icf::IcfError;
+use input::ObjectFile;
 use layout::{ExtraLayoutSections, Layout, LayoutInput};
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
 use macho::reader::ReadError;
-use macho::tbd::{parse_tbd, parse_version, Arch, Platform, Target};
+use macho::tbd::{
+    parse_tbd_for_target, parse_tbd_metadata_for_target, parse_version, Arch, Platform, Target,
+};
 use reloc::arm64::RelocError;
 use resolve::{
     classify_unresolved, drain_fetches, find_archive_by_path, force_load_all, force_load_archive,
     format_duplicate_diagnostic, format_undefined_diagnostic, format_undefined_warning_diagnostic,
-    seed_all, DrainReport, DylibLoadMeta, InputAddError, Inputs, Symbol, SymbolTable,
+    seed_all, DrainReport, DylibLoadMeta, InputAddError, InputId, Inputs, Symbol, SymbolTable,
     UndefinedTreatment,
 };
+use symbol::SymKind;
 
 const DEFAULT_TBD_VERSION: u32 = 1 << 16;
 const THUNK_PLAN_MAX_ITERATIONS: usize = 16;
@@ -118,6 +125,7 @@ pub struct LinkOptions {
     pub fixup_chains: bool,
     pub all_load: bool,
     pub force_load_archives: Vec<PathBuf>,
+    pub jobs: Option<usize>,
     pub kind: OutputKind,
     /// When set, afs-ld operates in dump mode and prints the given file's
     /// header + load commands instead of linking.
@@ -169,12 +177,25 @@ impl Default for LinkOptions {
             fixup_chains: false,
             all_load: false,
             force_load_archives: Vec::new(),
+            jobs: None,
             kind: OutputKind::Executable,
             dump: None,
             dump_archive: None,
             dump_dylib: None,
             dump_tbd: None,
         }
+    }
+}
+
+impl LinkOptions {
+    pub fn parallel_jobs(&self) -> usize {
+        self.jobs
+            .unwrap_or_else(|| {
+                thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1)
+            })
+            .max(1)
     }
 }
 
@@ -209,9 +230,22 @@ pub enum LinkError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LinkPhaseTimings {
     pub input_parsing: Duration,
+    pub input_read: Duration,
+    pub input_object_parse: Duration,
+    pub input_archive_parse: Duration,
+    pub input_dylib_parse: Duration,
+    pub input_tbd_decode: Duration,
+    pub input_tbd_materialize: Duration,
+    pub input_reloc_parse: Duration,
     pub symbol_resolution: Duration,
     pub atomization: Duration,
     pub layout: Duration,
+    pub layout_entry_lookup: Duration,
+    pub layout_dead_strip: Duration,
+    pub layout_icf: Duration,
+    pub layout_synthetic_plan: Duration,
+    pub layout_build: Duration,
+    pub layout_thunk_plan: Duration,
     pub synth_sections: Duration,
     pub synth_linkedit_finalize: Duration,
     pub synth_linkedit_symbol_plan: Duration,
@@ -219,6 +253,9 @@ pub struct LinkPhaseTimings {
     pub synth_linkedit_symbol_plan_globals: Duration,
     pub synth_linkedit_symbol_plan_strtab: Duration,
     pub synth_linkedit_dyld_info: Duration,
+    pub synth_linkedit_dyld_bind: Duration,
+    pub synth_linkedit_dyld_rebase: Duration,
+    pub synth_linkedit_dyld_export: Duration,
     pub synth_linkedit_metadata_tables: Duration,
     pub synth_linkedit_code_signature: Duration,
     pub synth_unwind: Duration,
@@ -236,6 +273,25 @@ impl LinkPhaseTimings {
             + self.reloc_apply
             + self.write_output
     }
+
+    fn add_input_load(&mut self, timings: InputLoadTimings) {
+        self.input_read += timings.read;
+        self.input_object_parse += timings.object_parse;
+        self.input_archive_parse += timings.archive_parse;
+        self.input_dylib_parse += timings.dylib_parse;
+        self.input_tbd_decode += timings.tbd_decode;
+        self.input_tbd_materialize += timings.tbd_materialize;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct InputLoadTimings {
+    read: Duration,
+    object_parse: Duration,
+    archive_parse: Duration,
+    dylib_parse: Duration,
+    tbd_decode: Duration,
+    tbd_materialize: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,6 +459,7 @@ impl Linker {
         if opts.inputs.is_empty() && opts.library_names.is_empty() && opts.frameworks.is_empty() {
             return Err(LinkError::NoInputs);
         }
+        let parallel_jobs = opts.parallel_jobs();
 
         if let Some(arch) = &opts.arch {
             if arch != "arm64" {
@@ -455,12 +512,33 @@ impl Linker {
         load_paths.extend(positional_dylibs);
 
         let mut inputs = Inputs::new();
+        let mut deferred_dylibs = Vec::new();
+        let mut initial_loads = Vec::new();
         let phase_started = Instant::now();
         for (load_order, path) in load_paths.iter().enumerate() {
+            if matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("dylib" | "tbd")
+            ) {
+                deferred_dylibs.push((load_order, path.clone()));
+                continue;
+            }
             if opts.trace_inputs {
                 eprintln!("afs-ld: loading {}", path.display());
             }
-            register_input(&mut inputs, path, load_order)?;
+            initial_loads.push((load_order, path.clone()));
+        }
+        for loaded in load_initial_inputs(initial_loads, parallel_jobs)? {
+            let timings = register_loaded_initial_input(&mut inputs, loaded);
+            phases.add_input_load(timings);
+        }
+        let include_tbd_exports = inputs_may_need_dylib_exports(&inputs)?;
+        for (load_order, path) in &deferred_dylibs {
+            if opts.trace_inputs {
+                eprintln!("afs-ld: loading {}", path.display());
+            }
+            let timings = register_input(&mut inputs, path, *load_order, include_tbd_exports)?;
+            phases.add_input_load(timings);
         }
         phases.input_parsing = phase_started.elapsed();
 
@@ -477,13 +555,24 @@ impl Linker {
 
         let mut force_report = DrainReport::default();
         if opts.all_load {
-            force_load_all(&mut inputs, &mut sym_table, &mut force_report)?;
+            force_load_all(
+                &mut inputs,
+                &mut sym_table,
+                &mut force_report,
+                parallel_jobs,
+            )?;
         }
         for archive_path in &opts.force_load_archives {
             let Some(archive_id) = find_archive_by_path(&inputs, archive_path) else {
                 return Err(LinkError::ForceLoadNotArchive(archive_path.clone()));
             };
-            force_load_archive(&mut inputs, &mut sym_table, archive_id, &mut force_report)?;
+            force_load_archive(
+                &mut inputs,
+                &mut sym_table,
+                archive_id,
+                &mut force_report,
+                parallel_jobs,
+            )?;
         }
         if opts.trace_inputs {
             for path in &force_report.loaded_paths {
@@ -498,7 +587,12 @@ impl Linker {
             return Err(LinkError::DuplicateSymbols(msg));
         }
 
-        let drain_report = drain_fetches(&mut inputs, &mut sym_table, seed_report.pending_fetches)?;
+        let drain_report = drain_fetches(
+            &mut inputs,
+            &mut sym_table,
+            seed_report.pending_fetches,
+            parallel_jobs,
+        )?;
         if opts.trace_inputs {
             for path in &drain_report.loaded_paths {
                 eprintln!("afs-ld: loading {}", path.display());
@@ -539,14 +633,8 @@ impl Linker {
         for idx in 0..inputs.objects.len() {
             let input_id = resolve::InputId(idx as u32);
             let obj = inputs.object_file(input_id)?;
-            let atomization = atomize_object(input_id, &obj, &mut atom_table);
-            backpatch_symbol_atoms(
-                &atomization,
-                input_id,
-                &obj,
-                &mut sym_table,
-                &mut atom_table,
-            );
+            let atomization = atomize_object(input_id, obj, &mut atom_table);
+            backpatch_symbol_atoms(&atomization, input_id, obj, &mut sym_table, &mut atom_table);
             objects.push((input_id, obj));
         }
         phases.atomization = phase_started.elapsed();
@@ -582,9 +670,14 @@ impl Linker {
         }
         let phase_started = Instant::now();
         let parsed_relocs = macho::writer::build_parsed_reloc_cache(&layout_inputs)?;
-        phases.input_parsing += phase_started.elapsed();
+        let elapsed = phase_started.elapsed();
+        phases.input_reloc_parse += elapsed;
+        phases.input_parsing += elapsed;
+        let layout_started = Instant::now();
         let phase_started = Instant::now();
         let entry_symbol = find_entry_symbol_id(opts, &sym_table)?;
+        phases.layout_entry_lookup = phase_started.elapsed();
+        let phase_started = Instant::now();
         let dead_strip = opts.dead_strip.then(|| {
             why_live::DeadStripAnalysis::build(
                 opts,
@@ -594,6 +687,8 @@ impl Linker {
                 entry_symbol,
             )
         });
+        phases.layout_dead_strip = phase_started.elapsed();
+        let phase_started = Instant::now();
         let icf = (opts.icf_mode == IcfMode::Safe)
             .then(|| {
                 icf::fold_safe(
@@ -604,19 +699,24 @@ impl Linker {
                 )
             })
             .transpose()?;
+        phases.layout_icf = phase_started.elapsed();
         let kept_atoms = if let Some(icf) = &icf {
             Some(icf.kept_atoms())
         } else {
             dead_strip.as_ref().map(|analysis| analysis.live_atoms())
         };
-        let synthetic_plan = synth::SyntheticPlan::build_filtered(
+        let phase_started = Instant::now();
+        let synthetic_plan = synth::SyntheticPlan::build_filtered_with_relocs(
             &layout_inputs,
             &atom_table,
             &mut sym_table,
             &inputs.dylibs,
             kept_atoms,
+            &parsed_relocs,
         )?;
+        phases.layout_synthetic_plan = phase_started.elapsed();
         let icf_redirects = icf.as_ref().map(|plan| plan.redirects());
+        let phase_started = Instant::now();
         let mut layout = Layout::build_with_synthetics_filtered(
             opts.kind,
             &layout_inputs,
@@ -625,18 +725,24 @@ impl Linker {
             Some(&synthetic_plan),
             kept_atoms,
         );
+        phases.layout_build += phase_started.elapsed();
         let mut thunk_plan = None;
         let mut thunk_converged = false;
         for _ in 0..THUNK_PLAN_MAX_ITERATIONS {
+            let phase_started = Instant::now();
             let next_plan = reloc::arm64::plan_thunks(
                 opts,
-                &layout,
-                &layout_inputs,
-                &atom_table,
-                &sym_table,
-                Some(&synthetic_plan),
-                icf_redirects,
+                reloc::arm64::ThunkPlanningContext {
+                    layout: &layout,
+                    inputs: &layout_inputs,
+                    atoms: &atom_table,
+                    sym_table: &sym_table,
+                    synthetic_plan: Some(&synthetic_plan),
+                    icf_redirects,
+                    parsed_relocs: &parsed_relocs,
+                },
             )?;
+            phases.layout_thunk_plan += phase_started.elapsed();
             if next_plan == thunk_plan {
                 thunk_converged = true;
                 break;
@@ -647,6 +753,7 @@ impl Linker {
             let split_after_atoms = next_plan
                 .as_ref()
                 .map_or_else(Vec::new, |plan| plan.split_after_atoms());
+            let phase_started = Instant::now();
             layout = Layout::build_with_synthetics_and_extra_filtered(
                 opts.kind,
                 &layout_inputs,
@@ -659,12 +766,13 @@ impl Linker {
                     split_after_atoms: &split_after_atoms,
                 },
             );
+            phases.layout_build += phase_started.elapsed();
             thunk_plan = next_plan;
         }
         if !thunk_converged {
             return Err(LinkError::ThunkPlanningDidNotConverge);
         }
-        phases.layout = phase_started.elapsed();
+        phases.layout = layout_started.elapsed();
         let linkedit_context = macho::writer::LinkEditContext {
             layout_inputs: &layout_inputs,
             atom_table: &atom_table,
@@ -681,6 +789,9 @@ impl Linker {
         let mut synth_linkedit_symbol_plan_globals = Duration::ZERO;
         let mut synth_linkedit_symbol_plan_strtab = Duration::ZERO;
         let mut synth_linkedit_dyld_info = Duration::ZERO;
+        let mut synth_linkedit_dyld_bind = Duration::ZERO;
+        let mut synth_linkedit_dyld_rebase = Duration::ZERO;
+        let mut synth_linkedit_dyld_export = Duration::ZERO;
         let mut synth_linkedit_metadata_tables = Duration::ZERO;
         let mut synth_linkedit_code_signature = Duration::ZERO;
         let mut synth_unwind = Duration::ZERO;
@@ -700,6 +811,9 @@ impl Linker {
             synth_linkedit_symbol_plan_globals += linkedit_timings.symbol_plan_globals;
             synth_linkedit_symbol_plan_strtab += linkedit_timings.symbol_plan_strtab;
             synth_linkedit_dyld_info += linkedit_timings.dyld_info;
+            synth_linkedit_dyld_bind += linkedit_timings.dyld_bind;
+            synth_linkedit_dyld_rebase += linkedit_timings.dyld_rebase;
+            synth_linkedit_dyld_export += linkedit_timings.dyld_export;
             synth_linkedit_metadata_tables += linkedit_timings.metadata_tables;
             synth_linkedit_code_signature += linkedit_timings.code_signature;
             layout = next_layout;
@@ -724,6 +838,9 @@ impl Linker {
         phases.synth_linkedit_symbol_plan_globals = synth_linkedit_symbol_plan_globals;
         phases.synth_linkedit_symbol_plan_strtab = synth_linkedit_symbol_plan_strtab;
         phases.synth_linkedit_dyld_info = synth_linkedit_dyld_info;
+        phases.synth_linkedit_dyld_bind = synth_linkedit_dyld_bind;
+        phases.synth_linkedit_dyld_rebase = synth_linkedit_dyld_rebase;
+        phases.synth_linkedit_dyld_export = synth_linkedit_dyld_export;
         phases.synth_linkedit_metadata_tables = synth_linkedit_metadata_tables;
         phases.synth_linkedit_code_signature = synth_linkedit_code_signature;
         phases.synth_unwind = synth_unwind;
@@ -739,6 +856,8 @@ impl Linker {
                 thunk_plan: thunk_plan.as_ref(),
                 linkedit: &linkedit,
                 icf_redirects,
+                parsed_relocs: &parsed_relocs,
+                parallel_jobs,
             },
         )?;
         phases.reloc_apply = phase_started.elapsed();
@@ -870,30 +989,221 @@ fn default_output_path(opts: &LinkOptions) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("a.out"))
 }
 
+struct LoadedObjectInput {
+    path: PathBuf,
+    load_order: usize,
+    bytes: Vec<u8>,
+    parsed: ObjectFile,
+    timings: InputLoadTimings,
+}
+
+struct LoadedArchiveInput {
+    path: PathBuf,
+    load_order: usize,
+    bytes: Vec<u8>,
+    timings: InputLoadTimings,
+}
+
+enum LoadedInitialInput {
+    Object(Box<LoadedObjectInput>),
+    Archive(LoadedArchiveInput),
+}
+
+impl LoadedInitialInput {
+    fn load_order(&self) -> usize {
+        match self {
+            LoadedInitialInput::Object(input) => input.load_order,
+            LoadedInitialInput::Archive(input) => input.load_order,
+        }
+    }
+}
+
+struct InitialLoadError {
+    load_order: usize,
+    error: LinkError,
+}
+
+fn load_initial_inputs(
+    loads: Vec<(usize, PathBuf)>,
+    parallel_jobs: usize,
+) -> Result<Vec<LoadedInitialInput>, LinkError> {
+    let mut results = Vec::new();
+    let mut object_jobs = Vec::new();
+    for (load_order, path) in loads {
+        if matches!(path.extension().and_then(|ext| ext.to_str()), Some("a")) {
+            results.push(load_archive_input(path, load_order));
+        } else {
+            object_jobs.push((load_order, path));
+        }
+    }
+    results.extend(load_objects_parallel(object_jobs, parallel_jobs));
+    results.sort_by_key(|result| match result {
+        Ok(input) => input.load_order(),
+        Err(error) => error.load_order,
+    });
+
+    let mut loaded = Vec::with_capacity(results.len());
+    for result in results {
+        match result {
+            Ok(input) => loaded.push(input),
+            Err(error) => return Err(error.error),
+        }
+    }
+    Ok(loaded)
+}
+
+fn load_objects_parallel(
+    jobs: Vec<(usize, PathBuf)>,
+    parallel_jobs: usize,
+) -> Vec<Result<LoadedInitialInput, InitialLoadError>> {
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    let job_count = parallel_jobs.max(1).min(jobs.len()).max(1);
+    if job_count == 1 {
+        return jobs
+            .into_iter()
+            .map(|(load_order, path)| load_object_input(path, load_order))
+            .collect();
+    }
+
+    let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
+    let (tx, rx) = mpsc::channel();
+    thread::scope(|scope| {
+        for _ in 0..job_count {
+            let queue = Arc::clone(&queue);
+            let tx = tx.clone();
+            scope.spawn(move || loop {
+                let Some((load_order, path)) = queue
+                    .lock()
+                    .expect("input load queue mutex poisoned")
+                    .pop_front()
+                else {
+                    break;
+                };
+                tx.send(load_object_input(path, load_order))
+                    .expect("input load receiver should stay live");
+            });
+        }
+        drop(tx);
+        rx.into_iter().collect()
+    })
+}
+
+fn load_object_input(
+    path: PathBuf,
+    load_order: usize,
+) -> Result<LoadedInitialInput, InitialLoadError> {
+    let mut timings = InputLoadTimings::default();
+    let phase_started = Instant::now();
+    let bytes = fs::read(&path).map_err(|error| InitialLoadError {
+        load_order,
+        error: LinkError::Io(error),
+    })?;
+    timings.read = phase_started.elapsed();
+
+    let phase_started = Instant::now();
+    let parsed = ObjectFile::parse(&path, &bytes).map_err(|error| InitialLoadError {
+        load_order,
+        error: LinkError::from(error),
+    })?;
+    timings.object_parse = phase_started.elapsed();
+
+    Ok(LoadedInitialInput::Object(Box::new(LoadedObjectInput {
+        path,
+        load_order,
+        bytes,
+        parsed,
+        timings,
+    })))
+}
+
+fn load_archive_input(
+    path: PathBuf,
+    load_order: usize,
+) -> Result<LoadedInitialInput, InitialLoadError> {
+    let mut timings = InputLoadTimings::default();
+    let phase_started = Instant::now();
+    let bytes = fs::read(&path).map_err(|error| InitialLoadError {
+        load_order,
+        error: LinkError::Io(error),
+    })?;
+    timings.read = phase_started.elapsed();
+
+    let phase_started = Instant::now();
+    Archive::open(&path, &bytes).map_err(|error| InitialLoadError {
+        load_order,
+        error: LinkError::from(InputAddError::from(error)),
+    })?;
+    timings.archive_parse = phase_started.elapsed();
+
+    Ok(LoadedInitialInput::Archive(LoadedArchiveInput {
+        path,
+        load_order,
+        bytes,
+        timings,
+    }))
+}
+
+fn register_loaded_initial_input(
+    inputs: &mut Inputs,
+    loaded: LoadedInitialInput,
+) -> InputLoadTimings {
+    match loaded {
+        LoadedInitialInput::Object(input) => {
+            inputs.add_parsed_object(input.path, input.bytes, input.parsed, input.load_order);
+            input.timings
+        }
+        LoadedInitialInput::Archive(input) => {
+            inputs.add_validated_archive(input.path, input.bytes, input.load_order);
+            input.timings
+        }
+    }
+}
+
 fn register_input(
     inputs: &mut Inputs,
     path: &std::path::Path,
     load_order: usize,
-) -> Result<(), LinkError> {
+    include_tbd_exports: bool,
+) -> Result<InputLoadTimings, LinkError> {
+    let mut timings = InputLoadTimings::default();
+    let phase_started = Instant::now();
     let bytes = fs::read(path)?;
+    timings.read = phase_started.elapsed();
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("a") => {
+            let phase_started = Instant::now();
             let _ = inputs.add_archive(path.to_path_buf(), bytes, load_order)?;
+            timings.archive_parse = phase_started.elapsed();
         }
         Some("dylib") => {
+            let phase_started = Instant::now();
             let _ = inputs.add_dylib(path.to_path_buf(), bytes)?;
+            timings.dylib_parse = phase_started.elapsed();
         }
         Some("tbd") => {
+            let phase_started = Instant::now();
             let text = std::str::from_utf8(&bytes).map_err(|e| {
                 LinkError::Tbd(macho::tbd::TbdError::Schema {
                     msg: format!("TBD input is not UTF-8: {e}"),
                 })
             })?;
-            let docs = parse_tbd(text)?;
             let target = Target {
                 arch: Arch::Arm64,
                 platform: Platform::MacOs,
             };
+            let docs = if include_tbd_exports {
+                parse_tbd_for_target(text, &target)?
+            } else {
+                parse_tbd_metadata_for_target(text, &target)?
+            };
+            timings.tbd_decode = phase_started.elapsed();
+
+            let phase_started = Instant::now();
+            if docs.is_empty() {
+                return Err(LinkError::NoTbdDocument(path.to_path_buf()));
+            }
             let canonical = docs
                 .iter()
                 .find(|doc| doc.parent_umbrella.is_empty())
@@ -912,25 +1222,39 @@ fn register_input(
                     .unwrap_or(DEFAULT_TBD_VERSION),
                 ordinal: inputs.next_dylib_ordinal(),
             };
-            let mut loaded = false;
-            for doc in docs
-                .iter()
-                .filter(|doc| doc.targets.iter().any(|t| t.matches_requested(&target)))
-            {
+            for doc in &docs {
                 let file = DylibFile::from_tbd(path, doc, &target);
                 let _ =
                     inputs.add_dylib_from_file_with_meta(path.to_path_buf(), file, load.clone());
-                loaded = true;
             }
-            if !loaded {
-                return Err(LinkError::NoTbdDocument(path.to_path_buf()));
-            }
+            timings.tbd_materialize = phase_started.elapsed();
         }
         _ => {
+            let phase_started = Instant::now();
             let _ = inputs.add_object(path.to_path_buf(), bytes, load_order)?;
+            timings.object_parse = phase_started.elapsed();
         }
     }
-    Ok(())
+    Ok(timings)
+}
+
+fn inputs_may_need_dylib_exports(inputs: &Inputs) -> Result<bool, LinkError> {
+    if !inputs.archives.is_empty() {
+        return Ok(true);
+    }
+    for i in 0..inputs.objects.len() {
+        let input_id = InputId(i as u32);
+        let object = inputs.object_file(input_id)?;
+        if object.symbols.iter().any(|sym| {
+            sym.stab_kind().is_none()
+                && (sym.is_ext() || sym.is_private_ext())
+                && sym.kind() == SymKind::Undef
+                && !sym.is_common()
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn resolve_entry_point(

@@ -55,6 +55,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "-dylib",
     "-all_load",
     "-force_load",
+    "-j",
     "--dump",
     "--dump-archive",
     "--dump-dylib",
@@ -139,6 +140,24 @@ fn parse_version_component(flag: &str, value: &str) -> Result<u32, ArgsError> {
         });
     }
     Ok((major << 16) | ((minor & 0xff) << 8) | (patch & 0xff))
+}
+
+fn parse_jobs(value: &str) -> Result<usize, ArgsError> {
+    let jobs = value
+        .parse::<usize>()
+        .map_err(|_| ArgsError::InvalidValue {
+            flag: "-j".into(),
+            value: value.to_string(),
+            expected: "positive integer job count".into(),
+        })?;
+    if jobs == 0 {
+        return Err(ArgsError::InvalidValue {
+            flag: "-j".into(),
+            value: value.to_string(),
+            expected: "positive integer job count".into(),
+        });
+    }
+    Ok(jobs)
 }
 
 pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
@@ -394,6 +413,12 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                     .push(PathBuf::from(it.next().ok_or_else(|| {
                         ArgsError::MissingValue("-force_load".into())
                     })?));
+            }
+            "-j" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| ArgsError::MissingValue("-j".into()))?;
+                opts.jobs = Some(parse_jobs(value)?);
             }
             "--dump" => {
                 opts.dump = Some(PathBuf::from(
@@ -783,6 +808,41 @@ mod tests {
             vec![PathBuf::from("liba.a"), PathBuf::from("libb.a")]
         );
         assert_eq!(opts.inputs, vec![PathBuf::from("main.o")]);
+    }
+
+    #[test]
+    fn jobs_flag_records_positive_worker_limit() {
+        let opts = parse(&argv(&["-j", "1", "main.o"])).unwrap();
+        assert_eq!(opts.jobs, Some(1));
+        assert_eq!(opts.inputs, vec![PathBuf::from("main.o")]);
+    }
+
+    #[test]
+    fn jobs_flag_rejects_zero_or_non_numeric_values() {
+        let err = parse(&argv(&["-j", "0"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::InvalidValue {
+                ref flag,
+                ref value,
+                ..
+            } if flag == "-j" && value == "0"
+        ));
+        let err = parse(&argv(&["-j", "many"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::InvalidValue {
+                ref flag,
+                ref value,
+                ..
+            } if flag == "-j" && value == "many"
+        ));
+    }
+
+    #[test]
+    fn missing_jobs_value_errors() {
+        let err = parse(&argv(&["-j"])).unwrap_err();
+        assert!(matches!(err, ArgsError::MissingValue(ref f) if f == "-j"));
     }
 
     #[test]

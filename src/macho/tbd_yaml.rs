@@ -185,6 +185,9 @@ fn strip_trailing_ws(s: &str) -> &str {
 /// quoted content untouched (otherwise single-quoted paths like
 /// `'/usr/lib/#funny'` would be mangled — unlikely but sound).
 fn strip_eol_comment(s: &mut String) {
+    if !s.as_bytes().contains(&b'#') {
+        return;
+    }
     let bytes = s.as_bytes();
     let mut in_single = false;
     let mut in_double = false;
@@ -215,6 +218,13 @@ fn strip_eol_comment(s: &mut String) {
 }
 
 fn flow_unbalanced(s: &str) -> bool {
+    if !s
+        .as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'[' | b']' | b'{' | b'}'))
+    {
+        return false;
+    }
     let mut depth = 0i32;
     let mut in_single = false;
     let mut in_double = false;
@@ -482,21 +492,23 @@ fn parse_flow_sequence(s: &str, line: usize, col: usize) -> Result<Value, YamlEr
         });
     }
     let inner = &s[1..s.len() - 1];
-    let items = split_flow_items(inner);
-    let mut out = Vec::with_capacity(items.len());
-    for piece in items {
+    let mut out = Vec::new();
+    split_flow_items(inner, |piece| {
         let piece = piece.trim();
         if piece.is_empty() {
-            continue;
+            return Ok(());
         }
         // Recursive: flow sequences can hold scalars or further flow sequences.
         out.push(parse_inline_value(piece, line, col)?);
-    }
+        Ok(())
+    })?;
     Ok(Value::Sequence(out))
 }
 
-fn split_flow_items(s: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
+fn split_flow_items(
+    s: &str,
+    mut visit: impl FnMut(&str) -> Result<(), YamlError>,
+) -> Result<(), YamlError> {
     let bytes = s.as_bytes();
     let mut in_single = false;
     let mut in_double = false;
@@ -515,7 +527,7 @@ fn split_flow_items(s: &str) -> Vec<&str> {
             b'[' | b'{' if !in_single && !in_double => depth += 1,
             b']' | b'}' if !in_single && !in_double => depth -= 1,
             b',' if !in_single && !in_double && depth == 0 => {
-                parts.push(&s[start..i]);
+                visit(&s[start..i])?;
                 start = i + 1;
             }
             _ => {}
@@ -523,9 +535,9 @@ fn split_flow_items(s: &str) -> Vec<&str> {
         i += 1;
     }
     if start <= s.len() {
-        parts.push(&s[start..]);
+        visit(&s[start..])?;
     }
-    parts
+    Ok(())
 }
 
 fn parse_single_quoted(s: &str, line: usize, col: usize) -> Result<String, YamlError> {

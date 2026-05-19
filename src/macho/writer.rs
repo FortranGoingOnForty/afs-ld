@@ -20,12 +20,14 @@ use crate::macho::reader::{
     LinkEditDataCmd, LoadCommand, MachHeader64, RpathCmd, Section64Header, Segment64, SymtabCmd,
     HEADER_SIZE,
 };
-use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
-use crate::resolve::InputId;
+use crate::reloc::{
+    parse_raw_relocs, parse_relocs, ParsedRelocCache, Referent, Reloc, RelocKind, RelocLength,
+};
+use crate::resolve::{AtomId, InputId};
 use crate::resolve::{Symbol, SymbolId, SymbolTable};
 use crate::section::is_executable;
 use crate::string_table::StringTableBuilder;
-use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind};
+use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind, NLIST_SIZE};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::{
     code_sig::CodeSignaturePlan,
@@ -53,8 +55,6 @@ pub struct LinkEditContext<'a> {
     pub parsed_relocs: &'a ParsedRelocCache,
 }
 
-pub type ParsedRelocCache = HashMap<(InputId, u8), Vec<Reloc>>;
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinkEditBuildTimings {
     pub symbol_plan: Duration,
@@ -62,6 +62,9 @@ pub struct LinkEditBuildTimings {
     pub symbol_plan_globals: Duration,
     pub symbol_plan_strtab: Duration,
     pub dyld_info: Duration,
+    pub dyld_bind: Duration,
+    pub dyld_rebase: Duration,
+    pub dyld_export: Duration,
     pub metadata_tables: Duration,
     pub code_signature: Duration,
 }
@@ -73,6 +76,9 @@ impl std::ops::AddAssign for LinkEditBuildTimings {
         self.symbol_plan_globals += rhs.symbol_plan_globals;
         self.symbol_plan_strtab += rhs.symbol_plan_strtab;
         self.dyld_info += rhs.dyld_info;
+        self.dyld_bind += rhs.dyld_bind;
+        self.dyld_rebase += rhs.dyld_rebase;
+        self.dyld_export += rhs.dyld_export;
         self.metadata_tables += rhs.metadata_tables;
         self.code_signature += rhs.code_signature;
     }
@@ -421,7 +427,7 @@ pub fn write_finalized_with_linkedit(
     out[stroff..end].copy_from_slice(&linkedit_plan.strtab_bytes);
     if let Some(code_signature) = &linkedit_plan.code_signature {
         let start = code_signature.dataoff as usize;
-        let bytes = code_signature.build(&out[..start]);
+        let bytes = code_signature.build_with_jobs(&out[..start], opts.parallel_jobs());
         let end = start + bytes.len();
         out[start..end].copy_from_slice(&bytes);
     }
@@ -921,7 +927,7 @@ fn build_linkedit_plan_profiled(
     timings.symbol_plan_locals += symbol_plan_timings.locals;
     timings.symbol_plan_globals += symbol_plan_timings.globals;
     timings.symbol_plan_strtab += symbol_plan_timings.strtab;
-    let mut symtab_bytes = Vec::new();
+    let mut symtab_bytes = Vec::with_capacity(symbol_plan.symbols.len() * NLIST_SIZE);
     write_nlist_table(&symbol_plan.symbols, &mut symtab_bytes);
 
     let mut indirect_symbols = Vec::new();
@@ -956,14 +962,20 @@ fn build_linkedit_plan_profiled(
         indirect_bytes.extend_from_slice(&index.to_le_bytes());
     }
 
+    let dyld_started = std::time::Instant::now();
     let phase_started = std::time::Instant::now();
     let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
-    let rebase_bytes = pad_dyld_info_stream(build_rebase_stream(layout, synthetic_plan, inputs)?);
     let bind_bytes = pad_dyld_info_stream(bind_streams.bind);
     let weak_bind_bytes = pad_dyld_info_stream(bind_streams.weak_bind);
     let lazy_bind_bytes = pad_dyld_info_stream(bind_streams.lazy_bind);
+    timings.dyld_bind += phase_started.elapsed();
+    let phase_started = std::time::Instant::now();
+    let rebase_bytes = pad_dyld_info_stream(build_rebase_stream(layout, synthetic_plan, inputs)?);
+    timings.dyld_rebase += phase_started.elapsed();
+    let phase_started = std::time::Instant::now();
     let export_bytes = pad_dyld_info_stream(build_export_trie(&symbol_plan.exports));
-    timings.dyld_info += phase_started.elapsed();
+    timings.dyld_export += phase_started.elapsed();
+    timings.dyld_info += dyld_started.elapsed();
 
     let phase_started = std::time::Instant::now();
     let loh_bytes = build_loh(
@@ -1417,10 +1429,7 @@ fn build_function_starts(
         .segment("__TEXT")
         .ok_or(WriteError::MissingSegment("__TEXT"))?
         .vm_addr;
-    let input_map: HashMap<InputId, &ObjectFile> = inputs
-        .iter()
-        .map(|input| (input.id, input.object))
-        .collect();
+    let symbol_offsets = build_function_start_symbol_index(inputs);
     let mut starts = Vec::new();
 
     for section in &layout.sections {
@@ -1435,36 +1444,19 @@ fn build_function_starts(
                     section.addr + placed.offset + alt.offset_within_atom as u64 - image_base,
                 );
             }
-            let Some(object) = input_map.get(&atom.origin) else {
-                continue;
-            };
-            let Some(input_section) = object
-                .sections
-                .get((atom.input_section as usize).saturating_sub(1))
+            let Some(section_symbols) = symbol_offsets.get(&(atom.origin, atom.input_section))
             else {
                 continue;
             };
-            let atom_start = input_section.addr + atom.input_offset as u64;
+            let atom_start = atom.input_offset as u64;
             let atom_end = atom_start + atom.size as u64;
-            for input_sym in &object.symbols {
-                if input_sym.stab_kind().is_some()
-                    || input_sym.kind() != SymKind::Sect
-                    || input_sym.alt_entry()
-                    || input_sym.sect_idx() != atom.input_section
-                {
-                    continue;
-                }
-                let Ok(name) = object.symbol_name(input_sym) else {
-                    continue;
-                };
-                if is_assembler_temporary_symbol(name) {
-                    continue;
-                }
-                let value = input_sym.value();
-                if !(atom_start < value && value < atom_end) {
-                    continue;
-                }
-                starts.push(section.addr + placed.offset + (value - atom_start) - image_base);
+            let start_idx = section_symbols.partition_point(|&offset| offset <= atom_start);
+            let end_idx = section_symbols.partition_point(|&offset| offset < atom_end);
+            if start_idx >= end_idx {
+                continue;
+            }
+            for &offset in &section_symbols[start_idx..end_idx] {
+                starts.push(section.addr + placed.offset + (offset - atom_start) - image_base);
             }
         }
     }
@@ -1486,6 +1478,39 @@ fn build_function_starts(
         out.push(0);
     }
     Ok(out)
+}
+
+type FunctionStartSymbolIndex = HashMap<(InputId, u8), Vec<u64>>;
+
+fn build_function_start_symbol_index(inputs: &[LayoutInput<'_>]) -> FunctionStartSymbolIndex {
+    let mut out: FunctionStartSymbolIndex = HashMap::new();
+    for input in inputs {
+        for input_sym in &input.object.symbols {
+            if input_sym.stab_kind().is_some()
+                || input_sym.kind() != SymKind::Sect
+                || input_sym.alt_entry()
+            {
+                continue;
+            }
+            let Ok(name) = input.object.symbol_name(input_sym) else {
+                continue;
+            };
+            if is_assembler_temporary_symbol(name) {
+                continue;
+            }
+            let Some(section) = input.object.section_for_symbol(input_sym) else {
+                continue;
+            };
+            out.entry((input.id, input_sym.sect_idx()))
+                .or_default()
+                .push(input_sym.value().saturating_sub(section.addr));
+        }
+    }
+    for offsets in out.values_mut() {
+        offsets.sort_unstable();
+        offsets.dedup();
+    }
+    out
 }
 
 fn build_data_in_code(
@@ -1693,6 +1718,7 @@ fn build_output_symbols_profiled(
 ) -> Result<(SymbolTablePlan, SymbolPlanBuildTimings), WriteError> {
     let sym_table = inputs.0.sym_table;
     let atom_sections = atom_section_ordinals(layout);
+    let atom_addrs = atom_addresses(layout);
     let atoms_by_input_section = inputs.0.atom_table.by_input_section();
     let atom_ranges = build_atom_range_index(
         inputs.0.atom_table,
@@ -1748,10 +1774,11 @@ fn build_output_symbols_profiled(
             atom_table: inputs.0.atom_table,
             atom_ranges: &atom_ranges,
             atom_sections: &atom_sections,
+            atom_addrs: &atom_addrs,
             input_id: input.id,
             file_index: file_index_by_input[&input.id],
         };
-        collect_local_symbols(layout, &ctx, input.object, &mut locals)?;
+        collect_local_symbols(&ctx, input.object, &mut locals)?;
     }
     collect_synthetic_local_symbols(layout, inputs.0.synthetic_plan, &mut locals)?;
     timings.locals += phase_started.elapsed();
@@ -1779,12 +1806,12 @@ fn build_output_symbols_profiled(
         let (n_type, n_sect, n_value) = if atom.0 == 0 {
             (absolute_symbol_type(hidden), NO_SECT, *value)
         } else {
-            if dead_strip && layout.atom_addr(*atom).is_none() {
-                continue;
-            }
-            let addr = layout
-                .atom_addr(*atom)
-                .ok_or(WriteError::DefinedSymbolAtomMissing(symbol_id, *atom))?;
+            let Some(addr) = atom_addrs.get(atom).copied() else {
+                if dead_strip {
+                    continue;
+                }
+                return Err(WriteError::DefinedSymbolAtomMissing(symbol_id, *atom));
+            };
             let sect = *atom_sections
                 .get(atom)
                 .ok_or(WriteError::DefinedSymbolSectionMissing(symbol_id, *atom))?;
@@ -1871,8 +1898,10 @@ fn build_output_symbols_profiled(
         Vec::new()
     };
 
-    let phase_started = std::time::Instant::now();
     let local_count = if strip_locals { 0 } else { locals.len() };
+    let external_defined_count = external_defineds.len();
+    let undefined_count = undefineds.len();
+    let phase_started = std::time::Instant::now();
     let mut specs = Vec::with_capacity(local_count + external_defineds.len() + undefineds.len());
     if !strip_locals {
         specs.extend(locals);
@@ -1880,27 +1909,11 @@ fn build_output_symbols_profiled(
     specs.extend(external_defineds);
     specs.extend(undefineds);
 
-    let mut strtab = StringTableBuilder::new();
-    for spec in &specs {
-        strtab.insert(&spec.name);
-    }
-    let (strtab_bytes, strx_by_name) = strtab.finish();
-
-    let nlocalsym = specs
-        .iter()
-        .filter(|spec| spec.partition == OutputSymbolPartition::Local)
-        .count() as u32;
-    let nextdefsym = specs
-        .iter()
-        .filter(|spec| spec.partition == OutputSymbolPartition::ExternalDefined)
-        .count() as u32;
-    let nundefsym = specs
-        .iter()
-        .filter(|spec| spec.partition == OutputSymbolPartition::Undefined)
-        .count() as u32;
+    let (strtab_bytes, strx_by_spec) =
+        StringTableBuilder::build_with_name_offsets(specs.iter().map(|spec| spec.name.as_str()));
 
     let mut symbols = Vec::with_capacity(specs.len());
-    let mut symbol_indices = HashMap::new();
+    let mut symbol_indices = HashMap::with_capacity(specs.len());
     let map_symbols = specs
         .iter()
         .filter(|spec| spec.partition != OutputSymbolPartition::Undefined)
@@ -1912,9 +1925,7 @@ fn build_output_symbols_profiled(
         })
         .collect();
     for (idx, spec) in specs.into_iter().enumerate() {
-        let strx = *strx_by_name
-            .get(&spec.name)
-            .expect("string table offset missing for output symbol");
+        let strx = strx_by_spec[idx];
         symbols.push(InputSymbol::from_raw(RawNlist {
             strx,
             n_type: spec.n_type,
@@ -1937,11 +1948,11 @@ fn build_output_symbols_profiled(
             exports,
             dysymtab: DysymtabCmd {
                 ilocalsym: 0,
-                nlocalsym,
-                iextdefsym: nlocalsym,
-                nextdefsym,
-                iundefsym: nlocalsym + nextdefsym,
-                nundefsym,
+                nlocalsym: local_count as u32,
+                iextdefsym: local_count as u32,
+                nextdefsym: external_defined_count as u32,
+                iundefsym: (local_count + external_defined_count) as u32,
+                nundefsym: undefined_count as u32,
                 ..DysymtabCmd::default()
             },
         },
@@ -1992,7 +2003,6 @@ fn collect_synthetic_local_symbols(
 }
 
 fn collect_local_symbols(
-    layout: &Layout,
     ctx: &LocalSymbolContext<'_>,
     object: &ObjectFile,
     out: &mut Vec<OutputSymbolSpec>,
@@ -2021,14 +2031,9 @@ fn collect_local_symbols(
                     offset,
                 )
                 .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
-                let addr =
-                    layout
-                        .atom_addr(atom_id)
-                        .ok_or(WriteError::DefinedSymbolAtomMissing(
-                            SymbolId(u32::MAX),
-                            atom_id,
-                        ))?
-                        + delta as u64;
+                let addr = ctx.atom_addrs.get(&atom_id).copied().ok_or(
+                    WriteError::DefinedSymbolAtomMissing(SymbolId(u32::MAX), atom_id),
+                )? + delta as u64;
                 let n_sect = *ctx.atom_sections.get(&atom_id).ok_or(
                     WriteError::DefinedSymbolSectionMissing(SymbolId(u32::MAX), atom_id),
                 )?;
@@ -2067,6 +2072,7 @@ struct LocalSymbolContext<'a> {
     atom_table: &'a AtomTable,
     atom_ranges: &'a AtomRangeIndex,
     atom_sections: &'a HashMap<crate::resolve::AtomId, u8>,
+    atom_addrs: &'a HashMap<crate::resolve::AtomId, u64>,
     input_id: InputId,
     file_index: usize,
 }
@@ -2171,6 +2177,16 @@ fn atom_section_ordinals(layout: &Layout) -> HashMap<crate::resolve::AtomId, u8>
         let ordinal = (idx + 1) as u8;
         for placed in &section.atoms {
             out.insert(placed.atom, ordinal);
+        }
+    }
+    out
+}
+
+fn atom_addresses(layout: &Layout) -> HashMap<AtomId, u64> {
+    let mut out = HashMap::new();
+    for section in &layout.sections {
+        for placed in &section.atoms {
+            out.insert(placed.atom, section.addr + placed.offset);
         }
     }
     out
@@ -2371,6 +2387,7 @@ fn build_bind_streams(
     let weak_bind = Vec::new();
     let mut lazy_bind = OpcodeStream::new();
     let mut lazy_offsets = HashMap::new();
+    let layout_index = BindLayoutIndex::build(layout)?;
 
     if let Some(tlv_bootstrap) = synthetic_plan.tlv_bootstrap_symbol {
         let segment_index = segment_index(layout, "__DATA")?;
@@ -2437,29 +2454,21 @@ fn build_bind_streams(
             .get(&entry.symbol)
             .copied()
             .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
-        let atom_addr = layout
-            .atom_addr(entry.atom)
+        let placement = layout_index
+            .atoms
+            .get(&entry.atom)
             .ok_or(WriteError::DirectBindAtomMissing(entry.atom))?;
-        let section = layout
-            .sections
-            .iter()
-            .find(|section| section.atoms.iter().any(|placed| placed.atom == entry.atom))
-            .ok_or(WriteError::DirectBindSectionMissing(entry.atom))?;
-        if section.segment == "__DATA" && section.name == "__thread_vars" {
+        if placement.is_thread_vars {
             // `__thread_vars` starts are emitted through the dedicated
             // `__tlv_bootstrap` pass above. Descriptor tails are rewritten to
             // template offsets before write, so any generic direct bind landing
             // back in this section is stale and would override the TLV bind.
             continue;
         }
-        let segment_index = segment_index(layout, &section.segment)?;
-        let segment = layout
-            .segment(&section.segment)
-            .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
-        let slot_addr = atom_addr + entry.atom_offset as u64;
+        let slot_addr = placement.addr + entry.atom_offset as u64;
         bind_specs.push(BindRecordSpec {
-            segment_index,
-            segment_offset: slot_addr - segment.vm_addr,
+            segment_index: placement.segment_index,
+            segment_offset: slot_addr - placement.segment_vm_addr,
             ordinal: import.ordinal,
             name: &import.name,
             weak_import: import.weak_import,
@@ -2506,6 +2515,59 @@ fn build_bind_streams(
         lazy_bind: lazy_bind.into_vec(),
         lazy_offsets,
     })
+}
+
+struct BindLayoutIndex {
+    atoms: HashMap<AtomId, BindAtomPlacement>,
+}
+
+#[derive(Clone, Copy)]
+struct BindAtomPlacement {
+    addr: u64,
+    segment_index: u8,
+    segment_vm_addr: u64,
+    is_thread_vars: bool,
+}
+
+impl BindLayoutIndex {
+    fn build(layout: &Layout) -> Result<Self, WriteError> {
+        let mut segment_meta = HashMap::with_capacity(layout.segments.len());
+        for (idx, segment) in layout.segments.iter().enumerate() {
+            segment_meta.insert(
+                segment.name.as_str(),
+                (
+                    u8::try_from(idx).map_err(|_| WriteError::OffsetTooLarge("segment index"))?,
+                    segment.vm_addr,
+                ),
+            );
+        }
+        let atom_count: usize = layout
+            .sections
+            .iter()
+            .map(|section| section.atoms.len())
+            .sum();
+        let mut atoms = HashMap::with_capacity(atom_count);
+        for section in &layout.sections {
+            let Some((segment_index, segment_vm_addr)) =
+                segment_meta.get(section.segment.as_str()).copied()
+            else {
+                continue;
+            };
+            let is_thread_vars = section.segment == "__DATA" && section.name == "__thread_vars";
+            for placed in &section.atoms {
+                atoms.insert(
+                    placed.atom,
+                    BindAtomPlacement {
+                        addr: section.addr + placed.offset,
+                        segment_index,
+                        segment_vm_addr,
+                        is_thread_vars,
+                    },
+                );
+            }
+        }
+        Ok(Self { atoms })
+    }
 }
 
 fn segment_index(layout: &Layout, name: &str) -> Result<u8, WriteError> {
@@ -2593,12 +2655,15 @@ fn u32_fit(value: u64, what: &'static str) -> Result<u32, WriteError> {
 #[cfg(test)]
 mod tests {
     use crate::atom::{AltEntry, Atom, AtomFlags, AtomSection, AtomTable};
+    use crate::input::ObjectFile;
     use crate::layout::{Layout, PAGE_SIZE};
     use crate::leb::read_uleb;
+    use crate::macho::reader::MachHeader64;
     use crate::resolve::{AtomId, InputId, SymbolId};
     use crate::section::{
-        OutputAtom, OutputSection, OutputSectionId, OutputSegment, Prot, SectionKind,
+        InputSection, OutputAtom, OutputSection, OutputSectionId, OutputSegment, Prot, SectionKind,
     };
+    use crate::string_table::StringTable;
 
     use super::*;
 
@@ -2859,6 +2924,160 @@ mod tests {
             decode_function_starts_blob(&blob),
             vec![0x1000, 0x1008, 0x1040]
         );
+    }
+
+    #[test]
+    fn function_starts_index_uses_only_interior_named_entries() {
+        let mut atoms = AtomTable::new();
+        let atom_id = atoms.push(Atom {
+            id: AtomId(0),
+            origin: InputId(1),
+            input_section: 1,
+            section: AtomSection::Text,
+            input_offset: 0,
+            size: 16,
+            align_pow2: 2,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 16],
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        });
+        let zero_atom_id = atoms.push(Atom {
+            id: AtomId(0),
+            origin: InputId(1),
+            input_section: 1,
+            section: AtomSection::Text,
+            input_offset: 16,
+            size: 0,
+            align_pow2: 2,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: Vec::new(),
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        });
+        let object = object_with_text_symbols(&[
+            ("_start", 0x1000, 0),
+            ("Ltmp0", 0x1004, 0),
+            ("_middle", 0x1008, 0),
+            ("_alt", 0x100c, N_ALT_ENTRY),
+            ("_end", 0x1010, 0),
+        ]);
+        let inputs = [LayoutInput {
+            id: InputId(1),
+            object: &object,
+            load_order: 0,
+            archive_member_offset: None,
+        }];
+        let layout = Layout {
+            kind: OutputKind::Executable,
+            segments: vec![OutputSegment {
+                name: "__TEXT".into(),
+                sections: vec![OutputSectionId(0)],
+                vm_addr: 0x1_0000_0000,
+                vm_size: 0x4000,
+                file_off: 0,
+                file_size: 0x4000,
+                init_prot: Prot::READ_EXECUTE,
+                max_prot: Prot::READ_EXECUTE,
+                flags: 0,
+            }],
+            sections: vec![OutputSection {
+                segment: "__TEXT".into(),
+                name: "__text".into(),
+                kind: SectionKind::Text,
+                align_pow2: 2,
+                flags: 0,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                atoms: vec![
+                    OutputAtom {
+                        atom: atom_id,
+                        offset: 0,
+                        size: 16,
+                        data: vec![0; 16],
+                    },
+                    OutputAtom {
+                        atom: zero_atom_id,
+                        offset: 16,
+                        size: 0,
+                        data: Vec::new(),
+                    },
+                ],
+                synthetic_offset: 0,
+                synthetic_data: Vec::new(),
+                addr: 0x1_0000_1000,
+                size: 16,
+                file_off: 0x1000,
+            }],
+        };
+
+        let blob = build_function_starts(&layout, &inputs, &atoms).unwrap();
+        assert_eq!(
+            decode_function_starts_blob(&blob),
+            vec![0x1000, 0x1008, 0x1010]
+        );
+    }
+
+    fn object_with_text_symbols(symbols: &[(&str, u64, u16)]) -> ObjectFile {
+        let mut strings = vec![0];
+        let mut strx = Vec::new();
+        for (name, _, _) in symbols {
+            strx.push(strings.len() as u32);
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        ObjectFile {
+            path: "function-starts-index.o".into(),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections: vec![InputSection {
+                segname: "__TEXT".into(),
+                sectname: "__text".into(),
+                kind: SectionKind::Text,
+                addr: 0x1000,
+                size: 16,
+                align_pow2: 2,
+                flags: 0,
+                offset: 0,
+                reloff: 0,
+                nreloc: 0,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                data: vec![0; 16],
+                raw_relocs: Vec::new(),
+            }],
+            symbols: symbols
+                .iter()
+                .zip(strx)
+                .map(|((_, value, desc), strx)| {
+                    InputSymbol::from_raw(RawNlist {
+                        strx,
+                        n_type: N_SECT,
+                        n_sect: 1,
+                        n_desc: *desc,
+                        n_value: *value,
+                    })
+                })
+                .collect(),
+            strings: StringTable::from_bytes(strings),
+            symtab: None,
+            dysymtab: None,
+            loh: Vec::new(),
+            data_in_code: Vec::new(),
+        }
     }
 
     #[test]

@@ -1174,7 +1174,7 @@ struct SymbolTablePlan {
     symbols: Vec<InputSymbol>,
     map_symbols: Vec<LinkMapSymbol>,
     strtab_bytes: Vec<u8>,
-    symbol_indices: HashMap<SymbolId, u32>,
+    symbol_indices: Vec<Option<u32>>,
     exports: Vec<ExportEntry>,
     dysymtab: DysymtabCmd,
 }
@@ -1922,7 +1922,7 @@ fn build_output_symbols_profiled(
         StringTableBuilder::build_with_name_offsets(specs.iter().map(|spec| spec.name.as_str()));
 
     let mut symbols = Vec::with_capacity(specs.len());
-    let mut symbol_indices = HashMap::with_capacity(specs.len());
+    let mut symbol_indices = vec![None; sym_table.len()];
     let map_symbols = if emit_link_map {
         specs
             .iter()
@@ -1947,7 +1947,9 @@ fn build_output_symbols_profiled(
             n_value: spec.n_value,
         }));
         if let Some(symbol) = spec.symbol {
-            symbol_indices.insert(symbol, idx as u32);
+            if let Some(slot) = symbol_indices.get_mut(symbol.0 as usize) {
+                *slot = Some(idx as u32);
+            }
         }
     }
     timings.strtab += phase_started.elapsed();
@@ -2403,12 +2405,13 @@ fn push_indirect_section(
 fn indirect_symbol_index(
     symbol: SymbolId,
     import_lookup: &HashMap<SymbolId, &ImportSymbolRecord>,
-    symbol_indices: &HashMap<SymbolId, u32>,
+    symbol_indices: &[Option<u32>],
 ) -> u32 {
     if import_lookup.contains_key(&symbol) {
         symbol_indices
-            .get(&symbol)
+            .get(symbol.0 as usize)
             .copied()
+            .flatten()
             .unwrap_or(INDIRECT_SYMBOL_LOCAL)
     } else {
         INDIRECT_SYMBOL_LOCAL

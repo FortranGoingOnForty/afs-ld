@@ -287,16 +287,11 @@ fn finalize_with_linkedit(
     cache: &mut LinkEditBuildCache,
 ) -> Result<(Layout, LinkEditPlan, LinkEditBuildTimings), WriteError> {
     let mut layout = layout.clone();
-    let (mut linkedit, mut timings) =
-        build_linkedit_plan_profiled(&layout, kind, opts, inputs, Some(cache))?;
-    apply_indirect_starts(&mut layout, &linkedit);
-    let header_size = estimate_header_size(&layout, kind, opts, dylibs, &linkedit);
+    let header_size = estimate_header_size(&layout, kind, opts, dylibs, false);
     layout.relayout(header_size);
 
-    let (next_linkedit, next_timings) =
+    let (mut linkedit, mut timings) =
         build_linkedit_plan_profiled(&layout, kind, opts, inputs, Some(cache))?;
-    linkedit = next_linkedit;
-    timings += next_timings;
     apply_indirect_starts(&mut layout, &linkedit);
     let exact_header_size =
         HEADER_SIZE as u64 + exact_sizeofcmds(&layout, kind, opts, dylibs, &linkedit)? as u64;
@@ -558,7 +553,7 @@ fn estimate_header_size(
     kind: OutputKind,
     opts: &LinkOptions,
     dylibs: &[DylibDependency],
-    linkedit: &LinkEditPlan,
+    has_loh: bool,
 ) -> u64 {
     let mut size = HEADER_SIZE as u64;
     for segment in &layout.segments {
@@ -605,7 +600,7 @@ fn estimate_header_size(
     size += SymtabCmd::WIRE_SIZE as u64;
     size += DysymtabCmd::WIRE_SIZE as u64;
     size += 16 * 3;
-    if linkedit.loh.is_some() {
+    if has_loh {
         size += 16;
     }
     size += DyldInfoCmd::WIRE_SIZE as u64;

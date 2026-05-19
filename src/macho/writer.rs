@@ -869,7 +869,7 @@ fn build_linkedit_plan_profiled(
     kind: OutputKind,
     opts: &LinkOptions,
     inputs: Option<LinkEditInputs<'_>>,
-    mut cache: Option<&mut LinkEditBuildCache>,
+    cache: Option<&mut LinkEditBuildCache>,
 ) -> Result<(LinkEditPlan, LinkEditBuildTimings), WriteError> {
     let mut timings = LinkEditBuildTimings::default();
     let linkedit = layout
@@ -938,14 +938,16 @@ fn build_linkedit_plan_profiled(
     let visibility = SymbolVisibilityPolicy::from_opts(opts)?;
     let (symbol_plan, symbol_plan_timings) = build_output_symbols_profiled(
         layout,
-        kind,
-        opts.dead_strip,
-        opts.strip_locals,
-        opts.map.is_some(),
-        &visibility,
+        SymbolPlanOptions {
+            kind,
+            dead_strip: opts.dead_strip,
+            strip_locals: opts.strip_locals,
+            emit_link_map: opts.map.is_some(),
+            visibility: &visibility,
+        },
         inputs,
         &imports,
-        cache.as_deref_mut(),
+        cache,
     )?;
     timings.symbol_plan += phase_started.elapsed();
     timings.symbol_plan_locals += symbol_plan_timings.locals;
@@ -1732,7 +1734,33 @@ struct SymbolPlanBuildTimings {
 
 #[derive(Debug, Default)]
 pub struct LinkEditBuildCache {
+    local_symbols: Option<CachedLocalSymbols>,
     symbol_strtab: Option<CachedSymbolStrtab>,
+}
+
+#[derive(Debug)]
+struct CachedLocalSymbols {
+    entries: Vec<CachedLocalSymbol>,
+}
+
+#[derive(Debug)]
+enum CachedLocalSymbol {
+    Sect {
+        name: String,
+        atom: AtomId,
+        delta: u32,
+        n_type: u8,
+        n_desc: u16,
+        size: u64,
+        file_index: usize,
+    },
+    Abs {
+        name: String,
+        n_type: u8,
+        n_desc: u16,
+        n_value: u64,
+        file_index: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -1742,20 +1770,31 @@ struct CachedSymbolStrtab {
     strx_by_spec: Arc<[u32]>,
 }
 
-fn build_output_symbols_profiled<'a>(
-    layout: &Layout,
+#[derive(Debug, Clone, Copy)]
+struct SymbolPlanOptions<'a> {
     kind: OutputKind,
     dead_strip: bool,
     strip_locals: bool,
     emit_link_map: bool,
-    visibility: &SymbolVisibilityPolicy,
+    visibility: &'a SymbolVisibilityPolicy,
+}
+
+fn build_output_symbols_profiled<'a>(
+    layout: &Layout,
+    options: SymbolPlanOptions<'_>,
     inputs: LinkEditInputs<'a>,
     imports: &'a [ImportSymbolRecord],
     cache: Option<&mut LinkEditBuildCache>,
 ) -> Result<(SymbolTablePlan, SymbolPlanBuildTimings), WriteError> {
+    let (local_symbol_cache, symbol_strtab_cache) = match cache {
+        Some(cache) => (
+            Some(&mut cache.local_symbols),
+            Some(&mut cache.symbol_strtab),
+        ),
+        None => (None, None),
+    };
     let sym_table = inputs.0.sym_table;
     let atom_outputs = AtomOutputIndex::new(layout);
-    let atom_ranges = build_atom_range_index(inputs.0.atom_table, inputs.0.icf_redirects);
     let file_index_by_input: HashMap<InputId, usize> = inputs
         .0
         .layout_inputs
@@ -1768,13 +1807,14 @@ fn build_output_symbols_profiled<'a>(
     let mut locals = Vec::new();
     let mut external_defineds = Vec::new();
     let mut undefineds = Vec::with_capacity(imports.len());
+    let transient_local_symbols: CachedLocalSymbols;
 
-    if kind == OutputKind::Executable && !layout.sections.is_empty() {
+    if options.kind == OutputKind::Executable && !layout.sections.is_empty() {
         let text_vmaddr = layout
             .segment("__TEXT")
             .ok_or(WriteError::MissingSegment("__TEXT"))?
             .vm_addr;
-        let hide_header = visibility.hides("__mh_execute_header");
+        let hide_header = options.visibility.hides("__mh_execute_header");
         let header_partition = if hide_header {
             OutputSymbolPartition::Local
         } else {
@@ -1800,16 +1840,13 @@ fn build_output_symbols_profiled<'a>(
     }
 
     let phase_started = std::time::Instant::now();
-    for input in inputs.0.layout_inputs {
-        let ctx = LocalSymbolContext {
-            atom_table: inputs.0.atom_table,
-            atom_ranges: &atom_ranges,
-            atom_outputs: &atom_outputs,
-            input_id: input.id,
-            file_index: file_index_by_input[&input.id],
-        };
-        collect_local_symbols(&ctx, input.object, &mut locals)?;
-    }
+    let cached = if let Some(cache) = local_symbol_cache {
+        cached_local_symbols(inputs, &file_index_by_input, cache)?
+    } else {
+        transient_local_symbols = build_local_symbol_records(inputs, &file_index_by_input)?;
+        &transient_local_symbols.entries
+    };
+    collect_cached_local_symbols(cached, &atom_outputs, &mut locals)?;
     collect_synthetic_local_symbols(layout, inputs.0.synthetic_plan, &mut locals)?;
     timings.locals += phase_started.elapsed();
 
@@ -1832,7 +1869,7 @@ fn build_output_symbols_profiled<'a>(
             continue;
         }
         let name = sym_table.interner.resolve(*name);
-        let hidden = visibility.hides(name);
+        let hidden = options.visibility.hides(name);
         let (n_type, n_sect, n_value) = if atom.0 == 0 {
             (absolute_symbol_type(hidden), NO_SECT, *value)
         } else {
@@ -1844,7 +1881,7 @@ fn build_output_symbols_profiled<'a>(
                 ) {
                     continue;
                 }
-                if dead_strip {
+                if options.dead_strip {
                     continue;
                 }
                 return Err(WriteError::DefinedSymbolAtomMissing(symbol_id, *atom));
@@ -1913,7 +1950,7 @@ fn build_output_symbols_profiled<'a>(
     undefineds.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
     timings.globals += phase_started.elapsed();
 
-    let exports = if matches!(kind, OutputKind::Dylib | OutputKind::Executable) {
+    let exports = if matches!(options.kind, OutputKind::Dylib | OutputKind::Executable) {
         external_defineds
             .iter()
             .map(|spec| ExportEntry {
@@ -1932,22 +1969,26 @@ fn build_output_symbols_profiled<'a>(
         Vec::new()
     };
 
-    let local_count = if strip_locals { 0 } else { locals.len() };
+    let local_count = if options.strip_locals {
+        0
+    } else {
+        locals.len()
+    };
     let external_defined_count = external_defineds.len();
     let undefined_count = undefineds.len();
     let phase_started = std::time::Instant::now();
     let mut specs = Vec::with_capacity(local_count + external_defineds.len() + undefineds.len());
-    if !strip_locals {
+    if !options.strip_locals {
         specs.extend(locals);
     }
     specs.extend(external_defineds);
     specs.extend(undefineds);
 
-    let (strtab_bytes, strx_by_spec) = build_cached_symbol_strtab(&specs, cache);
+    let (strtab_bytes, strx_by_spec) = build_cached_symbol_strtab(&specs, symbol_strtab_cache);
 
     let mut symbols = Vec::with_capacity(specs.len());
     let mut symbol_indices = vec![None; sym_table.len()];
-    let map_symbols = if emit_link_map {
+    let map_symbols = if options.emit_link_map {
         specs
             .iter()
             .filter(|spec| spec.partition != OutputSymbolPartition::Undefined)
@@ -2001,7 +2042,7 @@ fn build_output_symbols_profiled<'a>(
 
 fn build_cached_symbol_strtab(
     specs: &[OutputSymbolSpec<'_>],
-    cache: Option<&mut LinkEditBuildCache>,
+    cache: Option<&mut Option<CachedSymbolStrtab>>,
 ) -> (Arc<[u8]>, Arc<[u32]>) {
     let Some(cache) = cache else {
         let (strtab_bytes, strx_by_spec) = StringTableBuilder::build_with_name_offsets(
@@ -2009,7 +2050,7 @@ fn build_cached_symbol_strtab(
         );
         return (Arc::from(strtab_bytes), Arc::from(strx_by_spec));
     };
-    if let Some(cached) = cache.symbol_strtab.as_ref() {
+    if let Some(cached) = cache.as_ref() {
         if cached.names.len() == specs.len()
             && cached
                 .names
@@ -2028,7 +2069,7 @@ fn build_cached_symbol_strtab(
         StringTableBuilder::build_with_name_offsets(specs.iter().map(|spec| spec.name.as_ref()));
     let strtab_bytes = Arc::from(strtab_bytes);
     let strx_by_spec = Arc::from(strx_by_spec);
-    cache.symbol_strtab = Some(CachedSymbolStrtab {
+    *cache = Some(CachedSymbolStrtab {
         names: specs
             .iter()
             .map(|spec| spec.name.as_ref().to_string())
@@ -2099,10 +2140,99 @@ fn collect_synthetic_local_symbols<'a>(
     Ok(())
 }
 
-fn collect_local_symbols<'a>(
-    ctx: &LocalSymbolContext<'_>,
-    object: &'a ObjectFile,
+fn cached_local_symbols<'cache>(
+    inputs: LinkEditInputs<'_>,
+    file_index_by_input: &HashMap<InputId, usize>,
+    cache: &'cache mut Option<CachedLocalSymbols>,
+) -> Result<&'cache [CachedLocalSymbol], WriteError> {
+    if cache.is_none() {
+        *cache = Some(build_local_symbol_records(inputs, file_index_by_input)?);
+    }
+    Ok(&cache
+        .as_ref()
+        .expect("local symbol cache is populated")
+        .entries)
+}
+
+fn collect_cached_local_symbols<'a>(
+    cached: &'a [CachedLocalSymbol],
+    atom_outputs: &AtomOutputIndex,
     out: &mut Vec<OutputSymbolSpec<'a>>,
+) -> Result<(), WriteError> {
+    for entry in cached {
+        match entry {
+            CachedLocalSymbol::Sect {
+                name,
+                atom,
+                delta,
+                n_type,
+                n_desc,
+                size,
+                file_index,
+            } => {
+                let (n_sect, atom_addr) =
+                    atom_outputs
+                        .get(*atom)
+                        .ok_or(WriteError::DefinedSymbolAtomMissing(
+                            SymbolId(u32::MAX),
+                            *atom,
+                        ))?;
+                out.push(OutputSymbolSpec {
+                    symbol: None,
+                    name: Cow::Borrowed(name.as_str()),
+                    partition: OutputSymbolPartition::Local,
+                    n_type: *n_type,
+                    n_sect,
+                    n_desc: *n_desc,
+                    n_value: atom_addr + *delta as u64,
+                    size: *size,
+                    file_index: *file_index,
+                });
+            }
+            CachedLocalSymbol::Abs {
+                name,
+                n_type,
+                n_desc,
+                n_value,
+                file_index,
+            } => out.push(OutputSymbolSpec {
+                symbol: None,
+                name: Cow::Borrowed(name.as_str()),
+                partition: OutputSymbolPartition::Local,
+                n_type: *n_type,
+                n_sect: NO_SECT,
+                n_desc: *n_desc,
+                n_value: *n_value,
+                size: 0,
+                file_index: *file_index,
+            }),
+        }
+    }
+    Ok(())
+}
+
+fn build_local_symbol_records(
+    inputs: LinkEditInputs<'_>,
+    file_index_by_input: &HashMap<InputId, usize>,
+) -> Result<CachedLocalSymbols, WriteError> {
+    let atom_ranges = build_atom_range_index(inputs.0.atom_table, inputs.0.icf_redirects);
+    let mut entries = Vec::new();
+    for input in inputs.0.layout_inputs {
+        let ctx = LocalSymbolContext {
+            atom_table: inputs.0.atom_table,
+            atom_ranges: &atom_ranges,
+            input_id: input.id,
+            file_index: file_index_by_input[&input.id],
+        };
+        collect_local_symbol_records(&ctx, input.object, &mut entries)?;
+    }
+    Ok(CachedLocalSymbols { entries })
+}
+
+fn collect_local_symbol_records(
+    ctx: &LocalSymbolContext<'_>,
+    object: &ObjectFile,
+    out: &mut Vec<CachedLocalSymbol>,
 ) -> Result<(), WriteError> {
     for input_sym in &object.symbols {
         if input_sym.stab_kind().is_some() {
@@ -2131,39 +2261,23 @@ fn collect_local_symbols<'a>(
                     offset,
                 )
                 .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
-                let (n_sect, atom_addr) =
-                    ctx.atom_outputs
-                        .get(atom_id)
-                        .ok_or(WriteError::DefinedSymbolAtomMissing(
-                            SymbolId(u32::MAX),
-                            atom_id,
-                        ))?;
-                let addr = atom_addr + delta as u64;
-                out.push(OutputSymbolSpec {
-                    symbol: None,
-                    name: Cow::Borrowed(name),
-                    partition: OutputSymbolPartition::Local,
+                out.push(CachedLocalSymbol::Sect {
+                    name: name.to_string(),
+                    atom: atom_id,
+                    delta,
                     n_type: input_symbol_type(input_sym),
-                    n_sect,
                     n_desc: input_sym.raw.n_desc,
-                    n_value: addr,
                     size: ctx.atom_table.get(atom_id).size.saturating_sub(delta) as u64,
                     file_index: ctx.file_index,
                 });
             }
-            SymKind::Abs => {
-                out.push(OutputSymbolSpec {
-                    symbol: None,
-                    name: Cow::Borrowed(name),
-                    partition: OutputSymbolPartition::Local,
-                    n_type: input_symbol_type(input_sym),
-                    n_sect: NO_SECT,
-                    n_desc: input_sym.raw.n_desc,
-                    n_value: input_sym.value(),
-                    size: 0,
-                    file_index: ctx.file_index,
-                });
-            }
+            SymKind::Abs => out.push(CachedLocalSymbol::Abs {
+                name: name.to_string(),
+                n_type: input_symbol_type(input_sym),
+                n_desc: input_sym.raw.n_desc,
+                n_value: input_sym.value(),
+                file_index: ctx.file_index,
+            }),
             SymKind::Undef | SymKind::Indirect => {}
         }
     }
@@ -2173,7 +2287,6 @@ fn collect_local_symbols<'a>(
 struct LocalSymbolContext<'a> {
     atom_table: &'a AtomTable,
     atom_ranges: &'a AtomRangeIndex,
-    atom_outputs: &'a AtomOutputIndex,
     input_id: InputId,
     file_index: usize,
 }

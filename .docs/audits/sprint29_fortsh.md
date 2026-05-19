@@ -28,6 +28,7 @@ Status date: 2026-05-19
 - Relocation target resolution now uses a sorted per-input-section atom range index and a borrowed symbol-name index, avoiding repeated linear atom scans and duplicate symbol-name allocation during relocation/thunk passes.
 - Linkedit symbol planning now shares cached string-table buffers across convergence passes and makes suffix-dedup lookup O(1) after reverse-suffix sorting.
 - Unwind synthesis now reuses the linker-wide parsed relocation cache and indexed atom/symbol lookups instead of reparsing compact-unwind relocations and linearly scanning atoms/symbols for each record.
+- Linkedit symbol planning now caches local-symbol atom resolution across convergence passes, avoiding repeated object-local nlist scans and atom containment searches.
 - Regression coverage:
   - `layout_omits_debug_and_llvm_payload_sections`
   - `linker_run_omits_debug_and_llvm_payload_sections_like_ld`
@@ -57,11 +58,12 @@ or armfortas runtime/codegen issue, not an afs-ld issue.
 - Full Sprint 29 runtime matrix is blocked on the armfortas fortsh `-c` invalid-free bug.
 - Link-time performance still misses the Sprint 29 2x gate on this machine:
   - Through the armfortas final-link path with release afs-ld: afs-ld `0.16-0.17s`, Apple `ld` `0.06s`.
-  - Direct linker invocation on the same object list after the unwind-indexing slice: afs-ld warm runs are about `0.08-0.09s`, Apple `ld` remains about `0.03-0.04s`.
-  - Current profile for the fortsh fixture: total is typically about `87-102ms` warm; largest remaining buckets are linkedit finalization about `23-28ms`, relocation application about `18-21ms`, symbol resolution about `11-14ms`, and output write about `8-12ms`.
+  - Direct linker invocation on the same object list after the local-symbol-cache slice: afs-ld warm runs are about `0.07-0.08s`; Apple `ld` samples on the same object list are about `0.03-0.04s`.
+  - Current profile for the fortsh fixture: total is typically about `85-92ms` warm; largest remaining buckets are linkedit finalization about `20-22ms`, relocation application about `18-21ms`, symbol resolution about `11-12ms`, and output write about `8-19ms`.
   - The linkedit symbol-plan slices reduced the measured symbol-plan bucket from about `51ms` to about `13-17ms`, and the symbol string-table sub-bucket from about `32ms` to about `4.4-4.7ms`.
   - The targeted TBD slice reduced the measured TBD decode bucket from about `22-45ms` depending on cache/double-decode path to about `3-4ms`.
   - The sorted relocation slices avoid per-atom full-section relocation scans and speed section-backed target lookup; observed relocation-apply samples now range from about `18-20ms` on the fortsh fixture, with release direct warm runs around `0.09s`.
   - The linkedit convergence slice removed one full plan rebuild per finalize call, reducing observed linkedit finalization from about `40-46ms` to about `27-31ms`.
   - The unwind-indexing slice reduced observed unwind synthesis from about `8-9ms` to about `1.2ms`.
+  - The local-symbol-cache slice reduced observed linkedit symbol planning to about `8.6-8.9ms`, with local-symbol work about `1.8-2.2ms` on the fortsh fixture.
 - Load-command shape is improved by dropping debug/LLVM payloads, but afs-ld still emits classic `LC_DYLD_INFO_ONLY` rather than Apple's chained-fixup load-command shape for this executable.

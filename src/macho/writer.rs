@@ -2,6 +2,7 @@
 //!
 //! Emits a parseable `MH_EXECUTE` or `MH_DYLIB` image from the output layout.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -1145,9 +1146,9 @@ enum OutputSymbolPartition {
 }
 
 #[derive(Debug, Clone)]
-struct OutputSymbolSpec {
+struct OutputSymbolSpec<'a> {
     symbol: Option<SymbolId>,
-    name: String,
+    name: Cow<'a, str>,
     partition: OutputSymbolPartition,
     n_type: u8,
     n_sect: u8,
@@ -1745,15 +1746,15 @@ struct CachedSymbolStrtab {
     strx_by_spec: Vec<u32>,
 }
 
-fn build_output_symbols_profiled(
+fn build_output_symbols_profiled<'a>(
     layout: &Layout,
     kind: OutputKind,
     dead_strip: bool,
     strip_locals: bool,
     emit_link_map: bool,
     visibility: &SymbolVisibilityPolicy,
-    inputs: LinkEditInputs<'_>,
-    imports: &[ImportSymbolRecord],
+    inputs: LinkEditInputs<'a>,
+    imports: &'a [ImportSymbolRecord],
     cache: Option<&mut LinkEditBuildCache>,
 ) -> Result<(SymbolTablePlan, SymbolPlanBuildTimings), WriteError> {
     let sym_table = inputs.0.sym_table;
@@ -1797,7 +1798,7 @@ fn build_output_symbols_profiled(
         };
         target.push(OutputSymbolSpec {
             symbol: None,
-            name: "__mh_execute_header".to_string(),
+            name: Cow::Borrowed("__mh_execute_header"),
             partition: header_partition,
             n_type: header_type,
             n_sect: 1,
@@ -1841,8 +1842,8 @@ fn build_output_symbols_profiled(
         if *private_extern {
             continue;
         }
-        let name = sym_table.interner.resolve(*name).to_string();
-        let hidden = visibility.hides(&name);
+        let name = sym_table.interner.resolve(*name);
+        let hidden = visibility.hides(name);
         let (n_type, n_sect, n_value) = if atom.0 == 0 {
             (absolute_symbol_type(hidden), NO_SECT, *value)
         } else {
@@ -1893,7 +1894,7 @@ fn build_output_symbols_profiled(
         };
         target.push(OutputSymbolSpec {
             symbol: Some(symbol_id),
-            name,
+            name: Cow::Borrowed(name),
             partition,
             n_type,
             n_sect,
@@ -1913,7 +1914,7 @@ fn build_output_symbols_profiled(
         }
         undefineds.push(OutputSymbolSpec {
             symbol: Some(import.symbol),
-            name: import.name.clone(),
+            name: Cow::Borrowed(import.name.as_str()),
             partition: OutputSymbolPartition::Undefined,
             n_type: N_UNDF | N_EXT,
             n_sect: NO_SECT,
@@ -1930,7 +1931,7 @@ fn build_output_symbols_profiled(
         external_defineds
             .iter()
             .map(|spec| ExportEntry {
-                name: spec.name.clone(),
+                name: spec.name.clone().into_owned(),
                 flags: export_symbol_flags(layout, spec.n_desc, spec.n_type, spec.n_sect),
                 kind: export_symbol_kind(
                     layout,
@@ -1965,7 +1966,7 @@ fn build_output_symbols_profiled(
             .iter()
             .filter(|spec| spec.partition != OutputSymbolPartition::Undefined)
             .map(|spec| LinkMapSymbol {
-                name: spec.name.clone(),
+                name: spec.name.clone().into_owned(),
                 addr: spec.n_value,
                 size: spec.size,
                 file_index: spec.file_index,
@@ -2013,12 +2014,12 @@ fn build_output_symbols_profiled(
 }
 
 fn build_cached_symbol_strtab(
-    specs: &[OutputSymbolSpec],
+    specs: &[OutputSymbolSpec<'_>],
     cache: Option<&mut LinkEditBuildCache>,
 ) -> (Vec<u8>, Vec<u32>) {
     let Some(cache) = cache else {
         return StringTableBuilder::build_with_name_offsets(
-            specs.iter().map(|spec| spec.name.as_str()),
+            specs.iter().map(|spec| spec.name.as_ref()),
         );
     };
     if let Some(cached) = cache.symbol_strtab.as_ref() {
@@ -2027,16 +2028,19 @@ fn build_cached_symbol_strtab(
                 .names
                 .iter()
                 .zip(specs)
-                .all(|(cached, spec)| cached == &spec.name)
+                .all(|(cached, spec)| cached == spec.name.as_ref())
         {
             return (cached.strtab_bytes.clone(), cached.strx_by_spec.clone());
         }
     }
 
     let (strtab_bytes, strx_by_spec) =
-        StringTableBuilder::build_with_name_offsets(specs.iter().map(|spec| spec.name.as_str()));
+        StringTableBuilder::build_with_name_offsets(specs.iter().map(|spec| spec.name.as_ref()));
     cache.symbol_strtab = Some(CachedSymbolStrtab {
-        names: specs.iter().map(|spec| spec.name.clone()).collect(),
+        names: specs
+            .iter()
+            .map(|spec| spec.name.as_ref().to_string())
+            .collect(),
         strtab_bytes: strtab_bytes.clone(),
         strx_by_spec: strx_by_spec.clone(),
     });
@@ -2061,7 +2065,7 @@ fn atom_is_from_dropped_input_section(
         .is_some_and(|section| !should_emit_input_section(section))
 }
 
-fn sort_local_symbols(locals: &mut [OutputSymbolSpec]) {
+fn sort_local_symbols(locals: &mut [OutputSymbolSpec<'_>]) {
     locals.sort_by(|lhs, rhs| {
         lhs.n_sect
             .cmp(&rhs.n_sect)
@@ -2071,10 +2075,10 @@ fn sort_local_symbols(locals: &mut [OutputSymbolSpec]) {
     });
 }
 
-fn collect_synthetic_local_symbols(
+fn collect_synthetic_local_symbols<'a>(
     layout: &Layout,
     synthetic_plan: &SyntheticPlan,
-    out: &mut Vec<OutputSymbolSpec>,
+    out: &mut Vec<OutputSymbolSpec<'a>>,
 ) -> Result<(), WriteError> {
     if !synthetic_plan.needs_dyld_private {
         return Ok(());
@@ -2091,7 +2095,7 @@ fn collect_synthetic_local_symbols(
 
     out.push(OutputSymbolSpec {
         symbol: None,
-        name: "__dyld_private".to_string(),
+        name: Cow::Borrowed("__dyld_private"),
         partition: OutputSymbolPartition::Local,
         n_type: N_SECT,
         n_sect: u8::try_from(section_index + 1).expect("section index should fit in n_sect"),
@@ -2103,10 +2107,10 @@ fn collect_synthetic_local_symbols(
     Ok(())
 }
 
-fn collect_local_symbols(
+fn collect_local_symbols<'a>(
     ctx: &LocalSymbolContext<'_>,
-    object: &ObjectFile,
-    out: &mut Vec<OutputSymbolSpec>,
+    object: &'a ObjectFile,
+    out: &mut Vec<OutputSymbolSpec<'a>>,
 ) -> Result<(), WriteError> {
     for input_sym in &object.symbols {
         if input_sym.stab_kind().is_some() {
@@ -2115,8 +2119,8 @@ fn collect_local_symbols(
         if input_sym.is_ext() && !input_sym.is_private_ext() {
             continue;
         }
-        let name = object.symbol_name(input_sym).unwrap_or("").to_string();
-        if is_assembler_temporary_symbol(&name) {
+        let name = object.symbol_name(input_sym).unwrap_or("");
+        if is_assembler_temporary_symbol(name) {
             continue;
         }
         match input_sym.kind() {
@@ -2143,7 +2147,7 @@ fn collect_local_symbols(
                 )?;
                 out.push(OutputSymbolSpec {
                     symbol: None,
-                    name,
+                    name: Cow::Borrowed(name),
                     partition: OutputSymbolPartition::Local,
                     n_type: input_symbol_type(input_sym),
                     n_sect,
@@ -2156,7 +2160,7 @@ fn collect_local_symbols(
             SymKind::Abs => {
                 out.push(OutputSymbolSpec {
                     symbol: None,
-                    name,
+                    name: Cow::Borrowed(name),
                     partition: OutputSymbolPartition::Local,
                     n_type: input_symbol_type(input_sym),
                     n_sect: NO_SECT,

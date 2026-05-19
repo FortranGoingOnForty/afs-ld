@@ -29,7 +29,10 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::{collections::VecDeque, fs, io};
+use std::{
+    collections::{HashSet, VecDeque},
+    fs, io,
+};
 
 use archive::Archive;
 use atom::{atomize_object, backpatch_symbol_atoms, AtomTable};
@@ -39,14 +42,15 @@ use layout::{ExtraLayoutSections, Layout, LayoutInput};
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
 use macho::reader::ReadError;
 use macho::tbd::{
-    parse_tbd_for_target, parse_tbd_metadata_for_target, parse_version, Arch, Platform, Target,
+    parse_tbd_for_target_matching, parse_tbd_metadata_for_target, parse_version, Arch, Platform,
+    Target,
 };
 use reloc::arm64::RelocError;
 use resolve::{
     classify_unresolved, drain_fetches, find_archive_by_path, force_load_all, force_load_archive,
     format_duplicate_diagnostic, format_undefined_diagnostic, format_undefined_warning_diagnostic,
-    seed_all, DrainReport, DylibLoadMeta, InputAddError, InputId, Inputs, Symbol, SymbolTable,
-    UndefinedTreatment,
+    seed_all, seed_dylib, DrainReport, DylibLoadMeta, InputAddError, InputId, Inputs, SeedReport,
+    Symbol, SymbolTable, UndefinedTreatment,
 };
 use symbol::SymKind;
 
@@ -294,6 +298,17 @@ struct InputLoadTimings {
     tbd_materialize: Duration,
 }
 
+impl std::ops::AddAssign for InputLoadTimings {
+    fn add_assign(&mut self, rhs: Self) {
+        self.read += rhs.read;
+        self.object_parse += rhs.object_parse;
+        self.archive_parse += rhs.archive_parse;
+        self.dylib_parse += rhs.dylib_parse;
+        self.tbd_decode += rhs.tbd_decode;
+        self.tbd_materialize += rhs.tbd_materialize;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkProfile {
     pub output: PathBuf,
@@ -532,12 +547,20 @@ impl Linker {
             let timings = register_loaded_initial_input(&mut inputs, loaded);
             phases.add_input_load(timings);
         }
-        let include_tbd_exports = inputs_may_need_dylib_exports(&inputs)?;
+        let tbd_export_names = if inputs_may_need_dylib_exports(&inputs)? {
+            Some(collect_initial_tbd_export_names(&inputs)?)
+        } else {
+            None
+        };
+        let tbd_export_selection = tbd_export_names.as_ref().map_or(
+            TbdExportSelection::MetadataOnly,
+            TbdExportSelection::Matching,
+        );
         for (load_order, path) in &deferred_dylibs {
             if opts.trace_inputs {
                 eprintln!("afs-ld: loading {}", path.display());
             }
-            let timings = register_input(&mut inputs, path, *load_order, include_tbd_exports)?;
+            let timings = register_input(&mut inputs, path, *load_order, tbd_export_selection)?;
             phases.add_input_load(timings);
         }
         phases.input_parsing = phase_started.elapsed();
@@ -608,6 +631,20 @@ impl Linker {
         let mut referrers = seed_report.referrers.clone();
         referrers.extend_from(&force_report.referrers);
         referrers.extend_from(&drain_report.referrers);
+        let tbd_report = load_tbd_exports_for_unresolved(
+            &mut inputs,
+            &deferred_dylibs,
+            &mut sym_table,
+            tbd_export_names.as_ref(),
+        )?;
+        phases.add_input_load(tbd_report.timings);
+        if tbd_report.seed_report.has_errors() {
+            let mut msg = String::new();
+            for err in &tbd_report.seed_report.duplicates {
+                msg.push_str(&format_duplicate_diagnostic(&sym_table, &inputs, err));
+            }
+            return Err(LinkError::DuplicateSymbols(msg));
+        }
         let unresolved = classify_unresolved(&mut sym_table, opts.undefined_treatment);
         if !unresolved.errors.is_empty() {
             return Err(LinkError::UndefinedSymbols(format_undefined_diagnostic(
@@ -1167,7 +1204,7 @@ fn register_input(
     inputs: &mut Inputs,
     path: &std::path::Path,
     load_order: usize,
-    include_tbd_exports: bool,
+    tbd_exports: TbdExportSelection<'_>,
 ) -> Result<InputLoadTimings, LinkError> {
     let mut timings = InputLoadTimings::default();
     let phase_started = Instant::now();
@@ -1195,10 +1232,11 @@ fn register_input(
                 arch: Arch::Arm64,
                 platform: Platform::MacOs,
             };
-            let docs = if include_tbd_exports {
-                parse_tbd_for_target(text, &target)?
-            } else {
-                parse_tbd_metadata_for_target(text, &target)?
+            let docs = match tbd_exports {
+                TbdExportSelection::MetadataOnly => parse_tbd_metadata_for_target(text, &target)?,
+                TbdExportSelection::Matching(names) => {
+                    parse_tbd_for_target_matching(text, &target, names)?
+                }
             };
             timings.tbd_decode = phase_started.elapsed();
 
@@ -1240,6 +1278,17 @@ fn register_input(
     Ok(timings)
 }
 
+#[derive(Clone, Copy)]
+enum TbdExportSelection<'a> {
+    MetadataOnly,
+    Matching(&'a HashSet<String>),
+}
+
+struct TbdResolutionReport {
+    timings: InputLoadTimings,
+    seed_report: SeedReport,
+}
+
 fn inputs_may_need_dylib_exports(inputs: &Inputs) -> Result<bool, LinkError> {
     if !inputs.archives.is_empty() {
         return Ok(true);
@@ -1257,6 +1306,146 @@ fn inputs_may_need_dylib_exports(inputs: &Inputs) -> Result<bool, LinkError> {
         }
     }
     Ok(false)
+}
+
+fn collect_initial_tbd_export_names(inputs: &Inputs) -> Result<HashSet<String>, LinkError> {
+    let mut names = HashSet::new();
+    for object in &inputs.objects {
+        collect_object_undefined_names(&object.parsed, &mut names);
+    }
+    for archive_input in &inputs.archives {
+        let archive = Archive::open(&archive_input.path, &archive_input.bytes)
+            .map_err(|error| LinkError::from(InputAddError::from(error)))?;
+        if let Some(index) = archive.symbol_index() {
+            for entry in &index.entries {
+                names.insert(entry.name.clone());
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn collect_object_undefined_names(object: &ObjectFile, names: &mut HashSet<String>) {
+    for symbol in &object.symbols {
+        if symbol.stab_kind().is_some()
+            || (!symbol.is_ext() && !symbol.is_private_ext())
+            || symbol.kind() != SymKind::Undef
+            || symbol.is_common()
+        {
+            continue;
+        }
+        if let Ok(name) = object.symbol_name(symbol) {
+            names.insert(name.to_string());
+        }
+    }
+}
+
+fn collect_unresolved_symbol_names(sym_table: &SymbolTable) -> HashSet<String> {
+    sym_table
+        .iter()
+        .filter_map(|(_, symbol)| match symbol {
+            Symbol::Undefined { name, .. } => Some(sym_table.interner.resolve(*name).to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn load_tbd_exports_for_unresolved(
+    inputs: &mut Inputs,
+    deferred_dylibs: &[(usize, PathBuf)],
+    sym_table: &mut SymbolTable,
+    already_requested: Option<&HashSet<String>>,
+) -> Result<TbdResolutionReport, LinkError> {
+    let mut names = collect_unresolved_symbol_names(sym_table);
+    if let Some(already_requested) = already_requested {
+        names.retain(|name| !already_requested.contains(name));
+    }
+    if names.is_empty() {
+        return Ok(TbdResolutionReport {
+            timings: InputLoadTimings::default(),
+            seed_report: SeedReport::default(),
+        });
+    }
+
+    let first_new_dylib = inputs.dylibs.len();
+    let mut timings = InputLoadTimings::default();
+    for (_, path) in deferred_dylibs {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("tbd") {
+            continue;
+        }
+        let Some(load) = dylib_load_meta_for_path(inputs, path) else {
+            continue;
+        };
+        timings += register_tbd_matching_exports(inputs, path, &names, load)?;
+    }
+
+    let mut seed_report = SeedReport::default();
+    for idx in first_new_dylib..inputs.dylibs.len() {
+        seed_dylib(
+            inputs,
+            resolve::DylibId(idx as u32),
+            sym_table,
+            &mut seed_report,
+        )?;
+    }
+    Ok(TbdResolutionReport {
+        timings,
+        seed_report,
+    })
+}
+
+fn dylib_load_meta_for_path(inputs: &Inputs, path: &std::path::Path) -> Option<DylibLoadMeta> {
+    inputs
+        .dylibs
+        .iter()
+        .find(|dylib| dylib.path == path)
+        .map(|dylib| DylibLoadMeta {
+            install_name: dylib.load_install_name.clone(),
+            current_version: dylib.load_current_version,
+            compatibility_version: dylib.load_compatibility_version,
+            ordinal: dylib.ordinal,
+        })
+}
+
+fn register_tbd_matching_exports(
+    inputs: &mut Inputs,
+    path: &std::path::Path,
+    names: &HashSet<String>,
+    load: DylibLoadMeta,
+) -> Result<InputLoadTimings, LinkError> {
+    let mut timings = InputLoadTimings::default();
+    let phase_started = Instant::now();
+    let bytes = fs::read(path)?;
+    timings.read = phase_started.elapsed();
+
+    let phase_started = Instant::now();
+    let text = std::str::from_utf8(&bytes).map_err(|e| {
+        LinkError::Tbd(macho::tbd::TbdError::Schema {
+            msg: format!("TBD input is not UTF-8: {e}"),
+        })
+    })?;
+    let target = Target {
+        arch: Arch::Arm64,
+        platform: Platform::MacOs,
+    };
+    let docs = parse_tbd_for_target_matching(text, &target, names)?;
+    timings.tbd_decode = phase_started.elapsed();
+
+    let phase_started = Instant::now();
+    for doc in &docs {
+        if doc
+            .exports
+            .iter()
+            .chain(doc.reexports.iter())
+            .all(|scoped| scoped.value.is_empty())
+        {
+            continue;
+        }
+        let file = DylibFile::from_tbd(path, doc, &target);
+        let _ = inputs.add_dylib_from_file_with_meta(path.to_path_buf(), file, load.clone());
+    }
+    timings.tbd_materialize = phase_started.elapsed();
+    Ok(timings)
 }
 
 fn resolve_entry_point(

@@ -10,6 +10,9 @@
 //! most of them to produce a linker-side view. A later sprint can tighten
 //! this into strict mode if parity testing flags divergences.
 
+use std::borrow::Cow;
+use std::collections::HashSet;
+
 use super::tbd_yaml::{parse_documents, Document, Value, YamlError};
 
 #[derive(Debug)]
@@ -136,11 +139,29 @@ pub fn parse_tbd(input: &str) -> Result<Vec<Tbd>, TbdError> {
 /// libSystem.tbd. If it sees a shape outside that subset, it falls back to the
 /// generic decoder and applies the same target filter afterward.
 pub fn parse_tbd_for_target(input: &str, target: &Target) -> Result<Vec<Tbd>, TbdError> {
-    match parse_tbd_for_target_direct(input, target, true) {
+    match parse_tbd_for_target_direct(input, target, true, None) {
         Ok(docs) => Ok(docs),
         Err(_) => {
             let docs = parse_tbd(input)?;
             Ok(filter_docs_for_target(docs, target))
+        }
+    }
+}
+
+/// Parse a TBD for the linker hot path, keeping only target-compatible
+/// exports whose linker-visible names are present in `names`.
+pub fn parse_tbd_for_target_matching(
+    input: &str,
+    target: &Target,
+    names: &HashSet<String>,
+) -> Result<Vec<Tbd>, TbdError> {
+    match parse_tbd_for_target_direct(input, target, true, Some(names)) {
+        Ok(docs) => Ok(retain_metadata_and_matching_export_docs(docs)),
+        Err(_) => {
+            let docs = parse_tbd(input)?;
+            Ok(retain_metadata_and_matching_export_docs(
+                filter_docs_for_target_matching(docs, target, names),
+            ))
         }
     }
 }
@@ -151,7 +172,7 @@ pub fn parse_tbd_for_target(input: &str, target: &Target) -> Result<Vec<Tbd>, Tb
 /// requested `LC_LOAD_DYLIB` does not require materializing libSystem's full
 /// export surface.
 pub fn parse_tbd_metadata_for_target(input: &str, target: &Target) -> Result<Vec<Tbd>, TbdError> {
-    match parse_tbd_for_target_direct(input, target, false) {
+    match parse_tbd_for_target_direct(input, target, false, None) {
         Ok(docs) => Ok(docs),
         Err(_) => {
             let docs = parse_tbd(input)?;
@@ -177,6 +198,42 @@ fn filter_docs_for_target(mut docs: Vec<Tbd>, target: &Target) -> Vec<Tbd> {
     docs
 }
 
+fn filter_docs_for_target_matching(
+    mut docs: Vec<Tbd>,
+    target: &Target,
+    names: &HashSet<String>,
+) -> Vec<Tbd> {
+    docs = filter_docs_for_target(docs, target);
+    for doc in &mut docs {
+        for scoped in &mut doc.exports {
+            filter_symbol_lists_for_names(&mut scoped.value, names);
+        }
+        for scoped in &mut doc.reexports {
+            filter_symbol_lists_for_names(&mut scoped.value, names);
+        }
+    }
+    docs
+}
+
+fn retain_metadata_and_matching_export_docs(mut docs: Vec<Tbd>) -> Vec<Tbd> {
+    let canonical_idx = docs
+        .iter()
+        .position(|doc| doc.parent_umbrella.is_empty())
+        .unwrap_or(0);
+    let mut idx = 0usize;
+    docs.retain(|doc| {
+        let keep = idx == canonical_idx
+            || doc
+                .exports
+                .iter()
+                .chain(doc.reexports.iter())
+                .any(|scoped| !scoped.value.is_empty());
+        idx += 1;
+        keep
+    });
+    docs
+}
+
 fn filter_docs_for_target_metadata(docs: Vec<Tbd>, target: &Target) -> Vec<Tbd> {
     let mut docs = filter_docs_for_target(docs, target);
     for doc in &mut docs {
@@ -191,6 +248,7 @@ fn parse_tbd_for_target_direct(
     input: &str,
     target: &Target,
     include_exports: bool,
+    symbol_filter: Option<&HashSet<String>>,
 ) -> Result<Vec<Tbd>, TbdError> {
     let lines: Vec<&str> = input.lines().collect();
     let mut docs = Vec::new();
@@ -208,7 +266,7 @@ fn parse_tbd_for_target_direct(
             i += 1;
         }
 
-        let (doc, next) = parse_direct_document(&lines, i, target, include_exports)?;
+        let (doc, next) = parse_direct_document(&lines, i, target, include_exports, symbol_filter)?;
         i = next;
         if doc.install_name.is_empty() && doc.targets.is_empty() {
             continue;
@@ -225,6 +283,7 @@ fn parse_direct_document(
     mut i: usize,
     target: &Target,
     include_exports: bool,
+    symbol_filter: Option<&HashSet<String>>,
 ) -> Result<(Tbd, usize), TbdError> {
     let mut tbd = Tbd::default();
     while i < lines.len() {
@@ -283,7 +342,8 @@ fn parse_direct_document(
                 i = skip_direct_value(lines, i + 1);
             }
             "exports" if include_exports => {
-                let (value, next) = parse_direct_scoped_symbols(lines, i + 1, target)?;
+                let (value, next) =
+                    parse_direct_scoped_symbols(lines, i + 1, target, symbol_filter)?;
                 tbd.exports = value;
                 i = next;
             }
@@ -291,7 +351,8 @@ fn parse_direct_document(
                 i = skip_direct_value(lines, i + 1);
             }
             "reexports" if include_exports => {
-                let (value, next) = parse_direct_scoped_symbols(lines, i + 1, target)?;
+                let (value, next) =
+                    parse_direct_scoped_symbols(lines, i + 1, target, symbol_filter)?;
                 tbd.reexports = value;
                 i = next;
             }
@@ -390,6 +451,7 @@ fn parse_direct_scoped_symbols(
     lines: &[&str],
     mut i: usize,
     target: &Target,
+    symbol_filter: Option<&HashSet<String>>,
 ) -> Result<(Vec<Scoped<SymbolLists>>, usize), TbdError> {
     let mut out = Vec::new();
     let ctx = DirectCtx { lines, target };
@@ -397,9 +459,23 @@ fn parse_direct_scoped_symbols(
         let mut state = DirectScopeState::default();
         let mut lists = SymbolLists::default();
         let (key, rest) = entry?;
-        apply_direct_symbol_pair((key, rest), ctx, &mut i, &mut state, &mut lists)?;
+        apply_direct_symbol_pair(
+            (key, rest),
+            ctx,
+            &mut i,
+            &mut state,
+            &mut lists,
+            symbol_filter,
+        )?;
         while let Some((key, rest)) = direct_nested_pair(lines, i) {
-            apply_direct_symbol_pair((key, rest), ctx, &mut i, &mut state, &mut lists)?;
+            apply_direct_symbol_pair(
+                (key, rest),
+                ctx,
+                &mut i,
+                &mut state,
+                &mut lists,
+                symbol_filter,
+            )?;
         }
         if state.include == Some(true) {
             out.push(Scoped {
@@ -472,6 +548,7 @@ fn apply_direct_symbol_pair(
     i: &mut usize,
     state: &mut DirectScopeState,
     lists: &mut SymbolLists,
+    symbol_filter: Option<&HashSet<String>>,
 ) -> Result<(), TbdError> {
     let (key, rest) = pair;
     if key == "targets" {
@@ -495,7 +572,7 @@ fn apply_direct_symbol_pair(
         if state.include == Some(false) {
             *i = skip_direct_flow(ctx.lines, *i, rest)?;
         } else {
-            let (parsed, next) = parse_direct_string_list(ctx.lines, *i, rest)?;
+            let (parsed, next) = parse_direct_symbol_list(ctx.lines, *i, rest, key, symbol_filter)?;
             *slot = parsed;
             *i = next;
         }
@@ -503,6 +580,136 @@ fn apply_direct_symbol_pair(
         *i = skip_direct_inline_value(ctx.lines, *i, rest)?;
     }
     Ok(())
+}
+
+fn parse_direct_symbol_list(
+    lines: &[&str],
+    i: usize,
+    rest: &str,
+    key: &str,
+    symbol_filter: Option<&HashSet<String>>,
+) -> Result<(Vec<String>, usize), TbdError> {
+    let Some(symbol_filter) = symbol_filter else {
+        return parse_direct_string_list(lines, i, rest);
+    };
+    parse_direct_symbol_list_matching(lines, i, rest, key, symbol_filter)
+}
+
+fn parse_direct_symbol_list_matching(
+    lines: &[&str],
+    i: usize,
+    rest: &str,
+    key: &str,
+    symbol_filter: &HashSet<String>,
+) -> Result<(Vec<String>, usize), TbdError> {
+    let start_line = i + 1;
+    let first = rest.trim();
+    if !first.starts_with('[') {
+        return Err(schema("expected a flow sequence"));
+    }
+
+    let mut out = Vec::new();
+    let mut item = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut depth = 0i32;
+    let mut line_idx = i;
+
+    loop {
+        let segment = if line_idx == i {
+            first
+        } else {
+            let Some(segment) = lines.get(line_idx).and_then(|line| direct_trimmed(line)) else {
+                return Err(schema(&format!(
+                    "unterminated flow sequence from line {} near line {}",
+                    start_line,
+                    line_idx + 1
+                )));
+            };
+            if segment.starts_with("---") || segment.starts_with("...") {
+                return Err(schema(&format!(
+                    "unterminated flow sequence from line {} before line {}",
+                    start_line,
+                    line_idx + 1
+                )));
+            }
+            if depth > 0 && !item.is_empty() {
+                item.push(' ');
+            }
+            segment
+        };
+
+        let bytes = segment.as_bytes();
+        let mut j = 0usize;
+        while j < bytes.len() {
+            let b = bytes[j];
+            match b {
+                b'\'' if !in_double => {
+                    in_single = !in_single;
+                    if depth > 0 {
+                        item.push(b as char);
+                    }
+                }
+                b'"' if !in_single => {
+                    in_double = !in_double;
+                    if depth > 0 {
+                        item.push(b as char);
+                    }
+                }
+                b'\\' if in_double && j + 1 < bytes.len() => {
+                    if depth > 0 {
+                        item.push(b as char);
+                        item.push(bytes[j + 1] as char);
+                    }
+                    j += 2;
+                    continue;
+                }
+                b'[' if !in_single && !in_double => {
+                    if depth == 0 {
+                        depth = 1;
+                    } else {
+                        depth += 1;
+                        item.push(b as char);
+                    }
+                }
+                b']' if !in_single && !in_double => {
+                    if depth <= 0 {
+                        return Err(schema("unexpected closing bracket in flow sequence"));
+                    }
+                    if depth == 1 {
+                        push_direct_symbol_item_matching(&mut out, &item, key, symbol_filter);
+                        return Ok((out, line_idx + 1));
+                    }
+                    depth -= 1;
+                    item.push(b as char);
+                }
+                b',' if !in_single && !in_double && depth == 1 => {
+                    push_direct_symbol_item_matching(&mut out, &item, key, symbol_filter);
+                    item.clear();
+                }
+                _ => {
+                    if depth > 0 {
+                        item.push(b as char);
+                    }
+                }
+            }
+            j += 1;
+        }
+
+        line_idx += 1;
+    }
+}
+
+fn push_direct_symbol_item_matching(
+    out: &mut Vec<String>,
+    item: &str,
+    key: &str,
+    symbol_filter: &HashSet<String>,
+) {
+    let item = item.trim();
+    if !item.is_empty() && direct_symbol_scalar_matches(key, item, symbol_filter) {
+        out.push(parse_direct_scalar(item));
+    }
 }
 
 type DirectEntry<'a> = Result<(&'a str, &'a str), TbdError>;
@@ -625,6 +832,13 @@ fn skip_direct_value(lines: &[&str], mut i: usize) -> usize {
 }
 
 fn split_direct_flow_scalars(flow: &str) -> Result<Vec<String>, TbdError> {
+    split_direct_flow_scalars_matching(flow, |_| true)
+}
+
+fn split_direct_flow_scalars_matching(
+    flow: &str,
+    mut keep: impl FnMut(&str) -> bool,
+) -> Result<Vec<String>, TbdError> {
     let inner = flow
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
@@ -648,7 +862,7 @@ fn split_direct_flow_scalars(flow: &str) -> Result<Vec<String>, TbdError> {
             b'[' | b'{' if !in_single && !in_double => depth += 1,
             b']' | b'}' if !in_single && !in_double => depth -= 1,
             b',' if !in_single && !in_double && depth == 0 => {
-                push_direct_flow_scalar(&mut out, &inner[start..i]);
+                push_direct_flow_scalar_matching(&mut out, &inner[start..i], &mut keep);
                 start = i + 1;
             }
             _ => {}
@@ -656,16 +870,85 @@ fn split_direct_flow_scalars(flow: &str) -> Result<Vec<String>, TbdError> {
         i += 1;
     }
     if start <= inner.len() {
-        push_direct_flow_scalar(&mut out, &inner[start..]);
+        push_direct_flow_scalar_matching(&mut out, &inner[start..], &mut keep);
     }
     Ok(out)
 }
 
-fn push_direct_flow_scalar(out: &mut Vec<String>, item: &str) {
+fn push_direct_flow_scalar_matching(
+    out: &mut Vec<String>,
+    item: &str,
+    keep: &mut impl FnMut(&str) -> bool,
+) {
     let item = item.trim();
-    if !item.is_empty() {
+    if !item.is_empty() && keep(item) {
         out.push(parse_direct_scalar(item));
     }
+}
+
+fn direct_symbol_scalar_matches(key: &str, raw: &str, names: &HashSet<String>) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    match key {
+        "symbols" | "weak-symbols" | "thread-local-symbols" => {
+            direct_scalar_name_matches(raw, names)
+        }
+        "objc-classes" => direct_prefixed_symbol_matches("_OBJC_CLASS_$_", raw, names),
+        "objc-eh-types" => direct_prefixed_symbol_matches("_OBJC_EHTYPE_$_", raw, names),
+        "objc-ivars" => direct_prefixed_symbol_matches("_OBJC_IVAR_$_", raw, names),
+        _ => false,
+    }
+}
+
+fn direct_scalar_name_matches(raw: &str, names: &HashSet<String>) -> bool {
+    match direct_simple_scalar(raw) {
+        Some(name) => names.contains(name),
+        None => names.contains(parse_direct_scalar(raw).as_str()),
+    }
+}
+
+fn direct_prefixed_symbol_matches(prefix: &str, raw: &str, names: &HashSet<String>) -> bool {
+    let name = match direct_simple_scalar(raw) {
+        Some(name) => Cow::Borrowed(name),
+        None => Cow::Owned(parse_direct_scalar(raw)),
+    };
+    names.contains(format!("{prefix}{name}").as_str())
+}
+
+fn direct_simple_scalar(raw: &str) -> Option<&str> {
+    let raw = raw.trim();
+    if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
+        let inner = &raw[1..raw.len() - 1];
+        if !inner.contains("''") {
+            return Some(inner);
+        }
+    } else if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        let inner = &raw[1..raw.len() - 1];
+        if !inner.contains('\\') {
+            return Some(inner);
+        }
+    } else {
+        return Some(raw);
+    }
+    None
+}
+
+fn filter_symbol_lists_for_names(lists: &mut SymbolLists, names: &HashSet<String>) {
+    lists.symbols.retain(|name| names.contains(name));
+    lists.weak_symbols.retain(|name| names.contains(name));
+    lists
+        .thread_local_symbols
+        .retain(|name| names.contains(name));
+    lists
+        .objc_classes
+        .retain(|name| names.contains(format!("_OBJC_CLASS_$_{name}").as_str()));
+    lists
+        .objc_eh_types
+        .retain(|name| names.contains(format!("_OBJC_EHTYPE_$_{name}").as_str()));
+    lists
+        .objc_ivars
+        .retain(|name| names.contains(format!("_OBJC_IVAR_$_{name}").as_str()));
 }
 
 fn parse_direct_scalar(raw: &str) -> String {
@@ -1102,6 +1385,37 @@ mod tests {
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].exports.len(), 1);
         assert_eq!(docs[0].exports[0].value.symbols, ["_arm_one", "_arm_two"]);
+    }
+
+    #[test]
+    fn target_matching_fast_path_keeps_only_requested_exports() {
+        let src = "--- !tapi-tbd\n\
+                   tbd-version: 4\n\
+                   targets: [ arm64-macos ]\n\
+                   install-name: '/usr/lib/libfoo.dylib'\n\
+                   exports:\n\
+                   \x20 - targets: [ arm64-macos ]\n\
+                   \x20   symbols: [ _keep,\n\
+                   \x20              _drop,\n\
+                   \x20              '_quoted_keep' ]\n\
+                   \x20   weak-symbols: [ _weak_keep, _weak_drop ]\n\
+                   \x20   thread-local-symbols: [ _tlv_keep, _tlv_drop ]\n\
+                   \x20   objc-classes: [ Foo, Bar ]\n\
+                   ...\n";
+        let names = HashSet::from([
+            "_keep".to_string(),
+            "_quoted_keep".to_string(),
+            "_weak_keep".to_string(),
+            "_tlv_keep".to_string(),
+            "_OBJC_CLASS_$_Foo".to_string(),
+        ]);
+        let docs = parse_tbd_for_target_matching(src, &arm64_macos(), &names).unwrap();
+        assert_eq!(docs.len(), 1);
+        let lists = &docs[0].exports[0].value;
+        assert_eq!(lists.symbols, ["_keep", "_quoted_keep"]);
+        assert_eq!(lists.weak_symbols, ["_weak_keep"]);
+        assert_eq!(lists.thread_local_symbols, ["_tlv_keep"]);
+        assert_eq!(lists.objc_classes, ["Foo"]);
     }
 
     #[test]

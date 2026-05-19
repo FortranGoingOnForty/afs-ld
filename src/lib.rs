@@ -795,15 +795,17 @@ impl Linker {
         let mut synth_linkedit_metadata_tables = Duration::ZERO;
         let mut synth_linkedit_code_signature = Duration::ZERO;
         let mut synth_unwind = Duration::ZERO;
+        let mut linkedit_cache = macho::writer::LinkEditBuildCache::default();
         for _ in 0..4 {
             let phase_started = Instant::now();
             let (next_layout, next_linkedit, linkedit_timings) =
-                macho::writer::finalize_layout_with_linkedit(
+                macho::writer::finalize_layout_with_linkedit_cached(
                     &layout,
                     opts.kind,
                     opts,
                     &dylib_loads,
                     linkedit_context,
+                    &mut linkedit_cache,
                 )?;
             synth_linkedit_finalize += phase_started.elapsed();
             synth_linkedit_symbol_plan += linkedit_timings.symbol_plan;

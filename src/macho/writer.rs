@@ -213,7 +213,8 @@ pub fn finalize_layout(
     opts: &LinkOptions,
     dylibs: &[DylibDependency],
 ) -> Result<Layout, WriteError> {
-    Ok(finalize_with_linkedit(layout, kind, opts, dylibs, None)?.0)
+    let mut cache = LinkEditBuildCache::default();
+    Ok(finalize_with_linkedit(layout, kind, opts, dylibs, None, &mut cache)?.0)
 }
 
 pub fn finalize_layout_with_linkedit(
@@ -223,7 +224,26 @@ pub fn finalize_layout_with_linkedit(
     dylibs: &[DylibDependency],
     context: LinkEditContext<'_>,
 ) -> Result<(Layout, LinkEditPlan, LinkEditBuildTimings), WriteError> {
-    finalize_with_linkedit(layout, kind, opts, dylibs, Some(LinkEditInputs(context)))
+    let mut cache = LinkEditBuildCache::default();
+    finalize_layout_with_linkedit_cached(layout, kind, opts, dylibs, context, &mut cache)
+}
+
+pub fn finalize_layout_with_linkedit_cached(
+    layout: &Layout,
+    kind: OutputKind,
+    opts: &LinkOptions,
+    dylibs: &[DylibDependency],
+    context: LinkEditContext<'_>,
+    cache: &mut LinkEditBuildCache,
+) -> Result<(Layout, LinkEditPlan, LinkEditBuildTimings), WriteError> {
+    finalize_with_linkedit(
+        layout,
+        kind,
+        opts,
+        dylibs,
+        Some(LinkEditInputs(context)),
+        cache,
+    )
 }
 
 pub fn build_parsed_reloc_cache(
@@ -262,17 +282,17 @@ fn finalize_with_linkedit(
     opts: &LinkOptions,
     dylibs: &[DylibDependency],
     inputs: Option<LinkEditInputs<'_>>,
+    cache: &mut LinkEditBuildCache,
 ) -> Result<(Layout, LinkEditPlan, LinkEditBuildTimings), WriteError> {
     let mut layout = layout.clone();
-    let mut cache = LinkEditBuildCache::default();
     let (mut linkedit, mut timings) =
-        build_linkedit_plan_profiled(&layout, kind, opts, inputs, Some(&mut cache))?;
+        build_linkedit_plan_profiled(&layout, kind, opts, inputs, Some(cache))?;
     apply_indirect_starts(&mut layout, &linkedit);
     let header_size = estimate_header_size(&layout, kind, opts, dylibs, &linkedit);
     layout.relayout(header_size);
 
     let (next_linkedit, next_timings) =
-        build_linkedit_plan_profiled(&layout, kind, opts, inputs, Some(&mut cache))?;
+        build_linkedit_plan_profiled(&layout, kind, opts, inputs, Some(cache))?;
     linkedit = next_linkedit;
     timings += next_timings;
     apply_indirect_starts(&mut layout, &linkedit);
@@ -281,7 +301,7 @@ fn finalize_with_linkedit(
     if exact_header_size != header_size {
         layout.relayout(exact_header_size);
         let (next_linkedit, next_timings) =
-            build_linkedit_plan_profiled(&layout, kind, opts, inputs, Some(&mut cache))?;
+            build_linkedit_plan_profiled(&layout, kind, opts, inputs, Some(cache))?;
         linkedit = next_linkedit;
         timings += next_timings;
         apply_indirect_starts(&mut layout, &linkedit);
@@ -1714,7 +1734,7 @@ struct SymbolPlanBuildTimings {
 }
 
 #[derive(Debug, Default)]
-struct LinkEditBuildCache {
+pub struct LinkEditBuildCache {
     symbol_strtab: Option<CachedSymbolStrtab>,
 }
 

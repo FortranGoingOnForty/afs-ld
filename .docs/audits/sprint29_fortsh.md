@@ -23,12 +23,14 @@ Status date: 2026-05-19
 - Linkedit finalization now caches the output symbol string table across relayout convergence passes when the symbol-name order is unchanged.
 - The linkedit string-table cache is now reused across the outer unwind/finalize convergence loop, with the same symbol-name-order validation.
 - TBD-backed dylib loading now starts with metadata plus a targeted export filter, then materializes any remaining unresolved dylib exports after archive fetches. The filtered TBD path scans symbol flow lists incrementally instead of cloning libSystem's full export arrays.
+- Parsed relocation caches are now sorted once and relocation apply uses partitioned per-atom slices instead of scanning each section's full relocation list for every atom.
 - Regression coverage:
   - `layout_omits_debug_and_llvm_payload_sections`
   - `linker_run_omits_debug_and_llvm_payload_sections_like_ld`
   - `tests/parity_corpus/fortsh_debug_llvm_payload_exec`
   - `target_matching_fast_path_keeps_only_requested_exports`
   - `cargo test -p afs-ld --test tbd_integration -- --nocapture`
+  - `relocated_sections_match_apple_ld_across_fixture_matrix`
 
 ## Non-linker blocker found
 
@@ -52,7 +54,8 @@ or armfortas runtime/codegen issue, not an afs-ld issue.
 - Link-time performance still misses the Sprint 29 2x gate on this machine:
   - Through the armfortas final-link path with release afs-ld: afs-ld `0.16-0.17s`, Apple `ld` `0.06s`.
   - Direct linker invocation on the same object list after the targeted TBD slice: afs-ld warm runs are about `0.09-0.11s`, Apple `ld` remains about `0.03-0.04s`.
-  - Current profile for the fortsh fixture: total is typically about `127ms` warm; largest remaining buckets are linkedit finalization about `45ms`, relocation application about `21-22ms`, symbol resolution about `14ms`, and output write about `10-12ms`.
+  - Current profile for the fortsh fixture: total is typically about `112-127ms` warm; largest remaining buckets are linkedit finalization about `40-45ms`, relocation application about `19-22ms`, symbol resolution about `12-14ms`, and output write about `9-12ms`.
   - The latest linkedit slices reduced the measured symbol-plan bucket from about `51ms` to about `24-26ms`, and the symbol string-table sub-bucket from about `32ms` to about `8-9ms`.
   - The targeted TBD slice reduced the measured TBD decode bucket from about `22-45ms` depending on cache/double-decode path to about `3-4ms`.
+  - The sorted relocation slice avoids per-atom full-section relocation scans; observed relocation-apply samples range from about `19-22ms` on the fortsh fixture, with release direct warm runs around `0.09-0.10s`.
 - Load-command shape is improved by dropping debug/LLVM payloads, but afs-ld still emits classic `LC_DYLD_INFO_ONLY` rather than Apple's chained-fixup load-command shape for this executable.

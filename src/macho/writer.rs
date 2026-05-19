@@ -264,13 +264,14 @@ pub fn build_parsed_reloc_cache(
                     err.to_string(),
                 )
             })?;
-            let relocs = parse_relocs(&raws).map_err(|err| {
+            let mut relocs = parse_relocs(&raws).map_err(|err| {
                 WriteError::MalformedRelocations(
                     input.object.path.clone(),
                     section_idx,
                     err.to_string(),
                 )
             })?;
+            relocs.sort_by_key(|reloc| reloc.offset);
             cache.insert((input.id, section_idx), relocs);
         }
     }

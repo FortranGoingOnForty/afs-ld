@@ -413,9 +413,11 @@ fn patch_eh_frame_cie_pointer(
 fn relocs_for_atom<'a>(relocs: &'a [Reloc], atom: &Atom) -> impl Iterator<Item = Reloc> + 'a {
     let start = atom.input_offset;
     let end = atom.input_offset + atom.size;
-    relocs.iter().copied().filter(move |reloc| {
+    let first = relocs.partition_point(|reloc| reloc.offset < start);
+    let last = relocs.partition_point(|reloc| reloc.offset < end);
+    relocs[first..last].iter().copied().filter(move |reloc| {
         let reloc_end = reloc.offset + reloc.length.byte_width() as u32;
-        reloc.offset >= start && reloc_end <= end
+        reloc_end <= end
     })
 }
 

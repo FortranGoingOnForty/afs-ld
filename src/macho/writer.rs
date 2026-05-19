@@ -264,12 +264,15 @@ fn finalize_with_linkedit(
     inputs: Option<LinkEditInputs<'_>>,
 ) -> Result<(Layout, LinkEditPlan, LinkEditBuildTimings), WriteError> {
     let mut layout = layout.clone();
-    let (mut linkedit, mut timings) = build_linkedit_plan_profiled(&layout, kind, opts, inputs)?;
+    let mut cache = LinkEditBuildCache::default();
+    let (mut linkedit, mut timings) =
+        build_linkedit_plan_profiled(&layout, kind, opts, inputs, Some(&mut cache))?;
     apply_indirect_starts(&mut layout, &linkedit);
     let header_size = estimate_header_size(&layout, kind, opts, dylibs, &linkedit);
     layout.relayout(header_size);
 
-    let (next_linkedit, next_timings) = build_linkedit_plan_profiled(&layout, kind, opts, inputs)?;
+    let (next_linkedit, next_timings) =
+        build_linkedit_plan_profiled(&layout, kind, opts, inputs, Some(&mut cache))?;
     linkedit = next_linkedit;
     timings += next_timings;
     apply_indirect_starts(&mut layout, &linkedit);
@@ -278,7 +281,7 @@ fn finalize_with_linkedit(
     if exact_header_size != header_size {
         layout.relayout(exact_header_size);
         let (next_linkedit, next_timings) =
-            build_linkedit_plan_profiled(&layout, kind, opts, inputs)?;
+            build_linkedit_plan_profiled(&layout, kind, opts, inputs, Some(&mut cache))?;
         linkedit = next_linkedit;
         timings += next_timings;
         apply_indirect_starts(&mut layout, &linkedit);
@@ -840,7 +843,7 @@ fn build_linkedit_plan(
     opts: &LinkOptions,
     inputs: Option<LinkEditInputs<'_>>,
 ) -> Result<LinkEditPlan, WriteError> {
-    build_linkedit_plan_profiled(layout, kind, opts, inputs).map(|(plan, _)| plan)
+    build_linkedit_plan_profiled(layout, kind, opts, inputs, None).map(|(plan, _)| plan)
 }
 
 fn build_linkedit_plan_profiled(
@@ -848,6 +851,7 @@ fn build_linkedit_plan_profiled(
     kind: OutputKind,
     opts: &LinkOptions,
     inputs: Option<LinkEditInputs<'_>>,
+    mut cache: Option<&mut LinkEditBuildCache>,
 ) -> Result<(LinkEditPlan, LinkEditBuildTimings), WriteError> {
     let mut timings = LinkEditBuildTimings::default();
     let linkedit = layout
@@ -923,6 +927,7 @@ fn build_linkedit_plan_profiled(
         &visibility,
         inputs,
         &imports,
+        cache.as_deref_mut(),
     )?;
     timings.symbol_plan += phase_started.elapsed();
     timings.symbol_plan_locals += symbol_plan_timings.locals;
@@ -1708,6 +1713,18 @@ struct SymbolPlanBuildTimings {
     strtab: Duration,
 }
 
+#[derive(Debug, Default)]
+struct LinkEditBuildCache {
+    symbol_strtab: Option<CachedSymbolStrtab>,
+}
+
+#[derive(Debug)]
+struct CachedSymbolStrtab {
+    names: Vec<String>,
+    strtab_bytes: Vec<u8>,
+    strx_by_spec: Vec<u32>,
+}
+
 fn build_output_symbols_profiled(
     layout: &Layout,
     kind: OutputKind,
@@ -1717,6 +1734,7 @@ fn build_output_symbols_profiled(
     visibility: &SymbolVisibilityPolicy,
     inputs: LinkEditInputs<'_>,
     imports: &[ImportSymbolRecord],
+    cache: Option<&mut LinkEditBuildCache>,
 ) -> Result<(SymbolTablePlan, SymbolPlanBuildTimings), WriteError> {
     let sym_table = inputs.0.sym_table;
     let atom_sections = atom_section_ordinals(layout);
@@ -1918,8 +1936,7 @@ fn build_output_symbols_profiled(
     specs.extend(external_defineds);
     specs.extend(undefineds);
 
-    let (strtab_bytes, strx_by_spec) =
-        StringTableBuilder::build_with_name_offsets(specs.iter().map(|spec| spec.name.as_str()));
+    let (strtab_bytes, strx_by_spec) = build_cached_symbol_strtab(&specs, cache);
 
     let mut symbols = Vec::with_capacity(specs.len());
     let mut symbol_indices = vec![None; sym_table.len()];
@@ -1973,6 +1990,37 @@ fn build_output_symbols_profiled(
         },
         timings,
     ))
+}
+
+fn build_cached_symbol_strtab(
+    specs: &[OutputSymbolSpec],
+    cache: Option<&mut LinkEditBuildCache>,
+) -> (Vec<u8>, Vec<u32>) {
+    let Some(cache) = cache else {
+        return StringTableBuilder::build_with_name_offsets(
+            specs.iter().map(|spec| spec.name.as_str()),
+        );
+    };
+    if let Some(cached) = cache.symbol_strtab.as_ref() {
+        if cached.names.len() == specs.len()
+            && cached
+                .names
+                .iter()
+                .zip(specs)
+                .all(|(cached, spec)| cached == &spec.name)
+        {
+            return (cached.strtab_bytes.clone(), cached.strx_by_spec.clone());
+        }
+    }
+
+    let (strtab_bytes, strx_by_spec) =
+        StringTableBuilder::build_with_name_offsets(specs.iter().map(|spec| spec.name.as_str()));
+    cache.symbol_strtab = Some(CachedSymbolStrtab {
+        names: specs.iter().map(|spec| spec.name.clone()).collect(),
+        strtab_bytes: strtab_bytes.clone(),
+        strx_by_spec: strx_by_spec.clone(),
+    });
+    (strtab_bytes, strx_by_spec)
 }
 
 fn atom_is_from_dropped_input_section(

@@ -864,6 +864,7 @@ impl Linker {
                 &atom_table,
                 &sym_table,
                 &synthetic_plan,
+                &parsed_relocs,
             )?;
             synth_unwind += phase_started.elapsed();
             if !changed {

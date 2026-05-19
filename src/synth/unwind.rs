@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
 use crate::atom::{Atom, AtomSection, AtomTable};
 use crate::layout::{Layout, LayoutInput};
 use crate::macho::constants::S_REGULAR;
-use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc};
+use crate::reloc::{ParsedRelocCache, Referent, Reloc};
 use crate::resolve::{AtomId, InputId, Symbol, SymbolTable};
 use crate::section::{OutputSection, SectionKind};
 use crate::synth::SyntheticPlan;
@@ -136,15 +136,36 @@ struct CompressedPage {
     local_encodings: Vec<u32>,
 }
 
-pub fn synthesize(
+struct UnwindResolveIndex<'a> {
+    input_map: HashMap<InputId, &'a crate::input::ObjectFile>,
+    atom_addrs: HashMap<AtomId, u64>,
+    atom_ranges: HashMap<(InputId, u8), Vec<AtomRange>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AtomRange {
+    atom: AtomId,
+    start: u32,
+    end: u32,
+}
+
+pub fn synthesize<'a>(
     layout: &mut Layout,
-    inputs: &[LayoutInput<'_>],
+    inputs: &'a [LayoutInput<'a>],
     atoms: &AtomTable,
     sym_table: &SymbolTable,
     synthetic_plan: &SyntheticPlan,
+    parsed_relocs: &ParsedRelocCache,
 ) -> Result<bool, UnwindError> {
     let mut changed = remove_compact_unwind_sections(layout);
-    let records = collect_records(layout, inputs, atoms, sym_table, synthetic_plan)?;
+    let records = collect_records(
+        layout,
+        inputs,
+        atoms,
+        sym_table,
+        synthetic_plan,
+        parsed_relocs,
+    )?;
     if records.is_empty() {
         changed |= remove_unwind_info_section(layout);
         if changed {
@@ -176,58 +197,19 @@ fn should_validate_serialized_unwind_info() -> bool {
     std::env::var_os("AFS_LD_VALIDATE_UNWIND_INFO").is_some()
 }
 
-fn collect_records(
+fn collect_records<'a>(
     layout: &Layout,
-    inputs: &[LayoutInput<'_>],
+    inputs: &'a [LayoutInput<'a>],
     atoms: &AtomTable,
     sym_table: &SymbolTable,
     synthetic_plan: &SyntheticPlan,
+    parsed_relocs: &ParsedRelocCache,
 ) -> Result<Vec<UnwindRecord>, UnwindError> {
     let text_base = layout
         .segment("__TEXT")
         .map(|segment| segment.vm_addr)
         .unwrap_or(0);
-    let input_map: HashMap<InputId, &crate::input::ObjectFile> = inputs
-        .iter()
-        .map(|input| (input.id, input.object))
-        .collect();
-    let compact_unwind_sections: HashSet<(InputId, u8)> = atoms
-        .iter()
-        .filter(|(_, atom)| atom.section == AtomSection::CompactUnwind)
-        .map(|(_, atom)| (atom.origin, atom.input_section))
-        .collect();
-    let mut reloc_cache: HashMap<(InputId, u8), Vec<Reloc>> = HashMap::new();
-    for (input_id, section_idx) in compact_unwind_sections {
-        let obj = input_map.get(&input_id).ok_or_else(|| UnwindError {
-            input: PathBuf::from("<missing object>"),
-            atom: AtomId(0),
-            detail: "missing parsed object".to_string(),
-        })?;
-        let section = obj
-            .sections
-            .get((section_idx as usize).saturating_sub(1))
-            .ok_or_else(|| UnwindError {
-                input: obj.path.clone(),
-                atom: AtomId(0),
-                detail: format!("compact-unwind section {} is out of range", section_idx),
-            })?;
-        if section.nreloc == 0 {
-            continue;
-        }
-        let raws = parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(|err| {
-            UnwindError {
-                input: obj.path.clone(),
-                atom: AtomId(0),
-                detail: err.to_string(),
-            }
-        })?;
-        let relocs = parse_relocs(&raws).map_err(|err| UnwindError {
-            input: obj.path.clone(),
-            atom: AtomId(0),
-            detail: err.to_string(),
-        })?;
-        reloc_cache.insert((input_id, section_idx), relocs);
-    }
+    let resolve_index = build_unwind_resolve_index(layout, inputs, atoms);
 
     let mut records = Vec::new();
     for (atom_id, atom) in atoms.iter() {
@@ -236,11 +218,11 @@ fn collect_records(
         }
         if atom
             .parent_of
-            .is_some_and(|parent| layout.atom_addr(parent).is_none())
+            .is_some_and(|parent| !resolve_index.atom_addrs.contains_key(&parent))
         {
             continue;
         }
-        let Some(obj) = input_map.get(&atom.origin) else {
+        let Some(obj) = resolve_index.input_map.get(&atom.origin) else {
             return Err(UnwindError {
                 input: PathBuf::from("<missing object>"),
                 atom: atom_id,
@@ -257,20 +239,27 @@ fn collect_records(
                 ),
             });
         }
-        let relocs = reloc_cache
+        let relocs = parsed_relocs
             .get(&(atom.origin, atom.input_section))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let function_addr =
-            resolve_function_address(atom_id, atom, obj, relocs, atoms, sym_table, layout)?;
+        let function_addr = resolve_function_address(
+            atom_id,
+            atom,
+            obj,
+            relocs,
+            sym_table,
+            layout,
+            &resolve_index,
+        )?;
         let personality_offset = resolve_metadata_offset(
             atom_id,
             atom,
             obj,
             relocs,
-            atoms,
             sym_table,
             layout,
+            &resolve_index,
             synthetic_plan,
             COMPACT_UNWIND_PERSONALITY_OFFSET,
             true,
@@ -289,9 +278,9 @@ fn collect_records(
             atom,
             obj,
             relocs,
-            atoms,
             sym_table,
             layout,
+            &resolve_index,
             synthetic_plan,
             COMPACT_UNWIND_LSDA_OFFSET,
             false,
@@ -325,26 +314,89 @@ fn collect_records(
     Ok(records)
 }
 
+fn build_unwind_resolve_index<'a>(
+    layout: &Layout,
+    inputs: &'a [LayoutInput<'a>],
+    atoms: &AtomTable,
+) -> UnwindResolveIndex<'a> {
+    UnwindResolveIndex {
+        input_map: inputs
+            .iter()
+            .map(|input| (input.id, input.object))
+            .collect(),
+        atom_addrs: atom_address_map(layout),
+        atom_ranges: atom_range_index(atoms),
+    }
+}
+
+fn atom_address_map(layout: &Layout) -> HashMap<AtomId, u64> {
+    let mut out = HashMap::new();
+    for section in &layout.sections {
+        for placed in &section.atoms {
+            out.insert(placed.atom, section.addr + placed.offset);
+        }
+    }
+    out
+}
+
+fn atom_range_index(atoms: &AtomTable) -> HashMap<(InputId, u8), Vec<AtomRange>> {
+    let mut out: HashMap<(InputId, u8), Vec<AtomRange>> = HashMap::new();
+    for (atom_id, atom) in atoms.iter() {
+        out.entry((atom.origin, atom.input_section))
+            .or_default()
+            .push(AtomRange {
+                atom: atom_id,
+                start: atom.input_offset,
+                end: atom.input_offset.saturating_add(atom.size),
+            });
+    }
+    for ranges in out.values_mut() {
+        ranges.sort_by_key(|range| range.start);
+    }
+    out
+}
+
+fn find_atom_range(
+    atom_ranges: &HashMap<(InputId, u8), Vec<AtomRange>>,
+    input_id: InputId,
+    input_section: u8,
+    offset: u32,
+) -> Option<(AtomId, u32)> {
+    let ranges = atom_ranges.get(&(input_id, input_section))?;
+    let idx = ranges.partition_point(|range| range.start <= offset);
+    let range = idx.checked_sub(1).and_then(|idx| ranges.get(idx))?;
+    (range.start <= offset && offset < range.end).then_some((range.atom, offset - range.start))
+}
+
+fn reloc_at(relocs: &[Reloc], offset: u32) -> Option<Reloc> {
+    let idx = relocs.partition_point(|reloc| reloc.offset < offset);
+    relocs
+        .get(idx)
+        .copied()
+        .filter(|reloc| reloc.offset == offset)
+}
+
 fn resolve_function_address(
     atom_id: AtomId,
     atom: &Atom,
     obj: &crate::input::ObjectFile,
     relocs: &[Reloc],
-    atoms: &AtomTable,
     sym_table: &SymbolTable,
     layout: &Layout,
+    resolve_index: &UnwindResolveIndex<'_>,
 ) -> Result<u64, UnwindError> {
     if let Some(parent) = atom.parent_of {
-        return layout.atom_addr(parent).ok_or_else(|| UnwindError {
-            input: obj.path.clone(),
-            atom: atom_id,
-            detail: format!("function atom {:?} missing from final layout", parent),
-        });
+        return resolve_index
+            .atom_addrs
+            .get(&parent)
+            .copied()
+            .ok_or_else(|| UnwindError {
+                input: obj.path.clone(),
+                atom: atom_id,
+                detail: format!("function atom {:?} missing from final layout", parent),
+            });
     }
-    let Some(reloc) = relocs
-        .iter()
-        .find(|reloc| reloc.offset == atom.input_offset)
-    else {
+    let Some(reloc) = reloc_at(relocs, atom.input_offset) else {
         return Err(UnwindError {
             input: obj.path.clone(),
             atom: atom_id,
@@ -355,9 +407,9 @@ fn resolve_function_address(
         atom_id,
         atom,
         obj,
-        atoms,
         sym_table,
         layout,
+        resolve_index,
         None,
         reloc.referent,
         read_u64(atom, COMPACT_UNWIND_FUNCTION_OFFSET)? as u32,
@@ -372,18 +424,16 @@ fn resolve_metadata_offset(
     atom: &Atom,
     obj: &crate::input::ObjectFile,
     relocs: &[Reloc],
-    atoms: &AtomTable,
     sym_table: &SymbolTable,
     layout: &Layout,
+    resolve_index: &UnwindResolveIndex<'_>,
     synthetic_plan: &SyntheticPlan,
     field_offset: usize,
     allow_import_got: bool,
     label: &str,
 ) -> Result<Option<u64>, UnwindError> {
     let raw_value = read_u64(atom, field_offset)?;
-    let reloc = relocs
-        .iter()
-        .find(|reloc| reloc.offset == atom.input_offset + field_offset as u32);
+    let reloc = reloc_at(relocs, atom.input_offset + field_offset as u32);
     if raw_value == 0 && reloc.is_none() {
         return Ok(None);
     }
@@ -398,9 +448,9 @@ fn resolve_metadata_offset(
         atom_id,
         atom,
         obj,
-        atoms,
         sym_table,
         layout,
+        resolve_index,
         Some(synthetic_plan),
         reloc.referent,
         raw_value as u32,
@@ -414,9 +464,9 @@ fn resolve_reference_address(
     atom_id: AtomId,
     atom: &Atom,
     obj: &crate::input::ObjectFile,
-    atoms: &AtomTable,
     sym_table: &SymbolTable,
     layout: &Layout,
+    resolve_index: &UnwindResolveIndex<'_>,
     synthetic_plan: Option<&SyntheticPlan>,
     referent: Referent,
     target_offset: u32,
@@ -433,13 +483,10 @@ fn resolve_reference_address(
                     atom: atom_id,
                     detail: format!("{label} section {} is out of range", section_idx),
                 })?;
-            let Some((candidate_id, candidate)) = atoms.iter().find(|(_, candidate)| {
-                candidate.origin == atom.origin
-                    && candidate.input_section == section_idx
-                    && input_section.addr + candidate.input_offset as u64 <= target_offset as u64
-                    && (target_offset as u64)
-                        < input_section.addr + candidate.input_offset as u64 + candidate.size as u64
-            }) else {
+            let Some(section_relative) = (target_offset as u64)
+                .checked_sub(input_section.addr)
+                .and_then(|offset| u32::try_from(offset).ok())
+            else {
                 return Err(UnwindError {
                     input: obj.path.clone(),
                     atom: atom_id,
@@ -449,15 +496,29 @@ fn resolve_reference_address(
                     ),
                 });
             };
-            let Some(base_addr) = layout.atom_addr(candidate_id) else {
+            let Some((candidate_id, candidate_delta)) = find_atom_range(
+                &resolve_index.atom_ranges,
+                atom.origin,
+                section_idx,
+                section_relative,
+            ) else {
+                return Err(UnwindError {
+                    input: obj.path.clone(),
+                    atom: atom_id,
+                    detail: format!(
+                        "{label} points at missing input atom section {} offset 0x{:x}",
+                        section_idx, target_offset
+                    ),
+                });
+            };
+            let Some(base_addr) = resolve_index.atom_addrs.get(&candidate_id).copied() else {
                 return Err(UnwindError {
                     input: obj.path.clone(),
                     atom: atom_id,
                     detail: format!("{label} atom {:?} missing from final layout", candidate_id),
                 });
             };
-            let atom_input_addr = input_section.addr + candidate.input_offset as u64;
-            Ok(base_addr + (target_offset as u64 - atom_input_addr))
+            Ok(base_addr + candidate_delta as u64)
         }
         Referent::Symbol(sym_idx) => {
             let input_symbol = obj
@@ -473,23 +534,21 @@ fn resolve_reference_address(
                 atom: atom_id,
                 detail: err.to_string(),
             })?;
-            let Some((symbol_id, symbol)) = sym_table
-                .iter()
-                .find(|(_, symbol)| sym_table.interner.resolve(symbol.name()) == name)
-            else {
+            let Some(symbol_id) = sym_table.lookup_str(name) else {
                 return Err(UnwindError {
                     input: obj.path.clone(),
                     atom: atom_id,
                     detail: format!("{label} symbol `{name}` was not resolved"),
                 });
             };
+            let symbol = sym_table.get(symbol_id);
             match symbol {
                 Symbol::Defined {
                     atom: target_atom,
                     value,
                     ..
                 } => {
-                    let Some(base_addr) = layout.atom_addr(*target_atom) else {
+                    let Some(base_addr) = resolve_index.atom_addrs.get(target_atom).copied() else {
                         return Err(UnwindError {
                             input: obj.path.clone(),
                             atom: atom_id,
@@ -1095,6 +1154,64 @@ fn prune_empty_segments(layout: &mut Layout) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sorted_reloc_lookup_finds_exact_offsets_only() {
+        let relocs = [
+            Reloc {
+                offset: 4,
+                kind: crate::reloc::RelocKind::Unsigned,
+                length: crate::reloc::RelocLength::Quad,
+                pcrel: false,
+                referent: Referent::Section(1),
+                addend: 0,
+                subtrahend: None,
+            },
+            Reloc {
+                offset: 16,
+                kind: crate::reloc::RelocKind::Unsigned,
+                length: crate::reloc::RelocLength::Quad,
+                pcrel: false,
+                referent: Referent::Section(2),
+                addend: 0,
+                subtrahend: None,
+            },
+        ];
+
+        assert_eq!(reloc_at(&relocs, 4), Some(relocs[0]));
+        assert_eq!(reloc_at(&relocs, 8), None);
+        assert_eq!(reloc_at(&relocs, 16), Some(relocs[1]));
+    }
+
+    #[test]
+    fn atom_range_lookup_uses_sorted_input_offsets() {
+        let mut ranges = HashMap::new();
+        ranges.insert(
+            (InputId(7), 3),
+            vec![
+                AtomRange {
+                    atom: AtomId(1),
+                    start: 0,
+                    end: 8,
+                },
+                AtomRange {
+                    atom: AtomId(2),
+                    start: 8,
+                    end: 20,
+                },
+            ],
+        );
+
+        assert_eq!(
+            find_atom_range(&ranges, InputId(7), 3, 4),
+            Some((AtomId(1), 4))
+        );
+        assert_eq!(
+            find_atom_range(&ranges, InputId(7), 3, 8),
+            Some((AtomId(2), 0))
+        );
+        assert_eq!(find_atom_range(&ranges, InputId(7), 3, 20), None);
+    }
 
     #[test]
     fn serialize_single_leaf_record_matches_apple_shape() {

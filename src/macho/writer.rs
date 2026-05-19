@@ -2122,7 +2122,10 @@ fn find_containing_atom(
     input_section: u8,
     offset: u32,
 ) -> Option<(crate::resolve::AtomId, u32)> {
-    find_containing_atom_range(atom_ranges, input_id, input_section, offset, 1)
+    // Local N_SECT symbols are point locations.  A compiler can legally emit a
+    // local label at the end of a section, where a one-byte containment probe
+    // would fall past every atom even though the symbol itself is valid.
+    find_containing_atom_range(atom_ranges, input_id, input_section, offset, 0)
 }
 
 fn find_containing_atom_range(
@@ -3121,6 +3124,10 @@ mod tests {
         assert_eq!(
             find_containing_atom_range(&atom_ranges, InputId(7), 3, 10, 2),
             Some((second, 2))
+        );
+        assert_eq!(
+            find_containing_atom(&atom_ranges, InputId(7), 3, 20),
+            Some((second, 12))
         );
     }
 }

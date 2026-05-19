@@ -5804,6 +5804,47 @@ fn linker_run_partitions_symtab_like_ld() {
 }
 
 #[test]
+fn linker_run_keeps_local_label_at_section_end() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+
+    let obj = scratch("local-section-end.o");
+    let our_out = scratch("local-section-end-ours.out");
+
+    let asm = r#"
+        .text
+        .globl _main
+        .p2align 2
+    _main:
+        ret
+    _end_marker:
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(asm, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&our_out).unwrap();
+    let text_addr = output_section(&bytes, "__TEXT", "__text").unwrap().0;
+    let symbols = symbol_values(&bytes);
+    assert_eq!(symbols.get("_end_marker"), Some(&(text_addr + 4)));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+}
+
+#[test]
 fn linker_run_strips_locals_with_x_like_ld() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");

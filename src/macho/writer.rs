@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::atom::AtomTable;
@@ -822,7 +823,7 @@ pub struct LinkEditPlan {
     loh_bytes: Vec<u8>,
     function_starts_bytes: Vec<u8>,
     data_in_code_bytes: Vec<u8>,
-    pub strtab_bytes: Vec<u8>,
+    pub strtab_bytes: Arc<[u8]>,
     code_signature: Option<CodeSignaturePlan>,
     indirect_starts: HashMap<(String, String), u32>,
     lazy_bind_offsets: HashMap<SymbolId, u32>,
@@ -916,7 +917,7 @@ fn build_linkedit_plan_profiled(
                 loh_bytes: Vec::new(),
                 function_starts_bytes: Vec::new(),
                 data_in_code_bytes: Vec::new(),
-                strtab_bytes: vec![0; 8],
+                strtab_bytes: Arc::from(vec![0; 8]),
                 code_signature,
                 indirect_starts: HashMap::new(),
                 lazy_bind_offsets: HashMap::new(),
@@ -1195,7 +1196,7 @@ impl SymbolVisibilityPolicy {
 struct SymbolTablePlan {
     symbols: Vec<InputSymbol>,
     map_symbols: Vec<LinkMapSymbol>,
-    strtab_bytes: Vec<u8>,
+    strtab_bytes: Arc<[u8]>,
     symbol_indices: Vec<Option<u32>>,
     exports: Vec<ExportEntry>,
     dysymtab: DysymtabCmd,
@@ -1551,8 +1552,7 @@ fn build_data_in_code(
         kind: u16,
     }
 
-    let atoms_by_input_section = atom_table.by_input_section();
-    let atom_ranges = build_atom_range_index(atom_table, &atoms_by_input_section, icf_redirects);
+    let atom_ranges = build_atom_range_index(atom_table, icf_redirects);
     let mut remapped = Vec::new();
     for (input_order, input) in inputs.iter().enumerate() {
         for (input_entry_index, entry) in input.object.data_in_code.iter().copied().enumerate() {
@@ -1738,8 +1738,8 @@ pub struct LinkEditBuildCache {
 #[derive(Debug)]
 struct CachedSymbolStrtab {
     names: Vec<String>,
-    strtab_bytes: Vec<u8>,
-    strx_by_spec: Vec<u32>,
+    strtab_bytes: Arc<[u8]>,
+    strx_by_spec: Arc<[u32]>,
 }
 
 fn build_output_symbols_profiled<'a>(
@@ -1756,12 +1756,7 @@ fn build_output_symbols_profiled<'a>(
     let sym_table = inputs.0.sym_table;
     let atom_sections = atom_section_ordinals(layout);
     let atom_addrs = atom_addresses(layout);
-    let atoms_by_input_section = inputs.0.atom_table.by_input_section();
-    let atom_ranges = build_atom_range_index(
-        inputs.0.atom_table,
-        &atoms_by_input_section,
-        inputs.0.icf_redirects,
-    );
+    let atom_ranges = build_atom_range_index(inputs.0.atom_table, inputs.0.icf_redirects);
     let file_index_by_input: HashMap<InputId, usize> = inputs
         .0
         .layout_inputs
@@ -2012,11 +2007,12 @@ fn build_output_symbols_profiled<'a>(
 fn build_cached_symbol_strtab(
     specs: &[OutputSymbolSpec<'_>],
     cache: Option<&mut LinkEditBuildCache>,
-) -> (Vec<u8>, Vec<u32>) {
+) -> (Arc<[u8]>, Arc<[u32]>) {
     let Some(cache) = cache else {
-        return StringTableBuilder::build_with_name_offsets(
+        let (strtab_bytes, strx_by_spec) = StringTableBuilder::build_with_name_offsets(
             specs.iter().map(|spec| spec.name.as_ref()),
         );
+        return (Arc::from(strtab_bytes), Arc::from(strx_by_spec));
     };
     if let Some(cached) = cache.symbol_strtab.as_ref() {
         if cached.names.len() == specs.len()
@@ -2026,19 +2022,24 @@ fn build_cached_symbol_strtab(
                 .zip(specs)
                 .all(|(cached, spec)| cached == spec.name.as_ref())
         {
-            return (cached.strtab_bytes.clone(), cached.strx_by_spec.clone());
+            return (
+                Arc::clone(&cached.strtab_bytes),
+                Arc::clone(&cached.strx_by_spec),
+            );
         }
     }
 
     let (strtab_bytes, strx_by_spec) =
         StringTableBuilder::build_with_name_offsets(specs.iter().map(|spec| spec.name.as_ref()));
+    let strtab_bytes = Arc::from(strtab_bytes);
+    let strx_by_spec = Arc::from(strx_by_spec);
     cache.symbol_strtab = Some(CachedSymbolStrtab {
         names: specs
             .iter()
             .map(|spec| spec.name.as_ref().to_string())
             .collect(),
-        strtab_bytes: strtab_bytes.clone(),
-        strx_by_spec: strx_by_spec.clone(),
+        strtab_bytes: Arc::clone(&strtab_bytes),
+        strx_by_spec: Arc::clone(&strx_by_spec),
     });
     (strtab_bytes, strx_by_spec)
 }
@@ -2196,26 +2197,24 @@ fn is_assembler_temporary_symbol(name: &str) -> bool {
 
 fn build_atom_range_index(
     atom_table: &AtomTable,
-    atoms_by_input_section: &HashMap<(InputId, u8), Vec<crate::resolve::AtomId>>,
     icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
 ) -> AtomRangeIndex {
-    let mut out = HashMap::with_capacity(atoms_by_input_section.len());
-    for (&key, ids) in atoms_by_input_section {
-        let mut ranges = Vec::with_capacity(ids.len());
-        for atom_id in ids {
-            let atom = atom_table.get(*atom_id);
-            ranges.push(AtomRange {
-                atom: canonical_atom(*atom_id, icf_redirects),
+    let mut out: AtomRangeIndex = HashMap::new();
+    for (atom_id, atom) in atom_table.iter() {
+        out.entry((atom.origin, atom.input_section))
+            .or_default()
+            .push(AtomRange {
+                atom: canonical_atom(atom_id, icf_redirects),
                 start: atom.input_offset,
                 end: atom.input_offset.saturating_add(atom.size),
             });
-        }
+    }
+    for ranges in out.values_mut() {
         ranges.sort_by(|lhs, rhs| {
             lhs.start
                 .cmp(&rhs.start)
                 .then_with(|| lhs.end.cmp(&rhs.end))
         });
-        out.insert(key, ranges);
     }
     out
 }
@@ -3220,8 +3219,7 @@ mod tests {
             parent_of: None,
         });
 
-        let by_input_section = atoms.by_input_section();
-        let atom_ranges = build_atom_range_index(&atoms, &by_input_section, None);
+        let atom_ranges = build_atom_range_index(&atoms, None);
         assert_eq!(
             find_containing_atom(&atom_ranges, InputId(7), 3, 4),
             Some((first, 4))

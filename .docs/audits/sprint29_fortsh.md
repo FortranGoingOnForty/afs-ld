@@ -26,6 +26,7 @@ Status date: 2026-05-19
 - Parsed relocation caches are now sorted once and relocation apply uses partitioned per-atom slices instead of scanning each section's full relocation list for every atom.
 - Linkedit finalization now skips the pre-relayout full plan rebuild; the first pass computes load-command shape, relayouts, then builds the first real linkedit plan.
 - Relocation target resolution now uses a sorted per-input-section atom range index and a borrowed symbol-name index, avoiding repeated linear atom scans and duplicate symbol-name allocation during relocation/thunk passes.
+- Linkedit symbol planning now shares cached string-table buffers across convergence passes and makes suffix-dedup lookup O(1) after reverse-suffix sorting.
 - Regression coverage:
   - `layout_omits_debug_and_llvm_payload_sections`
   - `linker_run_omits_debug_and_llvm_payload_sections_like_ld`
@@ -56,8 +57,8 @@ or armfortas runtime/codegen issue, not an afs-ld issue.
 - Link-time performance still misses the Sprint 29 2x gate on this machine:
   - Through the armfortas final-link path with release afs-ld: afs-ld `0.16-0.17s`, Apple `ld` `0.06s`.
   - Direct linker invocation on the same object list after the linkedit convergence slice: afs-ld warm runs are about `0.08-0.09s`, Apple `ld` remains about `0.03-0.04s`.
-  - Current profile for the fortsh fixture: total is typically about `96-105ms` warm; largest remaining buckets are linkedit finalization about `26-31ms`, relocation application about `18-20ms`, symbol resolution about `11-14ms`, and output write about `8-12ms`.
-  - The latest linkedit slices reduced the measured symbol-plan bucket from about `51ms` to about `24-26ms`, and the symbol string-table sub-bucket from about `32ms` to about `8-9ms`.
+  - Current profile for the fortsh fixture: total is typically about `96-105ms` warm; largest remaining buckets are linkedit finalization about `27-31ms`, relocation application about `18-21ms`, symbol resolution about `11-14ms`, and output write about `8-12ms`.
+  - The linkedit symbol-plan slices reduced the measured symbol-plan bucket from about `51ms` to about `13-17ms`, and the symbol string-table sub-bucket from about `32ms` to about `4.4-4.7ms`.
   - The targeted TBD slice reduced the measured TBD decode bucket from about `22-45ms` depending on cache/double-decode path to about `3-4ms`.
   - The sorted relocation slices avoid per-atom full-section relocation scans and speed section-backed target lookup; observed relocation-apply samples now range from about `18-20ms` on the fortsh fixture, with release direct warm runs around `0.09s`.
   - The linkedit convergence slice removed one full plan rebuild per finalize call, reducing observed linkedit finalization from about `40-46ms` to about `27-31ms`.

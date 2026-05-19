@@ -189,10 +189,9 @@ impl StringTableBuilder {
         if name.is_empty() {
             return Some(0);
         }
-        let insert_at = self
-            .roots
-            .partition_point(|root| reverse_suffix_order(&root.name, name).is_lt());
-        let existing = self.roots.get(insert_at.checked_sub(1)?)?;
+        // Names are processed in reverse-suffix order, so an existing root
+        // that can absorb this suffix must be the immediately previous root.
+        let existing = self.roots.last()?;
         (existing.name.len() >= name.len() && existing.name.ends_with(name))
             .then(|| existing.offset + (existing.name.len() - name.len()) as u32)
     }
@@ -202,8 +201,8 @@ fn find_borrowed_suffix_offset(roots: &[BorrowedRootString<'_>], name: &str) -> 
     if name.is_empty() {
         return Some(0);
     }
-    let insert_at = roots.partition_point(|root| reverse_suffix_order(root.name, name).is_lt());
-    let existing = roots.get(insert_at.checked_sub(1)?)?;
+    // See `find_suffix_offset`: roots are emitted in reverse-suffix order.
+    let existing = roots.last()?;
     (existing.name.len() >= name.len() && existing.name.ends_with(name))
         .then(|| existing.offset + (existing.name.len() - name.len()) as u32)
 }
@@ -341,6 +340,19 @@ mod tests {
         assert_eq!(table.get(offsets[3]).unwrap(), "");
         assert_eq!(offsets[0], offsets[2]);
         assert_eq!(offsets[0], offsets[1] + 4);
+        assert_eq!(table.as_bytes().len() % 8, 0);
+    }
+
+    #[test]
+    fn borrowed_builder_dedups_suffix_chain_from_previous_root() {
+        let names = ["_suffix", "_long_suffix", "_very_long_suffix"];
+        let (bytes, offsets) = StringTableBuilder::build_with_name_offsets(names);
+        let table = StringTable::from_bytes(bytes);
+
+        for (idx, name) in names.iter().enumerate() {
+            assert_eq!(table.get(offsets[idx]).unwrap(), *name);
+        }
+        assert_eq!(offsets[0], offsets[2] + 10);
         assert_eq!(table.as_bytes().len() % 8, 0);
     }
 }

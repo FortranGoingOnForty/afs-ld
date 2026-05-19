@@ -124,6 +124,23 @@ impl Exports {
         }
     }
 
+    pub fn for_each_entry(&self, mut visit: impl FnMut(&ExportEntry)) -> Result<(), ReadError> {
+        match self {
+            Exports::Trie(_) => {
+                let entries = self.entries()?;
+                for entry in &entries {
+                    visit(entry);
+                }
+            }
+            Exports::Flat(entries) => {
+                for entry in entries {
+                    visit(entry);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn lookup(&self, name: &str) -> Result<Option<ExportEntry>, ReadError> {
         match self {
             Exports::Trie(raw) => {

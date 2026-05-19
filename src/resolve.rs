@@ -1078,8 +1078,7 @@ pub fn seed_dylib(
     report: &mut SeedReport,
 ) -> Result<(), SeedError> {
     let di = inputs.dylib(dylib_id);
-    let entries = di.file.exports.entries().map_err(SeedError::Read)?;
-    for entry in entries {
+    di.file.exports.for_each_entry(|entry| {
         let name = table.intern(&entry.name);
         let sym = Symbol::DylibImport {
             name,
@@ -1091,7 +1090,7 @@ pub fn seed_dylib(
             Ok(outcome) => report.record_outcome(outcome),
             Err(e) => report.record_error(e),
         }
-    }
+    })?;
     Ok(())
 }
 

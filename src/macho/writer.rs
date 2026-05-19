@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::atom::AtomTable;
 use crate::input::{DataInCodeEntry, ObjectFile};
-use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
+use crate::layout::{should_emit_input_section, Layout, LayoutInput, PAGE_SIZE};
 use crate::leb::write_uleb;
 use crate::macho::constants::*;
 use crate::macho::dylib::DylibDependency;
@@ -1807,6 +1807,13 @@ fn build_output_symbols_profiled(
             (absolute_symbol_type(hidden), NO_SECT, *value)
         } else {
             let Some(addr) = atom_addrs.get(atom).copied() else {
+                if atom_is_from_dropped_input_section(
+                    inputs.0.layout_inputs,
+                    inputs.0.atom_table,
+                    *atom,
+                ) {
+                    continue;
+                }
                 if dead_strip {
                     continue;
                 }
@@ -1960,6 +1967,24 @@ fn build_output_symbols_profiled(
     ))
 }
 
+fn atom_is_from_dropped_input_section(
+    inputs: &[LayoutInput<'_>],
+    atom_table: &AtomTable,
+    atom_id: crate::resolve::AtomId,
+) -> bool {
+    let atom = atom_table.get(atom_id);
+    inputs
+        .iter()
+        .find(|input| input.id == atom.origin)
+        .and_then(|input| {
+            input
+                .object
+                .sections
+                .get((atom.input_section as usize).saturating_sub(1))
+        })
+        .is_some_and(|section| !should_emit_input_section(section))
+}
+
 fn sort_local_symbols(locals: &mut [OutputSymbolSpec]) {
     locals.sort_by(|lhs, rhs| {
         lhs.n_sect
@@ -2023,6 +2048,9 @@ fn collect_local_symbols(
                 let section = object
                     .section_for_symbol(input_sym)
                     .expect("section symbol without section");
+                if !should_emit_input_section(section) {
+                    continue;
+                }
                 let offset = input_sym.value().saturating_sub(section.addr) as u32;
                 let (atom_id, delta) = find_containing_atom(
                     ctx.atom_ranges,

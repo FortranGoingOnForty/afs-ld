@@ -5845,6 +5845,72 @@ fn linker_run_keeps_local_label_at_section_end() {
 }
 
 #[test]
+fn linker_run_omits_debug_and_llvm_payload_sections_like_ld() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: no macOS SDK");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: no macOS SDK version");
+        return;
+    };
+
+    let obj = scratch("debug-llvm-sections.o");
+    let our_out = scratch("debug-llvm-sections-ours.out");
+    let apple_out = scratch("debug-llvm-sections-apple.out");
+    let asm = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        .p2align 2
+    _main:
+        mov w0, #0
+        ret
+
+        .section __DWARF,__debug_info,regular,debug
+        .globl _debug_payload
+    _debug_payload:
+        .byte 1, 2, 3, 4
+
+        .section __LLVM,__bitcode
+        .globl _bitcode_payload
+    _bitcode_payload:
+        .byte 5, 6, 7, 8
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(asm, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    for bytes in [&our_bytes, &apple_bytes] {
+        assert!(output_section(bytes, "__DWARF", "__debug_info").is_none());
+        assert!(output_section(bytes, "__LLVM", "__bitcode").is_none());
+        let symbols = symbol_values(bytes);
+        assert!(!symbols.contains_key("_debug_payload"));
+        assert!(!symbols.contains_key("_bitcode_payload"));
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
 fn linker_run_strips_locals_with_x_like_ld() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");

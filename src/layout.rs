@@ -7,10 +7,11 @@ use std::collections::{HashMap, HashSet};
 
 use crate::atom::AtomTable;
 use crate::input::ObjectFile;
-use crate::macho::constants::SG_READ_ONLY;
+use crate::macho::constants::{SG_READ_ONLY, S_ATTR_DEBUG};
 use crate::resolve::{AtomId, InputId};
 use crate::section::{
     is_zerofill, InputSection, OutputAtom, OutputSection, OutputSectionId, OutputSegment, Prot,
+    SectionKind,
 };
 use crate::synth::SyntheticPlan;
 use crate::OutputKind;
@@ -80,6 +81,16 @@ fn output_section_key(input_section: &InputSection) -> SectionKey {
             name: input_section.sectname.clone(),
         },
     }
+}
+
+pub(crate) fn should_emit_input_section(input_section: &InputSection) -> bool {
+    if input_section.kind == SectionKind::CompactUnwind {
+        return true;
+    }
+    if input_section.flags & S_ATTR_DEBUG != 0 {
+        return false;
+    }
+    input_section.segname != "__LLVM"
 }
 
 impl Layout {
@@ -173,6 +184,9 @@ impl Layout {
                         atom_id
                     )
                 });
+            if !should_emit_input_section(input_section) {
+                continue;
+            }
 
             let key = output_section_key(input_section);
             let idx = match section_index.get(&key) {
@@ -758,8 +772,9 @@ mod tests {
     use crate::atom::{Atom, AtomFlags, AtomSection, AtomTable};
     use crate::input::ObjectFile;
     use crate::macho::constants::{
-        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, S_ATTR_PURE_INSTRUCTIONS,
-        S_ATTR_SOME_INSTRUCTIONS, S_CSTRING_LITERALS, S_REGULAR, S_ZEROFILL,
+        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, S_ATTR_DEBUG,
+        S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_CSTRING_LITERALS, S_REGULAR,
+        S_ZEROFILL,
     };
     use crate::macho::reader::MachHeader64;
     use crate::resolve::{DylibId, InputId, SymbolId};
@@ -932,6 +947,97 @@ mod tests {
             .sections
             .iter()
             .any(|section| section.segment == "__DATA" && section.name == "__const"));
+    }
+
+    #[test]
+    fn layout_omits_debug_and_llvm_payload_sections() {
+        let object = ObjectFile {
+            path: PathBuf::from("/tmp/layout-debug.o"),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections: vec![
+                input_section(
+                    "__TEXT",
+                    "__text",
+                    SectionKind::Text,
+                    2,
+                    S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                ),
+                input_section(
+                    "__DWARF",
+                    "__debug_info",
+                    SectionKind::Data,
+                    0,
+                    S_REGULAR | S_ATTR_DEBUG,
+                ),
+                input_section("__LLVM", "__bitcode", SectionKind::Data, 0, S_REGULAR),
+                input_section(
+                    "__TEXT",
+                    "__compact_unwind",
+                    SectionKind::CompactUnwind,
+                    3,
+                    S_REGULAR | S_ATTR_DEBUG,
+                ),
+            ],
+            symbols: Vec::new(),
+            strings: crate::string_table::StringTable::from_bytes(vec![0]),
+            symtab: None,
+            dysymtab: None,
+            loh: Vec::new(),
+            data_in_code: Vec::new(),
+        };
+
+        let mut atoms = AtomTable::new();
+        atoms.push(atom(InputId(0), 1, AtomSection::Text, 0, 4, 2, vec![0; 4]));
+        atoms.push(atom(InputId(0), 2, AtomSection::Data, 0, 8, 0, vec![1; 8]));
+        atoms.push(atom(InputId(0), 3, AtomSection::Data, 0, 8, 0, vec![2; 8]));
+        atoms.push(atom(
+            InputId(0),
+            4,
+            AtomSection::CompactUnwind,
+            0,
+            32,
+            3,
+            vec![3; 32],
+        ));
+
+        let layout = Layout::build(
+            OutputKind::Executable,
+            &[LayoutInput {
+                id: InputId(0),
+                object: &object,
+                load_order: 0,
+                archive_member_offset: None,
+            }],
+            &atoms,
+            0x200,
+        );
+
+        assert!(layout
+            .sections
+            .iter()
+            .any(|section| section.segment == "__TEXT" && section.name == "__text"));
+        assert!(layout
+            .sections
+            .iter()
+            .any(|section| section.segment == "__TEXT" && section.name == "__compact_unwind"));
+        assert!(!layout
+            .sections
+            .iter()
+            .any(|section| section.segment == "__DWARF"));
+        assert!(!layout
+            .sections
+            .iter()
+            .any(|section| section.segment == "__LLVM"));
     }
 
     #[test]

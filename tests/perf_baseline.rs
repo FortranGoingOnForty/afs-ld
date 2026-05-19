@@ -287,3 +287,39 @@ fn bench_runtime_link_profile_reports_baseline_timings() {
         );
     }
 }
+
+#[test]
+fn bench_fortsh_fixture_profile_reports_baseline_timings() {
+    if !have_xcrun() || !have_xcrun_tool("ld") {
+        eprintln!("skipping: xcrun as/ld unavailable");
+        return;
+    }
+    let Some(inputs_file) = std::env::var_os("AFS_LD_FORTSH_INPUTS_FILE").map(PathBuf::from) else {
+        eprintln!("skipping: set AFS_LD_FORTSH_INPUTS_FILE to a newline-delimited input list");
+        return;
+    };
+
+    let mut inputs: Vec<PathBuf> = fs::read_to_string(&inputs_file)
+        .unwrap_or_else(|e| panic!("read {}: {e}", inputs_file.display()))
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(PathBuf::from)
+        .collect();
+    let runtime = runtime_archive_fixture().expect("fortsh profile runtime archive");
+    inputs.push(runtime);
+
+    let out = scratch("perf-fortsh.out");
+    let profile = Linker::run_profiled(&executable_opts(inputs, out)).expect("profile fortsh link");
+    assert_profile_basics("fortsh", &profile);
+
+    if let Ok(limit_ms) = std::env::var("AFS_LD_FORTSH_BUDGET_MS") {
+        let limit = Duration::from_millis(limit_ms.parse().expect("parse fortsh budget"));
+        assert!(
+            profile.total_wall <= limit,
+            "fortsh baseline exceeded budget: {:?} > {:?}",
+            profile.total_wall,
+            limit
+        );
+    }
+}

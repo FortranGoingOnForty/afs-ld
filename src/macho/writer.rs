@@ -919,6 +919,7 @@ fn build_linkedit_plan_profiled(
         kind,
         opts.dead_strip,
         opts.strip_locals,
+        opts.map.is_some(),
         &visibility,
         inputs,
         &imports,
@@ -1712,6 +1713,7 @@ fn build_output_symbols_profiled(
     kind: OutputKind,
     dead_strip: bool,
     strip_locals: bool,
+    emit_link_map: bool,
     visibility: &SymbolVisibilityPolicy,
     inputs: LinkEditInputs<'_>,
     imports: &[ImportSymbolRecord],
@@ -1921,16 +1923,20 @@ fn build_output_symbols_profiled(
 
     let mut symbols = Vec::with_capacity(specs.len());
     let mut symbol_indices = HashMap::with_capacity(specs.len());
-    let map_symbols = specs
-        .iter()
-        .filter(|spec| spec.partition != OutputSymbolPartition::Undefined)
-        .map(|spec| LinkMapSymbol {
-            name: spec.name.clone(),
-            addr: spec.n_value,
-            size: spec.size,
-            file_index: spec.file_index,
-        })
-        .collect();
+    let map_symbols = if emit_link_map {
+        specs
+            .iter()
+            .filter(|spec| spec.partition != OutputSymbolPartition::Undefined)
+            .map(|spec| LinkMapSymbol {
+                name: spec.name.clone(),
+                addr: spec.n_value,
+                size: spec.size,
+                file_index: spec.file_index,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     for (idx, spec) in specs.into_iter().enumerate() {
         let strx = strx_by_spec[idx];
         symbols.push(InputSymbol::from_raw(RawNlist {

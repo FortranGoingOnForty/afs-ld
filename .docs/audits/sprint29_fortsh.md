@@ -21,6 +21,7 @@ Status date: 2026-05-19
 - Regression coverage:
   - `layout_omits_debug_and_llvm_payload_sections`
   - `linker_run_omits_debug_and_llvm_payload_sections_like_ld`
+  - `tests/parity_corpus/fortsh_debug_llvm_payload_exec`
 
 ## Non-linker blocker found
 
@@ -41,5 +42,8 @@ or armfortas runtime/codegen issue, not an afs-ld issue.
 ## Still open
 
 - Full Sprint 29 runtime matrix is blocked on the armfortas fortsh `-c` invalid-free bug.
-- Link-time performance against Apple `ld` still needs a recorded fortsh measurement.
+- Link-time performance still misses the Sprint 29 2x gate on this machine:
+  - Through the armfortas final-link path with release afs-ld: afs-ld `0.16-0.17s`, Apple `ld` `0.06s`.
+  - Direct linker invocation on the same object list: afs-ld `0.13s`, Apple `ld` `0.03s`.
+  - Current profile for the fortsh fixture: total about `168ms`; largest buckets are linkedit symbol planning about `51ms`, input read/TBD decode about `50ms` combined, relocation application about `22ms`, and output write about `8-10ms`.
 - Load-command shape is improved by dropping debug/LLVM payloads, but afs-ld still emits classic `LC_DYLD_INFO_ONLY` rather than Apple's chained-fixup load-command shape for this executable.

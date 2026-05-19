@@ -1,0 +1,2 @@
+__DWARF __debug_info
+__LLVM __bitcode

@@ -1,0 +1,3 @@
+build_version
+symbol_partition_names
+string_table_near_parity

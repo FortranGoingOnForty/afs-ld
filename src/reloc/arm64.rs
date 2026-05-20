@@ -1634,7 +1634,7 @@ fn patch_unsigned(
             atom,
             obj,
             reloc.kind,
-            &describe_referent(obj, reloc.referent),
+            reloc.referent,
         ),
         RelocLength::Quad => write_u64(
             bytes,
@@ -1643,7 +1643,7 @@ fn patch_unsigned(
             atom,
             obj,
             reloc.kind,
-            &describe_referent(obj, reloc.referent),
+            reloc.referent,
         ),
         other => Err(reloc_error(
             atom,
@@ -1674,7 +1674,7 @@ fn clear_direct_import_slot(
         atom,
         obj,
         reloc.kind,
-        &describe_referent(obj, reloc.referent),
+        reloc.referent,
     )
 }
 
@@ -1724,7 +1724,7 @@ fn patch_subtractor(
             atom,
             obj,
             reloc.kind,
-            &describe_referent(obj, reloc.referent),
+            reloc.referent,
         ),
         RelocLength::Quad => write_u64(
             bytes,
@@ -1733,7 +1733,7 @@ fn patch_subtractor(
             atom,
             obj,
             reloc.kind,
-            &describe_referent(obj, reloc.referent),
+            reloc.referent,
         ),
         other => Err(reloc_error(
             atom,
@@ -1777,14 +1777,7 @@ fn patch_branch26(
             format!("branch target is out of BRANCH26 range (delta {delta:#x})"),
         ));
     }
-    let insn = read_u32(
-        bytes,
-        local_offset,
-        atom,
-        obj,
-        reloc.kind,
-        &describe_referent(obj, reloc.referent),
-    )?;
+    let insn = read_u32(bytes, local_offset, atom, obj, reloc.kind, reloc.referent)?;
     let imm26 = (imm as u32) & 0x03ff_ffff;
     write_u32(
         bytes,
@@ -1793,7 +1786,7 @@ fn patch_branch26(
         atom,
         obj,
         reloc.kind,
-        &describe_referent(obj, reloc.referent),
+        reloc.referent,
     )
 }
 
@@ -1818,14 +1811,7 @@ fn patch_page21(
             format!("page delta is out of PAGE21 range ({delta:#x})"),
         ));
     }
-    let insn = read_u32(
-        bytes,
-        local_offset,
-        atom,
-        obj,
-        reloc.kind,
-        &describe_referent(obj, reloc.referent),
-    )?;
+    let insn = read_u32(bytes, local_offset, atom, obj, reloc.kind, reloc.referent)?;
     let encoded = (imm as u32) & 0x1f_ffff;
     let immlo = encoded & 0x3;
     let immhi = (encoded >> 2) & 0x7ffff;
@@ -1837,7 +1823,7 @@ fn patch_page21(
         atom,
         obj,
         reloc.kind,
-        &describe_referent(obj, reloc.referent),
+        reloc.referent,
     )
 }
 
@@ -1850,14 +1836,7 @@ fn patch_pageoff12(
     target: u64,
 ) -> Result<(), RelocError> {
     let pageoff = target.wrapping_add_signed(reloc.addend) & 0xfff;
-    let insn = read_u32(
-        bytes,
-        local_offset,
-        atom,
-        obj,
-        reloc.kind,
-        &describe_referent(obj, reloc.referent),
-    )?;
+    let insn = read_u32(bytes, local_offset, atom, obj, reloc.kind, reloc.referent)?;
     let imm = if is_add_immediate(insn) {
         pageoff
     } else {
@@ -1893,7 +1872,7 @@ fn patch_pageoff12(
         atom,
         obj,
         reloc.kind,
-        &describe_referent(obj, reloc.referent),
+        reloc.referent,
     )
 }
 
@@ -1929,22 +1908,10 @@ fn read_implicit_addend(
     referent: Referent,
 ) -> Result<i64, RelocError> {
     match length {
-        RelocLength::Word => Ok(read_u32(
-            bytes,
-            local_offset,
-            atom,
-            obj,
-            kind,
-            &describe_referent(obj, referent),
-        )? as i32 as i64),
-        RelocLength::Quad => Ok(read_u64(
-            bytes,
-            local_offset,
-            atom,
-            obj,
-            kind,
-            &describe_referent(obj, referent),
-        )? as i64),
+        RelocLength::Word => {
+            Ok(read_u32(bytes, local_offset, atom, obj, kind, referent)? as i32 as i64)
+        }
+        RelocLength::Quad => Ok(read_u64(bytes, local_offset, atom, obj, kind, referent)? as i64),
         other => Err(reloc_error(
             atom,
             &obj.path,
@@ -1976,14 +1943,7 @@ fn patch_tlvp_pageoff12(
         ));
     }
 
-    let insn = read_u32(
-        bytes,
-        local_offset,
-        atom,
-        obj,
-        reloc.kind,
-        &describe_referent(obj, reloc.referent),
-    )?;
+    let insn = read_u32(bytes, local_offset, atom, obj, reloc.kind, reloc.referent)?;
     let rd = insn & 0x1f;
     let rn = (insn >> 5) & 0x1f;
     let patched = 0x9100_0000 | ((pageoff as u32) << 10) | (rn << 5) | rd;
@@ -1994,7 +1954,7 @@ fn patch_tlvp_pageoff12(
         atom,
         obj,
         reloc.kind,
-        &describe_referent(obj, reloc.referent),
+        reloc.referent,
     )
 }
 
@@ -2018,14 +1978,7 @@ fn patch_got_pageoff12_relaxed(
         ));
     }
 
-    let insn = read_u32(
-        bytes,
-        local_offset,
-        atom,
-        obj,
-        reloc.kind,
-        &describe_referent(obj, reloc.referent),
-    )?;
+    let insn = read_u32(bytes, local_offset, atom, obj, reloc.kind, reloc.referent)?;
     let rd = insn & 0x1f;
     let rn = (insn >> 5) & 0x1f;
     let patched = 0x9100_0000 | ((pageoff as u32) << 10) | (rn << 5) | rd;
@@ -2036,7 +1989,7 @@ fn patch_got_pageoff12_relaxed(
         atom,
         obj,
         reloc.kind,
-        &describe_referent(obj, reloc.referent),
+        reloc.referent,
     )
 }
 
@@ -2619,17 +2572,18 @@ fn read_u32(
     atom: &Atom,
     obj: &ObjectFile,
     kind: RelocKind,
-    referent: &str,
+    referent: Referent,
 ) -> Result<u32, RelocError> {
     let start = offset as usize;
     let end = start + 4;
     let slice = bytes.get(start..end).ok_or_else(|| {
+        let referent = describe_referent(obj, referent);
         reloc_error(
             atom,
             &obj.path,
             offset,
             kind,
-            referent,
+            &referent,
             "relocation write would run past the atom bytes".to_string(),
         )
     })?;
@@ -2642,17 +2596,18 @@ fn read_u64(
     atom: &Atom,
     obj: &ObjectFile,
     kind: RelocKind,
-    referent: &str,
+    referent: Referent,
 ) -> Result<u64, RelocError> {
     let start = offset as usize;
     let end = start + 8;
     let slice = bytes.get(start..end).ok_or_else(|| {
+        let referent = describe_referent(obj, referent);
         reloc_error(
             atom,
             &obj.path,
             offset,
             kind,
-            referent,
+            &referent,
             "relocation write would run past the atom bytes".to_string(),
         )
     })?;
@@ -2668,17 +2623,18 @@ fn write_u32(
     atom: &Atom,
     obj: &ObjectFile,
     kind: RelocKind,
-    referent: &str,
+    referent: Referent,
 ) -> Result<(), RelocError> {
     let start = offset as usize;
     let end = start + 4;
     let slice = bytes.get_mut(start..end).ok_or_else(|| {
+        let referent = describe_referent(obj, referent);
         reloc_error(
             atom,
             &obj.path,
             offset,
             kind,
-            referent,
+            &referent,
             "relocation write would run past the atom bytes".to_string(),
         )
     })?;
@@ -2693,17 +2649,18 @@ fn write_u64(
     atom: &Atom,
     obj: &ObjectFile,
     kind: RelocKind,
-    referent: &str,
+    referent: Referent,
 ) -> Result<(), RelocError> {
     let start = offset as usize;
     let end = start + 8;
     let slice = bytes.get_mut(start..end).ok_or_else(|| {
+        let referent = describe_referent(obj, referent);
         reloc_error(
             atom,
             &obj.path,
             offset,
             kind,
-            referent,
+            &referent,
             "relocation write would run past the atom bytes".to_string(),
         )
     })?;

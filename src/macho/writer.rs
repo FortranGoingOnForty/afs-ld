@@ -1227,6 +1227,29 @@ struct RebaseSite {
     segment_offset: u64,
 }
 
+struct InputObjectLookup<'a> {
+    objects: Vec<Option<&'a ObjectFile>>,
+}
+
+impl<'a> InputObjectLookup<'a> {
+    fn new(inputs: &'a [LayoutInput<'a>]) -> Self {
+        let max_input = inputs
+            .iter()
+            .map(|input| input.id.0 as usize)
+            .max()
+            .unwrap_or(0);
+        let mut objects = vec![None; max_input + 1];
+        for input in inputs {
+            objects[input.id.0 as usize] = Some(input.object);
+        }
+        Self { objects }
+    }
+
+    fn get(&self, input: InputId) -> Option<&'a ObjectFile> {
+        self.objects.get(input.0 as usize).copied().flatten()
+    }
+}
+
 fn build_rebase_stream(
     layout: &Layout,
     synthetic_plan: &SyntheticPlan,
@@ -1282,13 +1305,7 @@ fn collect_rebase_sites(
         synthetic_plan,
         inputs.0.sym_table,
     )?);
-    let input_map: HashMap<InputId, &ObjectFile> = inputs
-        .0
-        .layout_inputs
-        .iter()
-        .map(|input| (input.id, input.object))
-        .collect();
-    let symbol_name_index = build_symbol_name_index(inputs.0.sym_table);
+    let input_map = InputObjectLookup::new(inputs.0.layout_inputs);
 
     for section in &layout.sections {
         if !matches!(section.segment.as_str(), "__DATA" | "__DATA_CONST") {
@@ -1303,7 +1320,7 @@ fn collect_rebase_sites(
         let segment_index = segment_index(layout, &section.segment)?;
         for placed in &section.atoms {
             let atom = inputs.0.atom_table.get(placed.atom);
-            let Some(obj) = input_map.get(&atom.origin).copied() else {
+            let Some(obj) = input_map.get(atom.origin) else {
                 continue;
             };
             let relocs = inputs
@@ -1313,7 +1330,7 @@ fn collect_rebase_sites(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             for reloc in relocs_for_rebase(relocs, atom) {
-                if !reloc_needs_rebase(obj, reloc, inputs.0.sym_table, &symbol_name_index) {
+                if !reloc_needs_rebase(obj, reloc, inputs.0.sym_table) {
                     continue;
                 }
                 let local_offset = reloc.offset.saturating_sub(atom.input_offset) as u64;
@@ -1398,12 +1415,7 @@ fn relocs_for_rebase<'a>(
     })
 }
 
-fn reloc_needs_rebase(
-    obj: &ObjectFile,
-    reloc: Reloc,
-    sym_table: &SymbolTable,
-    symbol_name_index: &HashMap<String, SymbolId>,
-) -> bool {
+fn reloc_needs_rebase(obj: &ObjectFile, reloc: Reloc, sym_table: &SymbolTable) -> bool {
     if reloc.kind != RelocKind::Unsigned
         || reloc.length != RelocLength::Quad
         || reloc.pcrel
@@ -1418,7 +1430,11 @@ fn reloc_needs_rebase(
             let Some(input_sym) = obj.symbols.get(sym_idx as usize) else {
                 return false;
             };
-            match symbol_referent_id(obj, reloc.referent, symbol_name_index) {
+            match obj
+                .symbol_name(input_sym)
+                .ok()
+                .and_then(|name| sym_table.lookup_str(name))
+            {
                 Some(symbol_id) => match sym_table.get(symbol_id) {
                     Symbol::DylibImport { .. } => false,
                     Symbol::Defined { atom, .. } => atom.0 != 0,
@@ -1429,31 +1445,6 @@ fn reloc_needs_rebase(
             }
         }
     }
-}
-
-fn build_symbol_name_index(sym_table: &SymbolTable) -> HashMap<String, SymbolId> {
-    sym_table
-        .iter()
-        .map(|(symbol_id, symbol)| {
-            (
-                sym_table.interner.resolve(symbol.name()).to_string(),
-                symbol_id,
-            )
-        })
-        .collect()
-}
-
-fn symbol_referent_id(
-    obj: &ObjectFile,
-    referent: Referent,
-    symbol_name_index: &HashMap<String, SymbolId>,
-) -> Option<SymbolId> {
-    let Referent::Symbol(sym_idx) = referent else {
-        return None;
-    };
-    let input_sym = obj.symbols.get(sym_idx as usize)?;
-    let name = obj.symbol_name(input_sym).ok()?;
-    symbol_name_index.get(name).copied()
 }
 
 fn build_function_starts(

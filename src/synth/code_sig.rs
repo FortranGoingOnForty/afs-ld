@@ -1,4 +1,4 @@
-use std::thread;
+use std::{ffi::c_void, thread};
 
 use crate::layout::Layout;
 use crate::section::is_executable;
@@ -198,7 +198,36 @@ fn align_up(value: u64, align: u64) -> u64 {
     (value + mask) & !mask
 }
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn CC_SHA256(data: *const c_void, len: u32, md: *mut u8) -> *mut u8;
+}
+
 fn sha256(data: &[u8]) -> [u8; 32] {
+    #[cfg(target_os = "macos")]
+    {
+        let mut out = [0u8; 32];
+        // afs-ld is macOS-only; libSystem's CommonCrypto SHA-256 is the same
+        // platform primitive used by code-signing tools and is materially
+        // faster than the portable fallback for thousands of 4 KiB pages.
+        unsafe {
+            CC_SHA256(
+                data.as_ptr().cast::<c_void>(),
+                data.len() as u32,
+                out.as_mut_ptr(),
+            );
+        }
+        out
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        sha256_portable(data)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sha256_portable(data: &[u8]) -> [u8; 32] {
     const INIT: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
@@ -247,6 +276,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+#[cfg(not(target_os = "macos"))]
 fn compress(state: &mut [u32; 8], block: &[u8; 64], k: &[u32; 64]) {
     let mut w = [0u32; 64];
     for (idx, word) in w.iter_mut().take(16).enumerate() {

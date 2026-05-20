@@ -265,6 +265,10 @@ pub struct LinkPhaseTimings {
     pub synth_unwind: Duration,
     pub reloc_apply: Duration,
     pub write_output: Duration,
+    pub write_image_build: Duration,
+    pub write_file: Duration,
+    pub write_link_map: Duration,
+    pub write_permissions: Duration,
 }
 
 impl LinkPhaseTimings {
@@ -920,6 +924,7 @@ impl Linker {
             print!("{report}");
         }
 
+        let write_started = Instant::now();
         let phase_started = Instant::now();
         let mut image = Vec::new();
         let entry_point = resolve_entry_point(opts, &sym_table)?;
@@ -932,9 +937,13 @@ impl Linker {
             &linkedit,
             &mut image,
         )?;
+        phases.write_image_build = phase_started.elapsed();
         let output = default_output_path(opts);
+        let phase_started = Instant::now();
         fs::write(&output, image)?;
+        phases.write_file = phase_started.elapsed();
         if let Some(map_path) = &opts.map {
+            let phase_started = Instant::now();
             let dead_stripped = dead_strip
                 .as_ref()
                 .map(|analysis| {
@@ -950,14 +959,17 @@ impl Linker {
                 &folded_symbols,
                 &dead_stripped,
             )?;
+            phases.write_link_map = phase_started.elapsed();
         }
         if opts.kind == OutputKind::Executable {
+            let phase_started = Instant::now();
             let mut perms = fs::metadata(&output)?.permissions();
             let mode = perms.mode();
             perms.set_mode(mode | ((mode & 0o444) >> 2));
             fs::set_permissions(&output, perms)?;
+            phases.write_permissions = phase_started.elapsed();
         }
-        phases.write_output = phase_started.elapsed();
+        phases.write_output = write_started.elapsed();
         Ok(LinkProfile {
             output,
             phases,

@@ -106,7 +106,7 @@ fn executable_opts(inputs: Vec<PathBuf>, output: PathBuf) -> LinkOptions {
 
 fn assert_profile_basics(name: &str, profile: &LinkProfile) {
     eprintln!(
-        "{name}: total={:?} parse={:?} resolve={:?} atomize={:?} layout={:?} (entry={:?} dead={:?} icf={:?} synth_plan={:?} build={:?} thunks={:?}) synth={:?} (linkedit={:?}: symbols={:?} [locals={:?} globals={:?} strtab={:?}] dyld={:?} [bind={:?} rebase={:?} export={:?}] metadata={:?} codesig={:?}; unwind={:?}) reloc={:?} write={:?}",
+        "{name}: total={:?} parse={:?} resolve={:?} atomize={:?} layout={:?} (entry={:?} dead={:?} icf={:?} synth_plan={:?} build={:?} thunks={:?}) synth={:?} (linkedit={:?}: symbols={:?} [locals={:?} globals={:?} strtab={:?}] dyld={:?} [bind={:?} rebase={:?} export={:?}] metadata={:?} codesig={:?}; unwind={:?}) reloc={:?} write={:?} [image={:?} file={:?} linkmap={:?} perms={:?}]",
         profile.total_wall,
         profile.phases.input_parsing,
         profile.phases.symbol_resolution,
@@ -133,6 +133,10 @@ fn assert_profile_basics(name: &str, profile: &LinkProfile) {
         profile.phases.synth_unwind,
         profile.phases.reloc_apply,
         profile.phases.write_output,
+        profile.phases.write_image_build,
+        profile.phases.write_file,
+        profile.phases.write_link_map,
+        profile.phases.write_permissions,
     );
     eprintln!(
         "{name}: input read={:?} object={:?} archive={:?} dylib={:?} tbd_decode={:?} tbd_materialize={:?} reloc_cache={:?}",
@@ -202,6 +206,14 @@ fn assert_profile_basics(name: &str, profile: &LinkProfile) {
                 + profile.phases.synth_linkedit_dyld_rebase
                 + profile.phases.synth_linkedit_dyld_export,
         "{name}: dyld-info subphases exceeded dyld-info total"
+    );
+    assert!(
+        profile.phases.write_output
+            >= profile.phases.write_image_build
+                + profile.phases.write_file
+                + profile.phases.write_link_map
+                + profile.phases.write_permissions,
+        "{name}: write subphases exceeded write total"
     );
 }
 

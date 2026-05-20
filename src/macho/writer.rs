@@ -872,6 +872,7 @@ fn build_linkedit_plan_profiled(
     cache: Option<&mut LinkEditBuildCache>,
 ) -> Result<(LinkEditPlan, LinkEditBuildTimings), WriteError> {
     let mut timings = LinkEditBuildTimings::default();
+    let mut cache = cache;
     let linkedit = layout
         .segment("__LINKEDIT")
         .cloned()
@@ -947,7 +948,7 @@ fn build_linkedit_plan_profiled(
         },
         inputs,
         &imports,
-        cache,
+        cache.as_deref_mut(),
     )?;
     timings.symbol_plan += phase_started.elapsed();
     timings.symbol_plan_locals += symbol_plan_timings.locals;
@@ -1010,13 +1011,22 @@ fn build_linkedit_plan_profiled(
         inputs.0.atom_table,
         inputs.0.icf_redirects,
     )?;
-    let function_starts_bytes =
-        build_function_starts(layout, inputs.0.layout_inputs, inputs.0.atom_table)?;
+    let function_start_cache = cache
+        .as_mut()
+        .map(|cache| &mut cache.function_start_symbols);
+    let function_starts_bytes = build_function_starts(
+        layout,
+        inputs.0.layout_inputs,
+        inputs.0.atom_table,
+        function_start_cache,
+    )?;
+    let atom_range_cache = cache.as_mut().map(|cache| &mut cache.atom_ranges);
     let data_in_code_bytes = build_data_in_code(
         layout,
         inputs.0.layout_inputs,
         inputs.0.atom_table,
         inputs.0.icf_redirects,
+        atom_range_cache,
     )?;
     timings.metadata_tables += phase_started.elapsed();
 
@@ -1450,12 +1460,24 @@ fn build_function_starts(
     layout: &Layout,
     inputs: &[LayoutInput<'_>],
     atom_table: &AtomTable,
+    cache: Option<&mut Option<FunctionStartSymbolIndex>>,
 ) -> Result<Vec<u8>, WriteError> {
     let image_base = layout
         .segment("__TEXT")
         .ok_or(WriteError::MissingSegment("__TEXT"))?
         .vm_addr;
-    let symbol_offsets = build_function_start_symbol_index(inputs);
+    let transient_symbol_offsets;
+    let symbol_offsets = if let Some(cache) = cache {
+        if cache.is_none() {
+            *cache = Some(build_function_start_symbol_index(inputs));
+        }
+        cache
+            .as_ref()
+            .expect("function-start symbol index is populated")
+    } else {
+        transient_symbol_offsets = build_function_start_symbol_index(inputs);
+        &transient_symbol_offsets
+    };
     let mut starts = Vec::new();
 
     for section in &layout.sections {
@@ -1544,6 +1566,7 @@ fn build_data_in_code(
     inputs: &[LayoutInput<'_>],
     atom_table: &AtomTable,
     icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
+    cache: Option<&mut Option<AtomRangeIndex>>,
 ) -> Result<Vec<u8>, WriteError> {
     #[derive(Clone, Copy)]
     struct RemappedEntry {
@@ -1554,14 +1577,23 @@ fn build_data_in_code(
         kind: u16,
     }
 
-    let atom_ranges = build_atom_range_index(atom_table, icf_redirects);
+    let transient_atom_ranges;
+    let atom_ranges = if let Some(cache) = cache {
+        if cache.is_none() {
+            *cache = Some(build_atom_range_index(atom_table, icf_redirects));
+        }
+        cache.as_ref().expect("atom range index is populated")
+    } else {
+        transient_atom_ranges = build_atom_range_index(atom_table, icf_redirects);
+        &transient_atom_ranges
+    };
     let mut remapped = Vec::new();
     for (input_order, input) in inputs.iter().enumerate() {
         for (input_entry_index, entry) in input.object.data_in_code.iter().copied().enumerate() {
             let (section_index, section_relative) =
                 remap_data_in_code_to_section(input.object, entry)?;
             let (atom_id, atom_delta) = find_containing_atom_range(
-                &atom_ranges,
+                atom_ranges,
                 input.id,
                 section_index,
                 section_relative,
@@ -1736,6 +1768,8 @@ struct SymbolPlanBuildTimings {
 pub struct LinkEditBuildCache {
     local_symbols: Option<CachedLocalSymbols>,
     symbol_strtab: Option<CachedSymbolStrtab>,
+    function_start_symbols: Option<FunctionStartSymbolIndex>,
+    atom_ranges: Option<AtomRangeIndex>,
 }
 
 #[derive(Debug)]
@@ -3148,7 +3182,7 @@ mod tests {
             ],
         };
 
-        let blob = build_function_starts(&layout, &[], &atoms).unwrap();
+        let blob = build_function_starts(&layout, &[], &atoms, None).unwrap();
         assert_eq!(
             decode_function_starts_blob(&blob),
             vec![0x1000, 0x1008, 0x1040]
@@ -3243,7 +3277,7 @@ mod tests {
             }],
         };
 
-        let blob = build_function_starts(&layout, &inputs, &atoms).unwrap();
+        let blob = build_function_starts(&layout, &inputs, &atoms, None).unwrap();
         assert_eq!(
             decode_function_starts_blob(&blob),
             vec![0x1000, 0x1008, 0x1010]

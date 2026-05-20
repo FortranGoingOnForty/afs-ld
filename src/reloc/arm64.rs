@@ -46,7 +46,8 @@ impl std::error::Error for RelocError {}
 struct ResolveView<'a> {
     sym_table: &'a SymbolTable,
     symbol_name_index: &'a HashMap<&'a str, SymbolId>,
-    atom_addrs: &'a HashMap<crate::resolve::AtomId, u64>,
+    input_symbols: &'a InputSymbolIndex,
+    atom_addrs: &'a AtomAddressIndex,
     input_section_atoms: &'a HashMap<(InputId, u8), Vec<InputSectionAtom>>,
     section_addrs: &'a HashMap<(InputId, u8), u64>,
     stub_addrs: &'a HashMap<SymbolId, u64>,
@@ -74,6 +75,111 @@ struct InputSectionAtom {
     end: u32,
 }
 
+struct InputObjectIndex<'a> {
+    objects: Vec<Option<&'a ObjectFile>>,
+}
+
+impl<'a> InputObjectIndex<'a> {
+    fn new(inputs: &'a [LayoutInput<'a>]) -> Self {
+        let max_input = inputs
+            .iter()
+            .map(|input| input.id.0 as usize)
+            .max()
+            .unwrap_or(0);
+        let mut objects = vec![None; max_input + 1];
+        for input in inputs {
+            objects[input.id.0 as usize] = Some(input.object);
+        }
+        Self { objects }
+    }
+
+    fn get(&self, input: InputId) -> Option<&'a ObjectFile> {
+        self.objects.get(input.0 as usize).copied().flatten()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (InputId, &'a ObjectFile)> + '_ {
+        self.objects
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, object)| object.map(|object| (InputId(idx as u32), object)))
+    }
+}
+
+struct AtomAddressIndex {
+    addrs: Vec<u64>,
+    present: Vec<bool>,
+}
+
+impl AtomAddressIndex {
+    fn new(layout: &Layout) -> Self {
+        let max_atom = layout
+            .sections
+            .iter()
+            .flat_map(|section| section.atoms.iter().map(|placed| placed.atom.0 as usize))
+            .max()
+            .unwrap_or(0);
+        let mut addrs = vec![0; max_atom + 1];
+        let mut present = vec![false; max_atom + 1];
+        for section in &layout.sections {
+            for placed in &section.atoms {
+                let idx = placed.atom.0 as usize;
+                addrs[idx] = section.addr + placed.offset;
+                present[idx] = true;
+            }
+        }
+        Self { addrs, present }
+    }
+
+    fn get(&self, atom: crate::resolve::AtomId) -> Option<u64> {
+        let idx = atom.0 as usize;
+        self.present
+            .get(idx)
+            .copied()
+            .filter(|present| *present)
+            .map(|_| self.addrs[idx])
+    }
+}
+
+struct InputSymbolIndex {
+    symbols: Vec<Option<Vec<Option<SymbolId>>>>,
+}
+
+impl InputSymbolIndex {
+    fn new(inputs: &[LayoutInput<'_>], symbol_name_index: &HashMap<&str, SymbolId>) -> Self {
+        let max_input = inputs
+            .iter()
+            .map(|input| input.id.0 as usize)
+            .max()
+            .unwrap_or(0);
+        let mut symbols = vec![None; max_input + 1];
+        for input in inputs {
+            let object_symbols = input
+                .object
+                .symbols
+                .iter()
+                .map(|input_sym| {
+                    input
+                        .object
+                        .symbol_name(input_sym)
+                        .ok()
+                        .and_then(|name| symbol_name_index.get(name).copied())
+                })
+                .collect();
+            symbols[input.id.0 as usize] = Some(object_symbols);
+        }
+        Self { symbols }
+    }
+
+    fn get(&self, input: InputId, symbol_index: u32) -> Option<SymbolId> {
+        self.symbols
+            .get(input.0 as usize)?
+            .as_ref()?
+            .get(symbol_index as usize)
+            .copied()
+            .flatten()
+    }
+}
+
 pub struct ApplyLayoutPlan<'a> {
     pub synthetic_plan: Option<&'a SyntheticPlan>,
     pub thunk_plan: Option<&'a ThunkPlan>,
@@ -91,7 +197,7 @@ struct InputSectionResolveCtx<'a> {
 }
 
 struct RegularRelocContext<'a> {
-    input_map: &'a HashMap<InputId, &'a ObjectFile>,
+    input_map: &'a InputObjectIndex<'a>,
     atoms: &'a AtomTable,
     resolve: &'a ResolveView<'a>,
     thunk_plan: Option<&'a ThunkPlan>,
@@ -221,18 +327,17 @@ pub fn apply_layout(
     sym_table: &SymbolTable,
     plan: ApplyLayoutPlan<'_>,
 ) -> Result<(), RelocError> {
-    let input_map: HashMap<InputId, &ObjectFile> = inputs
-        .iter()
-        .map(|input| (input.id, input.object))
-        .collect();
-    let atom_addrs = atom_address_map(layout);
+    let input_map = InputObjectIndex::new(inputs);
+    let atom_addrs = AtomAddressIndex::new(layout);
     let input_section_atoms = input_section_atom_ranges(atoms);
     let section_addrs = input_section_address_map(layout, atoms);
     let synth_addrs = synthetic_address_maps(layout, plan.synthetic_plan);
     let symbol_name_index = build_symbol_name_index(sym_table);
+    let input_symbols = InputSymbolIndex::new(inputs, &symbol_name_index);
     let resolve = ResolveView {
         sym_table,
         symbol_name_index: &symbol_name_index,
+        input_symbols: &input_symbols,
         atom_addrs: &atom_addrs,
         input_section_atoms: &input_section_atoms,
         section_addrs: &section_addrs,
@@ -318,7 +423,7 @@ fn apply_regular_atom_chunk(
         if atom.size == 0 || placed.data.is_empty() {
             continue;
         }
-        let obj = ctx.input_map.get(&atom.origin).ok_or_else(|| {
+        let obj = ctx.input_map.get(atom.origin).ok_or_else(|| {
             reloc_error(
                 atom,
                 &PathBuf::from("<missing object>"),
@@ -384,7 +489,7 @@ fn patch_eh_frame_cie_pointer(
         .and_then(|ranges| {
             input_section_atom_at_offset(ranges, cie_offset).map(|(atom_id, _)| atom_id)
         })
-        .and_then(|atom_id| resolve.atom_addrs.get(&atom_id).copied())
+        .and_then(|atom_id| resolve.atom_addrs.get(atom_id))
         .ok_or_else(|| {
             reloc_error(
                 atom,
@@ -395,7 +500,7 @@ fn patch_eh_frame_cie_pointer(
                 "eh_frame CIE atom is missing from the final layout".to_string(),
             )
         })?;
-    let fde_field = resolve.atom_addrs.get(&atom.id).copied().ok_or_else(|| {
+    let fde_field = resolve.atom_addrs.get(atom.id).ok_or_else(|| {
         reloc_error(
             atom,
             &PathBuf::from("<eh_frame>"),
@@ -419,16 +524,6 @@ fn relocs_for_atom<'a>(relocs: &'a [Reloc], atom: &Atom) -> impl Iterator<Item =
         let reloc_end = reloc.offset + reloc.length.byte_width() as u32;
         reloc_end <= end
     })
-}
-
-fn atom_address_map(layout: &Layout) -> HashMap<crate::resolve::AtomId, u64> {
-    let mut out = HashMap::new();
-    for section in &layout.sections {
-        for placed in &section.atoms {
-            out.insert(placed.atom, section.addr + placed.offset);
-        }
-    }
-    out
 }
 
 fn input_section_address_map(layout: &Layout, atoms: &AtomTable) -> HashMap<(InputId, u8), u64> {
@@ -607,19 +702,18 @@ pub fn plan_thunks(
         return Ok(None);
     }
 
-    let input_map: HashMap<InputId, &ObjectFile> = inputs
-        .iter()
-        .map(|input| (input.id, input.object))
-        .collect();
-    let atom_addrs = atom_address_map(layout);
+    let input_map = InputObjectIndex::new(inputs);
+    let atom_addrs = AtomAddressIndex::new(layout);
     let atom_segments = atom_output_segment_map(layout);
     let input_section_atoms = input_section_atom_ranges(atoms);
     let section_addrs = input_section_address_map(layout, atoms);
     let synth_addrs = synthetic_address_maps(layout, synthetic_plan);
     let symbol_name_index = build_symbol_name_index(sym_table);
+    let input_symbols = InputSymbolIndex::new(inputs, &symbol_name_index);
     let resolve = ResolveView {
         sym_table,
         symbol_name_index: &symbol_name_index,
+        input_symbols: &input_symbols,
         atom_addrs: &atom_addrs,
         input_section_atoms: &input_section_atoms,
         section_addrs: &section_addrs,
@@ -638,7 +732,7 @@ pub fn plan_thunks(
     let mut islands: Vec<ThunkIsland> = Vec::new();
     let mut entries: Vec<ThunkEntry> = Vec::new();
     for (atom_id, atom) in atoms.iter() {
-        let Some(obj) = input_map.get(&atom.origin) else {
+        let Some(obj) = input_map.get(atom.origin) else {
             continue;
         };
         let relocs = parsed_relocs
@@ -650,7 +744,7 @@ pub fn plan_thunks(
                 continue;
             }
             let local_offset = reloc.offset.saturating_sub(atom.input_offset);
-            let Some(place) = resolve.atom_addrs.get(&atom.id).copied() else {
+            let Some(place) = resolve.atom_addrs.get(atom.id) else {
                 continue;
             };
             let Some(caller_segment) = atom_segments.get(&atom.id).cloned() else {
@@ -732,7 +826,7 @@ fn apply_one(
             "relocation lands before atom start".to_string(),
         )
     })?;
-    let place = resolve.atom_addrs.get(&atom.id).copied().ok_or_else(|| {
+    let place = resolve.atom_addrs.get(atom.id).ok_or_else(|| {
         reloc_error(
             atom,
             &obj.path,
@@ -744,7 +838,7 @@ fn apply_one(
     })? + local_offset as u64;
     match reloc.kind {
         RelocKind::Unsigned => {
-            if dylib_import_symbol_id(obj, reloc.referent, resolve).is_some() {
+            if dylib_import_symbol_id(obj, atom.origin, reloc.referent, resolve).is_some() {
                 if direct_import_bind_supported(reloc) {
                     clear_direct_import_slot(bytes, atom, obj, local_offset, reloc)
                 } else {
@@ -825,19 +919,19 @@ fn apply_one(
             local_offset,
             reloc,
             place,
-            if got_reloc_relaxes_locally(obj, reloc, resolve) {
+            if got_reloc_relaxes_locally(obj, atom, reloc, resolve) {
                 resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)?
             } else {
                 resolve_got_target(obj, atom, reloc, resolve)?
             },
         ),
         RelocKind::GotLoadPageOff12 => {
-            let target = if got_reloc_relaxes_locally(obj, reloc, resolve) {
+            let target = if got_reloc_relaxes_locally(obj, atom, reloc, resolve) {
                 resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)?
             } else {
                 resolve_got_target(obj, atom, reloc, resolve)?
             };
-            if got_reloc_relaxes_locally(obj, reloc, resolve) {
+            if got_reloc_relaxes_locally(obj, atom, reloc, resolve) {
                 patch_got_pageoff12_relaxed(bytes, atom, obj, local_offset, reloc, target)
             } else {
                 patch_pageoff12(bytes, atom, obj, local_offset, reloc, target)
@@ -862,7 +956,7 @@ fn apply_one(
         ),
         RelocKind::TlvpLoadPageOff12 => {
             let target = resolve_tlvp_pageoff_target(obj, atom, reloc, resolve)?;
-            if dylib_import_symbol_id(obj, reloc.referent, resolve).is_some() {
+            if dylib_import_symbol_id(obj, atom.origin, reloc.referent, resolve).is_some() {
                 patch_pageoff12(bytes, atom, obj, local_offset, reloc, target)
             } else {
                 patch_tlvp_pageoff12(bytes, atom, obj, local_offset, reloc, target)
@@ -887,7 +981,7 @@ fn resolve_branch_target_key(
     reloc: Reloc,
     resolve: &ResolveView<'_>,
 ) -> Result<BranchTargetKey, RelocError> {
-    if let Some(symbol_id) = dylib_import_symbol_id(obj, reloc.referent, resolve) {
+    if let Some(symbol_id) = dylib_import_symbol_id(obj, atom.origin, reloc.referent, resolve) {
         return Ok(BranchTargetKey::Stub(symbol_id));
     }
     match reloc.referent {
@@ -907,6 +1001,9 @@ fn resolve_branch_target_key(
                     "symbol index is out of range".to_string(),
                 )
             })?;
+            if let Some(symbol_id) = resolve.input_symbols.get(atom.origin, sym_idx) {
+                return Ok(BranchTargetKey::Symbol(symbol_id));
+            }
             if let Ok(name) = obj.symbol_name(input_sym) {
                 if let Some(symbol_id) = resolve.symbol_name_index.get(name).copied() {
                     return Ok(BranchTargetKey::Symbol(symbol_id));
@@ -974,8 +1071,7 @@ fn resolve_branch_target_from_key(
                 ..
             } => resolve
                 .atom_addrs
-                .get(&canonical_atom(*target_atom, resolve.icf_redirects))
-                .copied()
+                .get(canonical_atom(*target_atom, resolve.icf_redirects))
                 .map(|addr| addr + *value)
                 .ok_or_else(|| {
                     reloc_error(
@@ -1099,8 +1195,7 @@ fn synthesize_thunk_section(
             BranchTargetKey::Symbol(symbol_id) => match resolve.sym_table.get(symbol_id) {
                 Symbol::Defined { atom, value, .. } => resolve
                     .atom_addrs
-                    .get(&canonical_atom(*atom, resolve.icf_redirects))
-                    .copied()
+                    .get(canonical_atom(*atom, resolve.icf_redirects))
                     .map(|addr| addr + *value),
                 _ => None,
             },
@@ -1155,7 +1250,7 @@ fn resolve_got_target(
     reloc: Reloc,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
-    let Some(symbol_id) = symbol_referent_id(obj, reloc.referent, resolve) else {
+    let Some(symbol_id) = symbol_referent_id(obj, atom.origin, reloc.referent, resolve) else {
         return Err(reloc_error(
             atom,
             &obj.path,
@@ -1177,8 +1272,13 @@ fn resolve_got_target(
     })
 }
 
-fn got_reloc_relaxes_locally(obj: &ObjectFile, reloc: Reloc, resolve: &ResolveView<'_>) -> bool {
-    match symbol_referent_id(obj, reloc.referent, resolve) {
+fn got_reloc_relaxes_locally(
+    obj: &ObjectFile,
+    atom: &Atom,
+    reloc: Reloc,
+    resolve: &ResolveView<'_>,
+) -> bool {
+    match symbol_referent_id(obj, atom.origin, reloc.referent, resolve) {
         Some(symbol_id) => match resolve.sym_table.get(symbol_id) {
             Symbol::DylibImport { .. } => false,
             Symbol::Defined { .. } => true,
@@ -1194,7 +1294,7 @@ fn resolve_tlvp_target(
     reloc: Reloc,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
-    if dylib_import_symbol_id(obj, reloc.referent, resolve).is_some() {
+    if dylib_import_symbol_id(obj, atom.origin, reloc.referent, resolve).is_some() {
         return resolve_got_target(obj, atom, reloc, resolve);
     }
     resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)
@@ -1206,7 +1306,7 @@ fn resolve_tlvp_pageoff_target(
     reloc: Reloc,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
-    if dylib_import_symbol_id(obj, reloc.referent, resolve).is_some() {
+    if dylib_import_symbol_id(obj, atom.origin, reloc.referent, resolve).is_some() {
         return resolve_got_target(obj, atom, reloc, resolve);
     }
     resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)
@@ -1258,6 +1358,12 @@ fn resolve_symbol_referent(
         )
     })?;
 
+    if let Some(symbol_id) = resolve.input_symbols.get(atom.origin, sym_idx as u32) {
+        let symbol = resolve.sym_table.get(symbol_id);
+        let name = resolve.sym_table.interner.resolve(symbol.name());
+        return resolve_global_symbol(obj, atom, kind, name, symbol, resolve);
+    }
+
     if let Ok(name) = obj.symbol_name(input_sym) {
         if let Some(symbol_id) = resolve.symbol_name_index.get(name).copied() {
             return resolve_global_symbol(
@@ -1276,21 +1382,26 @@ fn resolve_symbol_referent(
 
 fn dylib_import_symbol_id(
     obj: &ObjectFile,
+    origin: InputId,
     referent: Referent,
     resolve: &ResolveView<'_>,
 ) -> Option<SymbolId> {
-    let symbol_id = symbol_referent_id(obj, referent, resolve)?;
+    let symbol_id = symbol_referent_id(obj, origin, referent, resolve)?;
     matches!(resolve.sym_table.get(symbol_id), Symbol::DylibImport { .. }).then_some(symbol_id)
 }
 
 fn symbol_referent_id(
     obj: &ObjectFile,
+    origin: InputId,
     referent: Referent,
     resolve: &ResolveView<'_>,
 ) -> Option<SymbolId> {
     let Referent::Symbol(sym_idx) = referent else {
         return None;
     };
+    if let Some(symbol_id) = resolve.input_symbols.get(origin, sym_idx) {
+        return Some(symbol_id);
+    }
     let input_sym = obj.symbols.get(sym_idx as usize)?;
     let name = obj.symbol_name(input_sym).ok()?;
     resolve.symbol_name_index.get(name).copied()
@@ -1318,8 +1429,7 @@ fn resolve_global_symbol(
             ..
         } => resolve
             .atom_addrs
-            .get(target_atom)
-            .copied()
+            .get(*target_atom)
             .map(|addr| addr + *value)
             .ok_or_else(|| {
                 reloc_error(
@@ -1425,21 +1535,17 @@ fn resolve_input_section_offset(
     if let Some(ranges) = resolve.input_section_atoms.get(&(origin, input_section)) {
         if let Some((target_atom, delta)) = input_section_atom_at_offset(ranges, input_offset) {
             let target_atom = canonical_atom(target_atom, resolve.icf_redirects);
-            let atom_addr = resolve
-                .atom_addrs
-                .get(&target_atom)
-                .copied()
-                .ok_or_else(|| {
-                    reloc_error(
-                        ctx.atom,
-                        &ctx.obj.path,
-                        0,
-                        ctx.kind,
-                        ctx.referent,
-                        "section-backed symbol's containing atom is missing a final address"
-                            .to_string(),
-                    )
-                })?;
+            let atom_addr = resolve.atom_addrs.get(target_atom).ok_or_else(|| {
+                reloc_error(
+                    ctx.atom,
+                    &ctx.obj.path,
+                    0,
+                    ctx.kind,
+                    ctx.referent,
+                    "section-backed symbol's containing atom is missing a final address"
+                        .to_string(),
+                )
+            })?;
             return Ok(atom_addr + delta as u64);
         }
     }
@@ -1472,8 +1578,7 @@ fn resolve_input_section_offset_simple(
             let target_atom = canonical_atom(target_atom, resolve.icf_redirects);
             return resolve
                 .atom_addrs
-                .get(&target_atom)
-                .copied()
+                .get(target_atom)
                 .map(|addr| addr + delta as u64);
         }
     }
@@ -1939,7 +2044,7 @@ fn synthesize_thread_variable_section(
     layout: &mut Layout,
     plan: &SyntheticPlan,
     atoms: &AtomTable,
-    input_map: &HashMap<InputId, &ObjectFile>,
+    input_map: &InputObjectIndex<'_>,
     reloc_cache: &HashMap<(InputId, u8), Vec<Reloc>>,
     resolve: &ResolveView<'_>,
 ) -> Result<(), RelocError> {
@@ -1971,7 +2076,7 @@ fn synthesize_thread_variable_section(
 
     for placed in &mut section.atoms {
         let atom = atoms.get(placed.atom);
-        let obj = input_map.get(&atom.origin).ok_or_else(|| RelocError {
+        let obj = input_map.get(atom.origin).ok_or_else(|| RelocError {
             input: PathBuf::from("<missing object>"),
             atom: placed.atom,
             atom_offset: 0,
@@ -2048,7 +2153,7 @@ fn resolve_tlv_init_address(
     obj: &ObjectFile,
     relocs: &[Reloc],
     descriptor_offset: u32,
-    input_map: &HashMap<InputId, &ObjectFile>,
+    input_map: &InputObjectIndex<'_>,
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
     for owner in descriptor_owner_symbols(obj, atom, descriptor_offset) {
@@ -2103,10 +2208,10 @@ fn matching_tlv_init_symbol<'a>(
 fn resolve_named_tlv_init(
     owner: &InputSymbol,
     atom: &Atom,
-    input_map: &HashMap<InputId, &ObjectFile>,
+    input_map: &InputObjectIndex<'_>,
     resolve: &ResolveView<'_>,
 ) -> Result<Option<u64>, RelocError> {
-    for (&origin, obj) in input_map {
+    for (origin, obj) in input_map.iter() {
         let Some(init_symbol) = matching_tlv_init_symbol(obj, owner)? else {
             continue;
         };
@@ -2184,8 +2289,7 @@ fn synthesize_got_section(
             } => {
                 resolve
                     .atom_addrs
-                    .get(target_atom)
-                    .copied()
+                    .get(*target_atom)
                     .ok_or_else(|| RelocError {
                         input: PathBuf::from("<synthetic got>"),
                         atom: crate::resolve::AtomId(0),

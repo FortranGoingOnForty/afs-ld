@@ -1214,6 +1214,36 @@ struct SymbolTablePlan {
     dysymtab: DysymtabCmd,
 }
 
+struct InputFileIndex {
+    indexes: Vec<usize>,
+}
+
+impl InputFileIndex {
+    fn new(inputs: &[LayoutInput<'_>]) -> Self {
+        let max_input = inputs
+            .iter()
+            .map(|input| input.id.0 as usize)
+            .max()
+            .unwrap_or(0);
+        let mut indexes = vec![0; max_input + 1];
+        for (idx, input) in inputs.iter().enumerate() {
+            indexes[input.id.0 as usize] = idx + 1;
+        }
+        Self { indexes }
+    }
+
+    fn get(&self, input: InputId) -> Option<usize> {
+        self.indexes
+            .get(input.0 as usize)
+            .copied()
+            .filter(|index| *index != 0)
+    }
+
+    fn get_or_zero(&self, input: InputId) -> usize {
+        self.get(input).unwrap_or(0)
+    }
+}
+
 struct BindStreams {
     bind: Vec<u8>,
     weak_bind: Vec<u8>,
@@ -1820,13 +1850,7 @@ fn build_output_symbols_profiled<'a>(
     };
     let sym_table = inputs.0.sym_table;
     let atom_outputs = AtomOutputIndex::new(layout);
-    let file_index_by_input: HashMap<InputId, usize> = inputs
-        .0
-        .layout_inputs
-        .iter()
-        .enumerate()
-        .map(|(idx, input)| (input.id, idx + 1))
-        .collect();
+    let file_index_by_input = InputFileIndex::new(inputs.0.layout_inputs);
     let image_base = layout.segment("__TEXT").map(|seg| seg.vm_addr).unwrap_or(0);
     let mut timings = SymbolPlanBuildTimings::default();
     let mut locals = Vec::new();
@@ -1949,7 +1973,7 @@ fn build_output_symbols_profiled<'a>(
             n_desc,
             n_value,
             size,
-            file_index: file_index_by_input.get(origin).copied().unwrap_or(0),
+            file_index: file_index_by_input.get_or_zero(*origin),
         });
     }
 
@@ -2167,7 +2191,7 @@ fn collect_synthetic_local_symbols<'a>(
 
 fn cached_local_symbols<'cache>(
     inputs: LinkEditInputs<'_>,
-    file_index_by_input: &HashMap<InputId, usize>,
+    file_index_by_input: &InputFileIndex,
     cache: &'cache mut Option<CachedLocalSymbols>,
 ) -> Result<&'cache [CachedLocalSymbol], WriteError> {
     if cache.is_none() {
@@ -2238,7 +2262,7 @@ fn collect_cached_local_symbols<'a>(
 
 fn build_local_symbol_records(
     inputs: LinkEditInputs<'_>,
-    file_index_by_input: &HashMap<InputId, usize>,
+    file_index_by_input: &InputFileIndex,
 ) -> Result<CachedLocalSymbols, WriteError> {
     let atom_ranges = build_atom_range_index(inputs.0.atom_table, inputs.0.icf_redirects);
     let mut entries = Vec::new();
@@ -2247,7 +2271,9 @@ fn build_local_symbol_records(
             atom_table: inputs.0.atom_table,
             atom_ranges: &atom_ranges,
             input_id: input.id,
-            file_index: file_index_by_input[&input.id],
+            file_index: file_index_by_input
+                .get(input.id)
+                .expect("layout input should have a file index"),
         };
         collect_local_symbol_records(&ctx, input.object, &mut entries)?;
     }

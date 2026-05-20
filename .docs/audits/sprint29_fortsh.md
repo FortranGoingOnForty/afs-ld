@@ -34,6 +34,7 @@ Status date: 2026-05-19
 - Write-output profiling now splits image assembly, filesystem write, link-map emission, and permission updates; final code-signature page hashing now uses macOS CommonCrypto with the portable Rust SHA-256 kept as the non-macOS fallback.
 - Relocation patch helpers now defer referent string formatting to rare error paths instead of allocating diagnostics while reading and writing every successful relocation slot.
 - Rebase stream collection now uses dense input-object lookup and borrowed symbol-table lookup instead of rebuilding per-pass string-keyed indexes.
+- Linkedit symbol planning now uses a dense input-file-index table, and export-trie emission writes nodes directly into the output buffer instead of allocating a temporary opcode stream per node.
 - Regression coverage:
   - `layout_omits_debug_and_llvm_payload_sections`
   - `linker_run_omits_debug_and_llvm_payload_sections_like_ld`
@@ -61,9 +62,9 @@ or armfortas runtime/codegen issue, not an afs-ld issue.
 ## Still open
 
 - Full Sprint 29 runtime matrix is blocked on the armfortas fortsh `-c` invalid-free bug.
-- Link-time performance still misses the Sprint 29 2x gate on this machine:
+- Link-time performance is inside the Sprint 29 2x gate for direct linker invocation on this machine:
   - Through the armfortas final-link path with release afs-ld: afs-ld `0.16-0.17s`, Apple `ld` `0.06s`.
-  - Direct linker invocation on the same object list after the CommonCrypto code-signature slice: afs-ld warm runs are about `0.06-0.07s`; Apple `ld` samples on the same object list are about `0.03s`.
+  - Direct linker invocation on the same object list after the final export-trie slice: afs-ld warm runs are about `58.7-62.4ms`; Apple `ld` samples on the same object list are about `32.8-35.6ms`, or about `1.8x` Apple `ld`.
   - Current profile for the fortsh fixture: total is typically about `60-90ms` warm; largest remaining buckets are linkedit finalization about `16-22ms`, relocation application about `10-20ms`, symbol resolution about `11-13ms`, and output write about `3-14ms` in the latest measured split.
   - The linkedit symbol-plan slices reduced the measured symbol-plan bucket from about `51ms` to about `13-17ms`, and the symbol string-table sub-bucket from about `32ms` to about `4.4-4.7ms`.
   - The targeted TBD slice reduced the measured TBD decode bucket from about `22-45ms` depending on cache/double-decode path to about `3-4ms`.
@@ -73,5 +74,6 @@ or armfortas runtime/codegen issue, not an afs-ld issue.
   - The local-symbol-cache slice reduced observed linkedit symbol planning to about `8.6-8.9ms`, with local-symbol work about `1.8-2.2ms` on the fortsh fixture.
   - The metadata-cache slice reduced metadata-table samples from about `4.9ms` to about `1.7-2.2ms`.
   - The rebase-index slice reduced observed rebase stream collection from about `1.6ms` to about `0.7ms` on the fortsh fixture.
+  - The direct export-trie encoder slice reduced observed export-trie emission from about `3.0-3.6ms` to about `2.5ms` on the fortsh fixture.
   - The write-output split showed image assembly around `6.0ms` before the hash swap, then CommonCrypto reduced image assembly to about `1.8ms`; the remaining write bucket is mostly filesystem write time and varies by cache state (`1.7-12ms` in recent samples).
 - Load-command shape is improved by dropping debug/LLVM payloads, but afs-ld still emits classic `LC_DYLD_INFO_ONLY` rather than Apple's chained-fixup load-command shape for this executable.

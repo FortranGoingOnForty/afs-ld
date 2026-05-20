@@ -193,16 +193,14 @@ fn trie_node_size(node: &FlatTrieNode, offsets: &[usize]) -> usize {
 }
 
 fn emit_trie_node(node: &FlatTrieNode, offsets: &[usize], out: &mut Vec<u8>) {
-    let mut stream = OpcodeStream::new();
-    stream.uleb(node.terminal_payload.len() as u64);
-    stream.bytes(&node.terminal_payload);
-    stream
-        .byte(u8::try_from(node.children.len()).expect("export trie node fanout should fit in u8"));
+    write_uleb(node.terminal_payload.len() as u64, out);
+    out.extend_from_slice(&node.terminal_payload);
+    out.push(u8::try_from(node.children.len()).expect("export trie node fanout should fit in u8"));
     for (edge, child) in &node.children {
-        stream.string(edge);
-        stream.uleb(offsets[*child] as u64);
+        out.extend_from_slice(edge.as_bytes());
+        out.push(0);
+        write_uleb(offsets[*child] as u64, out);
     }
-    out.extend_from_slice(&stream.into_vec());
 }
 
 fn terminal_payload(entry: Option<&ExportEntry>) -> Vec<u8> {

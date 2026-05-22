@@ -52,6 +52,7 @@ Options:
   --dump-dylib <path>             Dump a dylib summary
   --dump-tbd <path>               Dump a TBD summary
   -t, -trace                      Print input paths as they are loaded
+  --color=<auto|always|never>     Control ANSI diagnostic color (default: auto)
   -h, --help                      Show this help
   -v, --version                   Show afs-ld version
 "
@@ -70,6 +71,7 @@ fn version() -> String {
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
+    diag::configure_from_argv(&argv[1..]);
 
     let opts = match args::parse(&argv[1..]) {
         Ok(opts) => opts,
@@ -78,6 +80,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    diag::set_color_mode(opts.color);
 
     if opts.show_help {
         print!("{}", usage());

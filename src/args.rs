@@ -8,7 +8,8 @@ use std::path::PathBuf;
 
 use crate::resolve::{levenshtein, UndefinedTreatment};
 use crate::{
-    FixupChainsMode, FrameworkSpec, IcfMode, LinkOptions, OutputKind, PlatformVersion, ThunkMode,
+    ColorMode, FixupChainsMode, FrameworkSpec, IcfMode, LinkOptions, OutputKind, PlatformVersion,
+    ThunkMode,
 };
 
 const KNOWN_FLAGS: &[&str] = &[
@@ -53,6 +54,10 @@ const KNOWN_FLAGS: &[&str] = &[
     "--version",
     "-h",
     "--help",
+    "--color",
+    "--color=auto",
+    "--color=always",
+    "--color=never",
     "-x",
     "-dylib",
     "-all_load",
@@ -180,6 +185,19 @@ fn parse_jobs(value: &str) -> Result<usize, ArgsError> {
         });
     }
     Ok(jobs)
+}
+
+fn parse_color_mode(flag: &str, value: &str) -> Result<ColorMode, ArgsError> {
+    match value {
+        "auto" => Ok(ColorMode::Auto),
+        "always" => Ok(ColorMode::Always),
+        "never" => Ok(ColorMode::Never),
+        _ => Err(ArgsError::InvalidValue {
+            flag: flag.to_string(),
+            value: value.to_string(),
+            expected: "`auto`, `always`, or `never`".into(),
+        }),
+    }
 }
 
 pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
@@ -425,6 +443,16 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
             }
             "-h" | "--help" => {
                 opts.show_help = true;
+            }
+            "--color" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| ArgsError::MissingValue("--color".into()))?;
+                opts.color = parse_color_mode("--color", value)?;
+            }
+            s if s.starts_with("--color=") => {
+                let value = s.trim_start_matches("--color=");
+                opts.color = parse_color_mode("--color", value)?;
             }
             "-x" => {
                 opts.strip_locals = true;
@@ -826,6 +854,28 @@ mod tests {
         assert!(opts.show_version);
         let opts = parse(&argv(&["-v"])).unwrap();
         assert!(opts.show_version);
+    }
+
+    #[test]
+    fn color_flag_records_mode() {
+        let opts = parse(&argv(&["--color=never", "main.o"])).unwrap();
+        assert_eq!(opts.color, ColorMode::Never);
+
+        let opts = parse(&argv(&["--color", "always", "main.o"])).unwrap();
+        assert_eq!(opts.color, ColorMode::Always);
+    }
+
+    #[test]
+    fn color_flag_rejects_unknown_mode() {
+        let err = parse(&argv(&["--color=sometimes"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::InvalidValue {
+                ref flag,
+                ref value,
+                ..
+            } if flag == "--color" && value == "sometimes"
+        ));
     }
 
     #[test]

@@ -91,6 +91,13 @@ pub enum FixupChainsMode {
     Chained,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    Auto,
+    Always,
+    Never,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameworkSpec {
     pub name: String,
@@ -134,6 +141,7 @@ pub struct LinkOptions {
     pub icf_mode: IcfMode,
     pub thunks: ThunkMode,
     pub fixup_chains: FixupChainsMode,
+    pub color: ColorMode,
     pub all_load: bool,
     pub force_load_archives: Vec<PathBuf>,
     pub jobs: Option<usize>,
@@ -186,6 +194,7 @@ impl Default for LinkOptions {
             icf_mode: IcfMode::None,
             thunks: ThunkMode::Safe,
             fixup_chains: FixupChainsMode::Auto,
+            color: ColorMode::Auto,
             all_load: false,
             force_load_archives: Vec::new(),
             jobs: None,

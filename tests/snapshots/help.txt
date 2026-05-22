@@ -46,5 +46,6 @@ Options:
   --dump-dylib <path>             Dump a dylib summary
   --dump-tbd <path>               Dump a TBD summary
   -t, -trace                      Print input paths as they are loaded
+  --color=<auto|always|never>     Control ANSI diagnostic color (default: auto)
   -h, --help                      Show this help
   -v, --version                   Show afs-ld version

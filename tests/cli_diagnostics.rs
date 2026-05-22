@@ -204,6 +204,65 @@ fn mistyped_arch_suggests_arm64_and_exits_as_cli_misuse() {
 }
 
 #[test]
+fn color_always_colors_parse_errors() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let out = Command::new(exe)
+        .env_remove("NO_COLOR")
+        .args(["--color=always", "-all_lod"])
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(out.status.code(), Some(2), "bad flag is CLI misuse");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("\x1b[31mafs-ld: error:\x1b[0m"),
+        "expected colored error prefix:\n{stderr:?}"
+    );
+    assert!(
+        stderr.contains("did you mean `-all_load`?"),
+        "missing did-you-mean diagnostic:\n{stderr}"
+    );
+}
+
+#[test]
+fn color_never_suppresses_parse_error_color() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let out = Command::new(exe)
+        .args(["--color=never", "-all_lod"])
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(out.status.code(), Some(2), "bad flag is CLI misuse");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("\x1b["),
+        "expected --color=never to suppress ANSI escapes:\n{stderr:?}"
+    );
+    assert!(
+        stderr.contains("afs-ld: error: unknown flag `-all_lod`"),
+        "missing plain error prefix:\n{stderr}"
+    );
+}
+
+#[test]
+fn no_color_env_suppresses_forced_color() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let out = Command::new(exe)
+        .env("NO_COLOR", "1")
+        .args(["--color=always", "-all_lod"])
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(out.status.code(), Some(2), "bad flag is CLI misuse");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("\x1b["),
+        "expected NO_COLOR to suppress ANSI escapes:\n{stderr:?}"
+    );
+    assert!(
+        stderr.contains("afs-ld: error: unknown flag `-all_lod`"),
+        "missing plain error prefix:\n{stderr}"
+    );
+}
+
+#[test]
 fn missing_library_suggests_near_match() {
     let exe = env!("CARGO_BIN_EXE_afs-ld");
     let dir = scratch("library-suggestion-dir");

@@ -57,6 +57,17 @@ Options:
 "
 }
 
+fn version() -> String {
+    format!(
+        "afs-ld {}\n\
+         Bespoke ARM64 Mach-O linker for armfortas\n\
+         Target: arm64-apple-macos\n\
+         Commit: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        env!("AFS_LD_COMMIT")
+    )
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
 
@@ -74,7 +85,7 @@ fn main() -> ExitCode {
     }
 
     if opts.show_version {
-        println!("afs-ld {}", env!("CARGO_PKG_VERSION"));
+        print!("{}", version());
         return ExitCode::SUCCESS;
     }
 

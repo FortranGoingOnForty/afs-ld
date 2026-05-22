@@ -166,10 +166,22 @@ fn version_flag_prints_version_and_exits_successfully() {
         .expect("afs-ld should run");
     assert!(out.status.success(), "version should succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(
-        stdout.trim(),
-        format!("afs-ld {}", env!("CARGO_PKG_VERSION"))
+    let expected_prefix = format!(
+        "afs-ld {}\n\
+         Bespoke ARM64 Mach-O linker for armfortas\n\
+         Target: arm64-apple-macos\n\
+         Commit: ",
+        env!("CARGO_PKG_VERSION")
     );
+    assert!(
+        stdout.starts_with(&expected_prefix),
+        "unexpected version output:\n{stdout}"
+    );
+    let commit = stdout
+        .strip_prefix(&expected_prefix)
+        .and_then(|rest| rest.strip_suffix('\n'))
+        .expect("commit line");
+    assert!(!commit.is_empty(), "commit hash should not be empty");
 }
 
 #[test]

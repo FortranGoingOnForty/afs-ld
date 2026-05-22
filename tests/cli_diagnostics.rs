@@ -173,6 +173,91 @@ fn version_flag_prints_version_and_exits_successfully() {
 }
 
 #[test]
+fn mistyped_arch_suggests_arm64_and_exits_as_cli_misuse() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let out = Command::new(exe)
+        .args(["-arch", "arm86"])
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(out.status.code(), Some(2), "bad -arch is CLI misuse");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("flag `-arch` got invalid value `arm86` (expected `arm64`)"),
+        "missing invalid-arch diagnostic:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("did you mean `arm64`?"),
+        "missing arm64 suggestion:\n{stderr}"
+    );
+}
+
+#[test]
+fn missing_library_suggests_near_match() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let dir = scratch("library-suggestion-dir");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create library suggestion dir");
+    fs::write(dir.join("libfoozle.a"), b"!<arch>\n").expect("write placeholder library");
+
+    let out = Command::new(exe)
+        .arg("-L")
+        .arg(&dir)
+        .arg("-lfoozl")
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "missing library is a link failure"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unable to find library `foozl`"),
+        "missing library diagnostic:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("did you mean `-lfoozle`?"),
+        "missing library suggestion:\n{stderr}"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn missing_framework_suggests_case_near_match() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let sdk = scratch("framework-suggestion-sdk");
+    let frameworks = sdk.join("System/Library/Frameworks");
+    let framework = frameworks.join("Quartz.framework");
+    let _ = fs::remove_dir_all(&sdk);
+    fs::create_dir_all(&framework).expect("create framework suggestion dir");
+    fs::write(framework.join("Quartz.tbd"), b"--- !tapi-tbd\n").expect("write placeholder tbd");
+
+    let out = Command::new(exe)
+        .arg("-syslibroot")
+        .arg(&sdk)
+        .args(["-framework", "Qurtz"])
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "missing framework is a link failure"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unable to find framework `Qurtz`"),
+        "missing framework diagnostic:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("did you mean `-framework Quartz`?"),
+        "missing framework suggestion:\n{stderr}"
+    );
+
+    let _ = fs::remove_dir_all(sdk);
+}
+
+#[test]
 fn no_uuid_flag_omits_uuid_load_command() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun as unavailable");

@@ -74,6 +74,12 @@ pub enum ArgsError {
         value: String,
         expected: String,
     },
+    /// `-arch` currently supports only arm64, but near misses should be
+    /// diagnosed at parse time with the same did-you-mean surface as flags.
+    InvalidArch {
+        value: String,
+        suggestion: Option<String>,
+    },
     /// An unrecognized flag.
     UnknownFlag {
         flag: String,
@@ -97,12 +103,22 @@ impl std::fmt::Display for ArgsError {
                     "flag `{flag}` got invalid value `{value}` (expected {expected})"
                 )
             }
+            ArgsError::InvalidArch { value, suggestion } => {
+                write!(
+                    f,
+                    "flag `-arch` got invalid value `{value}` (expected `arm64`)"
+                )?;
+                if let Some(suggestion) = suggestion {
+                    write!(f, " (did you mean `{suggestion}`?)")?;
+                }
+                Ok(())
+            }
             ArgsError::UnknownFlag { flag, suggestion } => {
                 write!(f, "unknown flag `{flag}`")?;
                 if let Some(suggestion) = suggestion {
                     write!(f, " (did you mean `{suggestion}`?)")?;
                 }
-                write!(f, " (Sprint 19 adds the full `ld` surface)")
+                Ok(())
             }
         }
     }
@@ -119,6 +135,10 @@ fn unknown_flag(flag: &str) -> ArgsError {
         flag: flag.to_string(),
         suggestion,
     }
+}
+
+fn arch_suggestion(value: &str) -> Option<String> {
+    (levenshtein(value, "arm64") <= 3).then(|| "arm64".to_string())
 }
 
 fn parse_version_component(flag: &str, value: &str) -> Result<u32, ArgsError> {
@@ -182,11 +202,16 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                 );
             }
             "-arch" => {
-                opts.arch = Some(
-                    it.next()
-                        .ok_or_else(|| ArgsError::MissingValue("-arch".into()))?
-                        .clone(),
-                );
+                let arch = it
+                    .next()
+                    .ok_or_else(|| ArgsError::MissingValue("-arch".into()))?;
+                if arch != "arm64" {
+                    return Err(ArgsError::InvalidArch {
+                        value: arch.clone(),
+                        suggestion: arch_suggestion(arch),
+                    });
+                }
+                opts.arch = Some(arch.clone());
             }
             "-l" => {
                 opts.library_names.push(
@@ -493,6 +518,21 @@ mod tests {
     fn dylib_flag_switches_output_kind() {
         let opts = parse(&argv(&["-dylib", "foo.o"])).unwrap();
         assert_eq!(opts.kind, OutputKind::Dylib);
+    }
+
+    #[test]
+    fn arch_flag_accepts_arm64_only() {
+        let opts = parse(&argv(&["-arch", "arm64", "foo.o"])).unwrap();
+        assert_eq!(opts.arch.as_deref(), Some("arm64"));
+
+        let err = parse(&argv(&["-arch", "arm86", "foo.o"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::InvalidArch {
+                ref value,
+                suggestion: Some(ref suggestion)
+            } if value == "arm86" && suggestion == "arm64"
+        ));
     }
 
     #[test]

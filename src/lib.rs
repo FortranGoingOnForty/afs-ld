@@ -49,8 +49,8 @@ use reloc::arm64::RelocError;
 use resolve::{
     classify_unresolved, drain_fetches, find_archive_by_path, force_load_all, force_load_archive,
     format_duplicate_diagnostic, format_undefined_diagnostic, format_undefined_warning_diagnostic,
-    seed_all, seed_dylib, DrainReport, DylibLoadMeta, InputAddError, InputId, Inputs, SeedReport,
-    Symbol, SymbolTable, UndefinedTreatment,
+    levenshtein, seed_all, seed_dylib, DrainReport, DylibLoadMeta, InputAddError, InputId, Inputs,
+    SeedReport, Symbol, SymbolTable, UndefinedTreatment,
 };
 use symbol::SymKind;
 
@@ -241,8 +241,14 @@ pub enum LinkError {
     NoTbdDocument(PathBuf),
     EntrySymbolNotFound(String),
     ForceLoadNotArchive(PathBuf),
-    LibraryNotFound(String),
-    FrameworkNotFound(String),
+    LibraryNotFound {
+        name: String,
+        suggestion: Option<String>,
+    },
+    FrameworkNotFound {
+        name: String,
+        suggestion: Option<String>,
+    },
     ThunkPlanningDidNotConverge,
     WhyLive(String),
     UnsupportedOption(String),
@@ -356,7 +362,11 @@ impl std::fmt::Display for LinkError {
                 write!(f, "{msg}")
             }
             LinkError::UnsupportedArch(arch) => {
-                write!(f, "unsupported arch `{arch}` (afs-ld requires arm64)")
+                write!(f, "unsupported arch `{arch}` (afs-ld requires arm64)")?;
+                if let Some(suggestion) = arch_suggestion(arch) {
+                    write!(f, " (did you mean `{suggestion}`?)")?;
+                }
+                Ok(())
             }
             LinkError::NoTbdDocument(path) => {
                 write!(f, "{}: no arm64-macos TBD document found", path.display())
@@ -371,11 +381,19 @@ impl std::fmt::Display for LinkError {
                     path.display()
                 )
             }
-            LinkError::LibraryNotFound(name) => {
-                write!(f, "unable to find library `{name}`")
+            LinkError::LibraryNotFound { name, suggestion } => {
+                write!(f, "unable to find library `{name}`")?;
+                if let Some(suggestion) = suggestion {
+                    write!(f, " (did you mean `-l{suggestion}`?)")?;
+                }
+                Ok(())
             }
-            LinkError::FrameworkNotFound(name) => {
-                write!(f, "unable to find framework `{name}`")
+            LinkError::FrameworkNotFound { name, suggestion } => {
+                write!(f, "unable to find framework `{name}`")?;
+                if let Some(suggestion) = suggestion {
+                    write!(f, " (did you mean `-framework {suggestion}`?)")?;
+                }
+                Ok(())
             }
             LinkError::ThunkPlanningDidNotConverge => {
                 write!(f, "thunk planning did not converge")
@@ -995,6 +1013,27 @@ impl Linker {
 }
 
 fn resolve_library_input(opts: &LinkOptions, name: &str) -> Result<PathBuf, LinkError> {
+    let search_dirs = library_search_dirs(opts);
+    let candidates = [
+        format!("lib{name}.tbd"),
+        format!("lib{name}.dylib"),
+        format!("lib{name}.a"),
+    ];
+    for dir in &search_dirs {
+        for candidate in &candidates {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+    }
+    Err(LinkError::LibraryNotFound {
+        name: name.to_string(),
+        suggestion: library_suggestion(&search_dirs, name),
+    })
+}
+
+fn library_search_dirs(opts: &LinkOptions) -> Vec<PathBuf> {
     let mut search_dirs = Vec::new();
     for dir in &opts.search_paths {
         search_dirs.push(dir.clone());
@@ -1009,34 +1048,40 @@ fn resolve_library_input(opts: &LinkOptions, name: &str) -> Result<PathBuf, Link
     } else {
         search_dirs.push(PathBuf::from("/usr/lib"));
     }
+    search_dirs
+}
 
-    let candidates = [
-        format!("lib{name}.tbd"),
-        format!("lib{name}.dylib"),
-        format!("lib{name}.a"),
-    ];
+fn library_suggestion(search_dirs: &[PathBuf], requested: &str) -> Option<String> {
+    let mut available = Vec::new();
     for dir in search_dirs {
-        for candidate in &candidates {
-            let path = dir.join(candidate);
-            if path.is_file() {
-                return Ok(path);
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(filename) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if let Some(name) = parse_library_filename(&filename) {
+                available.push(name);
             }
         }
     }
-    Err(LinkError::LibraryNotFound(name.to_string()))
+    best_suggestion(requested, available.into_iter())
+}
+
+fn parse_library_filename(filename: &str) -> Option<String> {
+    let stem = filename.strip_prefix("lib")?;
+    for suffix in [".tbd", ".dylib", ".a"] {
+        if let Some(name) = stem.strip_suffix(suffix) {
+            return (!name.is_empty()).then(|| name.to_string());
+        }
+    }
+    None
 }
 
 fn resolve_framework_input(opts: &LinkOptions, name: &str) -> Result<PathBuf, LinkError> {
-    let mut roots = Vec::new();
-    if let Some(root) = &opts.syslibroot {
-        roots.push(root.join("System/Library/Frameworks"));
-        roots.push(root.join("Library/Frameworks"));
-    } else {
-        roots.push(PathBuf::from("/System/Library/Frameworks"));
-        roots.push(PathBuf::from("/Library/Frameworks"));
-    }
-
-    for root in roots {
+    let roots = framework_search_roots(opts);
+    for root in &roots {
         let framework_dir = root.join(format!("{name}.framework"));
         for candidate in [
             framework_dir.join(format!("{name}.tbd")),
@@ -1048,7 +1093,62 @@ fn resolve_framework_input(opts: &LinkOptions, name: &str) -> Result<PathBuf, Li
         }
     }
 
-    Err(LinkError::FrameworkNotFound(name.to_string()))
+    Err(LinkError::FrameworkNotFound {
+        name: name.to_string(),
+        suggestion: framework_suggestion(&roots, name),
+    })
+}
+
+fn framework_search_roots(opts: &LinkOptions) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(root) = &opts.syslibroot {
+        roots.push(root.join("System/Library/Frameworks"));
+        roots.push(root.join("Library/Frameworks"));
+    } else {
+        roots.push(PathBuf::from("/System/Library/Frameworks"));
+        roots.push(PathBuf::from("/Library/Frameworks"));
+    }
+    roots
+}
+
+fn framework_suggestion(roots: &[PathBuf], requested: &str) -> Option<String> {
+    let mut available = Vec::new();
+    for root in roots {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(filename) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if let Some(name) = filename.strip_suffix(".framework") {
+                available.push(name.to_string());
+            }
+        }
+    }
+    best_suggestion(requested, available.into_iter())
+}
+
+fn best_suggestion(requested: &str, candidates: impl Iterator<Item = String>) -> Option<String> {
+    let requested_lower = requested.to_ascii_lowercase();
+    candidates
+        .filter(|candidate| candidate != requested)
+        .map(|candidate| {
+            let distance = levenshtein(&requested_lower, &candidate.to_ascii_lowercase());
+            (distance, candidate)
+        })
+        .filter(|(distance, _)| *distance <= 3)
+        .min_by(|(lhs_distance, lhs), (rhs_distance, rhs)| {
+            lhs_distance
+                .cmp(rhs_distance)
+                .then_with(|| lhs.len().cmp(&rhs.len()))
+                .then_with(|| lhs.cmp(rhs))
+        })
+        .map(|(_, candidate)| candidate)
+}
+
+fn arch_suggestion(value: &str) -> Option<String> {
+    (levenshtein(value, "arm64") <= 3).then(|| "arm64".to_string())
 }
 
 fn default_output_path(opts: &LinkOptions) -> PathBuf {

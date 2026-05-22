@@ -2290,19 +2290,24 @@ fn synthesize_stub_section(
         let start = idx * STUB_SIZE as usize;
         let end = start + STUB_SIZE as usize;
         let stub_addr = section.addr + (idx as u64) * STUB_SIZE as u64;
-        let lazy_addr = resolve
-            .lazy_pointer_addrs
-            .get(&entry.symbol)
-            .copied()
-            .ok_or_else(|| RelocError {
-                input: PathBuf::from("<synthetic stubs>"),
-                atom: crate::resolve::AtomId(0),
-                atom_offset: start as u32,
-                kind: RelocKind::Branch26,
-                referent: format!("symbol {:?}", entry.symbol),
-                detail: "synthetic stub is missing lazy pointer target".to_string(),
-            })?;
-        let bytes = encode_stub(stub_addr, lazy_addr)?;
+        let pointer_addr = if plan.chained_fixups {
+            resolve.got_addrs.get(&entry.symbol).copied()
+        } else {
+            resolve.lazy_pointer_addrs.get(&entry.symbol).copied()
+        }
+        .ok_or_else(|| RelocError {
+            input: PathBuf::from("<synthetic stubs>"),
+            atom: crate::resolve::AtomId(0),
+            atom_offset: start as u32,
+            kind: RelocKind::Branch26,
+            referent: format!("symbol {:?}", entry.symbol),
+            detail: if plan.chained_fixups {
+                "synthetic stub is missing GOT bind target".to_string()
+            } else {
+                "synthetic stub is missing lazy pointer target".to_string()
+            },
+        })?;
+        let bytes = encode_stub(stub_addr, pointer_addr)?;
         section.synthetic_data[start..end].copy_from_slice(&bytes);
     }
 
@@ -2314,6 +2319,10 @@ fn synthesize_lazy_pointer_section(
     plan: &SyntheticPlan,
     resolve: &ResolveView<'_>,
 ) -> Result<(), RelocError> {
+    if plan.chained_fixups {
+        return Ok(());
+    }
+
     let Some(section) = layout
         .sections
         .iter_mut()

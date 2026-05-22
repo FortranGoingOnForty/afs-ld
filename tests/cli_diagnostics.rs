@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use afs_ld::macho::constants::LC_UUID;
+use afs_ld::macho::constants::{LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_UUID};
 use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand};
 
 const EXPECTED_HELP: &str = include_str!("snapshots/help.txt");
@@ -563,12 +563,52 @@ fn icf_all_flag_errors_loudly() {
 }
 
 #[test]
-fn fixup_chains_flag_errors_loudly() {
-    assert_flag_errors(
-        "-fixup_chains",
-        "`-fixup_chains` is not yet supported",
-        "fixup-chains",
+fn fixup_chains_flag_emits_chained_load_commands() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = match assemble_minimal_main("fixup-chains.o") {
+        Ok(obj) => obj,
+        Err(e) => {
+            eprintln!("skipping: assemble failed: {e}");
+            return;
+        }
+    };
+    let out_path = scratch("fixup-chains.out");
+    let out = Command::new(exe)
+        .arg("-fixup_chains")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        out.status.success(),
+        "-fixup_chains link should succeed:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
+
+    let bytes = fs::read(&out_path).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
+    assert!(commands
+        .iter()
+        .any(|cmd| matches!(cmd, LoadCommand::DyldChainedFixups(_))));
+    assert!(commands
+        .iter()
+        .any(|cmd| matches!(cmd, LoadCommand::DyldExportsTrie(_))));
+    assert!(!commands
+        .iter()
+        .any(|cmd| matches!(cmd, LoadCommand::DyldInfoOnly(_))));
+
+    let command_ids: Vec<u32> = commands.iter().map(LoadCommand::cmd).collect();
+    assert!(command_ids.contains(&LC_DYLD_CHAINED_FIXUPS));
+    assert!(command_ids.contains(&LC_DYLD_EXPORTS_TRIE));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
 }
 
 #[test]

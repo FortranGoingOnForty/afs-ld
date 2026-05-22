@@ -1,3 +1,4 @@
+pub mod chained_fixups;
 pub mod code_sig;
 pub mod dyld_info;
 pub mod got;
@@ -43,6 +44,7 @@ pub struct SyntheticPlan {
     pub binder_symbol: Option<SymbolId>,
     pub tlv_bootstrap_symbol: Option<SymbolId>,
     pub needs_dyld_private: bool,
+    pub chained_fixups: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +53,11 @@ pub struct DirectBind {
     pub atom_offset: u32,
     pub symbol: SymbolId,
     pub addend: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyntheticPlanOptions {
+    pub chained_fixups: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +113,26 @@ impl SyntheticPlan {
         dylibs: &[DylibInput],
         live_atoms: Option<&HashSet<AtomId>>,
         parsed_relocs: &ParsedRelocCache,
+    ) -> Result<Self, SynthError> {
+        Self::build_filtered_with_relocs_and_options(
+            inputs,
+            atoms,
+            sym_table,
+            dylibs,
+            live_atoms,
+            parsed_relocs,
+            SyntheticPlanOptions::default(),
+        )
+    }
+
+    pub fn build_filtered_with_relocs_and_options(
+        inputs: &[LayoutInput<'_>],
+        atoms: &AtomTable,
+        sym_table: &mut SymbolTable,
+        dylibs: &[DylibInput],
+        live_atoms: Option<&HashSet<AtomId>>,
+        parsed_relocs: &ParsedRelocCache,
+        options: SyntheticPlanOptions,
     ) -> Result<Self, SynthError> {
         let input_map: HashMap<InputId, &ObjectFile> = inputs
             .iter()
@@ -203,11 +230,15 @@ impl SyntheticPlan {
                             _ => continue,
                         };
                         stubs.intern(symbol_id, dylib, dylib_import_is_weak(sym_table, symbol_id));
-                        lazy_pointers.intern(
-                            symbol_id,
-                            dylib,
-                            dylib_import_is_weak(sym_table, symbol_id),
-                        );
+                        if options.chained_fixups {
+                            got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
+                        } else {
+                            lazy_pointers.intern(
+                                symbol_id,
+                                dylib,
+                                dylib_import_is_weak(sym_table, symbol_id),
+                            );
+                        }
                     }
                     RelocKind::TlvpLoadPage21 | RelocKind::TlvpLoadPageOff12 => {
                         if let Some(symbol_id) =
@@ -253,7 +284,7 @@ impl SyntheticPlan {
         let mut binder_symbol = None;
         let mut tlv_bootstrap_symbol = None;
         let mut needs_dyld_private = false;
-        if !stubs.entries.is_empty() {
+        if !stubs.entries.is_empty() && !options.chained_fixups {
             let binder = ensure_stub_helper_support(sym_table, dylibs, &mut got)?;
             binder_symbol = Some(binder);
             needs_dyld_private = true;
@@ -271,6 +302,7 @@ impl SyntheticPlan {
             binder_symbol,
             tlv_bootstrap_symbol,
             needs_dyld_private,
+            chained_fixups: options.chained_fixups,
         })
     }
 

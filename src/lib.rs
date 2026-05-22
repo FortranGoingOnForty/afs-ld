@@ -84,6 +84,13 @@ pub struct PlatformVersion {
     pub sdk: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixupChainsMode {
+    Auto,
+    Classic,
+    Chained,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameworkSpec {
     pub name: String,
@@ -126,7 +133,7 @@ pub struct LinkOptions {
     pub no_loh: bool,
     pub icf_mode: IcfMode,
     pub thunks: ThunkMode,
-    pub fixup_chains: bool,
+    pub fixup_chains: FixupChainsMode,
     pub all_load: bool,
     pub force_load_archives: Vec<PathBuf>,
     pub jobs: Option<usize>,
@@ -178,7 +185,7 @@ impl Default for LinkOptions {
             no_loh: false,
             icf_mode: IcfMode::None,
             thunks: ThunkMode::Safe,
-            fixup_chains: false,
+            fixup_chains: FixupChainsMode::Auto,
             all_load: false,
             force_load_archives: Vec::new(),
             jobs: None,
@@ -200,6 +207,16 @@ impl LinkOptions {
                     .unwrap_or(1)
             })
             .max(1)
+    }
+
+    pub fn uses_chained_fixups(&self) -> bool {
+        match self.fixup_chains {
+            FixupChainsMode::Chained => true,
+            FixupChainsMode::Classic => false,
+            FixupChainsMode::Auto => self
+                .platform_version
+                .is_some_and(|version| version.minos >= (12 << 16)),
+        }
     }
 }
 
@@ -463,11 +480,6 @@ impl Linker {
         if opts.bundle {
             return Err(LinkError::UnsupportedOption(
                 "`-bundle` output is not yet supported".into(),
-            ));
-        }
-        if opts.fixup_chains {
-            return Err(LinkError::UnsupportedOption(
-                "`-fixup_chains` is not yet supported".into(),
             ));
         }
         if opts.icf_mode == IcfMode::All {
@@ -747,13 +759,16 @@ impl Linker {
             dead_strip.as_ref().map(|analysis| analysis.live_atoms())
         };
         let phase_started = Instant::now();
-        let synthetic_plan = synth::SyntheticPlan::build_filtered_with_relocs(
+        let synthetic_plan = synth::SyntheticPlan::build_filtered_with_relocs_and_options(
             &layout_inputs,
             &atom_table,
             &mut sym_table,
             &inputs.dylibs,
             kept_atoms,
             &parsed_relocs,
+            synth::SyntheticPlanOptions {
+                chained_fixups: opts.uses_chained_fixups(),
+            },
         )?;
         phases.layout_synthetic_plan = phase_started.elapsed();
         let icf_redirects = icf.as_ref().map(|plan| plan.redirects());
@@ -904,6 +919,7 @@ impl Linker {
                 parallel_jobs,
             },
         )?;
+        macho::writer::apply_chained_fixups(&mut layout, &linkedit)?;
         phases.reloc_apply = phase_started.elapsed();
         let folded_symbols = icf
             .as_ref()

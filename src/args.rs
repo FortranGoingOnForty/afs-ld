@@ -7,7 +7,9 @@
 use std::path::PathBuf;
 
 use crate::resolve::{levenshtein, UndefinedTreatment};
-use crate::{FrameworkSpec, IcfMode, LinkOptions, OutputKind, PlatformVersion, ThunkMode};
+use crate::{
+    FixupChainsMode, FrameworkSpec, IcfMode, LinkOptions, OutputKind, PlatformVersion, ThunkMode,
+};
 
 const KNOWN_FLAGS: &[&str] = &[
     "-o",
@@ -372,10 +374,10 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                 };
             }
             "-fixup_chains" => {
-                opts.fixup_chains = true;
+                opts.fixup_chains = FixupChainsMode::Chained;
             }
             "-no_fixup_chains" => {
-                opts.fixup_chains = false;
+                opts.fixup_chains = FixupChainsMode::Classic;
             }
             "-map" => {
                 opts.map = Some(PathBuf::from(
@@ -534,7 +536,7 @@ mod tests {
         assert!(opts.dead_strip);
         assert_eq!(opts.thunks, ThunkMode::All);
         assert_eq!(opts.icf_mode, IcfMode::None);
-        assert!(!opts.fixup_chains);
+        assert_eq!(opts.fixup_chains, FixupChainsMode::Classic);
     }
 
     #[test]

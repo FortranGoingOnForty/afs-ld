@@ -1305,6 +1305,7 @@ mod tests {
             binder_symbol: Some(SymbolId(2)),
             tlv_bootstrap_symbol: None,
             needs_dyld_private: true,
+            chained_fixups: false,
         };
 
         let layout = Layout::build_with_synthetics(
@@ -1432,6 +1433,7 @@ mod tests {
             binder_symbol: None,
             tlv_bootstrap_symbol: None,
             needs_dyld_private: true,
+            chained_fixups: false,
         };
 
         let layout = Layout::build_with_synthetics(

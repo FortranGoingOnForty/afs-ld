@@ -17,10 +17,11 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
     BIND_SYMBOL_FLAGS_WEAK_IMPORT, DICE_KIND_JUMP_TABLE32, INDIRECT_SYMBOL_ABS,
-    INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
-    LC_FUNCTION_STARTS, LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, N_PEXT,
-    REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB,
-    REBASE_OPCODE_DONE, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
+    INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_CHAINED_FIXUPS,
+    LC_DYLD_EXPORTS_TRIE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS,
+    LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, N_PEXT, REBASE_IMMEDIATE_MASK,
+    REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE,
+    REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
     REBASE_OPCODE_MASK, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
     REBASE_TYPE_POINTER, SG_READ_ONLY,
@@ -555,6 +556,12 @@ fn raw_linkedit_data_cmd(bytes: &[u8], expected_cmd: u32) -> (u32, u32) {
             {
                 return (linkedit.dataoff, linkedit.datasize);
             }
+            LoadCommand::DyldChainedFixups(linkedit) if expected_cmd == LC_DYLD_CHAINED_FIXUPS => {
+                return (linkedit.dataoff, linkedit.datasize);
+            }
+            LoadCommand::DyldExportsTrie(linkedit) if expected_cmd == LC_DYLD_EXPORTS_TRIE => {
+                return (linkedit.dataoff, linkedit.datasize);
+            }
             _ => {}
         }
     }
@@ -598,6 +605,8 @@ fn command_ids(bytes: &[u8]) -> Vec<u32> {
             LoadCommand::BuildVersion(_) => LC_BUILD_VERSION,
             LoadCommand::Dylib(d) => d.cmd,
             LoadCommand::DyldInfoOnly(_) => LC_DYLD_INFO_ONLY,
+            LoadCommand::DyldChainedFixups(_) => LC_DYLD_CHAINED_FIXUPS,
+            LoadCommand::DyldExportsTrie(_) => LC_DYLD_EXPORTS_TRIE,
             LoadCommand::Raw { cmd, .. } => cmd,
             other => panic!("unexpected load command in command_ids helper: {other:?}"),
         })
@@ -4808,6 +4817,78 @@ fn linker_run_uses_multiple_thunk_islands_within_text_segment() {
         "codesign verify failed: {}",
         String::from_utf8_lossy(&verify.stderr)
     );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_emits_runnable_chained_fixups_for_imported_call() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("chained-import.o");
+    let out = scratch("chained-import.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            stp x29, x30, [sp, #-16]!
+            mov x29, sp
+            bl _getpid
+            mov x0, #0
+            ldp x29, x30, [sp], #16
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        platform_version: Some(afs_ld::PlatformVersion {
+            minos: 12 << 16,
+            sdk: 12 << 16,
+        }),
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
+    assert!(commands
+        .iter()
+        .any(|cmd| matches!(cmd, LoadCommand::DyldChainedFixups(_))));
+    assert!(commands
+        .iter()
+        .any(|cmd| matches!(cmd, LoadCommand::DyldExportsTrie(_))));
+    assert!(!commands
+        .iter()
+        .any(|cmd| matches!(cmd, LoadCommand::DyldInfoOnly(_))));
+    assert!(output_section(&bytes, "__TEXT", "__stub_helper").is_none());
+    assert!(output_section(&bytes, "__DATA", "__la_symbol_ptr").is_none());
+    let (_, got) = output_section(&bytes, "__DATA_CONST", "__got").unwrap();
+    let got_word = u64::from_le_bytes(got[0..8].try_into().unwrap());
+    assert_ne!(got_word >> 63, 0, "GOT slot should contain a chained bind");
+
+    let status = Command::new(&out).status().unwrap();
+    assert!(status.success(), "chained executable should run");
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);

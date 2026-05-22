@@ -32,6 +32,10 @@ use crate::string_table::StringTableBuilder;
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind, NLIST_SIZE};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::{
+    chained_fixups::{
+        self, ChainedFixupKind, ChainedFixupSite, ChainedImport, ChainedPointerKind,
+        ChainedPointerWrite, ChainedSegment,
+    },
     code_sig::CodeSignaturePlan,
     dyld_info::{
         build_export_trie, emit_bind_records, emit_lazy_bind_record, emit_rebase_run,
@@ -109,6 +113,7 @@ pub enum WriteError {
     MalformedLoh(PathBuf, String),
     MalformedDataInCode(PathBuf, String),
     SymbolListRead(PathBuf, String),
+    ChainedFixups(String),
 }
 
 impl fmt::Display for WriteError {
@@ -181,6 +186,9 @@ impl fmt::Display for WriteError {
                     "{}: unable to read symbol list: {detail}",
                     path.display()
                 )
+            }
+            WriteError::ChainedFixups(detail) => {
+                write!(f, "failed to build chained fixups: {detail}")
             }
         }
     }
@@ -397,7 +405,8 @@ pub fn write_finalized_with_linkedit(
     let bindoff = linkedit_plan.dyld_info.bind_off as usize;
     let weak_bind_off = linkedit_plan.dyld_info.weak_bind_off as usize;
     let lazy_bind_off = linkedit_plan.dyld_info.lazy_bind_off as usize;
-    let export_off = linkedit_plan.dyld_info.export_off as usize;
+    let export_off = linkedit_plan.export_dataoff() as usize;
+    let chained_fixups_off = linkedit_plan.chained_fixups.map(|cmd| cmd.dataoff as usize);
     let loh_off = linkedit_plan.loh.map(|loh| loh.dataoff as usize);
     let function_starts_off = linkedit_plan.function_starts.dataoff as usize;
     let data_in_code_off = linkedit_plan.data_in_code.dataoff as usize;
@@ -425,6 +434,12 @@ pub fn write_finalized_with_linkedit(
     if !linkedit_plan.lazy_bind_bytes.is_empty() {
         let end = lazy_bind_off + linkedit_plan.lazy_bind_bytes.len();
         out[lazy_bind_off..end].copy_from_slice(&linkedit_plan.lazy_bind_bytes);
+    }
+    if let Some(chained_fixups_off) = chained_fixups_off {
+        if !linkedit_plan.chained_fixups_bytes.is_empty() {
+            let end = chained_fixups_off + linkedit_plan.chained_fixups_bytes.len();
+            out[chained_fixups_off..end].copy_from_slice(&linkedit_plan.chained_fixups_bytes);
+        }
     }
     if !linkedit_plan.export_bytes.is_empty() {
         let end = export_off + linkedit_plan.export_bytes.len();
@@ -456,6 +471,106 @@ pub fn write_finalized_with_linkedit(
     Ok(())
 }
 
+pub fn apply_chained_fixups(
+    layout: &mut Layout,
+    linkedit: &LinkEditPlan,
+) -> Result<(), WriteError> {
+    if linkedit.chained_pointer_writes().is_empty() {
+        return Ok(());
+    }
+    let image_base = layout
+        .segment("__TEXT")
+        .ok_or(WriteError::MissingSegment("__TEXT"))?
+        .vm_addr;
+
+    for write in linkedit.chained_pointer_writes() {
+        let segment = layout.segments.get(write.segment_index).ok_or_else(|| {
+            WriteError::ChainedFixups(format!(
+                "pointer write references missing segment {}",
+                write.segment_index
+            ))
+        })?;
+        let addr = segment.vm_addr + write.segment_offset;
+        let slot = mutable_pointer_slot(layout, addr)?;
+        let current = u64::from_le_bytes(
+            slot.try_into()
+                .expect("mutable pointer slot should be exactly 8 bytes"),
+        );
+        let encoded = match write.kind {
+            ChainedPointerKind::Rebase { next } => {
+                encode_chained_rebase(current, image_base, next)?
+            }
+            ChainedPointerKind::Bind {
+                import_ordinal,
+                next,
+            } => encode_chained_bind(import_ordinal, next)?,
+        };
+        slot.copy_from_slice(&encoded.to_le_bytes());
+    }
+
+    Ok(())
+}
+
+fn mutable_pointer_slot(layout: &mut Layout, addr: u64) -> Result<&mut [u8], WriteError> {
+    for section in &mut layout.sections {
+        if section.is_zerofill() || addr < section.addr || addr + 8 > section.addr + section.size {
+            continue;
+        }
+        for placed in &mut section.atoms {
+            let start = section.addr + placed.offset;
+            let end = start + placed.data.len() as u64;
+            if start <= addr && addr + 8 <= end {
+                let local = (addr - start) as usize;
+                return Ok(&mut placed.data[local..local + 8]);
+            }
+        }
+        if !section.synthetic_data.is_empty() {
+            let start = section.addr + section.synthetic_offset;
+            let end = start + section.synthetic_data.len() as u64;
+            if start <= addr && addr + 8 <= end {
+                let local = (addr - start) as usize;
+                return Ok(&mut section.synthetic_data[local..local + 8]);
+            }
+        }
+    }
+    Err(WriteError::ChainedFixups(format!(
+        "pointer write at vmaddr 0x{addr:x} does not map to output bytes"
+    )))
+}
+
+fn encode_chained_rebase(current: u64, image_base: u64, next: u16) -> Result<u64, WriteError> {
+    if next > 0x0fff {
+        return Err(WriteError::ChainedFixups(format!(
+            "rebase chain next delta {next} exceeds 12 bits"
+        )));
+    }
+    let target = current.checked_sub(image_base).ok_or_else(|| {
+        WriteError::ChainedFixups(format!(
+            "rebase target 0x{current:x} is below image base 0x{image_base:x}"
+        ))
+    })?;
+    if target >= (1u64 << 36) {
+        return Err(WriteError::ChainedFixups(format!(
+            "rebase target offset 0x{target:x} exceeds DYLD_CHAINED_PTR_64_OFFSET width"
+        )));
+    }
+    Ok(target | (u64::from(next) << 51))
+}
+
+fn encode_chained_bind(import_ordinal: u32, next: u16) -> Result<u64, WriteError> {
+    if import_ordinal >= (1 << 24) {
+        return Err(WriteError::ChainedFixups(format!(
+            "bind ordinal {import_ordinal} exceeds 24 bits"
+        )));
+    }
+    if next > 0x0fff {
+        return Err(WriteError::ChainedFixups(format!(
+            "bind chain next delta {next} exceeds 12 bits"
+        )));
+    }
+    Ok(u64::from(import_ordinal) | (u64::from(next) << 51) | (1u64 << 63))
+}
+
 fn build_commands(
     layout: &Layout,
     kind: OutputKind,
@@ -474,7 +589,7 @@ fn build_commands(
 
     match kind {
         OutputKind::Executable => {
-            commands.push(LoadCommand::DyldInfoOnly(linkedit.dyld_info));
+            push_fixup_commands(&mut commands, linkedit);
             commands.push(LoadCommand::Symtab(linkedit.symtab));
             commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
             commands.push(raw_dylinker_command("/usr/lib/dyld"));
@@ -493,7 +608,7 @@ fn build_commands(
                 current_version: dylib_current_version(opts),
                 compatibility_version: dylib_compatibility_version(opts),
             }));
-            commands.push(LoadCommand::DyldInfoOnly(linkedit.dyld_info));
+            push_fixup_commands(&mut commands, linkedit);
             commands.push(LoadCommand::Symtab(linkedit.symtab));
             commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
             if opts.emit_uuid {
@@ -547,6 +662,17 @@ fn build_commands(
         commands.push(raw_linkedit_command(LC_CODE_SIGNATURE, 0, 0));
     }
     Ok(commands)
+}
+
+fn push_fixup_commands(commands: &mut Vec<LoadCommand>, linkedit: &LinkEditPlan) {
+    if let Some(chained_fixups) = linkedit.chained_fixups {
+        commands.push(LoadCommand::DyldChainedFixups(chained_fixups));
+        if let Some(exports_trie) = linkedit.exports_trie {
+            commands.push(LoadCommand::DyldExportsTrie(exports_trie));
+        }
+    } else {
+        commands.push(LoadCommand::DyldInfoOnly(linkedit.dyld_info));
+    }
 }
 
 fn estimate_header_size(
@@ -604,7 +730,11 @@ fn estimate_header_size(
     if has_loh {
         size += 16;
     }
-    size += DyldInfoCmd::WIRE_SIZE as u64;
+    size += if opts.uses_chained_fixups() {
+        LinkEditDataCmd::WIRE_SIZE as u64 * 2
+    } else {
+        DyldInfoCmd::WIRE_SIZE as u64
+    };
     size
 }
 
@@ -810,6 +940,8 @@ pub struct LinkEditPlan {
     pub symtab: SymtabCmd,
     pub dysymtab: DysymtabCmd,
     pub dyld_info: DyldInfoCmd,
+    pub chained_fixups: Option<LinkEditDataCmd>,
+    pub exports_trie: Option<LinkEditDataCmd>,
     pub loh: Option<LinkEditDataCmd>,
     pub function_starts: LinkEditDataCmd,
     pub data_in_code: LinkEditDataCmd,
@@ -820,6 +952,7 @@ pub struct LinkEditPlan {
     weak_bind_bytes: Vec<u8>,
     lazy_bind_bytes: Vec<u8>,
     export_bytes: Vec<u8>,
+    chained_fixups_bytes: Vec<u8>,
     loh_bytes: Vec<u8>,
     function_starts_bytes: Vec<u8>,
     data_in_code_bytes: Vec<u8>,
@@ -827,6 +960,7 @@ pub struct LinkEditPlan {
     code_signature: Option<CodeSignaturePlan>,
     indirect_starts: HashMap<(String, String), u32>,
     lazy_bind_offsets: HashMap<SymbolId, u32>,
+    chained_pointer_writes: Vec<ChainedPointerWrite>,
     pub map_symbols: Vec<LinkMapSymbol>,
 }
 
@@ -852,6 +986,16 @@ impl LinkEditPlan {
 
     pub fn loh_bytes(&self) -> &[u8] {
         &self.loh_bytes
+    }
+
+    pub fn chained_pointer_writes(&self) -> &[ChainedPointerWrite] {
+        &self.chained_pointer_writes
+    }
+
+    fn export_dataoff(&self) -> u32 {
+        self.exports_trie
+            .map(|cmd| cmd.dataoff)
+            .unwrap_or(self.dyld_info.export_off)
     }
 }
 
@@ -899,6 +1043,8 @@ fn build_linkedit_plan_profiled(
                 },
                 dysymtab: DysymtabCmd::default(),
                 dyld_info: DyldInfoCmd::default(),
+                chained_fixups: None,
+                exports_trie: None,
                 loh: None,
                 function_starts: LinkEditDataCmd {
                     dataoff: base_off,
@@ -915,6 +1061,7 @@ fn build_linkedit_plan_profiled(
                 weak_bind_bytes: Vec::new(),
                 lazy_bind_bytes: Vec::new(),
                 export_bytes: Vec::new(),
+                chained_fixups_bytes: Vec::new(),
                 loh_bytes: Vec::new(),
                 function_starts_bytes: Vec::new(),
                 data_in_code_bytes: Vec::new(),
@@ -922,6 +1069,7 @@ fn build_linkedit_plan_profiled(
                 code_signature,
                 indirect_starts: HashMap::new(),
                 lazy_bind_offsets: HashMap::new(),
+                chained_pointer_writes: Vec::new(),
                 map_symbols: Vec::new(),
             },
             timings,
@@ -929,6 +1077,7 @@ fn build_linkedit_plan_profiled(
     };
     let sym_table = inputs.0.sym_table;
     let synthetic_plan = inputs.0.synthetic_plan;
+    let use_chained_fixups = opts.uses_chained_fixups();
 
     let phase_started = std::time::Instant::now();
     let imports = collect_imports(sym_table, synthetic_plan)?;
@@ -990,15 +1139,37 @@ fn build_linkedit_plan_profiled(
     }
 
     let dyld_started = std::time::Instant::now();
-    let phase_started = std::time::Instant::now();
-    let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
-    let bind_bytes = pad_dyld_info_stream(bind_streams.bind);
-    let weak_bind_bytes = pad_dyld_info_stream(bind_streams.weak_bind);
-    let lazy_bind_bytes = pad_dyld_info_stream(bind_streams.lazy_bind);
-    timings.dyld_bind += phase_started.elapsed();
-    let phase_started = std::time::Instant::now();
-    let rebase_bytes = pad_dyld_info_stream(build_rebase_stream(layout, synthetic_plan, inputs)?);
-    timings.dyld_rebase += phase_started.elapsed();
+    let mut lazy_bind_offsets = HashMap::new();
+    let mut chained_pointer_writes = Vec::new();
+    let chained_fixups_bytes;
+    let bind_bytes;
+    let weak_bind_bytes;
+    let lazy_bind_bytes;
+    let rebase_bytes;
+    if use_chained_fixups {
+        let phase_started = std::time::Instant::now();
+        let chained = build_chained_fixups(layout, synthetic_plan, inputs, &import_lookup)?;
+        chained_fixups_bytes = chained.bytes;
+        chained_pointer_writes = chained.pointer_writes;
+        bind_bytes = Vec::new();
+        weak_bind_bytes = Vec::new();
+        lazy_bind_bytes = Vec::new();
+        rebase_bytes = Vec::new();
+        timings.dyld_bind += phase_started.elapsed();
+    } else {
+        let phase_started = std::time::Instant::now();
+        let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
+        bind_bytes = pad_dyld_info_stream(bind_streams.bind);
+        weak_bind_bytes = pad_dyld_info_stream(bind_streams.weak_bind);
+        lazy_bind_bytes = pad_dyld_info_stream(bind_streams.lazy_bind);
+        lazy_bind_offsets = bind_streams.lazy_offsets;
+        timings.dyld_bind += phase_started.elapsed();
+        let phase_started = std::time::Instant::now();
+        rebase_bytes =
+            pad_dyld_info_stream(build_rebase_stream(layout, synthetic_plan, inputs, true)?);
+        timings.dyld_rebase += phase_started.elapsed();
+        chained_fixups_bytes = Vec::new();
+    }
     let phase_started = std::time::Instant::now();
     let export_bytes = pad_dyld_info_stream(build_export_trie(&symbol_plan.exports));
     timings.dyld_export += phase_started.elapsed();
@@ -1031,19 +1202,57 @@ fn build_linkedit_plan_profiled(
     timings.metadata_tables += phase_started.elapsed();
 
     let mut cursor = base_off as u64;
-    let rebase_off = place_optional_block(&mut cursor, rebase_bytes.len(), "rebase stream offset")?;
-    let bindoff = place_optional_block(&mut cursor, bind_bytes.len(), "bind stream offset")?;
-    let weak_bind_off = place_optional_block(
-        &mut cursor,
-        weak_bind_bytes.len(),
-        "weak bind stream offset",
-    )?;
-    let lazy_bind_off = place_optional_block(
-        &mut cursor,
-        lazy_bind_bytes.len(),
-        "lazy bind stream offset",
-    )?;
-    let export_off = place_optional_block(&mut cursor, export_bytes.len(), "export trie offset")?;
+    let chained_fixups = if use_chained_fixups {
+        Some(place_linkedit_data_block(
+            &mut cursor,
+            chained_fixups_bytes.len(),
+            "chained fixups offset",
+        )?)
+    } else {
+        None
+    };
+    let rebase_off = if use_chained_fixups {
+        0
+    } else {
+        place_optional_block(&mut cursor, rebase_bytes.len(), "rebase stream offset")?
+    };
+    let bindoff = if use_chained_fixups {
+        0
+    } else {
+        place_optional_block(&mut cursor, bind_bytes.len(), "bind stream offset")?
+    };
+    let weak_bind_off = if use_chained_fixups {
+        0
+    } else {
+        place_optional_block(
+            &mut cursor,
+            weak_bind_bytes.len(),
+            "weak bind stream offset",
+        )?
+    };
+    let lazy_bind_off = if use_chained_fixups {
+        0
+    } else {
+        place_optional_block(
+            &mut cursor,
+            lazy_bind_bytes.len(),
+            "lazy bind stream offset",
+        )?
+    };
+    let exports_trie = if use_chained_fixups {
+        Some(place_linkedit_data_block(
+            &mut cursor,
+            export_bytes.len(),
+            "exports trie offset",
+        )?)
+    } else {
+        None
+    };
+    let export_off = if use_chained_fixups {
+        0
+    } else {
+        place_optional_block(&mut cursor, export_bytes.len(), "export trie offset")?
+    };
     let loh = place_optional_linkedit_data_block(&mut cursor, loh_bytes.len(), "LOH offset")?;
     let function_starts = place_linkedit_data_block(
         &mut cursor,
@@ -1093,6 +1302,8 @@ fn build_linkedit_plan_profiled(
                 export_off,
                 export_size: export_bytes.len() as u32,
             },
+            chained_fixups,
+            exports_trie,
             loh,
             function_starts,
             data_in_code,
@@ -1103,13 +1314,15 @@ fn build_linkedit_plan_profiled(
             weak_bind_bytes,
             lazy_bind_bytes,
             export_bytes,
+            chained_fixups_bytes,
             loh_bytes,
             function_starts_bytes,
             data_in_code_bytes,
             strtab_bytes: symbol_plan.strtab_bytes,
             code_signature,
             indirect_starts,
-            lazy_bind_offsets: bind_streams.lazy_offsets,
+            lazy_bind_offsets,
+            chained_pointer_writes,
             map_symbols: symbol_plan.map_symbols,
         },
         timings,
@@ -1257,6 +1470,14 @@ struct RebaseSite {
     segment_offset: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ChainedBindSite {
+    segment_index: u8,
+    segment_offset: u64,
+    symbol: SymbolId,
+    addend: i64,
+}
+
 struct InputObjectLookup<'a> {
     objects: Vec<Option<&'a ObjectFile>>,
 }
@@ -1284,8 +1505,10 @@ fn build_rebase_stream(
     layout: &Layout,
     synthetic_plan: &SyntheticPlan,
     inputs: LinkEditInputs<'_>,
+    include_lazy_pointer_rebases: bool,
 ) -> Result<Vec<u8>, WriteError> {
-    let mut sites = collect_rebase_sites(layout, synthetic_plan, inputs)?;
+    let mut sites =
+        collect_rebase_sites(layout, synthetic_plan, inputs, include_lazy_pointer_rebases)?;
     if sites.is_empty() {
         return Ok(Vec::new());
     }
@@ -1328,8 +1551,13 @@ fn collect_rebase_sites(
     layout: &Layout,
     synthetic_plan: &SyntheticPlan,
     inputs: LinkEditInputs<'_>,
+    include_lazy_pointer_rebases: bool,
 ) -> Result<Vec<RebaseSite>, WriteError> {
-    let mut sites = collect_lazy_pointer_rebase_sites(layout, synthetic_plan)?;
+    let mut sites = if include_lazy_pointer_rebases {
+        collect_lazy_pointer_rebase_sites(layout, synthetic_plan)?
+    } else {
+        Vec::new()
+    };
     sites.extend(collect_local_got_rebase_sites(
         layout,
         synthetic_plan,
@@ -2656,6 +2884,209 @@ fn indirect_symbol_index(
     } else {
         INDIRECT_SYMBOL_LOCAL
     }
+}
+
+fn build_chained_fixups(
+    layout: &Layout,
+    synthetic_plan: &SyntheticPlan,
+    inputs: LinkEditInputs<'_>,
+    imports: &HashMap<SymbolId, &ImportSymbolRecord>,
+) -> Result<chained_fixups::ChainedFixups, WriteError> {
+    let rebase_sites = collect_rebase_sites(layout, synthetic_plan, inputs, false)?;
+    let bind_sites = collect_chained_bind_sites(layout, synthetic_plan, imports)?;
+
+    let mut import_keys: Vec<(SymbolId, i64)> = bind_sites
+        .iter()
+        .map(|site| (site.symbol, site.addend))
+        .collect();
+    import_keys.sort_by(|lhs, rhs| {
+        let lhs_import = imports
+            .get(&lhs.0)
+            .expect("bind site symbols should have import records");
+        let rhs_import = imports
+            .get(&rhs.0)
+            .expect("bind site symbols should have import records");
+        lhs_import
+            .name
+            .cmp(&rhs_import.name)
+            .then_with(|| lhs.1.cmp(&rhs.1))
+            .then_with(|| lhs.0.cmp(&rhs.0))
+    });
+    import_keys.dedup();
+
+    let mut chained_imports = Vec::with_capacity(import_keys.len());
+    let mut import_ordinals = HashMap::with_capacity(import_keys.len());
+    for (idx, (symbol, addend)) in import_keys.into_iter().enumerate() {
+        let import = imports
+            .get(&symbol)
+            .copied()
+            .ok_or(WriteError::ImportSymbolMissing(symbol))?;
+        import_ordinals.insert((symbol, addend), idx as u32);
+        chained_imports.push(ChainedImport {
+            symbol,
+            dylib_ordinal: import.ordinal,
+            weak_import: import.weak_import,
+            name: import.name.clone(),
+            addend,
+        });
+    }
+
+    let mut sites = Vec::with_capacity(rebase_sites.len() + bind_sites.len());
+    for site in rebase_sites {
+        sites.push(ChainedFixupSite {
+            segment_index: site.segment_index as usize,
+            segment_offset: site.segment_offset,
+            kind: ChainedFixupKind::Rebase,
+        });
+    }
+    for site in bind_sites {
+        let import_ordinal = *import_ordinals
+            .get(&(site.symbol, site.addend))
+            .expect("bind site import ordinal should be assigned");
+        sites.push(ChainedFixupSite {
+            segment_index: site.segment_index as usize,
+            segment_offset: site.segment_offset,
+            kind: ChainedFixupKind::Bind { import_ordinal },
+        });
+    }
+    sites.sort_by_key(|site| (site.segment_index, site.segment_offset));
+    for pair in sites.windows(2) {
+        if pair[0].segment_index == pair[1].segment_index
+            && pair[0].segment_offset == pair[1].segment_offset
+        {
+            return Err(WriteError::ChainedFixups(format!(
+                "multiple fixups target segment {} offset 0x{:x}",
+                pair[0].segment_index, pair[0].segment_offset
+            )));
+        }
+    }
+
+    let image_base = layout
+        .segment("__TEXT")
+        .ok_or(WriteError::MissingSegment("__TEXT"))?
+        .vm_addr;
+    let segments: Vec<ChainedSegment> = layout
+        .segments
+        .iter()
+        .map(|segment| ChainedSegment {
+            vm_offset: segment.vm_addr.saturating_sub(image_base),
+            vm_size: segment.vm_size,
+        })
+        .collect();
+
+    chained_fixups::build(&segments, &chained_imports, &sites).map_err(WriteError::ChainedFixups)
+}
+
+fn collect_chained_bind_sites(
+    layout: &Layout,
+    synthetic_plan: &SyntheticPlan,
+    imports: &HashMap<SymbolId, &ImportSymbolRecord>,
+) -> Result<Vec<ChainedBindSite>, WriteError> {
+    let mut sites = Vec::new();
+    let layout_index = BindLayoutIndex::build(layout)?;
+
+    if let Some(tlv_bootstrap) = synthetic_plan.tlv_bootstrap_symbol {
+        let segment_index = segment_index(layout, "__DATA")?;
+        let segment = layout
+            .segment("__DATA")
+            .ok_or(WriteError::MissingSegment("__DATA"))?;
+        if let Some(section) = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__DATA" && section.name == "__thread_vars")
+        {
+            imports
+                .get(&tlv_bootstrap)
+                .copied()
+                .ok_or(WriteError::ImportSymbolMissing(tlv_bootstrap))?;
+            for placed in &section.atoms {
+                for descriptor_offset in
+                    (0..placed.size).step_by(THREAD_VARIABLE_DESCRIPTOR_SIZE as usize)
+                {
+                    let slot_addr = section.addr + placed.offset + descriptor_offset;
+                    sites.push(ChainedBindSite {
+                        segment_index,
+                        segment_offset: slot_addr - segment.vm_addr,
+                        symbol: tlv_bootstrap,
+                        addend: 0,
+                    });
+                }
+            }
+        }
+    }
+
+    if !synthetic_plan.got.entries.is_empty() {
+        let segment_index = segment_index(layout, "__DATA_CONST")?;
+        let segment = layout
+            .segment("__DATA_CONST")
+            .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
+        let section = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
+            .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
+        for (idx, entry) in synthetic_plan.got.entries.iter().enumerate() {
+            if !imports.contains_key(&entry.symbol) {
+                continue;
+            }
+            let slot_addr = section.addr + (idx as u64) * 8;
+            sites.push(ChainedBindSite {
+                segment_index,
+                segment_offset: slot_addr - segment.vm_addr,
+                symbol: entry.symbol,
+                addend: 0,
+            });
+        }
+    }
+
+    for entry in &synthetic_plan.direct_binds {
+        imports
+            .get(&entry.symbol)
+            .copied()
+            .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
+        let placement = layout_index
+            .atoms
+            .get(&entry.atom)
+            .ok_or(WriteError::DirectBindAtomMissing(entry.atom))?;
+        if placement.is_thread_vars {
+            continue;
+        }
+        sites.push(ChainedBindSite {
+            segment_index: placement.segment_index,
+            segment_offset: placement.addr + entry.atom_offset as u64 - placement.segment_vm_addr,
+            symbol: entry.symbol,
+            addend: entry.addend,
+        });
+    }
+
+    if !synthetic_plan.lazy_pointers.entries.is_empty() {
+        let segment_index = segment_index(layout, "__DATA")?;
+        let segment = layout
+            .segment("__DATA")
+            .ok_or(WriteError::MissingSegment("__DATA"))?;
+        let section = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
+            .ok_or(WriteError::MissingSegment("__DATA"))?;
+        for (idx, entry) in synthetic_plan.lazy_pointers.entries.iter().enumerate() {
+            imports
+                .get(&entry.symbol)
+                .copied()
+                .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
+            let slot_addr = section.addr + (idx as u64) * 8;
+            sites.push(ChainedBindSite {
+                segment_index,
+                segment_offset: slot_addr - segment.vm_addr,
+                symbol: entry.symbol,
+                addend: 0,
+            });
+        }
+    }
+
+    sites.sort_unstable();
+    sites.dedup();
+    Ok(sites)
 }
 
 fn build_bind_streams(

@@ -148,13 +148,53 @@ Required checklist:
 
 ## 4. CLI Parity Survey
 
-Status: open.
+Status: passing for the current armfortas and fortsh link surface.
 
-Required inputs:
+Inputs reviewed:
 
-- `armfortas/src/driver/mod.rs` linker invocation.
-- fortsh build-system linker flags.
-- Sprint 19 CLI list.
+- `armfortas/src/driver/mod.rs` normal linker invocation.
+- `armfortas/src/driver/mod.rs` `AFS_LD` / `AFS_LD_PATH` override invocation.
+- `../fortsh/Makefile` armfortas profile.
+- Sprint 19 CLI list in `.docs/sprints/sprint19.md`.
+
+Findings:
+
+- The armfortas executable link path passes object inputs, `libarmfortas_rt.a`,
+  `libSystem.tbd`, `-arch arm64`, `-e _main`, `-o`, user `-L`, user `-l`,
+  and user `-rpath`. afs-ld parses and wires all of these.
+- The armfortas shared-library path now maps the driver `-shared` flag to
+  afs-ld `-dylib` and omits the executable-only `_main` entry override.
+- The armfortas `-static` mode remains deliberately rejected by the afs-ld
+  override. The system linker path only approximates it with
+  `-search_paths_first`, and neither the current fortsh armfortas profile nor
+  the default-swap executable path depends on it.
+- The fortsh armfortas Makefile links with:
+
+```text
+$(FC) $(C_STRING_OBJ) $(CORE_C_OBJS) $(OBJECTS) -o $@ $(LDFLAGS)
+```
+
+  For `FC_KIND=armfortas`, `LDFLAGS` is empty unless `USE_C_STRINGS=1`, where
+  it adds a direct static archive path. That is inside the current afs-ld input
+  and archive-drain surface.
+
+Verification:
+
+```text
+cargo test --test standalone_toolchain -- --nocapture
+```
+
+Result:
+
+```text
+6 passed; 0 failed
+```
+
+Coverage added during this audit:
+
+- `shared_library_runs_through_driver_with_standalone_linker_override` builds a
+  Fortran dylib through `AFS_LD_PATH`, links a consumer through that dylib with
+  `-I`, `-L`, `-rpath`, and `-l`, then runs the result.
 
 ## 5. Binary Size Audit
 
@@ -226,3 +266,10 @@ Required action:
 
 - Make afs-ld the armfortas default linker with the documented one-sprint
   `AFS_LD=0` fallback.
+
+Current blocker status:
+
+- The known shared-library override blocker has been removed and covered by
+  `tests/standalone_toolchain.rs`.
+- The default flip itself is still intentionally open until the remaining
+  Sprint 31 audit sections pass.

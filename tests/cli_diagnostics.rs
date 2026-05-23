@@ -354,6 +354,26 @@ fn bad_flag_diagnostic_matches_snapshot() {
 }
 
 #[test]
+fn bad_flag_stderr_is_deterministic() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let first = Command::new(exe)
+        .args(["--color=never", "-all_lod"])
+        .output()
+        .expect("afs-ld should run");
+    let second = Command::new(exe)
+        .args(["--color=never", "-all_lod"])
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(first.status.code(), Some(2), "bad flag is CLI misuse");
+    assert_eq!(second.status.code(), Some(2), "bad flag is CLI misuse");
+    assert_eq!(
+        first.stderr, second.stderr,
+        "same input should produce deterministic stderr"
+    );
+    assert_stderr_snapshot(&first.stderr, EXPECTED_BAD_FLAG);
+}
+
+#[test]
 fn malformed_object_diagnostic_includes_hex_caret() {
     let exe = env!("CARGO_BIN_EXE_afs-ld");
     let obj = scratch("bad-segment.o");

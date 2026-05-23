@@ -125,6 +125,7 @@ pub struct LinkOptions {
     pub map: Option<PathBuf>,
     pub why_live: Vec<String>,
     pub trace_inputs: bool,
+    pub verbose_deprecation: bool,
     pub verbose: bool,
     pub show_version: bool,
     pub show_help: bool,
@@ -179,6 +180,7 @@ impl Default for LinkOptions {
             map: None,
             why_live: Vec::new(),
             trace_inputs: false,
+            verbose_deprecation: false,
             verbose: false,
             show_version: false,
             show_help: false,
@@ -554,6 +556,9 @@ impl Linker {
             crate::diag::warning(
                 "`-no_loh` requested, but afs-ld currently matches Apple ld by omitting final-output LOH; the flag has no effect",
             );
+        }
+        if opts.verbose_deprecation {
+            emit_deprecation_warnings(opts);
         }
 
         let mut load_paths = Vec::new();
@@ -1034,6 +1039,24 @@ impl Linker {
             phases,
             total_wall: overall_started.elapsed(),
         })
+    }
+}
+
+fn emit_deprecation_warnings(opts: &LinkOptions) {
+    if opts.strip_debug {
+        crate::diag::warning(
+            "deprecated compatibility flag `-S` accepted; afs-ld does not currently emit debug symbols",
+        );
+    }
+    if opts.objc_force_load {
+        crate::diag::warning(
+            "deprecated compatibility flag `-ObjC` accepted; Objective-C archive metadata scanning is not implemented",
+        );
+    }
+    if opts.no_loh {
+        crate::diag::warning(
+            "deprecated compatibility flag `-no_loh` accepted; final-output LOH is already omitted",
+        );
     }
 }
 

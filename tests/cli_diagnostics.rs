@@ -244,7 +244,7 @@ fn verbose_flag_prints_summary_and_continues_to_link() {
     );
     assert!(
         stderr.contains(
-            "Flags: dead_strip=false icf=none thunks=safe fixups=auto trace=false color=never"
+            "Flags: dead_strip=false icf=none thunks=safe fixups=auto trace=false verbose_deprecation=false color=never"
         ),
         "missing active flag summary:\n{stderr}"
     );
@@ -582,6 +582,45 @@ fn strip_debug_flag_warns_but_links_successfully() {
     assert!(
         stderr.contains("afs-ld: warning: `-S` requested"),
         "expected -S warning:\n{stderr}"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
+}
+
+#[test]
+fn verbose_deprecation_warns_for_deprecated_compatibility_flags() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = match assemble_minimal_main("verbose-deprecation-main.o") {
+        Ok(obj) => obj,
+        Err(e) => {
+            eprintln!("skipping: assemble failed: {e}");
+            return;
+        }
+    };
+    let out_path = scratch("verbose-deprecation.out");
+    let out = Command::new(exe)
+        .arg("-verbose_deprecation")
+        .arg("-S")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        out.status.success(),
+        "-verbose_deprecation link should succeed:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("deprecated compatibility flag `-S` accepted"),
+        "expected verbose deprecation warning:\n{stderr}"
     );
 
     let _ = fs::remove_file(obj);

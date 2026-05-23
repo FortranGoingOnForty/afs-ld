@@ -51,6 +51,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "-t",
     "-trace",
     "--trace",
+    "-verbose_deprecation",
     "-v",
     "--version",
     "-h",
@@ -438,6 +439,9 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
             }
             "-t" | "-trace" | "--trace" => {
                 opts.trace_inputs = true;
+            }
+            "-verbose_deprecation" => {
+                opts.verbose_deprecation = true;
             }
             "-v" => {
                 opts.verbose = true;
@@ -832,6 +836,12 @@ mod tests {
         assert!(opts.trace_inputs);
         let opts = parse(&argv(&["--trace", "main.o"])).unwrap();
         assert!(opts.trace_inputs);
+    }
+
+    #[test]
+    fn verbose_deprecation_flag_is_recorded() {
+        let opts = parse(&argv(&["-verbose_deprecation", "main.o"])).unwrap();
+        assert!(opts.verbose_deprecation);
     }
 
     #[test]

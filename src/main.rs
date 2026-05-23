@@ -50,6 +50,7 @@ Diagnostics:
   -map <path>                     Emit text link map
   -why_live <symbol>              Print a reachability chain for <symbol>
   -t, -trace, --trace             Print input paths as they are loaded
+  -verbose_deprecation            Warn about deprecated compatibility flags
   --color=<auto|always|never>     Control ANSI diagnostic color (default: auto)
   --dump <path>                   Dump a Mach-O file summary
   --dump-archive <path>           Dump an archive summary
@@ -98,12 +99,13 @@ fn emit_verbose(opts: &LinkOptions) {
     );
     eprintln!("Entry: {}", opts.entry.as_deref().unwrap_or("_main"));
     eprintln!(
-        "Flags: dead_strip={} icf={} thunks={} fixups={} trace={} color={}",
+        "Flags: dead_strip={} icf={} thunks={} fixups={} trace={} verbose_deprecation={} color={}",
         opts.dead_strip,
         icf_name(opts.icf_mode),
         thunk_name(opts.thunks),
         fixups_name(opts.fixup_chains),
         opts.trace_inputs,
+        opts.verbose_deprecation,
         color_name(opts.color)
     );
 }

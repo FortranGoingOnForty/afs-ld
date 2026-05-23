@@ -23,8 +23,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use afs_ld::resolve::{
-    classify_unresolved, drain_fetches, format_undefined_diagnostic, seed_all, Inputs, Symbol,
-    SymbolTable, UndefinedTreatment,
+    classify_unresolved, drain_fetches, format_undefined_diagnostic, seed_all, AtomId, InputId,
+    Inputs, ReferrerLog, Symbol, SymbolTable, UndefinedTreatment, Unresolved,
 };
 
 fn have_xcrun() -> bool {
@@ -234,5 +234,44 @@ fn levenshtein_hint_suggests_close_match() {
     assert!(
         hints.iter().any(|h| h == "_afs_program_init"),
         "expected did-you-mean to suggest _afs_program_init; got {hints:?}"
+    );
+}
+
+#[test]
+fn undefined_diagnostic_caps_suggestions_at_ten() {
+    let mut table = SymbolTable::new();
+    let missing = table.intern("_missing_symbol");
+    for index in 0..12 {
+        let name = table.intern(&format!("_missing_symbol{index}"));
+        table
+            .insert(Symbol::Defined {
+                name,
+                origin: InputId(0),
+                atom: AtomId(0),
+                value: 0,
+                weak: false,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap();
+    }
+
+    let text = format_undefined_diagnostic(
+        &table,
+        &Inputs::new(),
+        &ReferrerLog::new(),
+        &[Unresolved {
+            name: missing,
+            id: afs_ld::resolve::SymbolId(0),
+        }],
+    );
+    let hint = text
+        .lines()
+        .find(|line| line.contains("Hint:"))
+        .expect("undefined diagnostic should include suggestions");
+    assert_eq!(
+        hint.matches("\"_missing_symbol").count(),
+        10,
+        "undefined did-you-mean should cap at ten closest names:\n{text}"
     );
 }

@@ -1569,7 +1569,7 @@ fn format_undefined_diagnostic_with_level(
                 out.push_str(&format!("      referenced by {}\n", oi.path.display()));
             }
         }
-        let suggestions = did_you_mean(table, name, 3, 3);
+        let suggestions = did_you_mean(table, name, 3, 10);
         if !suggestions.is_empty() {
             out.push_str(&format!(
                 "  Hint: did you mean {}?\n",

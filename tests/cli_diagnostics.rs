@@ -213,6 +213,48 @@ fn version_flag_prints_version_and_exits_successfully() {
 }
 
 #[test]
+fn verbose_flag_prints_summary_and_continues_to_link() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let out = Command::new(exe)
+        .args(["--color=never", "-v"])
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "-v alone should still require input"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "-v summary should not go to stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("afs-ld {}", env!("CARGO_PKG_VERSION"))),
+        "missing version line:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Target: arm64-apple-macos"),
+        "missing target line:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Mode: executable"),
+        "missing output kind summary:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Flags: dead_strip=false icf=none thunks=safe fixups=auto trace=false color=never"
+        ),
+        "missing active flag summary:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("afs-ld: error: no input files"),
+        "-v should continue into link validation:\n{stderr}"
+    );
+}
+
+#[test]
 fn mistyped_arch_suggests_arm64_and_exits_as_cli_misuse() {
     let exe = env!("CARGO_BIN_EXE_afs-ld");
     let out = Command::new(exe)

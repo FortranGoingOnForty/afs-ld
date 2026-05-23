@@ -46,8 +46,9 @@ Diagnostics:
   --dump-archive <path>           Dump an archive summary
   --dump-dylib <path>             Dump a dylib summary
   --dump-tbd <path>               Dump a TBD summary
+  -v                              Print verbose link summary
   -h, --help                      Show this help
-  -v, --version                   Show afs-ld version
+  --version                       Show afs-ld version
 
 Platform:
   -arch arm64                     Select the arm64 target

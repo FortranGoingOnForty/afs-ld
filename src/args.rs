@@ -438,7 +438,10 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
             "-t" | "-trace" => {
                 opts.trace_inputs = true;
             }
-            "-v" | "--version" => {
+            "-v" => {
+                opts.verbose = true;
+            }
+            "--version" => {
                 opts.show_version = true;
             }
             "-h" | "--help" => {
@@ -853,7 +856,8 @@ mod tests {
         let opts = parse(&argv(&["--version"])).unwrap();
         assert!(opts.show_version);
         let opts = parse(&argv(&["-v"])).unwrap();
-        assert!(opts.show_version);
+        assert!(opts.verbose);
+        assert!(!opts.show_version);
     }
 
     #[test]

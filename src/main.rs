@@ -1,6 +1,9 @@
 use std::process::ExitCode;
 
-use afs_ld::{args, diag, dump, LinkError, Linker};
+use afs_ld::{
+    args, diag, dump, ColorMode, FixupChainsMode, IcfMode, LinkError, LinkOptions, Linker,
+    OutputKind, ThunkMode,
+};
 
 fn usage() -> &'static str {
     "\
@@ -52,8 +55,9 @@ Diagnostics:
   --dump-archive <path>           Dump an archive summary
   --dump-dylib <path>             Dump a dylib summary
   --dump-tbd <path>               Dump a TBD summary
+  -v                              Print verbose link summary
   -h, --help                      Show this help
-  -v, --version                   Show afs-ld version
+  --version                       Show afs-ld version
 
 Platform:
   -arch arm64                     Select the arm64 target
@@ -82,6 +86,67 @@ fn version() -> String {
     )
 }
 
+fn emit_verbose(opts: &LinkOptions) {
+    eprint!("{}", version());
+    eprintln!("Mode: {}", output_kind_name(opts.kind));
+    eprintln!(
+        "Output: {}",
+        opts.output
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "a.out".to_string())
+    );
+    eprintln!("Entry: {}", opts.entry.as_deref().unwrap_or("_main"));
+    eprintln!(
+        "Flags: dead_strip={} icf={} thunks={} fixups={} trace={} color={}",
+        opts.dead_strip,
+        icf_name(opts.icf_mode),
+        thunk_name(opts.thunks),
+        fixups_name(opts.fixup_chains),
+        opts.trace_inputs,
+        color_name(opts.color)
+    );
+}
+
+fn output_kind_name(kind: OutputKind) -> &'static str {
+    match kind {
+        OutputKind::Executable => "executable",
+        OutputKind::Dylib => "dylib",
+    }
+}
+
+fn icf_name(mode: IcfMode) -> &'static str {
+    match mode {
+        IcfMode::None => "none",
+        IcfMode::Safe => "safe",
+        IcfMode::All => "all",
+    }
+}
+
+fn thunk_name(mode: ThunkMode) -> &'static str {
+    match mode {
+        ThunkMode::None => "none",
+        ThunkMode::Safe => "safe",
+        ThunkMode::All => "all",
+    }
+}
+
+fn fixups_name(mode: FixupChainsMode) -> &'static str {
+    match mode {
+        FixupChainsMode::Auto => "auto",
+        FixupChainsMode::Classic => "classic",
+        FixupChainsMode::Chained => "chained",
+    }
+}
+
+fn color_name(mode: ColorMode) -> &'static str {
+    match mode {
+        ColorMode::Auto => "auto",
+        ColorMode::Always => "always",
+        ColorMode::Never => "never",
+    }
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     diag::configure_from_argv(&argv[1..]);
@@ -103,6 +168,10 @@ fn main() -> ExitCode {
     if opts.show_version {
         print!("{}", version());
         return ExitCode::SUCCESS;
+    }
+
+    if opts.verbose {
+        emit_verbose(&opts);
     }
 
     if let Some(path) = &opts.dump {

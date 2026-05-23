@@ -60,7 +60,7 @@ pub fn error(msg: &str) {
 pub fn error_verbatim(msg: &str) {
     let stderr = std::io::stderr();
     let mut h = stderr.lock();
-    let _ = writeln!(h, "{msg}");
+    let _ = write_verbatim(&mut h, msg);
 }
 
 pub fn warning(msg: &str) {
@@ -72,7 +72,15 @@ pub fn warning(msg: &str) {
 pub fn warning_verbatim(msg: &str) {
     let stderr = std::io::stderr();
     let mut h = stderr.lock();
-    let _ = writeln!(h, "{msg}");
+    let _ = write_verbatim(&mut h, msg);
+}
+
+fn write_verbatim(h: &mut impl Write, msg: &str) -> std::io::Result<()> {
+    if msg.ends_with('\n') {
+        write!(h, "{msg}")
+    } else {
+        writeln!(h, "{msg}")
+    }
 }
 
 pub fn binary_error(path: &Path, bytes: &[u8], error: &ReadError) {

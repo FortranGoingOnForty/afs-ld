@@ -1,0 +1,3 @@
+afs-ld: error: duplicate symbol _dup_snapshot
+  defined in <TMP>/duplicate-a.o
+  also in <TMP>/duplicate-b.o

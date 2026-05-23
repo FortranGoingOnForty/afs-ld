@@ -1,0 +1,2 @@
+afs-ld: error: undefined symbol: _missing_snapshot
+      referenced by <TMP>/undefined-snapshot.o

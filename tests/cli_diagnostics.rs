@@ -9,6 +9,11 @@ use afs_ld::macho::constants::{
 use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand};
 
 const EXPECTED_HELP: &str = include_str!("snapshots/help.txt");
+const EXPECTED_BAD_FLAG: &str = include_str!("snapshots/bad_flag.stderr");
+const EXPECTED_DUPLICATE_SYMBOL: &str = include_str!("snapshots/duplicate_symbol.stderr");
+const EXPECTED_MALFORMED_INPUT: &str = include_str!("snapshots/malformed_input.stderr");
+const EXPECTED_MISSING_LIBRARY: &str = include_str!("snapshots/missing_library.stderr");
+const EXPECTED_UNDEFINED_SYMBOL: &str = include_str!("snapshots/undefined_symbol.stderr");
 
 fn have_xcrun() -> bool {
     Command::new("xcrun")
@@ -67,6 +72,19 @@ fn assemble(src: &str, out: &PathBuf) -> Result<(), String> {
 
 fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-cli-diag-{}-{name}", std::process::id()))
+}
+
+fn normalize_stderr(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let scratch_prefix = std::env::temp_dir()
+        .join(format!("afs-ld-cli-diag-{}-", std::process::id()))
+        .display()
+        .to_string();
+    text.replace(&scratch_prefix, "<TMP>/")
+}
+
+fn assert_stderr_snapshot(stderr: &[u8], expected: &str) {
+    assert_eq!(normalize_stderr(stderr), expected);
 }
 
 fn assemble_minimal_main(name: &str) -> Result<PathBuf, String> {
@@ -325,6 +343,17 @@ fn color_always_colors_parse_errors() {
 }
 
 #[test]
+fn bad_flag_diagnostic_matches_snapshot() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let out = Command::new(exe)
+        .args(["--color=never", "-all_lod"])
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(out.status.code(), Some(2), "bad flag is CLI misuse");
+    assert_stderr_snapshot(&out.stderr, EXPECTED_BAD_FLAG);
+}
+
+#[test]
 fn malformed_object_diagnostic_includes_hex_caret() {
     let exe = env!("CARGO_BIN_EXE_afs-ld");
     let obj = scratch("bad-segment.o");
@@ -354,6 +383,27 @@ fn malformed_object_diagnostic_includes_hex_caret() {
         "missing hex dump:\n{stderr}"
     );
     assert!(stderr.contains("  ^^^^^^^^^^^"), "missing caret:\n{stderr}");
+
+    let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn malformed_object_diagnostic_matches_snapshot() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = scratch("malformed-snapshot.o");
+    fs::write(&obj, malformed_segment_object()).expect("write malformed object");
+
+    let out = Command::new(exe)
+        .args(["--color=never"])
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(
+        out.status.code(),
+        Some(65),
+        "malformed input should use EX_DATAERR"
+    );
+    assert_stderr_snapshot(&out.stderr, EXPECTED_MALFORMED_INPUT);
 
     let _ = fs::remove_file(obj);
 }
@@ -425,6 +475,31 @@ fn missing_library_suggests_near_match() {
         stderr.contains("did you mean `-lfoozle`?"),
         "missing library suggestion:\n{stderr}"
     );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn missing_library_diagnostic_matches_snapshot() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let dir = scratch("library-snapshot-dir");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create library snapshot dir");
+    fs::write(dir.join("libfoozle.a"), b"!<arch>\n").expect("write placeholder library");
+
+    let out = Command::new(exe)
+        .args(["--color=never"])
+        .arg("-L")
+        .arg(&dir)
+        .arg("-lfoozl")
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "missing library is a link failure"
+    );
+    assert_stderr_snapshot(&out.stderr, EXPECTED_MISSING_LIBRARY);
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -980,6 +1055,95 @@ fn undefined_symbol_diagnostic_is_not_double_prefixed() {
     );
 
     let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn undefined_symbol_diagnostic_matches_snapshot() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = scratch("undefined-snapshot.o");
+    let out_path = scratch("undefined-snapshot.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            bl _missing_snapshot
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let out = Command::new(exe)
+        .args(["--color=never"])
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "undefined symbol is a link failure"
+    );
+    assert_stderr_snapshot(&out.stderr, EXPECTED_UNDEFINED_SYMBOL);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
+}
+
+#[test]
+fn duplicate_symbol_diagnostic_matches_snapshot() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let first = scratch("duplicate-a.o");
+    let second = scratch("duplicate-b.o");
+    let out_path = scratch("duplicate.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _dup_snapshot
+        _dup_snapshot:
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &first) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+    if let Err(e) = assemble(src, &second) {
+        eprintln!("skipping: assemble failed: {e}");
+        let _ = fs::remove_file(first);
+        return;
+    }
+
+    let out = Command::new(exe)
+        .args(["--color=never"])
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&first)
+        .arg(&second)
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "duplicate symbol is a link failure"
+    );
+    assert_stderr_snapshot(&out.stderr, EXPECTED_DUPLICATE_SYMBOL);
+
+    let _ = fs::remove_file(first);
+    let _ = fs::remove_file(second);
+    let _ = fs::remove_file(out_path);
 }
 
 #[test]

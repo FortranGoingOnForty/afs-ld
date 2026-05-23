@@ -1,0 +1,4 @@
+afs-ld: error: in <TMP>/malformed-snapshot.o at byte 0x60: load command 0x19 at offset 0x60: cmdsize 72 invalid (nsects implies more bytes than cmdsize accommodates)
+
+  0x0060: 01 00 00 00 00 00 00 00
+          ^^^^^^^^^^^

@@ -2,7 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use afs_ld::macho::constants::{LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_UUID};
+use afs_ld::macho::constants::{
+    CPU_TYPE_ARM64, LC_DYLD_CHAINED_FIXUPS, LC_DYLD_EXPORTS_TRIE, LC_SEGMENT_64, LC_UUID,
+    MH_MAGIC_64, MH_OBJECT,
+};
 use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand};
 
 const EXPECTED_HELP: &str = include_str!("snapshots/help.txt");
@@ -70,6 +73,31 @@ fn assemble_minimal_main(name: &str) -> Result<PathBuf, String> {
     let obj = scratch(name);
     assemble(minimal_main_src(), &obj)?;
     Ok(obj)
+}
+
+fn malformed_segment_object() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&MH_MAGIC_64.to_le_bytes());
+    bytes.extend_from_slice(&CPU_TYPE_ARM64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&MH_OBJECT.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&72u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+
+    bytes.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
+    bytes.extend_from_slice(&72u32.to_le_bytes());
+    bytes.extend_from_slice(&[0; 16]);
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes
 }
 
 fn assert_flag_errors(flag: &str, expected: &str, name: &str) {
@@ -221,6 +249,40 @@ fn color_always_colors_parse_errors() {
         stderr.contains("did you mean `-all_load`?"),
         "missing did-you-mean diagnostic:\n{stderr}"
     );
+}
+
+#[test]
+fn malformed_object_diagnostic_includes_hex_caret() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = scratch("bad-segment.o");
+    fs::write(&obj, malformed_segment_object()).expect("write malformed object");
+
+    let out = Command::new(exe)
+        .args(["--color=never"])
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(
+        out.status.code(),
+        Some(65),
+        "malformed input should use EX_DATAERR"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("in {} at byte 0x60", obj.display())),
+        "missing path and byte offset:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("nsects implies more bytes than cmdsize accommodates"),
+        "missing structural reason:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("  0x0060: 01 00 00 00 00 00 00 00"),
+        "missing hex dump:\n{stderr}"
+    );
+    assert!(stderr.contains("  ^^^^^^^^^^^"), "missing caret:\n{stderr}");
+
+    let _ = fs::remove_file(obj);
 }
 
 #[test]

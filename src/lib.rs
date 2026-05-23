@@ -244,6 +244,11 @@ pub enum LinkError {
     Unwind(synth::unwind::UnwindError),
     Icf(IcfError),
     Loh(loh::LohError),
+    MalformedInput {
+        path: PathBuf,
+        bytes: Vec<u8>,
+        error: ReadError,
+    },
     DuplicateSymbols(String),
     UndefinedSymbols(String),
     UnsupportedArch(String),
@@ -367,6 +372,9 @@ impl std::fmt::Display for LinkError {
             LinkError::Unwind(e) => write!(f, "{e}"),
             LinkError::Icf(e) => write!(f, "{e}"),
             LinkError::Loh(e) => write!(f, "{e}"),
+            LinkError::MalformedInput { path, error, .. } => {
+                write!(f, "{}: {error}", path.display())
+            }
             LinkError::DuplicateSymbols(msg) | LinkError::UndefinedSymbols(msg) => {
                 write!(f, "{msg}")
             }
@@ -1280,10 +1288,15 @@ fn load_object_input(
     timings.read = phase_started.elapsed();
 
     let phase_started = Instant::now();
-    let parsed = ObjectFile::parse(&path, &bytes).map_err(|error| InitialLoadError {
-        load_order,
-        error: LinkError::from(error),
-    })?;
+    let parsed = match ObjectFile::parse(&path, &bytes) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Err(InitialLoadError {
+                load_order,
+                error: LinkError::MalformedInput { path, bytes, error },
+            });
+        }
+    };
     timings.object_parse = phase_started.elapsed();
 
     Ok(LoadedInitialInput::Object(Box::new(LoadedObjectInput {

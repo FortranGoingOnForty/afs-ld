@@ -155,6 +155,10 @@ fn main() -> ExitCode {
             diag::error_verbatim(&msg);
             ExitCode::from(1)
         }
+        Err(LinkError::MalformedInput { path, bytes, error }) => {
+            diag::binary_error(&path, &bytes, &error);
+            ExitCode::from(65)
+        }
         Err(e) => {
             diag::error(&e.to_string());
             ExitCode::from(1)

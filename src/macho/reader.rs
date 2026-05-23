@@ -14,7 +14,7 @@ use super::constants::*;
 /// Every error surface this module can produce. Diagnostics include byte
 /// offsets and a static context string so downstream layers can produce the
 /// caret-under-source style that `afs-as/src/diag*.rs` uses.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ReadError {
     /// Not enough bytes to decode the next field.
     Truncated {
@@ -68,6 +68,39 @@ impl fmt::Display for ReadError {
 }
 
 impl std::error::Error for ReadError {}
+
+impl ReadError {
+    pub fn with_base(mut self, base: usize) -> Self {
+        match &mut self {
+            ReadError::BadCmdsize { at_offset, .. } => *at_offset += base,
+            ReadError::BadRelocation { at_offset, .. } => {
+                *at_offset = at_offset.saturating_add(base as u32);
+            }
+            _ => {}
+        }
+        self
+    }
+
+    pub fn primary_offset(&self) -> usize {
+        match self {
+            ReadError::Truncated { have, .. } => have.saturating_sub(1),
+            ReadError::BadMagic { .. } => 0,
+            ReadError::UnsupportedCpu { .. } => 4,
+            ReadError::BadCmdsize { at_offset, .. } => *at_offset,
+            ReadError::BadRelocation { at_offset, .. } => *at_offset as usize,
+        }
+    }
+
+    pub fn primary_len(&self) -> usize {
+        match self {
+            ReadError::Truncated { .. } => 1,
+            ReadError::BadMagic { .. }
+            | ReadError::UnsupportedCpu { .. }
+            | ReadError::BadCmdsize { .. } => 4,
+            ReadError::BadRelocation { .. } => 8,
+        }
+    }
+}
 
 /// `mach_header_64` — 32 bytes on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,7 +295,7 @@ impl Segment64 {
             return Err(ReadError::BadCmdsize {
                 cmd: LC_SEGMENT_64,
                 cmdsize,
-                at_offset: 0,
+                at_offset: 8 + 56,
                 reason: "nsects implies more bytes than cmdsize accommodates",
             });
         }
@@ -435,7 +468,7 @@ pub fn parse_commands(header: &MachHeader64, bytes: &[u8]) -> Result<Vec<LoadCom
             });
         }
         let payload = &bytes[cursor + 8..end];
-        out.push(decode_command(cmd, cmdsize, payload)?);
+        out.push(decode_command(cmd, cmdsize, payload).map_err(|err| err.with_base(cursor))?);
         cursor = end;
     }
 

@@ -50,6 +50,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "-why_live",
     "-t",
     "-trace",
+    "--trace",
     "-v",
     "--version",
     "-h",
@@ -435,7 +436,7 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                         .clone(),
                 );
             }
-            "-t" | "-trace" => {
+            "-t" | "-trace" | "--trace" => {
                 opts.trace_inputs = true;
             }
             "-v" => {
@@ -828,6 +829,8 @@ mod tests {
         let opts = parse(&argv(&["-trace", "main.o"])).unwrap();
         assert!(opts.trace_inputs);
         let opts = parse(&argv(&["-t", "main.o"])).unwrap();
+        assert!(opts.trace_inputs);
+        let opts = parse(&argv(&["--trace", "main.o"])).unwrap();
         assert!(opts.trace_inputs);
     }
 

@@ -49,7 +49,7 @@ Optimization:
 Diagnostics:
   -map <path>                     Emit text link map
   -why_live <symbol>              Print a reachability chain for <symbol>
-  -t, -trace                      Print input paths as they are loaded
+  -t, -trace, --trace             Print input paths as they are loaded
   --color=<auto|always|never>     Control ANSI diagnostic color (default: auto)
   --dump <path>                   Dump a Mach-O file summary
   --dump-archive <path>           Dump an archive summary

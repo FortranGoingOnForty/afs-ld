@@ -1068,7 +1068,7 @@ fn trace_flag_prints_loaded_inputs_and_archive_members() {
     }
 
     let out = Command::new(exe)
-        .arg("-t")
+        .arg("--trace")
         .arg("-o")
         .arg(&out_path)
         .arg(&main_obj)

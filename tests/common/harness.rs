@@ -132,6 +132,22 @@ pub struct LinkOutputs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeterminismReport {
+    pub hash: u64,
+    pub len: usize,
+}
+
+struct PreparedLinkCase {
+    work_dir: PathBuf,
+    compiled: BTreeMap<String, PathBuf>,
+    sidecars: BTreeMap<String, PathBuf>,
+    artifacts: BTreeMap<String, PathBuf>,
+    sdk: String,
+    sdk_ver: String,
+    suffix: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffCategory {
     /// A diff we expect: UUID bytes, code-signature hashes, etc.
     Tolerated(&'static str),
@@ -408,7 +424,7 @@ pub fn load_corpus(root: &Path) -> Result<Vec<LinkCase>, String> {
     Ok(cases)
 }
 
-pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
+fn prepare_link_case(case: &LinkCase) -> Result<PreparedLinkCase, String> {
     let sdk = sdk_path().ok_or_else(|| "xcrun --show-sdk-path unavailable".to_string())?;
     let sdk_ver =
         sdk_version().ok_or_else(|| "xcrun --show-sdk-version unavailable".to_string())?;
@@ -517,20 +533,40 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
     } else {
         "out"
     };
-    let our_path = work_dir.join(format!("ours.{suffix}"));
-    let their_path = work_dir.join(format!("apple.{suffix}"));
+
+    Ok(PreparedLinkCase {
+        work_dir,
+        compiled,
+        sidecars,
+        artifacts,
+        sdk,
+        sdk_ver,
+        suffix,
+    })
+}
+
+pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
+    let prepared = prepare_link_case(case)?;
+    let our_path = prepared.work_dir.join(format!("ours.{}", prepared.suffix));
+    let their_path = prepared.work_dir.join(format!("apple.{}", prepared.suffix));
 
     let our_args = expand_args(
-        &case.args, &compiled, &sidecars, &artifacts, &our_path, &sdk, &sdk_ver,
+        &case.args,
+        &prepared.compiled,
+        &prepared.sidecars,
+        &prepared.artifacts,
+        &our_path,
+        &prepared.sdk,
+        &prepared.sdk_ver,
     )?;
     let their_args = expand_args(
         &case.args,
-        &compiled,
-        &sidecars,
-        &artifacts,
+        &prepared.compiled,
+        &prepared.sidecars,
+        &prepared.artifacts,
         &their_path,
-        &sdk,
-        &sdk_ver,
+        &prepared.sdk,
+        &prepared.sdk_ver,
     )?;
 
     let our_output = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
@@ -569,6 +605,83 @@ pub fn link_both(case: &LinkCase) -> Result<LinkOutputs, String> {
         our_path,
         their_path,
     })
+}
+
+pub fn assert_case_deterministic(
+    case: &LinkCase,
+    runs: usize,
+    jobs: usize,
+) -> Result<DeterminismReport, String> {
+    if runs == 0 {
+        return Err("determinism run count must be positive".into());
+    }
+
+    let prepared = prepare_link_case(case)?;
+    let out_path = prepared
+        .work_dir
+        .join(format!("deterministic.{}", prepared.suffix));
+    let mut args = expand_args(
+        &case.args,
+        &prepared.compiled,
+        &prepared.sidecars,
+        &prepared.artifacts,
+        &out_path,
+        &prepared.sdk,
+        &prepared.sdk_ver,
+    )?;
+    args.push("-j".into());
+    args.push(jobs.max(1).to_string());
+
+    let mut baseline = None;
+    for run in 0..runs {
+        let output = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .args(&args)
+            .output()
+            .map_err(|e| format!("spawn afs-ld for {} run {run}: {e}", case.name))?;
+        if !output.status.success() {
+            return Err(format!(
+                "afs-ld failed for {} run {run}:\n{}",
+                case.name,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let bytes = fs::read(&out_path).map_err(|e| {
+            format!(
+                "read deterministic output {} for {} run {run}: {e}",
+                out_path.display(),
+                case.name
+            )
+        })?;
+        match &baseline {
+            None => baseline = Some(bytes),
+            Some(expected) if *expected == bytes => {}
+            Some(expected) => {
+                return Err(format!(
+                    "{} run {run} differed: baseline={} bytes hash={:016x}, output={} bytes hash={:016x}",
+                    case.name,
+                    expected.len(),
+                    hash_bytes(expected),
+                    bytes.len(),
+                    hash_bytes(&bytes)
+                ));
+            }
+        }
+    }
+
+    let baseline = baseline.expect("runs > 0");
+    Ok(DeterminismReport {
+        hash: hash_bytes(&baseline),
+        len: baseline.len(),
+    })
+}
+
+pub fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 pub fn command_ids(bytes: &[u8]) -> Result<Vec<u32>, String> {

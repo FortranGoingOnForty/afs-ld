@@ -274,6 +274,37 @@ fn mistyped_arch_suggests_arm64_and_exits_as_cli_misuse() {
 }
 
 #[test]
+fn missing_input_exits_noinput_and_cites_path() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let missing = scratch("does-not-exist.o");
+    let out_path = scratch("missing-input.out");
+    let _ = fs::remove_file(&missing);
+    let _ = fs::remove_file(&out_path);
+
+    let out = Command::new(exe)
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&missing)
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(
+        out.status.code(),
+        Some(66),
+        "missing input should use EX_NOINPUT:\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("afs-ld: error: {}", missing.display())),
+        "missing path in diagnostic:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("No such file") || stderr.contains("not found"),
+        "missing no-input reason:\n{stderr}"
+    );
+}
+
+#[test]
 fn color_always_colors_parse_errors() {
     let exe = env!("CARGO_BIN_EXE_afs-ld");
     let out = Command::new(exe)

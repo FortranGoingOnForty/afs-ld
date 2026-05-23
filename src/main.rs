@@ -228,6 +228,10 @@ fn main() -> ExitCode {
             diag::binary_error(&path, &bytes, &error);
             ExitCode::from(65)
         }
+        Err(LinkError::ReadInput { path, error }) => {
+            diag::error(&format!("{}: {error}", path.display()));
+            ExitCode::from(66)
+        }
         Err(e) => {
             diag::error(&e.to_string());
             ExitCode::from(1)

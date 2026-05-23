@@ -236,6 +236,10 @@ pub enum LinkError {
     /// No input files were provided on the command line.
     NoInputs,
     Io(io::Error),
+    ReadInput {
+        path: PathBuf,
+        error: io::Error,
+    },
     Input(InputAddError),
     Seed(resolve::SeedError),
     Fetch(resolve::FetchError),
@@ -364,6 +368,7 @@ impl std::fmt::Display for LinkError {
         match self {
             LinkError::NoInputs => write!(f, "no input files"),
             LinkError::Io(e) => write!(f, "{e}"),
+            LinkError::ReadInput { path, error } => write!(f, "{}: {error}", path.display()),
             LinkError::Input(e) => write!(f, "{e}"),
             LinkError::Seed(e) => write!(f, "{e}"),
             LinkError::Fetch(e) => write!(f, "{e}"),
@@ -1286,7 +1291,10 @@ fn load_object_input(
     let phase_started = Instant::now();
     let bytes = fs::read(&path).map_err(|error| InitialLoadError {
         load_order,
-        error: LinkError::Io(error),
+        error: LinkError::ReadInput {
+            path: path.clone(),
+            error,
+        },
     })?;
     timings.read = phase_started.elapsed();
 
@@ -1319,7 +1327,10 @@ fn load_archive_input(
     let phase_started = Instant::now();
     let bytes = fs::read(&path).map_err(|error| InitialLoadError {
         load_order,
-        error: LinkError::Io(error),
+        error: LinkError::ReadInput {
+            path: path.clone(),
+            error,
+        },
     })?;
     timings.read = phase_started.elapsed();
 
@@ -1362,7 +1373,10 @@ fn register_input(
 ) -> Result<InputLoadTimings, LinkError> {
     let mut timings = InputLoadTimings::default();
     let phase_started = Instant::now();
-    let bytes = fs::read(path)?;
+    let bytes = fs::read(path).map_err(|error| LinkError::ReadInput {
+        path: path.to_path_buf(),
+        error,
+    })?;
     timings.read = phase_started.elapsed();
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("a") => {

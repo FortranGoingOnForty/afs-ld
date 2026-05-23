@@ -448,6 +448,38 @@ fn no_color_env_suppresses_forced_color() {
 }
 
 #[test]
+fn color_auto_colors_parse_errors_on_tty() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let out = match Command::new("script")
+        .env_remove("NO_COLOR")
+        .env("AFS_LD_EXE", exe)
+        .arg("-q")
+        .arg("/dev/null")
+        .arg("sh")
+        .arg("-c")
+        .arg("\"$AFS_LD_EXE\" -all_lod 2>&1")
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("skipping: script PTY harness unavailable: {e}");
+            return;
+        }
+    };
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "script should propagate afs-ld CLI-misuse exit"
+    );
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        combined.contains("\x1b[31mafs-ld: error:\x1b[0m"),
+        "expected auto color on PTY stderr/stdout stream:\n{combined:?}"
+    );
+}
+
+#[test]
 fn missing_library_suggests_near_match() {
     let exe = env!("CARGO_BIN_EXE_afs-ld");
     let dir = scratch("library-suggestion-dir");

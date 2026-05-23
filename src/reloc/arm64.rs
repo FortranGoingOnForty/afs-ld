@@ -43,6 +43,36 @@ impl fmt::Display for RelocError {
 
 impl std::error::Error for RelocError {}
 
+pub fn enrich_reloc_error(
+    mut error: RelocError,
+    atoms: &AtomTable,
+    sym_table: &SymbolTable,
+) -> RelocError {
+    let Some((_, atom)) = atoms.iter().find(|(id, _)| *id == error.atom) else {
+        return error;
+    };
+    let Some(name) = atom_context_name(atom, sym_table) else {
+        return error;
+    };
+    let input_offset = atom.input_offset.saturating_add(error.atom_offset);
+    let context = format!(
+        "in atom {name} (input section {} offset 0x{input_offset:x})",
+        atom.input_section
+    );
+    if !error.detail.starts_with("in atom ") {
+        error.detail = format!("{context}: {}", error.detail);
+    }
+    error
+}
+
+fn atom_context_name(atom: &Atom, sym_table: &SymbolTable) -> Option<String> {
+    let symbol_id = atom
+        .owner
+        .or_else(|| atom.alt_entries.first().map(|entry| entry.symbol))?;
+    let symbol = sym_table.get(symbol_id);
+    Some(sym_table.interner.resolve(symbol.name()).to_string())
+}
+
 struct ResolveView<'a> {
     sym_table: &'a SymbolTable,
     symbol_name_index: &'a HashMap<&'a str, SymbolId>,
@@ -2771,6 +2801,45 @@ mod tests {
         assert!(is_add_immediate(insn));
         let patched = (insn & !(0xfff << 10)) | (0xabc << 10);
         assert_eq!((patched >> 10) & 0xfff, 0xabc);
+    }
+
+    #[test]
+    fn enrich_reloc_error_reports_atom_symbol_context() {
+        let mut sym_table = SymbolTable::new();
+        let name = sym_table.intern("_main");
+        let InsertOutcome::Inserted(owner) = sym_table
+            .insert(Symbol::Defined {
+                name,
+                origin: crate::resolve::InputId(0),
+                atom: AtomId(0),
+                value: 0,
+                weak: false,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap()
+        else {
+            panic!("expected fresh symbol insert");
+        };
+
+        let mut atom = test_atom(0x40, 0x20);
+        atom.owner = Some(owner);
+        let mut atoms = AtomTable::new();
+        let atom_id = atoms.push(atom);
+        let error = RelocError {
+            input: PathBuf::from("main.o"),
+            atom: atom_id,
+            atom_offset: 4,
+            kind: RelocKind::Branch26,
+            referent: "_callee".into(),
+            detail: "target out of range".into(),
+        };
+
+        let formatted = enrich_reloc_error(error, &atoms, &sym_table).to_string();
+        assert!(formatted.contains("main.o: relocation Branch26"));
+        assert!(formatted.contains("at atom AtomId(1)+0x4 against _callee"));
+        assert!(formatted.contains("in atom _main (input section 1 offset 0x44)"));
+        assert!(formatted.contains("target out of range"));
     }
 
     #[test]

@@ -955,7 +955,8 @@ impl Linker {
                 parsed_relocs: &parsed_relocs,
                 parallel_jobs,
             },
-        )?;
+        )
+        .map_err(|err| reloc::arm64::enrich_reloc_error(err, &atom_table, &sym_table))?;
         macho::writer::apply_chained_fixups(&mut layout, &linkedit)?;
         phases.reloc_apply = phase_started.elapsed();
         let folded_symbols = icf

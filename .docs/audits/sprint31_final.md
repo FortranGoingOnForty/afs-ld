@@ -2,11 +2,11 @@
 
 Date: 2026-05-23
 
-Status: in progress.
+Status: passing.
 
 Sprint 31 is the final gate before afs-ld can be treated as the permanent
-armfortas default linker. This report records hard evidence, not intent. Any
-unchecked section below is still open work.
+armfortas default linker. This report records hard evidence, not intent. All
+sections below are passing as of the local `v0.1.0` tag target.
 
 ## 1. Parity Corpus
 

@@ -67,8 +67,9 @@ Every time a new decoder lands, extend the relevant `--dump*` output.
 - **Current state**: Sprint 31 final-gate work is in progress. The parity,
   determinism, spec-conformance, binary-size, performance, diagnostic, and
   panic/dead-code audit gates are recorded in `.docs/audits/sprint31_final.md`.
-  The parent driver still defaults to Apple `ld`; `AFS_LD=1` or
-  `AFS_LD_PATH=<path>` selects afs-ld until the default-swap patch lands.
+  The parent driver now defaults to afs-ld; `AFS_LD=0` selects Apple `ld` for
+  the one-sprint fallback window and `AFS_LD_PATH=<path>` selects an explicit
+  afs-ld build.
 
 ## Design Philosophy
 

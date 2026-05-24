@@ -379,9 +379,9 @@ Changes:
   README.
 - Refreshed `CLAUDE.md` test commands and test architecture table to use the
   current integration-test filenames.
-- Documented the current parent-driver reality: Apple `ld` is still default,
-  `AFS_LD=1` / `AFS_LD_PATH=<path>` selects afs-ld, and the default-swap patch
-  is still gated on this audit.
+- Documented the current parent-driver reality: afs-ld is the default,
+  `AFS_LD=0` selects the one-sprint Apple `ld` fallback, and
+  `AFS_LD_PATH=<path>` selects an explicit afs-ld build.
 - Refreshed `.docs/overview.md` for the 56-case parity matrix, fortsh audit
   status, and Sprint 30/Sprint 31 audit state.
 
@@ -399,16 +399,32 @@ Required actions:
 
 ## 11. Default-Swap Removal
 
-Status: open.
+Status: passing.
 
-Required action:
+Action:
 
-- Make afs-ld the armfortas default linker with the documented one-sprint
-  `AFS_LD=0` fallback.
+- Made afs-ld the armfortas default linker.
+- Preserved `AFS_LD=0` as the documented one-sprint Apple `ld` fallback.
+- Preserved `AFS_LD=1` compatibility and `AFS_LD_PATH=<path>` explicit linker
+  selection.
+- Added a fallback regression to `tests/standalone_toolchain.rs`.
+
+Command:
+
+```text
+cargo test --test standalone_toolchain -- --nocapture
+```
+
+Result:
+
+```text
+running 7 tests
+test hello_world_allows_apple_ld_fallback_with_afs_ld_zero ... ok
+test result: ok. 7 passed; 0 failed
+```
 
 Current blocker status:
 
 - The known shared-library override blocker has been removed and covered by
   `tests/standalone_toolchain.rs`.
-- The default flip itself is still intentionally open until the remaining
-  Sprint 31 audit sections pass.
+- The default flip is complete. Release mechanics remain in Section 10.

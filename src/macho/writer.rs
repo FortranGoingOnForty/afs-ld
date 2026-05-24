@@ -112,6 +112,11 @@ pub enum WriteError {
     MalformedRelocations(PathBuf, u8, String),
     MalformedLoh(PathBuf, String),
     MalformedDataInCode(PathBuf, String),
+    MalformedLocalSymbolSection {
+        path: PathBuf,
+        name: String,
+        n_sect: u8,
+    },
     SymbolListRead(PathBuf, String),
     ChainedFixups(String),
 }
@@ -177,6 +182,13 @@ impl fmt::Display for WriteError {
                 write!(
                     f,
                     "failed to remap LC_DATA_IN_CODE in {}: {detail}",
+                    path.display()
+                )
+            }
+            WriteError::MalformedLocalSymbolSection { path, name, n_sect } => {
+                write!(
+                    f,
+                    "{}: section-backed local symbol `{name}` has invalid section index {n_sect}",
                     path.display()
                 )
             }
@@ -2526,9 +2538,13 @@ fn collect_local_symbol_records(
         }
         match input_sym.kind() {
             SymKind::Sect => {
-                let section = object
-                    .section_for_symbol(input_sym)
-                    .expect("section symbol without section");
+                let Some(section) = object.section_for_symbol(input_sym) else {
+                    return Err(WriteError::MalformedLocalSymbolSection {
+                        path: object.path.clone(),
+                        name: name.to_string(),
+                        n_sect: input_sym.sect_idx(),
+                    });
+                };
                 if !should_emit_input_section(section) {
                     continue;
                 }

@@ -321,13 +321,45 @@ Remaining Sprint 31 action:
 
 ## 8. Dead Code And Panic Sweep
 
-Status: open.
+Status: passing.
 
-Required checks:
+Commands:
 
-- Review `.unwrap()` / `.expect()` usage.
-- Review `panic!`, `todo!`, and `unimplemented!`.
-- Remove or document dead code.
+```text
+rg -n "todo!|unimplemented!|panic!|unwrap\\(|expect\\(" src --glob '!**/tests/**'
+rg -n "allow\\(dead_code\\)|dead_code|TODO|FIXME|XXX" src --glob '!**/tests/**'
+cargo clippy -p afs-ld --all-targets -- -D warnings
+cargo test -p afs-ld --test cli_diagnostics malformed_local_symbol_section_index_reports_error_instead_of_panicking -- --nocapture
+```
+
+Results:
+
+```text
+cargo clippy -p afs-ld --all-targets -- -D warnings
+Finished `dev` profile [optimized + debuginfo]
+
+test malformed_local_symbol_section_index_reports_error_instead_of_panicking ... ok
+test result: ok. 1 passed; 0 failed; 37 filtered out
+```
+
+Action taken:
+
+- Replaced the final-output local-symbol-table `expect("section symbol without
+  section")` with a user-facing `WriteError::MalformedLocalSymbolSection`.
+- Added a CLI regression that assembles an object, corrupts a local section
+  symbol's `n_sect`, and verifies afs-ld exits with a diagnostic instead of
+  panicking.
+
+Remaining reviewed production panic/unwrap classes:
+
+- Fixed-width byte-slice conversions after explicit size checks.
+- Formatting into `String` buffers.
+- Internal layout/linkedit convergence invariants.
+- Scoped worker `join` and mutex poison checks, where a panic would indicate a
+  separate internal bug in the worker body.
+- Unit-test-only unwraps and panics inside `#[cfg(test)]` modules.
+
+No `todo!` or `unimplemented!` remains in production `src/`.
 
 ## 9. Documentation Refresh
 

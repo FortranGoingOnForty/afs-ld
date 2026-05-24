@@ -7,6 +7,8 @@ use afs_ld::macho::constants::{
     MH_MAGIC_64, MH_OBJECT,
 };
 use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand};
+use afs_ld::string_table::StringTable;
+use afs_ld::symbol::{parse_nlist_table, SymKind, NLIST_SIZE};
 
 const EXPECTED_HELP: &str = include_str!("snapshots/help.txt");
 const EXPECTED_BAD_FLAG: &str = include_str!("snapshots/bad_flag.stderr");
@@ -116,6 +118,35 @@ fn malformed_segment_object() -> Vec<u8> {
     bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes
+}
+
+fn corrupt_local_symbol_section_index(path: &PathBuf, symbol_name: &str, n_sect: u8) {
+    let mut bytes = fs::read(path).expect("read object to corrupt");
+    let header = parse_header(&bytes).expect("parse object header");
+    let commands = parse_commands(&header, &bytes).expect("parse object commands");
+    let symtab = commands
+        .iter()
+        .find_map(|cmd| match cmd {
+            LoadCommand::Symtab(symtab) => Some(*symtab),
+            _ => None,
+        })
+        .expect("object has symtab");
+    let symbols = parse_nlist_table(&bytes, symtab.symoff, symtab.nsyms).expect("parse nlists");
+    let strings =
+        StringTable::from_file(&bytes, symtab.stroff, symtab.strsize).expect("parse strings");
+    let symbol_index = symbols
+        .iter()
+        .position(|symbol| {
+            symbol.kind() == SymKind::Sect
+                && !symbol.is_ext()
+                && strings
+                    .get(symbol.strx())
+                    .is_ok_and(|name| name == symbol_name)
+        })
+        .unwrap_or_else(|| panic!("missing local section symbol `{symbol_name}`"));
+    let n_sect_offset = symtab.symoff as usize + symbol_index * NLIST_SIZE + 5;
+    bytes[n_sect_offset] = n_sect;
+    fs::write(path, bytes).expect("write corrupted object");
 }
 
 fn assert_flag_errors(flag: &str, expected: &str, name: &str) {
@@ -426,6 +457,50 @@ fn malformed_object_diagnostic_matches_snapshot() {
     assert_stderr_snapshot(&out.stderr, EXPECTED_MALFORMED_INPUT);
 
     let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn malformed_local_symbol_section_index_reports_error_instead_of_panicking() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = scratch("bad-local-symbol-section.o");
+    let out_path = scratch("bad-local-symbol-section.out");
+    let src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+        _local_bad:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+    corrupt_local_symbol_section_index(&obj, "_local_bad", 0xff);
+
+    let out = Command::new(exe)
+        .args(["--color=never"])
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = normalize_stderr(&out.stderr);
+    assert!(
+        stderr.contains(
+            "<TMP>/bad-local-symbol-section.o: section-backed local symbol `_local_bad` has invalid section index 255"
+        ),
+        "missing malformed local-symbol diagnostic:\n{stderr}"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
 }
 
 #[test]

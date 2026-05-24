@@ -6,7 +6,11 @@ Sister project to [afs-as](https://github.com/FortranGoingOnForty/afs-as) (the a
 
 ## Status
 
-Sprint 0 — scaffolding only. Does not yet produce usable output.
+Sprint 31 final-gate work. `afs-ld` now emits runnable arm64 `MH_EXECUTE`
+and `MH_DYLIB` outputs, links the armfortas runtime corpus, and has a
+56-case Apple `ld` parity matrix. The parent armfortas driver can use it via
+`AFS_LD=1` or `AFS_LD_PATH=<path>`; making it the default linker is the
+remaining default-swap gate.
 
 ## Build
 
@@ -17,6 +21,17 @@ cargo clippy -p afs-ld --all-targets -- -D warnings
 ```
 
 Tests require macOS on Apple Silicon and a working Xcode command-line toolchain (`xcrun`).
+
+Useful final-gate checks:
+
+```bash
+cargo test -p afs-ld --test parity_matrix parity_corpus -- --nocapture
+cargo test -p afs-ld --test parity_determinism -- --nocapture
+cargo test -p afs-ld --test spec_conformance -- --nocapture
+cargo test -p afs-ld --test binary_size_audit -- --nocapture
+AFS_LD_HELLO_BUDGET_MS=25 AFS_LD_RUNTIME_BUDGET_MS=150 \
+  cargo test -p afs-ld --test perf_baseline -- --nocapture
+```
 
 ## Design
 

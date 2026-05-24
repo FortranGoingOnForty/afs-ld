@@ -27,13 +27,16 @@ cargo test  -p afs-ld                          # full suite
 cargo clippy -p afs-ld --all-targets -- -D warnings
 
 cargo test --lib -p afs-ld                     # unit tests only
-cargo test --test <name> -p afs-ld             # one integration test file
-cargo test --test parity_matrix                # vs Apple `ld` across the corpus (Sprint 27)
-cargo test --test hello_world                  # executable end-to-end (Sprint 18)
-cargo test --test hello_library                # dylib end-to-end (Sprint 18.5)
-cargo test --test reader_corpus_round_trip     # afs-as corpus → byte-identity
-cargo test --test archive_runtime              # libarmfortas_rt.a reality check
-cargo test --test dylib_integration            # clang-built dylib → DylibFile
+cargo test -p afs-ld --test <name>             # one integration test file
+cargo test -p afs-ld --test parity_matrix parity_corpus -- --nocapture
+cargo test -p afs-ld --test parity_determinism -- --nocapture
+cargo test -p afs-ld --test spec_conformance -- --nocapture
+cargo test -p afs-ld --test load_command_parity
+cargo test -p afs-ld --test linker_run
+cargo test -p afs-ld --test cli_diagnostics
+cargo test -p afs-ld --test binary_size_audit -- --nocapture
+AFS_LD_HELLO_BUDGET_MS=25 AFS_LD_RUNTIME_BUDGET_MS=150 \
+  cargo test -p afs-ld --test perf_baseline -- --nocapture
 cargo test -p afs-ld -- <substring>            # filter by test name
 ```
 
@@ -61,6 +64,11 @@ Every time a new decoder lands, extend the relevant `--dump*` output.
 - **Goal**: parity with Apple `ld` for the binaries armfortas produces and
   the fortsh milestone. Not a toy. Not a subset. The full Mach-O/dyld
   contract for our use cases.
+- **Current state**: Sprint 31 final-gate work is in progress. The parity,
+  determinism, spec-conformance, binary-size, performance, diagnostic, and
+  panic/dead-code audit gates are recorded in `.docs/audits/sprint31_final.md`.
+  The parent driver still defaults to Apple `ld`; `AFS_LD=1` or
+  `AFS_LD_PATH=<path>` selects afs-ld until the default-swap patch lands.
 
 ## Design Philosophy
 
@@ -109,11 +117,12 @@ args.rs  input.rs resolve.rs atom.rs layout.rs  reloc/arm64.rs  synth/*.rs  mach
 - **`src/reloc/`** — ARM64 relocs.
   - `mod.rs`: `RawRelocation` (bit-packed), `Reloc` (fused; ADDEND / SUBTRACTOR prefixes folded into primaries), `parse_relocs` / `write_relocs` (reversible), `validate_relocs` (bounds, referent range, kind-vs-length-vs-pcrel).
   - `arm64.rs`: reloc application against final addresses (Sprint 11).
-  - `loh.rs`: LOH preservation / relaxation (Sprint 25).
+- **`src/loh.rs`** — LOH parsing, remapping, and Apple-parity behavior.
 - **`src/leb.rs`** — ULEB128/SLEB128 codec reused by export trie, function-starts deltas, dyld opcode streams, chained fixups.
 - **`src/diag.rs`** — diagnostics. Path + byte offset + caret, matching `afs-as/src/diag*.rs` style. Deterministic output: no wall clock, no pid, no thread-id in error text.
 - **`src/dump.rs`** — `--dump*` inspection modes. Every time a reader decodes something new, extend the dump.
-- **`src/driver.rs`** — orchestrator (Sprint 20).
+- **`src/lib.rs`** — linker orchestration, profiling, and top-level error
+  plumbing.
 
 ## Coding Conventions
 
@@ -191,13 +200,20 @@ of regression:
 | `tests/reader_empty.rs`              | CLI contract: empty argv → `afs-ld: error: no input files`, exit 2 |
 | `tests/diff_harness_sanity.rs`       | Harness zero-diffs on identical inputs |
 | `tests/diff_harness_finds_critical.rs` | Harness catches intentional byte differences |
-| `tests/hello_world.rs`               | Executable end-to-end (Sprint 18) |
-| `tests/hello_library.rs`             | Dylib end-to-end (Sprint 18.5) |
 | `tests/parity_matrix.rs`             | Corpus byte-level differential vs Apple `ld` (Sprint 27) |
-| `tests/armfortas_integration.rs`     | Parent's integration suite under `AFS_LD=1` (Sprint 21) |
+| `tests/parity_determinism.rs`        | Corpus-wide deterministic relink sweep |
+| `tests/parity_canary.rs`             | Intentional mutation proves the diff harness fails outside the allowlist |
+| `tests/spec_conformance.rs`          | Supported Mach-O constants and wire-shape gate |
+| `tests/load_command_parity.rs`       | Apple `ld` load-command shape checks |
+| `tests/linker_run.rs`                | End-to-end executable, dylib, relocation, LOH, dead-strip, ICF, and runtime coverage |
+| `tests/linker_write_integration.rs`  | Writer-level executable/dylib/rpath metadata coverage |
+| `tests/cli_diagnostics.rs`           | CLI, diagnostics, malformed-input, warning, and UX snapshots |
+| `tests/binary_size_audit.rs`         | Output-size budget against Apple `ld` |
+| `tests/perf_baseline.rs`             | Link-time profile and budget gate |
 
-Corpus fixtures live in `tests/corpus/`. Every new relocation kind,
-section kind, or CLI flag lands a corpus entry in the same sprint.
+Parity fixtures live in `tests/parity_corpus/`; reader fixtures live in
+`tests/corpus/` when needed. Every new relocation kind, section kind, or CLI
+flag lands focused coverage in the same sprint.
 
 ## Audit Discipline
 

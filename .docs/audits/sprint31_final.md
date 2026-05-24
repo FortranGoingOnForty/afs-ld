@@ -363,14 +363,30 @@ No `todo!` or `unimplemented!` remains in production `src/`.
 
 ## 9. Documentation Refresh
 
-Status: open.
+Status: passing.
 
-Required files:
+Updated files:
 
 - `CLAUDE.md`
 - `README.md`
 - `.docs/overview.md`
-- sprint index if scope changed.
+
+Changes:
+
+- Replaced the stale README "Sprint 0 scaffolding only" status with the
+  current Sprint 31 final-gate state.
+- Added final-gate parity, determinism, spec, size, and perf commands to the
+  README.
+- Refreshed `CLAUDE.md` test commands and test architecture table to use the
+  current integration-test filenames.
+- Documented the current parent-driver reality: Apple `ld` is still default,
+  `AFS_LD=1` / `AFS_LD_PATH=<path>` selects afs-ld, and the default-swap patch
+  is still gated on this audit.
+- Refreshed `.docs/overview.md` for the 56-case parity matrix, fortsh audit
+  status, and Sprint 30/Sprint 31 audit state.
+
+The sprint index did not need a scope change; Sprint 31 remains the active
+final-audit/default-swap gate.
 
 ## 10. Submodule Pin And Tag
 

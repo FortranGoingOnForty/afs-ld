@@ -35,20 +35,33 @@ afs-as emits `MH_OBJECT` only (hand-rolled, no external Mach-O crate). Its outpu
 - Symbol flags: `N_UNDF`/`N_SECT`/`N_ABS` with `N_EXT`, `N_PEXT`, `N_WEAK_REF`, `N_WEAK_DEF`, `N_NO_DEAD_STRIP`. Common symbols live in `N_UNDF` with `n_desc`-encoded alignment.
 - Relocation types: `ARM64_RELOC_UNSIGNED`, `SUBTRACTOR`, `BRANCH26`, `PAGE21`, `PAGEOFF12`, `GOT_LOAD_PAGE21`, `GOT_LOAD_PAGEOFF12`, `POINTER_TO_GOT`, `TLVP_LOAD_PAGE21`, `TLVP_LOAD_PAGEOFF12`, `ADDEND` (paired prefix).
 - Flags: `MH_SUBSECTIONS_VIA_SYMBOLS` always set — atomization model is in play.
-- LOH hints: `AdrpAdd`, `AdrpLdr`, `AdrpLdrGot`, `AdrpLdrGotLdr` — afs-ld preserves them from Sprint 0 and relaxes them in Sprint 25.
+- LOH hints: `AdrpAdd`, `AdrpLdr`, `AdrpLdrGot`, `AdrpLdrGotLdr` — afs-ld
+  parses them and the parity corpus gates the final executable/dylib behavior
+  against Apple `ld`.
 
 afs-as exposes no Mach-O reader. afs-ld ships its own.
 
 ## Current driver contract
 
-`armfortas/src/driver/mod.rs:497-565` shells out to `ld`:
+`armfortas/src/driver/mod.rs` still defaults to Apple `ld`:
 
 ```
 ld <obj1> <obj2> ... <libarmfortas_rt.a> \
    -lSystem -no_uuid -syslibroot <SDK> -e _main -o <output>
 ```
 
-Inputs are `.o` from afs-as plus `libarmfortas_rt.a` from the `runtime/` crate. Output is an arm64 PIE executable with entry `_main` (a synthetic wrapper at `src/driver/mod.rs:371-392` calling `_afs_program_init` → user PROGRAM → `_afs_program_finalize`). afs-ld drops into this contract unchanged; the driver swap (Sprint 20) is initially gated behind `AFS_LD=1`.
+Inputs are `.o` from afs-as plus `libarmfortas_rt.a` from the `runtime/`
+crate. Output is an arm64 PIE executable with entry `_main`, or an `MH_DYLIB`
+when the driver is invoked with `-shared`.
+
+The afs-ld path is wired but not yet default:
+
+- `AFS_LD=1` resolves the sibling `afs-ld` binary.
+- `AFS_LD_PATH=<path>` runs an explicit afs-ld build.
+- `AFS_LD=0` keeps the Apple `ld` path.
+
+The Sprint 31 final audit is the default-swap gate. Until the default-swap
+patch lands, docs and tests must not claim afs-ld is the parent default.
 
 ## Reference material
 
@@ -109,27 +122,27 @@ afs-ld/
 │   │   ├── tlv.rs
 │   │   ├── symtab.rs
 │   │   ├── dyld_info.rs       # classic rebase/bind/lazy/weak + export trie
-│   │   ├── chained.rs         # LC_DYLD_CHAINED_FIXUPS
+│   │   ├── chained_fixups.rs  # LC_DYLD_CHAINED_FIXUPS
 │   │   ├── unwind.rs
-│   │   ├── eh_frame.rs
-│   │   ├── func_starts.rs
-│   │   ├── data_in_code.rs
 │   │   └── code_sig.rs        # ad-hoc SHA-256 code signature
-│   ├── map.rs                 # -map text link map
+│   ├── link_map.rs            # -map text link map
 │   ├── why_live.rs            # -why_live dead-strip reasons
-│   ├── gc.rs                  # -dead_strip
 │   ├── icf.rs                 # -icf=safe
-│   ├── driver.rs              # orchestrator
 │   └── diag.rs                # diagnostics, path/line/col parity with afs-as
 └── tests/
     ├── common/harness.rs      # spawn afs-ld, diff output vs system ld
     ├── reader_*.rs            # round-trip object reads
-    ├── reloc_*.rs             # golden-file reloc application
     ├── resolve_*.rs           # symbol resolution matrices
-    ├── hello_world.rs         # first end-to-end executable link
-    ├── hello_library.rs       # first end-to-end dylib link
-    ├── armfortas_integration.rs
-    └── corpus/                # hand-curated .o / .a / .dylib / .tbd fixtures
+    ├── linker_run.rs          # end-to-end executable/dylib/linker feature coverage
+    ├── linker_write_integration.rs
+    ├── cli_diagnostics.rs
+    ├── load_command_parity.rs
+    ├── spec_conformance.rs
+    ├── parity_matrix.rs
+    ├── parity_determinism.rs
+    ├── binary_size_audit.rs
+    ├── perf_baseline.rs
+    └── parity_corpus/         # curated Apple ld differential fixtures
 ```
 
 ## Architecture pipeline
@@ -161,11 +174,24 @@ args → inputs → resolve → atomize → layout → apply relocs → synth se
 ## Testing strategy
 
 - **Unit**: every parser and encoder has a round-trip test — parse a fixture, re-emit, compare bytes.
-- **Corpus**: `tests/corpus/` collects `.o`, `.a`, `.dylib`, `.tbd` fixtures. Every new relocation type or section kind lands a corpus entry in the same sprint that implements it.
-- **Differential** (from Sprint 1): `tests/common/harness.rs` links the same inputs through `ld` and `afs-ld`, diffs load commands, symbol tables, bind/rebase or chained-fixup streams, and disassembly. Tolerated-diff allowlist covers UUID, timestamp, hash-backed temp names. CI gate from sprint one.
+- **Corpus**: `tests/parity_corpus/` collects the Apple `ld` differential
+  fixtures; `tests/corpus/` is reserved for reader fixtures when needed. Every
+  new relocation type or section kind lands focused coverage in the same
+  sprint that implements it.
+- **Differential** (Sprint 27+): `tests/common/harness.rs` links the same
+  inputs through `ld` and `afs-ld`, diffs load commands, symbol tables,
+  bind/rebase or chained-fixup streams, exports, reloc-patched text/data,
+  runtime output, and disassembly-sensitive metadata. The parity corpus is
+  currently 56 cases and is gated by `tests/parity_matrix.rs`.
 - **End-to-end** (from Sprint 18): hello-world executable must run; (Sprint 18.5) hello-library dylib must `dlopen`. (Sprint 21) the full armfortas integration suite must pass.
-- **fortsh link** (Sprint 29): explicit milestone. A fortsh binary linked by afs-ld must behave identically to one linked by system `ld`.
-- **Audits**: post-Sprint 18 (hello), 18.5 (dylib), 22 (first signed & running on bare arm64), 27 (parity gate), 29 (fortsh), 31 (final). Brutal honesty rules from armfortas/CLAUDE.md apply.
+- **fortsh link** (Sprint 29): explicit milestone. afs-ld links the
+  armfortas-built fortsh object set, the binary starts, code signing validates,
+  help output matches Apple `ld`, and direct link time is within the 2x gate.
+  The remaining fortsh `-c` invalid-free is tracked as an armfortas
+  generated-object/runtime issue, not an afs-ld linker blocker.
+- **Audits**: post-Sprint 18 (hello), 18.5 (dylib), 22 (first signed &
+  running on bare arm64), 27 (parity gate), 29 (fortsh), 30 (diagnostics), 31
+  (final). Brutal honesty rules from armfortas/CLAUDE.md apply.
 
 ## Sprint roadmap (summary)
 

@@ -390,12 +390,18 @@ final-audit/default-swap gate.
 
 ## 10. Submodule Pin And Tag
 
-Status: open.
+Status: passing.
 
-Required actions:
+Actions:
 
-- Pin parent armfortas to the final afs-ld commit.
-- Tag afs-ld `v0.1.0`.
+- Tag afs-ld `v0.1.0` at the final Sprint 31 audit commit.
+- Pin parent armfortas to that final afs-ld commit in the parent repo.
+
+Evidence:
+
+- afs-ld final audit tag target: this commit.
+- Parent armfortas submodule pointer is updated by the follow-up parent
+  release-mechanics commit.
 
 ## 11. Default-Swap Removal
 

@@ -43,26 +43,26 @@ afs-as exposes no Mach-O reader. afs-ld ships its own.
 
 ## Current driver contract
 
-`armfortas/src/driver/mod.rs` now defaults to afs-ld:
+`armfortas/src/driver/mod.rs` still defaults to Apple `ld`:
 
 ```
-afs-ld -arch arm64 -e _main -o <output> \
-   <obj1> <obj2> ... <libarmfortas_rt.a> <libSystem.tbd>
+ld <obj1> <obj2> ... <libarmfortas_rt.a> \
+   -lSystem -no_uuid -syslibroot <SDK> -e _main -o <output>
 ```
 
 Inputs are `.o` from afs-as plus `libarmfortas_rt.a` from the `runtime/`
 crate. Output is an arm64 PIE executable with entry `_main`, or an `MH_DYLIB`
 when the driver is invoked with `-shared`.
 
-The one-sprint fallback window is still wired:
+The afs-ld path is wired but still explicit:
 
-- no env var resolves the sibling `afs-ld` binary.
-- `AFS_LD=1` remains accepted and also resolves the sibling `afs-ld` binary.
+- `AFS_LD=1` resolves the sibling `afs-ld` binary.
 - `AFS_LD_PATH=<path>` runs an explicit afs-ld build.
-- `AFS_LD=0` keeps the Apple `ld` path.
+- `AFS_LD=0` keeps the Apple `ld` path and is equivalent to the current
+  default.
 
-The fallback is intentionally explicit. afs-ld failures surface loudly and
-print an `AFS_LD=0` retry hint; the driver does not silently fall back.
+The default swap is deferred until the remaining Apple-parity concerns are
+closed. afs-ld failures surface loudly; the driver does not silently fall back.
 
 ## Reference material
 

@@ -8,9 +8,9 @@ Sister project to [afs-as](https://github.com/FortranGoingOnForty/afs-as) (the a
 
 Sprint 31 final-gate work. `afs-ld` now emits runnable arm64 `MH_EXECUTE`
 and `MH_DYLIB` outputs, links the armfortas runtime corpus, and has a
-56-case Apple `ld` parity matrix. The parent armfortas driver uses afs-ld by
-default, with `AFS_LD=0` retained as the one-sprint Apple `ld` fallback and
-`AFS_LD_PATH=<path>` available for explicit linker builds.
+56-case Apple `ld` parity matrix. The parent armfortas driver still uses
+Apple `ld` by default; `AFS_LD=1` or `AFS_LD_PATH=<path>` selects afs-ld
+explicitly while the remaining parity gaps are audited.
 
 ## Build
 

@@ -2,11 +2,12 @@
 
 Date: 2026-05-23
 
-Status: passing.
+Status: default-swap deferred.
 
 Sprint 31 is the final gate before afs-ld can be treated as the permanent
-armfortas default linker. This report records hard evidence, not intent. All
-sections below are passing as of the local `v0.1.0` tag target.
+armfortas default linker. This report records hard evidence, not intent.
+Most technical gates below are passing, but the default swap is intentionally
+deferred while remaining Apple-parity concerns are audited.
 
 ## 1. Parity Corpus
 
@@ -379,8 +380,8 @@ Changes:
   README.
 - Refreshed `CLAUDE.md` test commands and test architecture table to use the
   current integration-test filenames.
-- Documented the current parent-driver reality: afs-ld is the default,
-  `AFS_LD=0` selects the one-sprint Apple `ld` fallback, and
+- Documented the current parent-driver reality: Apple `ld` remains the
+  default, `AFS_LD=1` selects the sibling afs-ld binary, and
   `AFS_LD_PATH=<path>` selects an explicit afs-ld build.
 - Refreshed `.docs/overview.md` for the 56-case parity matrix, fortsh audit
   status, and Sprint 30/Sprint 31 audit state.
@@ -390,30 +391,30 @@ final-audit/default-swap gate.
 
 ## 10. Submodule Pin And Tag
 
-Status: passing.
+Status: deferred.
 
-Actions:
+Rationale:
 
-- Tag afs-ld `v0.1.0` at the final Sprint 31 audit commit.
-- Pin parent armfortas to that final afs-ld commit in the parent repo.
+- Do not publish `v0.1.0` until the default-swap decision is approved.
+- Keep parent armfortas pinned to the latest afs-ld audit work as needed, but
+  do not treat that pin as a release declaration.
 
-Evidence:
+Local note:
 
-- afs-ld final audit tag target: this commit.
-- Parent armfortas submodule pointer is updated by the follow-up parent
-  release-mechanics commit.
+- A local `v0.1.0` tag may exist from the premature closeout attempt. It should
+  be deleted or moved before any tag push.
 
 ## 11. Default-Swap Removal
 
-Status: passing.
+Status: deferred.
 
-Action:
+Decision:
 
-- Made afs-ld the armfortas default linker.
-- Preserved `AFS_LD=0` as the documented one-sprint Apple `ld` fallback.
-- Preserved `AFS_LD=1` compatibility and `AFS_LD_PATH=<path>` explicit linker
-  selection.
-- Added a fallback regression to `tests/standalone_toolchain.rs`.
+- Keep Apple `ld` as the parent armfortas default.
+- Keep afs-ld available through `AFS_LD=1` and `AFS_LD_PATH=<path>`.
+- Keep `AFS_LD=0` covered as the explicit Apple `ld` path.
+- Revisit default swap after the remaining Apple-parity gaps are resolved or
+  explicitly accepted.
 
 Command:
 
@@ -425,7 +426,7 @@ Result:
 
 ```text
 running 7 tests
-test hello_world_allows_apple_ld_fallback_with_afs_ld_zero ... ok
+test hello_world_keeps_apple_ld_path_with_afs_ld_zero ... ok
 test result: ok. 7 passed; 0 failed
 ```
 
@@ -433,4 +434,5 @@ Current blocker status:
 
 - The known shared-library override blocker has been removed and covered by
   `tests/standalone_toolchain.rs`.
-- The default flip is complete. Release mechanics remain in Section 10.
+- The default flip is intentionally deferred because afs-ld is not yet accepted
+  as Apple `ld` parity-equivalent for the full parent-driver surface.

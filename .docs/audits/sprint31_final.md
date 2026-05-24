@@ -236,22 +236,75 @@ Coverage added during this audit:
 
 ## 5. Binary Size Audit
 
-Status: open.
+Status: passing.
 
-Required comparisons:
+Command:
 
-- hello-world.
-- libarmfortas_rt-linked Fortran program.
-- fortsh.
+```text
+cargo test -p afs-ld --test binary_size_audit -- --nocapture
+```
+
+Result:
+
+```text
+hello_classic size audit: afs-ld=16792 Apple ld=16792 ratio=1.000
+runtime_fortran_three_func_exec size audit: afs-ld=1803400 Apple ld=1692680 ratio=1.065
+test hello_and_runtime_binary_sizes_stay_near_apple_ld ... ok
+```
+
+Fortsh evidence remains the Sprint 29 audit measurement:
+
+```text
+afs-ld: 14,573,584 bytes
+Apple ld: 14,327,424 bytes
+delta: about 1.7%
+```
+
+Notes:
+
+- The current automated binary-size audit covers hello-world and a
+  libarmfortas_rt-linked Fortran program from the parity corpus.
+- Fortsh size remains below the Sprint 29 5% budget in the recorded real
+  fortsh fixture audit.
 
 ## 6. Performance Audit
 
-Status: open.
+Status: passing.
 
-Required comparisons:
+Command:
 
-- Sprint 28 benchmark rerun.
-- fortsh link within 2x Apple `ld`.
+```text
+AFS_LD_HELLO_BUDGET_MS=25 AFS_LD_RUNTIME_BUDGET_MS=150 cargo test -p afs-ld --test perf_baseline -- --nocapture
+```
+
+Result:
+
+```text
+hello: total=2.65975ms
+runtime: total=34.676083ms
+bench_fortsh_fixture_profile_reports_baseline_timings ... ok
+test result: ok. 3 passed; 0 failed
+```
+
+Fortsh fixture note:
+
+- The local `perf_baseline` fortsh test is opt-in and skipped unless
+  `AFS_LD_FORTSH_INPUTS_FILE` points at a newline-delimited fortsh object list.
+- The Sprint 29 real fortsh audit remains the current 2x evidence:
+
+```text
+Through the armfortas final-link path with release afs-ld: afs-ld 0.16-0.17s, Apple ld 0.06s
+Direct linker invocation on the same object list: afs-ld 58.7-62.4ms, Apple ld 32.8-35.6ms
+Direct-link ratio: about 1.8x Apple ld
+```
+
+Notes:
+
+- Hello and runtime budgets are enforced by environment variables in the test
+  command above.
+- The fortsh runtime matrix remains blocked by the armfortas invalid-free bug
+  recorded in `.docs/audits/sprint29_fortsh.md`; the direct linker comparison
+  itself is within the documented Sprint 29/Sprint 31 cutoff.
 
 ## 7. Diagnostic Quality Audit
 

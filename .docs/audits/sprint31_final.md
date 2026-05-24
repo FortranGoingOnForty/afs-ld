@@ -130,21 +130,59 @@ Notes:
 
 ## 3. Spec Conformance Survey
 
-Status: open.
+Status: passing for the supported executable/dylib final-gate surface.
 
-Required checklist:
+Command:
 
-- Header and magic.
-- Load command set.
-- Segment/section flags.
-- Every relocation type in `<mach-o/arm64/reloc.h>`.
-- Symbol types in `<mach-o/nlist.h>`.
-- `LC_DYLD_INFO_ONLY` opcode set.
-- `LC_DYLD_CHAINED_FIXUPS` format.
-- Export trie terminal formats.
-- `__unwind_info` layout.
-- Compact unwind encoding.
-- Code signature SuperBlob.
+```text
+cargo test -p afs-ld --test spec_conformance -- --nocapture
+```
+
+Result:
+
+```text
+7 passed; 0 failed
+```
+
+Coverage:
+
+- `public_macho_constants_match_supported_apple_wire_values` pins the supported
+  `<mach-o/loader.h>`, `<mach-o/nlist.h>`, `<mach-o/arm64/reloc.h>`, export
+  trie, rebase, and bind opcode constants.
+- `writer_outputs_have_spec_shaped_headers_load_commands_and_code_signature`
+  validates executable and dylib `mach_header_64`, load-command accounting,
+  `LC_MAIN` / `LC_ID_DYLIB` kind-specific presence, `__TEXT`, and
+  `LC_CODE_SIGNATURE` SuperBlob magic in writer output.
+- `every_arm64_relocation_wire_type_is_parsed_or_fused_intentionally` covers
+  every `ARM64_RELOC_*` wire type, including `ADDEND` prefix fusion and
+  `SUBTRACTOR + UNSIGNED` pair fusion.
+- `nlist_symbol_types_decode_supported_spec_variants` covers `N_UNDF`,
+  `N_ABS`, `N_SECT`, `N_INDR`, `N_STAB`, `N_EXT`, and `N_PEXT`.
+- `export_trie_round_trips_all_terminal_payload_forms` covers regular,
+  thread-local, absolute, re-export, weak-definition, and stub/resolver export
+  trie terminal payloads.
+- `chained_fixups_blob_uses_supported_header_starts_imports_and_pointer_formats`
+  validates `LC_DYLD_CHAINED_FIXUPS` header/starts/import/symbol-string
+  shape plus rebase and bind pointer-write formats.
+- `code_signature_superblob_has_ad_hoc_codedirectory_shape` validates the
+  ad-hoc SuperBlob and CodeDirectory fields used by afs-ld outputs.
+
+Existing differential coverage that remains part of this gate:
+
+- `cargo test -p afs-ld --test load_command_parity`
+- `cargo test -p afs-ld --test parity_matrix parity_corpus -- --nocapture`
+
+These cover Apple `ld` load-command order, segment/section parity, dyld-info
+streams, rebased `__unwind_info`, compact-unwind consumption, code-signature
+tolerance, and the broader relocation corpus.
+
+Current results:
+
+```text
+load_command_parity: 3 passed; 0 failed
+parity matrix timing: 56 case(s) in 7.04s
+parity_corpus ... ok
+```
 
 ## 4. CLI Parity Survey
 

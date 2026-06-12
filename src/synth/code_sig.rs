@@ -1,4 +1,8 @@
-use std::{ffi::c_void, thread};
+use std::thread;
+// CC_SHA256's signature is the only c_void consumer; scope the import
+// with the macOS-only extern so non-Darwin clippy doesn't flag it.
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
 
 use crate::layout::Layout;
 use crate::section::is_executable;

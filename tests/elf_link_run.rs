@@ -75,6 +75,45 @@ fn freestanding_exit42_matches_system_linkers() {
         "afs-ld ELF output must be byte-deterministic"
     );
 
+    // The full bespoke chain: the same source assembled by afs-as
+    // (sibling binary in the workspace target dir; crate independence
+    // preserved — we shell out, never link against it), then linked
+    // by afs-ld. Skip only when the sibling isn't built.
+    let afs_as = ["../target/debug/afs-as", "target/debug/afs-as"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists());
+    if let Some(afs_as) = afs_as {
+        let obj2 = dir.join("x_afsas.o");
+        let r = Command::new(&afs_as)
+            .args(["--64", "-o"])
+            .arg(&obj2)
+            .arg(&s)
+            .output()
+            .unwrap();
+        assert!(
+            r.status.success(),
+            "afs-as: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let ours3 = dir.join("x_allbespoke");
+        let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-o")
+            .arg(&ours3)
+            .arg(&obj2)
+            .output()
+            .unwrap();
+        assert!(
+            r.status.success(),
+            "afs-ld on afs-as object: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let run = Command::new(&ours3).output().unwrap();
+        assert_eq!(run.status.code(), Some(42), "all-bespoke binary exit code");
+    } else {
+        eprintln!("skipping: afs-as sibling binary not built (all-bespoke leg)");
+    }
+
     // Behavioral parity with every available system linker.
     for ld in ["/usr/bin/ld", "/usr/local/bin/ld"] {
         if !std::path::Path::new(ld).exists() {

@@ -8,7 +8,7 @@
 //! 64/32/32S/PC32/PLT32. PLT32 in a static link with the target
 //! defined resolves exactly like PC32 — there is no PLT.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const EM_X86_64: u16 = 62;
 pub const ET_REL: u16 = 1;
@@ -280,9 +280,121 @@ fn output_rank(flags: u64, is_bss: bool) -> u32 {
     }
 }
 
-/// Link relocatable objects into a static freestanding ET_EXEC image.
-/// Entry symbol must be defined; every undefined global is an error
-/// (rung 1: no libraries).
+/// A library archive (`.a`) offered for lazy member selection. The raw
+/// bytes are the whole `ar` container; members are parsed as ELF only
+/// when pulled to satisfy an undefined symbol.
+pub struct Library {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Names a symtab entry defines (global/weak, section-bound, non-empty).
+fn defined_names(obj: &ElfObject, out: &mut HashSet<String>) {
+    for sym in &obj.symbols {
+        if sym.name.is_empty() || sym.bind == STB_LOCAL || sym.shndx == SHN_UNDEF {
+            continue;
+        }
+        out.insert(sym.name.clone());
+    }
+}
+
+/// Strong-undefined names an object references, in first-seen order,
+/// skipping any already defined. Weak-undefined does not pull archive
+/// members (it resolves to 0 if left unsatisfied).
+fn undefined_demand(objects: &[ElfObject], defined: &HashSet<String>) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut demand = Vec::new();
+    for obj in objects {
+        for sym in &obj.symbols {
+            if sym.shndx != SHN_UNDEF
+                || sym.bind != STB_GLOBAL
+                || sym.name.is_empty()
+                || defined.contains(&sym.name)
+            {
+                continue;
+            }
+            if seen.insert(sym.name.clone()) {
+                demand.push(sym.name.clone());
+            }
+        }
+    }
+    demand
+}
+
+/// Link relocatable objects plus library archives into a static
+/// ET_EXEC. Explicit objects load unconditionally, in order; archive
+/// members load lazily, pulled to satisfy strong-undefined symbols and
+/// iterated to a fixed point (global `--start-group` semantics, so
+/// mutually-referencing archives resolve regardless of order). The
+/// first archive to define a symbol wins.
+pub fn link_static(
+    mut objects: Vec<ElfObject>,
+    libs: &[Library],
+    entry: &str,
+) -> Result<Vec<u8>, ElfError> {
+    use crate::archive::Archive as ArContainer;
+
+    let archives: Vec<ArContainer> = libs
+        .iter()
+        .map(|l| {
+            ArContainer::open(l.name.clone(), &l.bytes)
+                .map_err(|e| ElfError(format!("{}: {}", l.name, e)))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut defined: HashSet<String> = HashSet::new();
+    for obj in &objects {
+        defined_names(obj, &mut defined);
+    }
+    let mut pulled: Vec<HashSet<usize>> = vec![HashSet::new(); archives.len()];
+
+    loop {
+        let demand = undefined_demand(&objects, &defined);
+        let mut changed = false;
+        for name in &demand {
+            for (ai, ar) in archives.iter().enumerate() {
+                let Some(off) = ar
+                    .symbol_index()
+                    .and_then(|si| si.first_defining_offset(name))
+                else {
+                    continue;
+                };
+                // First archive to define the symbol wins; stop scanning
+                // once found whether or not its member is freshly pulled.
+                if pulled[ai].insert(off as usize) {
+                    let member = ar.member_at_offset(off).ok_or_else(|| {
+                        ElfError(format!(
+                            "{}: symbol index points at offset {:#x} with no member",
+                            libs[ai].name, off
+                        ))
+                    })?;
+                    if member.body.is_empty() {
+                        return err(format!(
+                            "{}({}): thin-archive members are out of scope for ELF static linking",
+                            libs[ai].name, member.name
+                        ));
+                    }
+                    let logical = format!("{}({})", libs[ai].name, member.name);
+                    let obj = parse_rel(&logical, member.body)?;
+                    defined_names(&obj, &mut defined);
+                    objects.push(obj);
+                    changed = true;
+                }
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    link_static_exec(&objects, entry)
+}
+
+/// Link relocatable objects into a static ET_EXEC image. Explicit
+/// objects only — undefined strong globals are an error; use
+/// [`link_static`] to pull definitions from library archives. Undefined
+/// *weak* references resolve to 0.
 pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, ElfError> {
     // ---- Merge input sections by (name, flags) in first-seen order,
     // ranked text / rodata / data / bss for segment assignment.
@@ -412,9 +524,13 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
         let resolved: (usize, usize) = if sym.shndx == SHN_UNDEF {
             match globals.get(&sym.name) {
                 Some(&(doi, dsi)) => (doi, dsi),
+                // A weak reference with no definition is legal — it
+                // resolves to the absolute address 0. Strong undefined
+                // is a real error.
+                None if sym.bind == STB_WEAK => return Ok(0),
                 None => {
                     return err(format!(
-                        "undefined symbol '{}' (referenced from {}) — libraries land in rung 2",
+                        "undefined symbol '{}' (referenced from {})",
                         sym.name, objects[oi].name
                     ))
                 }

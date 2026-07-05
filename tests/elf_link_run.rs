@@ -142,14 +142,123 @@ fn elf_mode_rejects_unsupported_flags_loudly() {
     std::fs::write(&s, ".text\n.globl _start\n_start:\n    ret\n").unwrap();
     assert!(Command::new(&gas).args(["--64", "-o"]).arg(&obj).arg(&s).output().unwrap().status.success());
 
+    // `-pie` is a dynamic-link request — rung 3, must be rejected loudly.
     let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
-        .args(["--eh-frame-hdr", "-o"])
+        .args(["-pie", "-o"])
         .arg(dir.join("y_out"))
         .arg(&obj)
         .output()
         .unwrap();
     assert!(!r.status.success());
     let stderr = String::from_utf8_lossy(&r.stderr);
-    assert!(stderr.contains("rung 2"), "must name the rung: {}", stderr);
+    assert!(stderr.contains("rung 3"), "must name the rung: {}", stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Assemble `src` with gas into `obj`. Panics on failure.
+fn assemble(gas: &std::path::Path, src: &str, s: &std::path::Path, obj: &std::path::Path) {
+    std::fs::write(s, src).unwrap();
+    let out = Command::new(gas)
+        .args(["--64", "-o"])
+        .arg(obj)
+        .arg(s)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "gas: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Archive selection is lazy: only members that satisfy an undefined
+/// symbol are pulled. The archive carries a poison member that
+/// references a never-defined strong symbol; a correct linker never
+/// pulls it, so the link succeeds and the binary exits with the value
+/// returned by the one member it did pull.
+#[test]
+fn archive_member_selection_links_only_used_members() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=archive_member_selection_links_only_used_members count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    // `ar` is needed to build the archive + symbol index.
+    let ar = ["/usr/bin/ar", "/usr/local/bin/ar"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists());
+    let Some(ar) = ar else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=archive_member_selection_links_only_used_members count=1 reason=\"no ar on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_arsel_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    // main.o: exit(answer()).
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n    call answer\n    movl %eax, %edi\n    movl ${exit_nr}, %eax\n    syscall\n"
+        ),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+    // used.o: answer() -> 42.
+    let used_obj = dir.join("used.o");
+    assemble(
+        &gas,
+        ".text\n.globl answer\nanswer:\n    movl $42, %eax\n    ret\n",
+        &dir.join("used.s"),
+        &used_obj,
+    );
+    // poison.o: defines an unused symbol but references a strong symbol
+    // that nothing defines. Pulling it in would fail the link.
+    let poison_obj = dir.join("poison.o");
+    assemble(
+        &gas,
+        ".text\n.globl unused_sym\nunused_sym:\n    call nonexistent_dependency\n    ret\n",
+        &dir.join("poison.s"),
+        &poison_obj,
+    );
+
+    // Archive both library members (order: poison first, so a naive
+    // linker that loads every member would hit the poison immediately).
+    let archive = dir.join("libstuff.a");
+    let _ = std::fs::remove_file(&archive);
+    let r = Command::new(&ar)
+        .arg("rcs")
+        .arg(&archive)
+        .arg(&poison_obj)
+        .arg(&used_obj)
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "ar: {}", String::from_utf8_lossy(&r.stderr));
+
+    // Positional-archive form: main.o libstuff.a.
+    let out1 = dir.join("sel_positional");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&out1)
+        .arg(&main_obj)
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "afs-ld positional archive: {}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(Command::new(&out1).output().unwrap().status.code(), Some(42));
+
+    // `-L <dir> -l stuff` form resolves the same archive by name.
+    let out2 = dir.join("sel_dashl");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&out2)
+        .arg(&main_obj)
+        .arg("-L")
+        .arg(&dir)
+        .arg("-lstuff")
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "afs-ld -l form: {}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(Command::new(&out2).output().unwrap().status.code(), Some(42));
+
+    // Both forms are byte-identical (determinism + form equivalence).
+    assert_eq!(std::fs::read(&out1).unwrap(), std::fs::read(&out2).unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }

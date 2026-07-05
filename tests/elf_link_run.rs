@@ -167,6 +167,46 @@ fn assemble(gas: &std::path::Path, src: &str, s: &std::path::Path, obj: &std::pa
     assert!(out.status.success(), "gas: {}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// GOT synthesis: a `foo@GOTPCREL` load resolves through a synthesized
+/// `.got` slot holding foo's final address, and an unsatisfied *weak*
+/// GOTPCREL reference reads back 0. The program exits 42 only when both
+/// hold.
+#[test]
+fn gotpcrel_loads_through_synthesized_got() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=gotpcrel_loads_through_synthesized_got count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_got_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let obj = dir.join("g.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n.weak missing\n_start:\n    movq missing@GOTPCREL(%rip), %rax\n    cmpq $0, %rax\n    jne 1f\n    movq val@GOTPCREL(%rip), %rax\n    movl (%rax), %edi\n    jmp 2f\n1:  movl $7, %edi\n2:  movl ${exit_nr}, %eax\n    syscall\n.data\n.globl val\nval:\n    .long 42\n"
+        ),
+        &dir.join("g.s"),
+        &obj,
+    );
+    let out = dir.join("g");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
+
+    // Determinism.
+    let out2 = dir.join("g2");
+    assert!(Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o").arg(&out2).arg(&obj).output().unwrap().status.success());
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&out2).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Archive selection is lazy: only members that satisfy an undefined
 /// symbol are pulled. The archive carries a poison member that
 /// references a never-defined strong symbol; a correct linker never

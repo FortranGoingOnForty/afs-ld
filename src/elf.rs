@@ -35,8 +35,11 @@ pub const SHN_COMMON: u16 = 0xfff2;
 pub const R_X86_64_64: u32 = 1;
 pub const R_X86_64_PC32: u32 = 2;
 pub const R_X86_64_PLT32: u32 = 4;
+pub const R_X86_64_GOTPCREL: u32 = 9;
 pub const R_X86_64_32: u32 = 10;
 pub const R_X86_64_32S: u32 = 11;
+pub const R_X86_64_GOTPCRELX: u32 = 41;
+pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
 
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
@@ -440,10 +443,6 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
             place.insert((oi, si), (idx, cursor));
         }
     }
-    // Deterministic segment order: text, rodata, data, bss.
-    let mut order: Vec<usize> = (0..outs.len()).collect();
-    order.sort_by_key(|&i| (output_rank(outs[i].flags, outs[i].is_bss), i));
-
     // ---- Global symbol resolution.
     // name -> (object, symbol index); strong duplicates are errors,
     // weak yields to strong.
@@ -483,6 +482,82 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
         }
     }
 
+    // Reference -> definition identity. None means an unsatisfied weak
+    // reference (address 0). Depends only on `globals`, so it is valid
+    // before layout — the GOT pre-scan uses it.
+    let resolve_def = |oi: usize, si: usize| -> Result<Option<(usize, usize)>, ElfError> {
+        let sym = &objects[oi].symbols[si];
+        if sym.shndx == SHN_UNDEF {
+            match globals.get(&sym.name) {
+                Some(&d) => Ok(Some(d)),
+                None if sym.bind == STB_WEAK => Ok(None),
+                None => err(format!(
+                    "undefined symbol '{}' (referenced from {})",
+                    sym.name, objects[oi].name
+                )),
+            }
+        } else {
+            Ok(Some((oi, si)))
+        }
+    };
+
+    // ---- GOT synthesis. Each GOTPCREL-family reference gets an 8-byte
+    // slot holding the target's final address, deduplicated by target;
+    // unsatisfied weak references share one zero slot. A static link
+    // could relax the load to a lea, but a real slot is uniformly
+    // correct and keeps the reloc arm simple.
+    let mut got_targets: Vec<Option<(usize, usize)>> = Vec::new();
+    let mut got_of: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut got_weak0: Option<usize> = None;
+    for (oi, obj) in objects.iter().enumerate() {
+        for sec in &obj.sections {
+            for r in &sec.relas {
+                if !is_gotpcrel(r.r_type) {
+                    continue;
+                }
+                match resolve_def(oi, r.sym as usize)? {
+                    Some(d) => {
+                        got_of.entry(d).or_insert_with(|| {
+                            got_targets.push(Some(d));
+                            got_targets.len() - 1
+                        });
+                    }
+                    None => {
+                        if got_weak0.is_none() {
+                            got_targets.push(None);
+                            got_weak0 = Some(got_targets.len() - 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let got_out: Option<usize> = if got_targets.is_empty() {
+        None
+    } else {
+        outs.push(OutSec {
+            name: ".got".to_string(),
+            flags: SHF_ALLOC | SHF_WRITE,
+            align: 8,
+            data: vec![0u8; got_targets.len() * 8],
+            bss_size: 0,
+            vaddr: 0,
+            file_off: 0,
+            is_bss: false,
+        });
+        Some(outs.len() - 1)
+    };
+    let got_slot = |def: Option<(usize, usize)>| -> usize {
+        match def {
+            Some(d) => got_of[&d],
+            None => got_weak0.unwrap(),
+        }
+    };
+
+    // Deterministic segment order: text, rodata, data, bss (GOT included).
+    let mut order: Vec<usize> = (0..outs.len()).collect();
+    order.sort_by_key(|&i| (output_rank(outs[i].flags, outs[i].is_bss), i));
+
     // ---- Layout: one RX PT_LOAD covering ehdr+phdrs+text/rodata,
     // one RW PT_LOAD for data+bss. (rodata shares the RX segment at
     // rung 1 — matches what lld does with a small freestanding
@@ -517,28 +592,15 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
     }
 
     // Symbol address resolver (vaddr snapshot avoids borrowing
-    // `outs` inside the mutating relocation loop).
+    // `outs` inside the mutating relocation loop). An unsatisfied weak
+    // reference resolves to 0.
     let out_vaddrs: Vec<u64> = outs.iter().map(|o| o.vaddr).collect();
     let sym_vaddr = |oi: usize, si: usize| -> Result<u64, ElfError> {
-        let sym = &objects[oi].symbols[si];
-        let resolved: (usize, usize) = if sym.shndx == SHN_UNDEF {
-            match globals.get(&sym.name) {
-                Some(&(doi, dsi)) => (doi, dsi),
-                // A weak reference with no definition is legal — it
-                // resolves to the absolute address 0. Strong undefined
-                // is a real error.
-                None if sym.bind == STB_WEAK => return Ok(0),
-                None => {
-                    return err(format!(
-                        "undefined symbol '{}' (referenced from {})",
-                        sym.name, objects[oi].name
-                    ))
-                }
-            }
-        } else {
-            (oi, si)
+        let (doi, dsi) = match resolve_def(oi, si)? {
+            Some(d) => d,
+            None => return Ok(0),
         };
-        let d = &objects[resolved.0].symbols[resolved.1];
+        let d = &objects[doi].symbols[dsi];
         if d.shndx == SHN_ABS {
             return Ok(d.value);
         }
@@ -546,10 +608,22 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
             return err(format!("symbol '{}' has no section", d.name));
         };
         let &(out_idx, sec_base) = place
-            .get(&(resolved.0, sec))
+            .get(&(doi, sec))
             .ok_or_else(|| ElfError(format!("unplaced section for symbol '{}'", d.name)))?;
         Ok(out_vaddrs[out_idx] + sec_base + d.value)
     };
+
+    // Fill GOT slots now that every definition has a final address.
+    if let Some(gi) = got_out {
+        for (slot, target) in got_targets.iter().enumerate() {
+            let val = match *target {
+                Some((doi, dsi)) => sym_vaddr(doi, dsi)?,
+                None => 0,
+            };
+            let off = slot * 8;
+            outs[gi].data[off..off + 8].copy_from_slice(&val.to_le_bytes());
+        }
+    }
 
     // ---- Apply relocations into the merged section bytes.
     for (oi, obj) in objects.iter().enumerate() {
@@ -589,9 +663,21 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
                         outs[out_idx].data[spot..spot + 4]
                             .copy_from_slice(&(v as i32).to_le_bytes());
                     }
+                    // GOT-relative load of the target's address: patch the
+                    // displacement to point at the target's GOT slot.
+                    t if is_gotpcrel(t) => {
+                        let def = resolve_def(oi, r.sym as usize)?;
+                        let ga = out_vaddrs[got_out.unwrap()] + (got_slot(def) * 8) as u64;
+                        let v = ga as i64 + r.addend - p as i64;
+                        if v < i32::MIN as i64 || v > i32::MAX as i64 {
+                            return err(format!("GOTPCREL displacement overflow at {:#x}", p));
+                        }
+                        outs[out_idx].data[spot..spot + 4]
+                            .copy_from_slice(&(v as i32).to_le_bytes());
+                    }
                     other => {
                         return err(format!(
-                            "relocation type {} is out of rung-1 scope (GOT/TLS land in rung 2)",
+                            "relocation type {} is out of rung-2 scope (TLS/IFUNC pending)",
                             other
                         ))
                     }
@@ -751,4 +837,11 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
 fn next_multiple(v: u64, a: u64) -> u64 {
     let a = a.max(1);
     v.div_ceil(a) * a
+}
+
+fn is_gotpcrel(t: u32) -> bool {
+    matches!(
+        t,
+        R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX
+    )
 }

@@ -57,8 +57,10 @@ Every time a new decoder lands, extend the relevant `--dump*` output.
 ## Target
 
 - **Architecture**: arm64 Mach-O (primary; the rules below) plus
-  x86_64 ELF static linking (x16 arc, src/elf.rs — rung 1 landed
-  2026-07-04; parent repo .docs/sprints/x16-afs-ld-elf.md).
+  x86_64 ELF static linking (x16 arc, src/elf.rs — rungs 1-2 landed
+  2026-07-05: freestanding + full static libc.a/crt via archive
+  selection, GOT, TLS local-exec, IFUNC/IPLT, init arrays, symbol
+  versioning; parent repo .docs/sprints/x16-afs-ld-elf.md).
 - **OS**: macOS. Mach-O file format, Apple AAPCS64 calling convention.
 - **Goal**: parity with Apple `ld` for the binaries armfortas produces and
   the fortsh milestone. Not a toy. Not a subset. The full Mach-O/dyld

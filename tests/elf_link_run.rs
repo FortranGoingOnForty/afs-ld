@@ -509,6 +509,99 @@ fn archive_member_selection_links_only_used_members() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Versioned dynamic import: afs-ld links against a `.so` that exports
+/// `answer@@VERS_2.0` (default) and `answer@VERS_1.0`. A plain `answer`
+/// reference binds to the default; the exe must *declare* it needs
+/// VERS_2.0 (a `.gnu.version_r` entry naming the version), not just bind
+/// and run — that declaration is what keeps the binding stable when the
+/// library later adds a newer default. Structural check: the version
+/// string lands in the afs-ld output (rung-3a output never carried it).
+#[test]
+fn versioned_dynamic_import_declares_and_binds_default_version() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=versioned_dynamic_import_declares_and_binds_default_version count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let Some(ld) = system_ld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=versioned_dynamic_import_declares_and_binds_default_version count=1 reason=\"no system ld to build the reference .so\"");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=versioned_dynamic_import_declares_and_binds_default_version count=1 reason=\"no standard dynamic loader on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_ver_dyn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    // Reference .so: answer@@VERS_2.0 -> 42 (default), answer@VERS_1.0 -> 7.
+    let lib_obj = dir.join("lib.o");
+    assemble(
+        &gas,
+        ".text\n.globl answer_v2\n.type answer_v2,@function\nanswer_v2:\n    movl $42, %eax\n    ret\n.globl answer_v1\n.type answer_v1,@function\nanswer_v1:\n    movl $7, %eax\n    ret\n.symver answer_v2, answer@@VERS_2.0\n.symver answer_v1, answer@VERS_1.0\n",
+        &dir.join("lib.s"),
+        &lib_obj,
+    );
+    let vmap = dir.join("ver.map");
+    std::fs::write(&vmap, "VERS_1.0 { global: answer; };\nVERS_2.0 { global: answer; } VERS_1.0;\n").unwrap();
+    let so = dir.join("libver.so.1");
+    let r = Command::new(&ld)
+        .args(["-shared", "-soname", "libver.so.1", "--version-script"])
+        .arg(&vmap)
+        .arg("-o")
+        .arg(&so)
+        .arg(&lib_obj)
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "ld -shared --version-script: {}", String::from_utf8_lossy(&r.stderr));
+
+    // main.o: exit(answer()) — plain reference binds the default version.
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(".text\n.globl _start\n_start:\n    call answer@plt\n    movl %eax, %edi\n    movl ${exit_nr}, %eax\n    syscall\n"),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+
+    let out = dir.join("ver_dyn");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&out)
+        .arg(&main_obj)
+        .arg(&so)
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "afs-ld versioned dynamic: {}", String::from_utf8_lossy(&r.stderr));
+
+    // Structural: the required version string is present in the output
+    // (it reaches .dynstr only via the VERNEED path — rung-3a never
+    // emitted it).
+    let bytes = std::fs::read(&out).unwrap();
+    assert!(
+        bytes.windows(8).any(|w| w == b"VERS_2.0"),
+        "exe must declare the required version VERS_2.0 (VERNEED)"
+    );
+
+    // Behavioral: binds the default (VERS_2.0 -> 42), not VERS_1.0 -> 7.
+    let run = Command::new(&out).env("LD_LIBRARY_PATH", &dir).output().unwrap();
+    assert_eq!(run.status.code(), Some(42), "versioned exe exit: {}", String::from_utf8_lossy(&run.stderr));
+
+    // Determinism.
+    let out2 = dir.join("ver_dyn2");
+    assert!(Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&out2)
+        .arg(&main_obj)
+        .arg(&so)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&out2).unwrap(), "versioned link must be deterministic");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// System `ld`, if present, for building the reference shared object.
 /// Probes the usual FHS spots and then bare `ld` on PATH (NixOS keeps it
 /// in the current-system profile, not /usr/bin).

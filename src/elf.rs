@@ -18,10 +18,18 @@ pub const SHT_PROGBITS: u32 = 1;
 pub const SHT_SYMTAB: u32 = 2;
 pub const SHT_STRTAB: u32 = 3;
 pub const SHT_RELA: u32 = 4;
+pub const SHT_HASH: u32 = 5;
+pub const SHT_DYNAMIC: u32 = 6;
 pub const SHT_NOBITS: u32 = 8;
+pub const SHT_DYNSYM: u32 = 11;
 pub const SHT_INIT_ARRAY: u32 = 14;
 pub const SHT_FINI_ARRAY: u32 = 15;
 pub const SHT_PREINIT_ARRAY: u32 = 16;
+
+pub const ET_DYN: u16 = 3;
+pub const STT_FUNC: u8 = 2;
+/// `.dynamic` tag: shared-object name.
+pub const DT_SONAME: i64 = 14;
 
 /// `st_info` symbol type for an indirect (ifunc) function.
 pub const STT_GNU_IFUNC: u8 = 10;
@@ -31,6 +39,7 @@ pub const R_X86_64_IRELATIVE: u32 = 37;
 pub const SHF_WRITE: u64 = 0x1;
 pub const SHF_ALLOC: u64 = 0x2;
 pub const SHF_EXECINSTR: u64 = 0x4;
+pub const SHF_INFO_LINK: u64 = 0x40;
 pub const SHF_TLS: u64 = 0x400;
 
 pub const STB_LOCAL: u8 = 0;
@@ -57,6 +66,28 @@ pub const R_X86_64_GOTPCRELX: u32 = 41;
 pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
 
 const PT_TLS: u32 = 7;
+const PT_INTERP: u32 = 3;
+const PT_DYNAMIC: u32 = 2;
+const PT_GNU_STACK: u32 = 0x6474_e551;
+
+pub const R_X86_64_GLOB_DAT: u32 = 6;
+pub const R_X86_64_JUMP_SLOT: u32 = 7;
+
+// `.dynamic` tags used by the dynamic executable writer.
+const DT_NULL: i64 = 0;
+const DT_NEEDED: i64 = 1;
+const DT_PLTRELSZ: i64 = 2;
+const DT_PLTGOT: i64 = 3;
+const DT_HASH: i64 = 4;
+const DT_STRTAB: i64 = 5;
+const DT_SYMTAB: i64 = 6;
+const DT_RELA: i64 = 7;
+const DT_STRSZ: i64 = 10;
+const DT_SYMENT: i64 = 11;
+const DT_PLTREL: i64 = 20;
+const DT_JMPREL: i64 = 23;
+const DT_FLAGS: i64 = 30;
+const DF_BIND_NOW: u64 = 0x8;
 
 /// Symbols the linker itself provides, bracketing the matching output
 /// section (an empty range when the section is absent). The index into
@@ -297,6 +328,113 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
         sections,
         symbols,
     })
+}
+
+// ---- Shared-object reader (for dynamic linking) ----
+
+/// One symbol a shared object exports.
+#[derive(Debug, Clone)]
+pub struct Export {
+    /// Symbol version (`""` when unversioned). Populated in a later rung.
+    pub version: String,
+    /// STT_FUNC (PLT-callable) vs a data object (GLOB_DAT).
+    pub func: bool,
+}
+
+/// A parsed shared object: its runtime name and the symbols it exports.
+#[derive(Debug)]
+pub struct SharedLib {
+    pub soname: String,
+    pub exports: HashMap<String, Export>,
+}
+
+/// Read an ET_DYN shared object's SONAME and exported dynamic symbols
+/// via its section headers (which `ld`-produced `.so`s always carry).
+pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
+    if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" {
+        return err(format!("{}: not an ELF file", name));
+    }
+    if bytes[4] != 2 || bytes[5] != 1 {
+        return err(format!("{}: not ELF64 little-endian", name));
+    }
+    if ru16(bytes, 16) != ET_DYN {
+        return err(format!("{}: not a shared object", name));
+    }
+    let shoff = ru64(bytes, 40) as usize;
+    let shentsize = ru16(bytes, 58) as usize;
+    let shnum = ru16(bytes, 60) as usize;
+    if shoff == 0 || shnum == 0 {
+        return err(format!("{}: shared object has no section headers", name));
+    }
+    let sh = |i: usize| -> &[u8] { &bytes[shoff + i * shentsize..shoff + (i + 1) * shentsize] };
+
+    // Locate .dynsym (with its linked string table) and .dynamic.
+    let mut dynsym: Option<(usize, usize, usize, usize)> = None; // off,size,link,entsize
+    let mut dynamic: Option<(usize, usize)> = None; // off,size
+    for i in 0..shnum {
+        let h = sh(i);
+        match ru32(h, 4) {
+            SHT_DYNSYM => {
+                dynsym = Some((
+                    ru64(h, 24) as usize,
+                    ru64(h, 32) as usize,
+                    ru32(h, 40) as usize,
+                    ru64(h, 56) as usize,
+                ));
+            }
+            SHT_DYNAMIC => dynamic = Some((ru64(h, 24) as usize, ru64(h, 32) as usize)),
+            _ => {}
+        }
+    }
+    let Some((soff, ssize, slink, sent)) = dynsym else {
+        return err(format!("{}: shared object has no .dynsym", name));
+    };
+    let link_h = sh(slink);
+    let stroff = ru64(link_h, 24) as usize;
+    let strsz = ru64(link_h, 32) as usize;
+    let dynstr = &bytes[stroff..stroff + strsz];
+
+    // SONAME from .dynamic, else the file's own name.
+    let mut soname = String::new();
+    if let Some((doff, dsz)) = dynamic {
+        for k in 0..dsz / 16 {
+            let e = &bytes[doff + k * 16..doff + (k + 1) * 16];
+            let tag = ru64(e, 0) as i64;
+            if tag == 0 {
+                break;
+            }
+            if tag == DT_SONAME {
+                soname = cstr(dynstr, ru64(e, 8) as usize);
+            }
+        }
+    }
+    if soname.is_empty() {
+        soname = std::path::Path::new(name)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.to_string());
+    }
+
+    let sent = if sent == 0 { 24 } else { sent };
+    let mut exports = HashMap::new();
+    for k in 0..ssize / sent {
+        let e = &bytes[soff + k * sent..soff + k * sent + 24];
+        let shndx = ru16(e, 6);
+        let bind = e[4] >> 4;
+        let typ = e[4] & 0xf;
+        if shndx == SHN_UNDEF || bind == STB_LOCAL {
+            continue;
+        }
+        let nm = cstr(dynstr, ru32(e, 0) as usize);
+        if nm.is_empty() {
+            continue;
+        }
+        exports.entry(nm).or_insert(Export {
+            version: String::new(),
+            func: typ == STT_FUNC,
+        });
+    }
+    Ok(SharedLib { soname, exports })
 }
 
 // ---- Static layout + link ----
@@ -1328,6 +1466,579 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
     image[58..60].copy_from_slice(&64u16.to_le_bytes()); // shentsize
     image[60..62].copy_from_slice(&(shdrs.len() as u16).to_le_bytes());
     image[62..64].copy_from_slice(&((shdrs.len() - 1) as u16).to_le_bytes()); // shstrndx
+
+    Ok(image)
+}
+
+/// SysV ELF hash (for the `.hash` section the dynamic loader walks).
+fn elf_hash(name: &[u8]) -> u32 {
+    let mut h: u32 = 0;
+    for &c in name {
+        h = (h << 4).wrapping_add(c as u32);
+        let g = h & 0xf000_0000;
+        if g != 0 {
+            h ^= g >> 24;
+        }
+        h &= !g;
+    }
+    h
+}
+
+/// Link relocatable objects into a dynamically-linked ET_EXEC that runs
+/// under `interp`, importing undefined functions from `shared`. Rung-3a
+/// scope: non-PIE, eager binding, function imports via PLT/JUMP_SLOT —
+/// no data imports (GLOB_DAT), TLS, or symbol versioning yet.
+pub fn link_dynamic_exec(
+    objects: &[ElfObject],
+    shared: &[SharedLib],
+    entry: &str,
+    interp: &str,
+) -> Result<Vec<u8>, ElfError> {
+    const DBASE: u64 = 0x20_0000;
+
+    // ---- Merge input sections (text/rodata/data/bss). Init arrays and
+    // TLS are out of 3a scope and error loudly.
+    let mut outs: Vec<OutSec> = Vec::new();
+    let mut out_index: HashMap<String, usize> = HashMap::new();
+    let mut place: Placement = HashMap::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sec) in obj.sections.iter().enumerate() {
+            if sec.sh_flags & SHF_TLS != 0 || array_kind(&sec.name).is_some() {
+                return err(format!(
+                    "section '{}' (TLS/init-array) is out of rung-3a scope",
+                    sec.name
+                ));
+            }
+            let is_bss = sec.sh_type == SHT_NOBITS;
+            let idx = *out_index.entry(sec.name.clone()).or_insert_with(|| {
+                outs.push(OutSec {
+                    name: sec.name.clone(),
+                    flags: sec.sh_flags,
+                    align: 1,
+                    data: Vec::new(),
+                    bss_size: 0,
+                    vaddr: 0,
+                    file_off: 0,
+                    is_bss,
+                });
+                outs.len() - 1
+            });
+            let out = &mut outs[idx];
+            out.align = out.align.max(sec.sh_addralign);
+            let cursor = if is_bss {
+                let c = next_multiple(out.bss_size, sec.sh_addralign);
+                out.bss_size = c + sec.nobits_size;
+                c
+            } else {
+                let c = next_multiple(out.data.len() as u64, sec.sh_addralign);
+                out.data.resize(c as usize, 0);
+                out.data.extend_from_slice(&sec.data);
+                c
+            };
+            place.insert((oi, si), (idx, cursor));
+        }
+    }
+
+    // ---- Resolve defined globals.
+    let mut globals: HashMap<String, (usize, usize)> = HashMap::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sym) in obj.symbols.iter().enumerate() {
+            if sym.name.is_empty() || sym.bind == STB_LOCAL || sym.shndx == SHN_UNDEF {
+                continue;
+            }
+            globals.entry(sym.name.clone()).or_insert((oi, si));
+        }
+    }
+
+    // ---- Imports: undefined strong globals a shared library exports.
+    // Functions get a PLT slot; anything else is out of 3a scope.
+    let mut imports: Vec<String> = Vec::new();
+    let mut import_index: HashMap<String, usize> = HashMap::new();
+    let mut used_lib = vec![false; shared.len()];
+    for obj in objects {
+        for sym in &obj.symbols {
+            if sym.shndx != SHN_UNDEF
+                || sym.bind != STB_GLOBAL
+                || sym.name.is_empty()
+                || globals.contains_key(&sym.name)
+                || import_index.contains_key(&sym.name)
+            {
+                continue;
+            }
+            let Some(li) = shared.iter().position(|l| l.exports.contains_key(&sym.name)) else {
+                return err(format!(
+                    "undefined symbol '{}' (referenced from {}) — not exported by any shared object",
+                    sym.name, obj.name
+                ));
+            };
+            if !shared[li].exports[&sym.name].func {
+                return err(format!(
+                    "data import '{}' (GLOB_DAT) is out of rung-3a scope",
+                    sym.name
+                ));
+            }
+            used_lib[li] = true;
+            import_index.insert(sym.name.clone(), imports.len());
+            imports.push(sym.name.clone());
+        }
+    }
+    let n_imp = imports.len();
+
+    // ---- Build .dynstr (soname + import name strings) and note offsets.
+    let mut dynstr: Vec<u8> = vec![0];
+    let str_off = |s: &str, dynstr: &mut Vec<u8>| -> u32 {
+        let off = dynstr.len() as u32;
+        dynstr.extend_from_slice(s.as_bytes());
+        dynstr.push(0);
+        off
+    };
+    let mut needed_offsets: Vec<u32> = Vec::new();
+    for (li, lib) in shared.iter().enumerate() {
+        if used_lib[li] {
+            needed_offsets.push(str_off(&lib.soname, &mut dynstr));
+        }
+    }
+    let import_name_off: Vec<u32> = imports
+        .iter()
+        .map(|n| str_off(n, &mut dynstr))
+        .collect();
+
+    // ---- .dynsym: null entry then one UND FUNC per import.
+    let n_dynsym = n_imp + 1;
+    let mut dynsym = vec![0u8; n_dynsym * 24];
+    for (i, &noff) in import_name_off.iter().enumerate() {
+        let e = (i + 1) * 24;
+        dynsym[e..e + 4].copy_from_slice(&noff.to_le_bytes());
+        dynsym[e + 4] = (STB_GLOBAL << 4) | STT_FUNC; // st_info
+        // st_other=0, st_shndx=0 (UND), value/size=0 already zeroed.
+    }
+
+    // ---- .hash (SysV): buckets + chains over .dynsym.
+    let nbucket = (n_dynsym.max(1)) as u32;
+    let mut buckets = vec![0u32; nbucket as usize];
+    let mut chain = vec![0u32; n_dynsym];
+    for (i, name) in imports.iter().enumerate() {
+        let si = (i + 1) as u32;
+        let b = (elf_hash(name.as_bytes()) % nbucket) as usize;
+        chain[si as usize] = buckets[b];
+        buckets[b] = si;
+    }
+    let mut hash: Vec<u8> = Vec::new();
+    hash.extend_from_slice(&nbucket.to_le_bytes());
+    hash.extend_from_slice(&(n_dynsym as u32).to_le_bytes());
+    for b in &buckets {
+        hash.extend_from_slice(&b.to_le_bytes());
+    }
+    for c in &chain {
+        hash.extend_from_slice(&c.to_le_bytes());
+    }
+
+    // Section byte sizes now known; build .interp, size .plt/.got.plt/
+    // .rela.plt/.dynamic (contents filled after vaddrs are assigned).
+    let mut interp_bytes = interp.as_bytes().to_vec();
+    interp_bytes.push(0);
+    let plt_size = ((n_imp + 1) * 16) as u64; // PLT0 + one stub per import
+    let gotplt_size = ((n_imp + 3) * 8) as u64; // 3 reserved + one per import
+    let relaplt_size = (n_imp * 24) as u64;
+    let n_needed = needed_offsets.len();
+    // .dynamic entry count: NEEDED* + the fixed tags + NULL.
+    let dyn_fixed = [
+        DT_HASH, DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT, DT_PLTGOT, DT_PLTRELSZ, DT_PLTREL,
+        DT_JMPREL, DT_FLAGS,
+    ];
+    let dynamic_count = n_needed + dyn_fixed.len() + 1; // +NULL
+    let dynamic_size = (dynamic_count * 16) as u64;
+
+    // ---- Layout. Fixed section order across three load segments.
+    let ehsize = 64u64;
+    let phnum = 6u64; // 3 LOAD + INTERP + DYNAMIC + GNU_STACK
+    let phsize = 56 * phnum;
+
+    // Metadata region (PF_R): synthetic sections in a fixed order.
+    let mut v = DBASE + ehsize + phsize;
+    let mut fo = ehsize + phsize;
+    let place_ro = |sz: u64, align: u64, v: &mut u64, fo: &mut u64| -> (u64, u64) {
+        *v = next_multiple(*v, align);
+        *fo = next_multiple(*fo, align);
+        let a = (*v, *fo);
+        *v += sz;
+        *fo += sz;
+        a
+    };
+    let (interp_v, interp_fo) = place_ro(interp_bytes.len() as u64, 1, &mut v, &mut fo);
+    let (dynsym_v, dynsym_fo) = place_ro(dynsym.len() as u64, 8, &mut v, &mut fo);
+    let (hash_v, hash_fo) = place_ro(hash.len() as u64, 8, &mut v, &mut fo);
+    let (dynstr_v, dynstr_fo) = place_ro(dynstr.len() as u64, 1, &mut v, &mut fo);
+    let (relaplt_v, relaplt_fo) = place_ro(relaplt_size, 8, &mut v, &mut fo);
+    // Merged rodata (read-only, non-writable, non-exec) joins the RO seg.
+    let ro_order: Vec<usize> = (0..outs.len())
+        .filter(|&i| outs[i].flags & SHF_EXECINSTR == 0 && outs[i].flags & SHF_WRITE == 0)
+        .collect();
+    for &i in &ro_order {
+        let (vv, ff) = place_ro(outs[i].data.len() as u64, outs[i].align, &mut v, &mut fo);
+        outs[i].vaddr = vv;
+        outs[i].file_off = ff;
+    }
+    let ro_end_v = v;
+    let ro_end_fo = fo;
+
+    // Executable region (PF_R|PF_X) on a new page.
+    v = next_multiple(ro_end_v, PAGE);
+    fo = next_multiple(ro_end_fo, PAGE);
+    // Keep file offset congruent to vaddr mod PAGE.
+    let text_order: Vec<usize> = (0..outs.len())
+        .filter(|&i| outs[i].flags & SHF_EXECINSTR != 0)
+        .collect();
+    let rx_start_v = v;
+    let rx_start_fo = fo;
+    for &i in &text_order {
+        outs[i].vaddr = next_multiple(v, outs[i].align);
+        outs[i].file_off = rx_start_fo + (outs[i].vaddr - rx_start_v);
+        v = outs[i].vaddr + outs[i].data.len() as u64;
+    }
+    v = next_multiple(v, 16);
+    let plt_v = v;
+    let plt_fo = rx_start_fo + (plt_v - rx_start_v);
+    v += plt_size;
+    let rx_end_v = v;
+
+    // Writable region (PF_R|PF_W) on a new page.
+    v = next_multiple(rx_end_v, PAGE);
+    let rw_start_v = v;
+    let rw_start_fo = next_multiple(plt_fo + plt_size, PAGE);
+    let data_order: Vec<usize> = (0..outs.len())
+        .filter(|&i| outs[i].flags & SHF_WRITE != 0 && !outs[i].is_bss)
+        .collect();
+    for &i in &data_order {
+        outs[i].vaddr = next_multiple(v, outs[i].align);
+        outs[i].file_off = rw_start_fo + (outs[i].vaddr - rw_start_v);
+        v = outs[i].vaddr + outs[i].data.len() as u64;
+    }
+    let rw_file_end = rw_start_fo + (next_multiple(v, 8) - rw_start_v);
+    v = next_multiple(v, 8);
+    let gotplt_v = v;
+    let gotplt_fo = rw_start_fo + (gotplt_v - rw_start_v);
+    v += gotplt_size;
+    v = next_multiple(v, 8);
+    let dynamic_v = v;
+    let dynamic_fo = rw_start_fo + (dynamic_v - rw_start_v);
+    v += dynamic_size;
+    let rw_data_end_v = v; // end of file-backed RW
+    // .bss (nobits) after the file-backed RW content.
+    let bss_order: Vec<usize> = (0..outs.len()).filter(|&i| outs[i].is_bss).collect();
+    for &i in &bss_order {
+        outs[i].vaddr = next_multiple(v, outs[i].align.max(1));
+        v = outs[i].vaddr + outs[i].bss_size;
+    }
+    let rw_mem_end_v = v;
+    let rw_file_end = rw_file_end.max(gotplt_fo + gotplt_size).max(dynamic_fo + dynamic_size);
+
+    // Import n resolves to its PLT stub (PLT0 is index 0, imports 1..).
+    let plt_stub = |imp_idx: usize| plt_v + ((imp_idx + 1) * 16) as u64;
+    let gotplt_slot = |imp_idx: usize| gotplt_v + ((imp_idx + 3) * 8) as u64;
+
+    // ---- Address resolver (vaddr snapshot avoids borrowing `outs`
+    // while the relocation loop mutates it).
+    let out_vaddrs: Vec<u64> = outs.iter().map(|o| o.vaddr).collect();
+    let sym_vaddr = |oi: usize, si: usize| -> Result<u64, ElfError> {
+        let sym = &objects[oi].symbols[si];
+        let (doi, dsi) = if sym.shndx == SHN_UNDEF {
+            if let Some(&d) = globals.get(&sym.name) {
+                d
+            } else if let Some(&ii) = import_index.get(&sym.name) {
+                return Ok(plt_stub(ii));
+            } else if sym.bind == STB_WEAK {
+                return Ok(0);
+            } else {
+                return err(format!("undefined symbol '{}'", sym.name));
+            }
+        } else {
+            (oi, si)
+        };
+        let d = &objects[doi].symbols[dsi];
+        if d.shndx == SHN_ABS {
+            return Ok(d.value);
+        }
+        let sec = d
+            .section
+            .ok_or_else(|| ElfError(format!("symbol '{}' has no section", d.name)))?;
+        let &(oidx, base) = place
+            .get(&(doi, sec))
+            .ok_or_else(|| ElfError(format!("unplaced section for '{}'", d.name)))?;
+        Ok(out_vaddrs[oidx] + base + d.value)
+    };
+
+    // ---- Apply relocations into the merged section bytes.
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sec) in obj.sections.iter().enumerate() {
+            let &(out_idx, base) = &place[&(oi, si)];
+            for r in &sec.relas {
+                let s = sym_vaddr(oi, r.sym as usize)?;
+                let p = out_vaddrs[out_idx] + base + r.offset;
+                let spot = (base + r.offset) as usize;
+                match r.r_type {
+                    R_X86_64_64 => {
+                        let val = (s as i64 + r.addend) as u64;
+                        outs[out_idx].data[spot..spot + 8].copy_from_slice(&val.to_le_bytes());
+                    }
+                    R_X86_64_32 => {
+                        let val = s as i64 + r.addend;
+                        outs[out_idx].data[spot..spot + 4]
+                            .copy_from_slice(&(val as u32).to_le_bytes());
+                    }
+                    R_X86_64_32S => {
+                        let val = s as i64 + r.addend;
+                        outs[out_idx].data[spot..spot + 4]
+                            .copy_from_slice(&(val as i32).to_le_bytes());
+                    }
+                    R_X86_64_PC32 | R_X86_64_PLT32 => {
+                        let val = s as i64 + r.addend - p as i64;
+                        if !(i32::MIN as i64..=i32::MAX as i64).contains(&val) {
+                            return err(format!("PC32 overflow at {:#x}", p));
+                        }
+                        outs[out_idx].data[spot..spot + 4]
+                            .copy_from_slice(&(val as i32).to_le_bytes());
+                    }
+                    other => {
+                        return err(format!(
+                            "relocation type {} is out of rung-3a scope",
+                            other
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Build .plt. PLT0 pushes GOT[1] and jumps GOT[2]; each stub
+    // jumps through its GOT.PLT slot, else falls to the lazy trampoline.
+    let mut plt = vec![0u8; plt_size as usize];
+    // PLT0: ff 35 <gotplt+8> ; ff 25 <gotplt+16> ; nop nop nop nop
+    let disp = |from_end: u64, to: u64| (to as i64 - from_end as i64) as i32;
+    plt[0] = 0xff;
+    plt[1] = 0x35;
+    plt[2..6].copy_from_slice(&disp(plt_v + 6, gotplt_v + 8).to_le_bytes());
+    plt[6] = 0xff;
+    plt[7] = 0x25;
+    plt[8..12].copy_from_slice(&disp(plt_v + 12, gotplt_v + 16).to_le_bytes());
+    plt[12..16].copy_from_slice(&[0x0f, 0x1f, 0x40, 0x00]);
+    for i in 0..n_imp {
+        let o = (i + 1) * 16;
+        let stub = plt_v + o as u64;
+        let slot = gotplt_slot(i);
+        // jmp *slot(%rip)
+        plt[o] = 0xff;
+        plt[o + 1] = 0x25;
+        plt[o + 2..o + 6].copy_from_slice(&disp(stub + 6, slot).to_le_bytes());
+        // push $i
+        plt[o + 6] = 0x68;
+        plt[o + 7..o + 11].copy_from_slice(&(i as u32).to_le_bytes());
+        // jmp PLT0
+        plt[o + 11] = 0xe9;
+        plt[o + 12..o + 16].copy_from_slice(&disp(stub + 16, plt_v).to_le_bytes());
+    }
+
+    // ---- Build .got.plt: [0]=&_DYNAMIC, [1]=[2]=0, [3+i]=stub push insn.
+    let mut gotplt = vec![0u8; gotplt_size as usize];
+    gotplt[0..8].copy_from_slice(&dynamic_v.to_le_bytes());
+    for i in 0..n_imp {
+        let slot = (i + 3) * 8;
+        gotplt[slot..slot + 8].copy_from_slice(&(plt_stub(i) + 6).to_le_bytes());
+    }
+
+    // ---- Build .rela.plt: one JUMP_SLOT per import.
+    let mut relaplt = vec![0u8; relaplt_size as usize];
+    for i in 0..n_imp {
+        let e = i * 24;
+        relaplt[e..e + 8].copy_from_slice(&gotplt_slot(i).to_le_bytes());
+        let info = ((i as u64 + 1) << 32) | R_X86_64_JUMP_SLOT as u64;
+        relaplt[e + 8..e + 16].copy_from_slice(&info.to_le_bytes());
+        // addend 0.
+    }
+
+    // ---- Build .dynamic.
+    let mut dynamic: Vec<u8> = Vec::with_capacity(dynamic_size as usize);
+    let dyn_push = |tag: i64, val: u64, d: &mut Vec<u8>| {
+        d.extend_from_slice(&tag.to_le_bytes());
+        d.extend_from_slice(&val.to_le_bytes());
+    };
+    for &noff in &needed_offsets {
+        dyn_push(DT_NEEDED, noff as u64, &mut dynamic);
+    }
+    dyn_push(DT_HASH, hash_v, &mut dynamic);
+    dyn_push(DT_STRTAB, dynstr_v, &mut dynamic);
+    dyn_push(DT_SYMTAB, dynsym_v, &mut dynamic);
+    dyn_push(DT_STRSZ, dynstr.len() as u64, &mut dynamic);
+    dyn_push(DT_SYMENT, 24, &mut dynamic);
+    dyn_push(DT_PLTGOT, gotplt_v, &mut dynamic);
+    dyn_push(DT_PLTRELSZ, relaplt_size, &mut dynamic);
+    dyn_push(DT_PLTREL, DT_RELA as u64, &mut dynamic);
+    dyn_push(DT_JMPREL, relaplt_v, &mut dynamic);
+    dyn_push(DT_FLAGS, DF_BIND_NOW, &mut dynamic);
+    dyn_push(DT_NULL, 0, &mut dynamic);
+
+    let e_entry = {
+        let &(eoi, esi) = globals
+            .get(entry)
+            .ok_or_else(|| ElfError(format!("entry symbol '{}' not defined", entry)))?;
+        sym_vaddr(eoi, esi)?
+    };
+
+    // ---- Emit the image.
+    let total_file = rw_file_end;
+    let mut image = vec![0u8; total_file as usize];
+    image[0..4].copy_from_slice(b"\x7fELF");
+    image[4] = 2;
+    image[5] = 1;
+    image[6] = 1;
+    image[7] = if cfg!(target_os = "freebsd") { 9 } else { 0 };
+    image[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+    image[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+    image[20..24].copy_from_slice(&1u32.to_le_bytes());
+    image[24..32].copy_from_slice(&e_entry.to_le_bytes());
+    image[32..40].copy_from_slice(&ehsize.to_le_bytes());
+    image[52..54].copy_from_slice(&64u16.to_le_bytes());
+    image[54..56].copy_from_slice(&56u16.to_le_bytes());
+    image[56..58].copy_from_slice(&(phnum as u16).to_le_bytes());
+
+    // Program headers.
+    let mut ph = Vec::new();
+    let mut phdr = |t: u32, fl: u32, off: u64, va: u64, fsz: u64, msz: u64, al: u64| {
+        ph.extend_from_slice(&t.to_le_bytes());
+        ph.extend_from_slice(&fl.to_le_bytes());
+        ph.extend_from_slice(&off.to_le_bytes());
+        ph.extend_from_slice(&va.to_le_bytes());
+        ph.extend_from_slice(&va.to_le_bytes());
+        ph.extend_from_slice(&fsz.to_le_bytes());
+        ph.extend_from_slice(&msz.to_le_bytes());
+        ph.extend_from_slice(&al.to_le_bytes());
+    };
+    phdr(PT_INTERP, PF_R, interp_fo, interp_v, interp_bytes.len() as u64, interp_bytes.len() as u64, 1);
+    phdr(PT_LOAD, PF_R, 0, DBASE, ro_end_fo, ro_end_fo, PAGE);
+    phdr(PT_LOAD, PF_R | PF_X, rx_start_fo, rx_start_v, (plt_fo + plt_size) - rx_start_fo, rx_end_v - rx_start_v, PAGE);
+    phdr(PT_LOAD, PF_R | PF_W, rw_start_fo, rw_start_v, rw_file_end - rw_start_fo, rw_mem_end_v - rw_start_v, PAGE);
+    phdr(PT_DYNAMIC, PF_R | PF_W, dynamic_fo, dynamic_v, dynamic_size, dynamic_size, 8);
+    phdr(PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0);
+    image[64..64 + ph.len()].copy_from_slice(&ph);
+
+    // Write metadata sections.
+    let put = |img: &mut [u8], off: u64, bytes: &[u8]| {
+        img[off as usize..off as usize + bytes.len()].copy_from_slice(bytes);
+    };
+    put(&mut image, interp_fo, &interp_bytes);
+    put(&mut image, dynsym_fo, &dynsym);
+    put(&mut image, hash_fo, &hash);
+    put(&mut image, dynstr_fo, &dynstr);
+    put(&mut image, relaplt_fo, &relaplt);
+    put(&mut image, plt_fo, &plt);
+    put(&mut image, gotplt_fo, &gotplt);
+    put(&mut image, dynamic_fo, &dynamic);
+    let _ = rw_data_end_v;
+
+    // Write merged object sections (skip bss).
+    for o in &outs {
+        if o.is_bss {
+            continue;
+        }
+        put(&mut image, o.file_off, &o.data);
+    }
+
+    // ---- Section header table (not loaded; for readelf/gdb/objdump).
+    // Built in ascending-file-offset order so cross-references resolve to
+    // fixed indices: .dynstr and .dynsym sit at known positions, and
+    // .got.plt's index (for .rela.plt's sh_info) is tracked as we go.
+    let mut shstr: Vec<u8> = vec![0];
+    let mut shdrs: Vec<[u8; 64]> = Vec::new();
+    #[allow(clippy::too_many_arguments)]
+    fn mk(
+        shstr: &mut Vec<u8>,
+        shdrs: &mut Vec<[u8; 64]>,
+        name: &str,
+        typ: u32,
+        flags: u64,
+        addr: u64,
+        off: u64,
+        size: u64,
+        link: u32,
+        info: u32,
+        align: u64,
+        entsize: u64,
+    ) -> usize {
+        let noff = shstr.len() as u32;
+        if !name.is_empty() {
+            shstr.extend_from_slice(name.as_bytes());
+            shstr.push(0);
+        }
+        let mut h = [0u8; 64];
+        h[0..4].copy_from_slice(&(if name.is_empty() { 0 } else { noff }).to_le_bytes());
+        h[4..8].copy_from_slice(&typ.to_le_bytes());
+        h[8..16].copy_from_slice(&flags.to_le_bytes());
+        h[16..24].copy_from_slice(&addr.to_le_bytes());
+        h[24..32].copy_from_slice(&off.to_le_bytes());
+        h[32..40].copy_from_slice(&size.to_le_bytes());
+        h[40..44].copy_from_slice(&link.to_le_bytes());
+        h[44..48].copy_from_slice(&info.to_le_bytes());
+        h[48..56].copy_from_slice(&align.to_le_bytes());
+        h[56..64].copy_from_slice(&entsize.to_le_bytes());
+        shdrs.push(h);
+        shdrs.len() - 1
+    }
+    // [0] NULL, then the fixed-position synthetic sections.
+    mk(&mut shstr, &mut shdrs, "", 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    mk(&mut shstr, &mut shdrs, ".interp", SHT_PROGBITS, SHF_ALLOC, interp_v, interp_fo, interp_bytes.len() as u64, 0, 0, 1, 0);
+    let dynsym_idx =
+        mk(&mut shstr, &mut shdrs, ".dynsym", SHT_DYNSYM, SHF_ALLOC, dynsym_v, dynsym_fo, dynsym.len() as u64, 0, 1, 8, 24) as u32;
+    // .dynsym.link → .dynstr; patched once .dynstr's index is known.
+    mk(&mut shstr, &mut shdrs, ".hash", SHT_HASH, SHF_ALLOC, hash_v, hash_fo, hash.len() as u64, dynsym_idx, 0, 8, 4);
+    let dynstr_idx =
+        mk(&mut shstr, &mut shdrs, ".dynstr", SHT_STRTAB, SHF_ALLOC, dynstr_v, dynstr_fo, dynstr.len() as u64, 0, 0, 1, 0) as u32;
+    shdrs[dynsym_idx as usize][40..44].copy_from_slice(&dynstr_idx.to_le_bytes());
+    // .rela.plt.info → .got.plt; patched once .got.plt's index is known.
+    let relaplt_idx = mk(
+        &mut shstr, &mut shdrs, ".rela.plt", SHT_RELA, SHF_ALLOC | SHF_INFO_LINK, relaplt_v, relaplt_fo,
+        relaplt_size, dynsym_idx, 0, 8, 24,
+    );
+    for &i in &ro_order {
+        let o = &outs[i];
+        mk(&mut shstr, &mut shdrs, &o.name, SHT_PROGBITS, o.flags, o.vaddr, o.file_off, o.data.len() as u64, 0, 0, o.align, 0);
+    }
+    for &i in &text_order {
+        let o = &outs[i];
+        mk(&mut shstr, &mut shdrs, &o.name, SHT_PROGBITS, o.flags, o.vaddr, o.file_off, o.data.len() as u64, 0, 0, o.align, 0);
+    }
+    mk(&mut shstr, &mut shdrs, ".plt", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, plt_v, plt_fo, plt_size, 0, 0, 16, 16);
+    for &i in &data_order {
+        let o = &outs[i];
+        mk(&mut shstr, &mut shdrs, &o.name, SHT_PROGBITS, o.flags, o.vaddr, o.file_off, o.data.len() as u64, 0, 0, o.align, 0);
+    }
+    let gotplt_idx =
+        mk(&mut shstr, &mut shdrs, ".got.plt", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, gotplt_v, gotplt_fo, gotplt_size, 0, 0, 8, 8) as u32;
+    shdrs[relaplt_idx][44..48].copy_from_slice(&gotplt_idx.to_le_bytes());
+    mk(&mut shstr, &mut shdrs, ".dynamic", SHT_DYNAMIC, SHF_ALLOC | SHF_WRITE, dynamic_v, dynamic_fo, dynamic_size, dynstr_idx, 0, 8, 16);
+    for &i in &bss_order {
+        let o = &outs[i];
+        mk(&mut shstr, &mut shdrs, &o.name, SHT_NOBITS, o.flags, o.vaddr, o.vaddr, o.bss_size, 0, 0, o.align.max(1), 0);
+    }
+    // .shstrtab last; its own name is the final string, so reserve the
+    // index before appending the shstrtab bytes.
+    let shstrtab_idx = shdrs.len() as u32;
+    let shstrtab_off = image.len() as u64;
+    // Append the shstrtab's own name, then the section itself.
+    mk(&mut shstr, &mut shdrs, ".shstrtab", SHT_STRTAB, 0, 0, shstrtab_off, 0, 0, 0, 1, 0);
+    shdrs[shstrtab_idx as usize][32..40].copy_from_slice(&(shstr.len() as u64).to_le_bytes());
+    image.extend_from_slice(&shstr);
+
+    while !image.len().is_multiple_of(8) {
+        image.push(0);
+    }
+    let shoff = image.len() as u64;
+    for h in &shdrs {
+        image.extend_from_slice(h);
+    }
+    image[40..48].copy_from_slice(&shoff.to_le_bytes());
+    image[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+    image[60..62].copy_from_slice(&(shdrs.len() as u16).to_le_bytes());
+    image[62..64].copy_from_slice(&(shstrtab_idx as u16).to_le_bytes());
 
     Ok(image)
 }

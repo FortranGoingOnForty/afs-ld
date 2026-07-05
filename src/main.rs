@@ -147,13 +147,15 @@ fn main() -> ExitCode {
 /// an ELF object (Mach-O flow continues unchanged).
 fn elf_mode(args: &[String]) -> Option<ExitCode> {
     let mut output: Option<std::path::PathBuf> = None;
-    // Positional inputs, in command-line order: an object or an archive.
+    // Positional inputs, in command-line order: an object, an archive,
+    // or a shared object.
     let mut inputs: Vec<std::path::PathBuf> = Vec::new();
     let mut lib_dirs: Vec<std::path::PathBuf> = Vec::new();
     // `-lfoo` requests, resolved against `lib_dirs` after arg parsing so
     // a `-L` that follows a `-l` on the command line still applies.
     let mut lib_names: Vec<String> = Vec::new();
     let mut unsupported: Vec<String> = Vec::new();
+    let mut dynamic_linker: Option<String> = None;
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -168,21 +170,23 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
                     lib_names.push(n.clone());
                 }
             }
-            // Static-link flags we honor or safely ignore: group markers
-            // are no-ops (selection iterates to a global fixed point);
-            // -static and a target emulation are the expected mode.
-            "-static" | "-Bstatic" | "--start-group" | "--end-group"
-            | "-(" | "-)" | "--eh-frame-hdr" | "-melf_x86_64" => {}
+            "--dynamic-linker" | "-dynamic-linker" => {
+                dynamic_linker = it.next().cloned();
+            }
+            // Flags we honor or safely ignore. Group markers are no-ops
+            // (selection iterates to a global fixed point); -static and a
+            // target emulation are the expected mode.
+            "-static" | "-Bstatic" | "-Bdynamic" | "--start-group" | "--end-group" | "-("
+            | "-)" | "--eh-frame-hdr" | "-melf_x86_64" | "-znow" | "--no-as-needed"
+            | "--as-needed" => {}
             "-m" => {
                 it.next();
             }
-            // Dynamic-only flags belong to rung 3.
-            "-pie" | "--pie" | "-shared" | "-Bdynamic" | "--dynamic-linker" | "-dynamic-linker" => {
-                unsupported.push(a.to_string());
-                if a.ends_with("dynamic-linker") {
-                    it.next();
-                }
+            "-z" => {
+                it.next();
             }
+            // PIE and shared-object output are later rungs.
+            "-pie" | "--pie" | "-shared" | "-Bshareable" => unsupported.push(a.to_string()),
             s if s.starts_with("-L") => lib_dirs.push(std::path::PathBuf::from(&s[2..])),
             s if s.starts_with("-l") => lib_names.push(s[2..].to_string()),
             s if s.starts_with('-') => unsupported.push(s.to_string()),
@@ -199,7 +203,7 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
     }
     if !unsupported.is_empty() {
         diag::error(&format!(
-            "ELF static mode (x16 rung 2) does not support: {} — dynamic linking lands in rung 3",
+            "ELF mode does not support: {} — PIE and shared-object output land in a later rung",
             unsupported.join(" ")
         ));
         return Some(ExitCode::from(2));
@@ -209,82 +213,125 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
         return Some(ExitCode::from(2));
     };
 
-    // Resolve `-lfoo` to `libfoo.a` on the search path.
-    let mut archive_paths: Vec<std::path::PathBuf> = Vec::new();
-    for name in &lib_names {
-        let found = lib_dirs.iter().find_map(|d| {
-            let cand = d.join(format!("lib{name}.a"));
-            cand.exists().then_some(cand)
-        });
-        match found {
-            Some(p) => archive_paths.push(p),
-            None => {
-                diag::error(&format!("unable to find library -l{name}"));
-                return Some(ExitCode::from(1));
-            }
-        }
-    }
-
-    // Classify positional inputs by magic: ELF objects load eagerly,
-    // `ar` archives feed lazy member selection. Preserve link order.
-    const AR_MAGIC: &[u8] = b"!<arch>\n";
-    let mut objects = Vec::new();
-    let mut libs: Vec<elf::Library> = Vec::new();
     let read_bytes = |p: &std::path::Path| -> Result<Vec<u8>, ExitCode> {
         std::fs::read(p).map_err(|e| {
             diag::error(&format!("{}: {}", p.display(), e));
             ExitCode::from(1)
         })
     };
-    for p in &inputs {
-        let bytes = match read_bytes(p) {
-            Ok(b) => b,
-            Err(c) => return Some(c),
-        };
-        if bytes.starts_with(AR_MAGIC) {
-            libs.push(elf::Library {
-                name: p.display().to_string(),
-                bytes,
-            });
-        } else {
-            match elf::parse_rel(&p.display().to_string(), &bytes) {
-                Ok(o) => objects.push(o),
-                Err(e) => {
-                    diag::error(&e.to_string());
-                    return Some(ExitCode::from(1));
-                }
-            }
-        }
-    }
-    for p in &archive_paths {
-        match read_bytes(p) {
-            Ok(bytes) => libs.push(elf::Library {
-                name: p.display().to_string(),
-                bytes,
-            }),
-            Err(c) => return Some(c),
-        }
-    }
 
-    match elf::link_static(objects, &libs, "_start") {
-        Ok(image) => {
-            if let Err(e) = std::fs::write(&output, &image) {
-                diag::error(&format!("{}: {}", output.display(), e));
-                return Some(ExitCode::from(1));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &output,
-                    std::fs::Permissions::from_mode(0o755),
-                );
-            }
-            Some(ExitCode::SUCCESS)
+    let image = if let Some(interp) = dynamic_linker {
+        match link_dynamic(&inputs, &lib_dirs, &lib_names, &interp, read_bytes) {
+            Ok(img) => img,
+            Err(code) => return Some(code),
         }
-        Err(e) => {
-            diag::error(&e.to_string());
-            Some(ExitCode::from(1))
+    } else {
+        match link_static(&inputs, &lib_dirs, &lib_names, read_bytes) {
+            Ok(img) => img,
+            Err(code) => return Some(code),
+        }
+    };
+
+    if let Err(e) = std::fs::write(&output, &image) {
+        diag::error(&format!("{}: {}", output.display(), e));
+        return Some(ExitCode::from(1));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o755));
+    }
+    Some(ExitCode::SUCCESS)
+}
+
+/// Static link: objects load eagerly, `ar` archives feed lazy member
+/// selection. `-lfoo` resolves to `libfoo.a`.
+fn link_static(
+    inputs: &[std::path::PathBuf],
+    lib_dirs: &[std::path::PathBuf],
+    lib_names: &[String],
+    read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
+) -> Result<Vec<u8>, ExitCode> {
+    const AR_MAGIC: &[u8] = b"!<arch>\n";
+    let mut objects = Vec::new();
+    let mut libs: Vec<elf::Library> = Vec::new();
+    for p in inputs {
+        let bytes = read_bytes(p)?;
+        if bytes.starts_with(AR_MAGIC) {
+            libs.push(elf::Library { name: p.display().to_string(), bytes });
+        } else {
+            objects.push(parse_object(p, &bytes)?);
         }
     }
+    for name in lib_names {
+        let found = lib_dirs.iter().find_map(|d| {
+            let cand = d.join(format!("lib{name}.a"));
+            cand.exists().then_some(cand)
+        });
+        let Some(p) = found else {
+            diag::error(&format!("unable to find library -l{name}"));
+            return Err(ExitCode::from(1));
+        };
+        libs.push(elf::Library { name: p.display().to_string(), bytes: read_bytes(&p)? });
+    }
+    elf::link_static(objects, &libs, "_start").map_err(|e| {
+        diag::error(&e.to_string());
+        ExitCode::from(1)
+    })
+}
+
+/// Dynamic link: objects load eagerly; `.so` inputs (positional or from
+/// `-lfoo` → `libfoo.so`) provide imports resolved at runtime.
+fn link_dynamic(
+    inputs: &[std::path::PathBuf],
+    lib_dirs: &[std::path::PathBuf],
+    lib_names: &[String],
+    interp: &str,
+    read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
+) -> Result<Vec<u8>, ExitCode> {
+    let mut objects = Vec::new();
+    let mut shared = Vec::new();
+    let mut push_input = |p: &std::path::Path, bytes: &[u8]| -> Result<(), ExitCode> {
+        // ET_DYN (e_type == 3) is a shared object; otherwise a relocatable.
+        if bytes.len() >= 18 && bytes[16] == 3 && bytes[17] == 0 {
+            shared.push(parse_shared_lib(p, bytes)?);
+        } else {
+            objects.push(parse_object(p, bytes)?);
+        }
+        Ok(())
+    };
+    for p in inputs {
+        let bytes = read_bytes(p)?;
+        push_input(p, &bytes)?;
+    }
+    for name in lib_names {
+        let found = lib_dirs.iter().find_map(|d| {
+            let cand = d.join(format!("lib{name}.so"));
+            cand.exists().then_some(cand)
+        });
+        let Some(p) = found else {
+            diag::error(&format!("unable to find shared library -l{name}"));
+            return Err(ExitCode::from(1));
+        };
+        let bytes = read_bytes(&p)?;
+        push_input(&p, &bytes)?;
+    }
+    elf::link_dynamic_exec(&objects, &shared, "_start", interp).map_err(|e| {
+        diag::error(&e.to_string());
+        ExitCode::from(1)
+    })
+}
+
+fn parse_object(p: &std::path::Path, bytes: &[u8]) -> Result<elf::ElfObject, ExitCode> {
+    elf::parse_rel(&p.display().to_string(), bytes).map_err(|e| {
+        diag::error(&e.to_string());
+        ExitCode::from(1)
+    })
+}
+
+fn parse_shared_lib(p: &std::path::Path, bytes: &[u8]) -> Result<elf::SharedLib, ExitCode> {
+    elf::parse_shared(&p.display().to_string(), bytes).map_err(|e| {
+        diag::error(&e.to_string());
+        ExitCode::from(1)
+    })
 }

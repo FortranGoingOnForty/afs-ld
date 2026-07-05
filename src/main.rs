@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use afs_ld::{args, diag, dump, LinkError, Linker};
+use afs_ld::{args, diag, dump, elf, LinkError, Linker};
 
 fn usage() -> &'static str {
     "\
@@ -59,6 +59,14 @@ Options:
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
+
+    // x16: ELF mode. If any input file carries ELF magic, route to
+    // the ELF linker before the Mach-O argument surface sees it.
+    // Rung-1 flag set: `-o <out> <objects...>`; anything else is a
+    // loud not-yet, never a silent ignore.
+    if let Some(code) = elf_mode(&argv[1..]) {
+        return code;
+    }
 
     let opts = match args::parse(&argv[1..]) {
         Ok(opts) => opts,
@@ -131,6 +139,81 @@ fn main() -> ExitCode {
         Err(e) => {
             diag::error(&e.to_string());
             ExitCode::from(1)
+        }
+    }
+}
+
+/// Detect and run the ELF link path. Returns None when no input is
+/// an ELF object (Mach-O flow continues unchanged).
+fn elf_mode(args: &[String]) -> Option<ExitCode> {
+    let mut output: Option<std::path::PathBuf> = None;
+    let mut inputs: Vec<std::path::PathBuf> = Vec::new();
+    let mut unsupported: Vec<String> = Vec::new();
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-o" => {
+                output = it.next().map(std::path::PathBuf::from);
+            }
+            s if s.starts_with('-') => unsupported.push(s.to_string()),
+            _ => inputs.push(std::path::PathBuf::from(a)),
+        }
+    }
+    let any_elf = inputs.iter().any(|p| {
+        std::fs::read(p)
+            .map(|b| b.len() >= 4 && &b[0..4] == b"\x7fELF")
+            .unwrap_or(false)
+    });
+    if !any_elf {
+        return None;
+    }
+    if !unsupported.is_empty() {
+        diag::error(&format!(
+            "ELF mode (x16 rung 1) supports only `-o <out> <objects...>`; unsupported: {} — the crt/library contract lands in rung 2",
+            unsupported.join(" ")
+        ));
+        return Some(ExitCode::from(2));
+    }
+    let Some(output) = output else {
+        diag::error("ELF mode requires -o <output>");
+        return Some(ExitCode::from(2));
+    };
+    let mut objects = Vec::new();
+    for p in &inputs {
+        let bytes = match std::fs::read(p) {
+            Ok(b) => b,
+            Err(e) => {
+                diag::error(&format!("{}: {}", p.display(), e));
+                return Some(ExitCode::from(1));
+            }
+        };
+        match elf::parse_rel(&p.display().to_string(), &bytes) {
+            Ok(o) => objects.push(o),
+            Err(e) => {
+                diag::error(&e.to_string());
+                return Some(ExitCode::from(1));
+            }
+        }
+    }
+    match elf::link_static_exec(&objects, "_start") {
+        Ok(image) => {
+            if let Err(e) = std::fs::write(&output, &image) {
+                diag::error(&format!("{}: {}", output.display(), e));
+                return Some(ExitCode::from(1));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &output,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+            Some(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            diag::error(&e.to_string());
+            Some(ExitCode::from(1))
         }
     }
 }

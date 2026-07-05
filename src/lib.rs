@@ -9,6 +9,7 @@ pub mod args;
 pub mod atom;
 pub mod diag;
 pub mod dump;
+pub mod elf;
 pub mod icf;
 pub mod input;
 pub mod layout;

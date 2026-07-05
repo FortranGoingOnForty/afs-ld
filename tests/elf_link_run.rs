@@ -142,7 +142,7 @@ fn elf_mode_rejects_unsupported_flags_loudly() {
     std::fs::write(&s, ".text\n.globl _start\n_start:\n    ret\n").unwrap();
     assert!(Command::new(&gas).args(["--64", "-o"]).arg(&obj).arg(&s).output().unwrap().status.success());
 
-    // `-pie` is a dynamic-link request — rung 3, must be rejected loudly.
+    // `-pie` is not yet supported (PIE lands in a later rung); reject loudly.
     let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
         .args(["-pie", "-o"])
         .arg(dir.join("y_out"))
@@ -151,7 +151,11 @@ fn elf_mode_rejects_unsupported_flags_loudly() {
         .unwrap();
     assert!(!r.status.success());
     let stderr = String::from_utf8_lossy(&r.stderr);
-    assert!(stderr.contains("rung 3"), "must name the rung: {}", stderr);
+    assert!(
+        stderr.contains("-pie") && stderr.contains("does not support"),
+        "must name the unsupported flag: {}",
+        stderr
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -502,5 +506,151 @@ fn archive_member_selection_links_only_used_members() {
 
     // Both forms are byte-identical (determinism + form equivalence).
     assert_eq!(std::fs::read(&out1).unwrap(), std::fs::read(&out2).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// System `ld`, if present, for building the reference shared object.
+/// Probes the usual FHS spots and then bare `ld` on PATH (NixOS keeps it
+/// in the current-system profile, not /usr/bin).
+fn system_ld() -> Option<PathBuf> {
+    for p in ["/usr/bin/ld", "/usr/local/bin/ld"] {
+        if std::path::Path::new(p).exists() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    if let Ok(o) = Command::new("ld").arg("--version").output() {
+        if o.status.success() {
+            return Some(PathBuf::from("ld"));
+        }
+    }
+    None
+}
+
+/// The runtime dynamic loader for this OS, or None when its path is
+/// nonstandard (e.g. NixOS) — the dynamic-run legs skip in that case.
+fn rtld() -> Option<&'static str> {
+    let cands: &[&str] = if cfg!(target_os = "freebsd") {
+        &["/libexec/ld-elf.so.1"]
+    } else if cfg!(target_os = "linux") {
+        &["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-x86-64.so.2"]
+    } else {
+        &[]
+    };
+    cands.iter().copied().find(|p| std::path::Path::new(p).exists())
+}
+
+/// Dynamic executable: afs-ld links a freestanding `_start` that calls
+/// `answer()` from a shared object through the PLT. The output carries
+/// PT_INTERP, a PT_DYNAMIC with DT_NEEDED=libanswer.so.1, and one
+/// R_X86_64_JUMP_SLOT; the runtime loader binds it and the program exits
+/// 42. Both the positional-`.so` and `-lanswer` input forms are exercised
+/// and must produce byte-identical output.
+#[test]
+fn dynamic_executable_calls_shared_answer_through_plt() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_calls_shared_answer_through_plt count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let Some(ld) = system_ld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_calls_shared_answer_through_plt count=1 reason=\"no system ld to build the reference .so\"");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_calls_shared_answer_through_plt count=1 reason=\"no standard dynamic loader on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_dyn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    // Reference shared object: answer() -> 42, soname libanswer.so.1.
+    let answer_obj = dir.join("answer.o");
+    assemble(
+        &gas,
+        ".text\n.globl answer\n.type answer,@function\nanswer:\n    movl $42, %eax\n    ret\n",
+        &dir.join("answer.s"),
+        &answer_obj,
+    );
+    let so = dir.join("libanswer.so.1");
+    let r = Command::new(&ld)
+        .args(["-shared", "-soname", "libanswer.so.1", "-o"])
+        .arg(&so)
+        .arg(&answer_obj)
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "ld -shared: {}", String::from_utf8_lossy(&r.stderr));
+    // Dev symlink libanswer.so -> libanswer.so.1 for the -lanswer form.
+    let so_link = dir.join("libanswer.so");
+    let _ = std::fs::remove_file(&so_link);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("libanswer.so.1", &so_link).unwrap();
+
+    // main.o: exit(answer()) with answer imported through the PLT.
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n    call answer@plt\n    movl %eax, %edi\n    movl ${exit_nr}, %eax\n    syscall\n"
+        ),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+
+    // Positional-.so form.
+    let out1 = dir.join("dyn_positional");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&out1)
+        .arg(&main_obj)
+        .arg(&so)
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "afs-ld dynamic positional: {}", String::from_utf8_lossy(&r.stderr));
+
+    // `-L <dir> -lanswer` form resolves libanswer.so on the search path.
+    let out2 = dir.join("dyn_dashl");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&out2)
+        .arg(&main_obj)
+        .arg("-L")
+        .arg(&dir)
+        .arg("-lanswer")
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "afs-ld dynamic -l form: {}", String::from_utf8_lossy(&r.stderr));
+
+    // Both input forms name the same DT_NEEDED (the soname), so the
+    // linked images are byte-identical.
+    assert_eq!(
+        std::fs::read(&out1).unwrap(),
+        std::fs::read(&out2).unwrap(),
+        "positional and -l forms must link identically"
+    );
+
+    // Run under the loader: LD_LIBRARY_PATH points at the .so's dir so
+    // the loader resolves DT_NEEDED=libanswer.so.1.
+    let run = Command::new(&out1)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(42), "dynamic exe exit code: {}", String::from_utf8_lossy(&run.stderr));
+
+    // Determinism: a fresh link is byte-identical.
+    let out3 = dir.join("dyn_again");
+    assert!(Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&out3)
+        .arg(&main_obj)
+        .arg(&so)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert_eq!(
+        std::fs::read(&out1).unwrap(),
+        std::fs::read(&out3).unwrap(),
+        "dynamic link must be byte-deterministic"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

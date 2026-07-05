@@ -167,6 +167,107 @@ fn assemble(gas: &std::path::Path, src: &str, s: &std::path::Path, obj: &std::pa
     assert!(out.status.success(), "gas: {}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// Prologue that installs a thread pointer so freestanding TLS accesses
+/// work: TP = &tcb+64 with a TCB self-pointer at [TP], then the
+/// per-OS set-fsbase syscall. `%r15` holds TP on return.
+fn tls_prologue() -> &'static str {
+    if cfg!(target_os = "freebsd") {
+        // sysarch(AMD64_SET_FSBASE=129, &tp); SYS_sysarch=165.
+        "    leaq tcb(%rip), %r15\n    addq $64, %r15\n    movq %r15, (%r15)\n    movq %r15, -8(%rsp)\n    leaq -8(%rsp), %rsi\n    movq $129, %rdi\n    movq $165, %rax\n    syscall\n"
+    } else {
+        // arch_prctl(ARCH_SET_FS=0x1002, tp); syscall 158.
+        "    leaq tcb(%rip), %r15\n    addq $64, %r15\n    movq %r15, (%r15)\n    movq %r15, %rsi\n    movq $0x1002, %rdi\n    movq $158, %rax\n    syscall\n"
+    }
+}
+
+/// `.tdata tvar=0` + a 128-byte `tcb` scratch buffer, the fixture the
+/// TLS prologue relies on.
+const TLS_FIXTURE: &str = ".section .tdata,\"awT\",@progbits\n.globl tvar\ntvar: .long 0\n.bss\n.globl tcb\ntcb: .zero 128\n";
+
+/// TLS local-exec (TPOFF32) store and initial-exec (GOTTPOFF) load hit
+/// the same thread-local: store 42 via `%fs:tvar@tpoff`, read it back
+/// through the GOT, exit with the value.
+#[test]
+fn tls_local_exec_and_initial_exec_read_back() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=tls_local_exec_and_initial_exec_read_back count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_tls_ie_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let obj = dir.join("t.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n{}    movl $42, %fs:tvar@tpoff\n    movq tvar@gottpoff(%rip), %rax\n    movl %fs:(%rax), %edi\n    movl ${exit_nr}, %eax\n    syscall\n{}",
+            tls_prologue(),
+            TLS_FIXTURE
+        ),
+        &dir.join("t.s"),
+        &obj,
+    );
+    let out = dir.join("t");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o").arg(&out).arg(&obj).output().unwrap();
+    assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
+    // Behavioral parity with the reference static linker, if present.
+    for ld in ["/usr/bin/ld", "/usr/local/bin/ld"] {
+        if !std::path::Path::new(ld).exists() { continue; }
+        let theirs = dir.join(format!("t_{}", ld.replace('/', "_")));
+        if Command::new(ld).args(["-static", "-o"]).arg(&theirs).arg(&obj).output().unwrap().status.success() {
+            assert_eq!(Command::new(&theirs).output().unwrap().status.code(), Some(42), "{ld} static TLS");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TLS general-dynamic (TLSGD) and local-dynamic (TLSLD+DTPOFF32) call
+/// sequences relax to local-exec in place — no `__tls_get_addr` needed.
+/// Each computes &tvar, stores 42, reads it back.
+#[test]
+fn tls_general_and_local_dynamic_relax_to_local_exec() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=tls_general_and_local_dynamic_relax_to_local_exec count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_tls_gd_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    // General dynamic.
+    let gd = dir.join("gd.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n{}    .byte 0x66\n    leaq tvar@tlsgd(%rip), %rdi\n    .value 0x6666\n    rex64\n    call __tls_get_addr@plt\n    movl $42, (%rax)\n    movl (%rax), %edi\n    movl ${exit_nr}, %eax\n    syscall\n{}",
+            tls_prologue(), TLS_FIXTURE
+        ),
+        &dir.join("gd.s"),
+        &gd,
+    );
+    let gd_out = dir.join("gd");
+    assert!(Command::new(env!("CARGO_BIN_EXE_afs-ld")).arg("-o").arg(&gd_out).arg(&gd).output().unwrap().status.success());
+    assert_eq!(Command::new(&gd_out).output().unwrap().status.code(), Some(42), "GD relax");
+
+    // Local dynamic.
+    let ld = dir.join("ld.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n{}    leaq tvar@tlsld(%rip), %rdi\n    call __tls_get_addr@plt\n    leaq tvar@dtpoff(%rax), %rax\n    movl $42, (%rax)\n    movl (%rax), %edi\n    movl ${exit_nr}, %eax\n    syscall\n{}",
+            tls_prologue(), TLS_FIXTURE
+        ),
+        &dir.join("ld.s"),
+        &ld,
+    );
+    let ld_out = dir.join("ld");
+    assert!(Command::new(env!("CARGO_BIN_EXE_afs-ld")).arg("-o").arg(&ld_out).arg(&ld).output().unwrap().status.success());
+    assert_eq!(Command::new(&ld_out).output().unwrap().status.code(), Some(42), "LD relax");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// GOT synthesis: a `foo@GOTPCREL` load resolves through a synthesized
 /// `.got` slot holding foo's final address, and an unsatisfied *weak*
 /// GOTPCREL reference reads back 0. The program exits 42 only when both

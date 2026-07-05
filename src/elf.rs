@@ -23,6 +23,7 @@ pub const SHT_NOBITS: u32 = 8;
 pub const SHF_WRITE: u64 = 0x1;
 pub const SHF_ALLOC: u64 = 0x2;
 pub const SHF_EXECINSTR: u64 = 0x4;
+pub const SHF_TLS: u64 = 0x400;
 
 pub const STB_LOCAL: u8 = 0;
 pub const STB_GLOBAL: u8 = 1;
@@ -38,8 +39,16 @@ pub const R_X86_64_PLT32: u32 = 4;
 pub const R_X86_64_GOTPCREL: u32 = 9;
 pub const R_X86_64_32: u32 = 10;
 pub const R_X86_64_32S: u32 = 11;
+pub const R_X86_64_DTPOFF64: u32 = 17;
+pub const R_X86_64_TLSGD: u32 = 19;
+pub const R_X86_64_TLSLD: u32 = 20;
+pub const R_X86_64_DTPOFF32: u32 = 21;
+pub const R_X86_64_GOTTPOFF: u32 = 22;
+pub const R_X86_64_TPOFF32: u32 = 23;
 pub const R_X86_64_GOTPCRELX: u32 = 41;
 pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
+
+const PT_TLS: u32 = 7;
 
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
@@ -271,6 +280,14 @@ struct OutSec {
 /// (object index, section index) -> (output section, offset within it)
 type Placement = HashMap<(usize, usize), (usize, u64)>;
 
+/// A synthesized GOT slot. `Addr` holds a symbol's final address
+/// (`None` = an unsatisfied weak reference, i.e. 0); `TpOff` holds a
+/// TLS symbol's TP-relative offset for the initial-exec model.
+enum GotEntry {
+    Addr(Option<(usize, usize)>),
+    TpOff((usize, usize)),
+}
+
 fn output_rank(flags: u64, is_bss: bool) -> u32 {
     if flags & SHF_EXECINSTR != 0 {
         0
@@ -407,6 +424,11 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
 
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
+            // TLS sections do not join the normal segment layout; they
+            // form the PT_TLS initialization image, handled below.
+            if sec.sh_flags & SHF_TLS != 0 {
+                continue;
+            }
             let is_bss = sec.sh_type == SHT_NOBITS;
             let key = sec.name.clone();
             let idx = *out_index.entry(key).or_insert_with(|| {
@@ -443,6 +465,64 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
             place.insert((oi, si), (idx, cursor));
         }
     }
+
+    // ---- TLS block (variant II, local-exec). Concatenate every .tdata
+    // (the initialized image) then every .tbss (zero template past it);
+    // each TLS symbol gets a block offset. The thread pointer sits just
+    // past the block, so a symbol's TP-relative offset is
+    // block_off - align_up(memsz, align) — negative, as x86_64 expects.
+    let mut tls_data: Vec<u8> = Vec::new();
+    let mut tls_align: u64 = 1;
+    let mut tls_place: HashMap<(usize, usize), u64> = HashMap::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sec) in obj.sections.iter().enumerate() {
+            if sec.sh_flags & SHF_TLS == 0 || sec.sh_type == SHT_NOBITS {
+                continue;
+            }
+            tls_align = tls_align.max(sec.sh_addralign);
+            let c = next_multiple(tls_data.len() as u64, sec.sh_addralign);
+            tls_data.resize(c as usize, 0);
+            tls_data.extend_from_slice(&sec.data);
+            tls_place.insert((oi, si), c);
+        }
+    }
+    let tls_bss_base = tls_data.len() as u64;
+    let mut tls_bss: u64 = 0;
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sec) in obj.sections.iter().enumerate() {
+            if sec.sh_flags & SHF_TLS == 0 || sec.sh_type != SHT_NOBITS {
+                continue;
+            }
+            tls_align = tls_align.max(sec.sh_addralign);
+            let c = next_multiple(tls_bss, sec.sh_addralign);
+            tls_place.insert((oi, si), tls_bss_base + c);
+            tls_bss = c + sec.nobits_size;
+        }
+    }
+    let tls_memsz = tls_bss_base + tls_bss;
+    let tls_neg_base = next_multiple(tls_memsz, tls_align) as i64;
+    let has_tls = tls_memsz > 0;
+    // The init image is a normal RW chunk PT_TLS overlays; .tbss adds no
+    // process memory (it is a per-thread template). Anchor PT_TLS on a
+    // synthetic section so it has a file offset and vaddr even for a
+    // .tbss-only program.
+    let tls_out: Option<usize> = if has_tls {
+        let name = if tls_data.is_empty() { ".tbss" } else { ".tdata" };
+        outs.push(OutSec {
+            name: name.to_string(),
+            flags: SHF_ALLOC | SHF_WRITE | SHF_TLS,
+            align: tls_align,
+            data: std::mem::take(&mut tls_data),
+            bss_size: 0,
+            vaddr: 0,
+            file_off: 0,
+            is_bss: false,
+        });
+        Some(outs.len() - 1)
+    } else {
+        None
+    };
+
     // ---- Global symbol resolution.
     // name -> (object, symbol index); strong duplicates are errors,
     // weak yields to strong.
@@ -501,45 +581,76 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
         }
     };
 
+    // TLS reference -> TP-relative offset (tpoff). Undefined-weak TLS is
+    // not meaningful; treat it as an error.
+    let tls_offset = |oi: usize, si: usize| -> Result<i64, ElfError> {
+        let (doi, dsi) = resolve_def(oi, si)?.ok_or_else(|| {
+            ElfError(format!(
+                "TLS relocation against undefined symbol in {}",
+                objects[oi].name
+            ))
+        })?;
+        let d = &objects[doi].symbols[dsi];
+        let sec = d
+            .section
+            .ok_or_else(|| ElfError(format!("TLS symbol '{}' has no section", d.name)))?;
+        let block_off = *tls_place.get(&(doi, sec)).ok_or_else(|| {
+            ElfError(format!("TLS symbol '{}' is not in a TLS section", d.name))
+        })?;
+        Ok(block_off as i64 + d.value as i64 - tls_neg_base)
+    };
+
     // ---- GOT synthesis. Each GOTPCREL-family reference gets an 8-byte
-    // slot holding the target's final address, deduplicated by target;
-    // unsatisfied weak references share one zero slot. A static link
-    // could relax the load to a lea, but a real slot is uniformly
-    // correct and keeps the reloc arm simple.
-    let mut got_targets: Vec<Option<(usize, usize)>> = Vec::new();
-    let mut got_of: HashMap<(usize, usize), usize> = HashMap::new();
-    let mut got_weak0: Option<usize> = None;
+    // slot holding the target's final address; each GOTTPOFF (TLS IE)
+    // reference gets a slot holding the target's tpoff. Slots are
+    // deduplicated per kind; unsatisfied weak address references share
+    // one zero slot. A static link could relax these loads, but a real
+    // slot is uniformly correct and keeps the reloc arms simple.
+    let mut got_entries: Vec<GotEntry> = Vec::new();
+    let mut got_addr_of: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut got_addr_weak0: Option<usize> = None;
+    let mut got_tpoff_of: HashMap<(usize, usize), usize> = HashMap::new();
     for (oi, obj) in objects.iter().enumerate() {
         for sec in &obj.sections {
             for r in &sec.relas {
-                if !is_gotpcrel(r.r_type) {
-                    continue;
-                }
-                match resolve_def(oi, r.sym as usize)? {
-                    Some(d) => {
-                        got_of.entry(d).or_insert_with(|| {
-                            got_targets.push(Some(d));
-                            got_targets.len() - 1
-                        });
-                    }
-                    None => {
-                        if got_weak0.is_none() {
-                            got_targets.push(None);
-                            got_weak0 = Some(got_targets.len() - 1);
+                if is_gotpcrel(r.r_type) {
+                    match resolve_def(oi, r.sym as usize)? {
+                        Some(d) => {
+                            got_addr_of.entry(d).or_insert_with(|| {
+                                got_entries.push(GotEntry::Addr(Some(d)));
+                                got_entries.len() - 1
+                            });
+                        }
+                        None => {
+                            if got_addr_weak0.is_none() {
+                                got_entries.push(GotEntry::Addr(None));
+                                got_addr_weak0 = Some(got_entries.len() - 1);
+                            }
                         }
                     }
+                } else if r.r_type == R_X86_64_GOTTPOFF {
+                    let d = resolve_def(oi, r.sym as usize)?.ok_or_else(|| {
+                        ElfError(format!(
+                            "TLS IE relocation against undefined symbol in {}",
+                            obj.name
+                        ))
+                    })?;
+                    got_tpoff_of.entry(d).or_insert_with(|| {
+                        got_entries.push(GotEntry::TpOff(d));
+                        got_entries.len() - 1
+                    });
                 }
             }
         }
     }
-    let got_out: Option<usize> = if got_targets.is_empty() {
+    let got_out: Option<usize> = if got_entries.is_empty() {
         None
     } else {
         outs.push(OutSec {
             name: ".got".to_string(),
             flags: SHF_ALLOC | SHF_WRITE,
             align: 8,
-            data: vec![0u8; got_targets.len() * 8],
+            data: vec![0u8; got_entries.len() * 8],
             bss_size: 0,
             vaddr: 0,
             file_off: 0,
@@ -547,23 +658,25 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
         });
         Some(outs.len() - 1)
     };
-    let got_slot = |def: Option<(usize, usize)>| -> usize {
+    let got_addr_slot = |def: Option<(usize, usize)>| -> usize {
         match def {
-            Some(d) => got_of[&d],
-            None => got_weak0.unwrap(),
+            Some(d) => got_addr_of[&d],
+            None => got_addr_weak0.unwrap(),
         }
     };
 
-    // Deterministic segment order: text, rodata, data, bss (GOT included).
+    // Deterministic segment order: text, rodata, data, bss (synthetic
+    // GOT/TLS sections included).
     let mut order: Vec<usize> = (0..outs.len()).collect();
     order.sort_by_key(|&i| (output_rank(outs[i].flags, outs[i].is_bss), i));
 
-    // ---- Layout: one RX PT_LOAD covering ehdr+phdrs+text/rodata,
-    // one RW PT_LOAD for data+bss. (rodata shares the RX segment at
-    // rung 1 — matches what lld does with a small freestanding
-    // input's defaults closely enough for behavioral parity.)
+    // ---- Layout: one RX PT_LOAD covering ehdr+phdrs+text/rodata, one
+    // RW PT_LOAD for data+bss, plus PT_TLS when the program has thread
+    // locals. (rodata shares the RX segment at rung 1 — matches what
+    // lld does with a small freestanding input closely enough for
+    // behavioral parity.)
     let ehsize = 64u64;
-    let phnum = 2u64;
+    let phnum = 2u64 + if has_tls { 1 } else { 0 };
     let phsize = 56 * phnum;
     let mut cursor_file = ehsize + phsize;
     let mut cursor_vaddr = BASE_VADDR + cursor_file;
@@ -613,24 +726,76 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
         Ok(out_vaddrs[out_idx] + sec_base + d.value)
     };
 
-    // Fill GOT slots now that every definition has a final address.
+    // Fill GOT slots now that every definition has a final address /
+    // tpoff.
     if let Some(gi) = got_out {
-        for (slot, target) in got_targets.iter().enumerate() {
-            let val = match *target {
-                Some((doi, dsi)) => sym_vaddr(doi, dsi)?,
-                None => 0,
+        for (slot, entry) in got_entries.iter().enumerate() {
+            let val: u64 = match entry {
+                GotEntry::Addr(Some((doi, dsi))) => sym_vaddr(*doi, *dsi)?,
+                GotEntry::Addr(None) => 0,
+                GotEntry::TpOff((doi, dsi)) => tls_offset(*doi, *dsi)? as u64,
             };
             let off = slot * 8;
             outs[gi].data[off..off + 8].copy_from_slice(&val.to_le_bytes());
         }
     }
 
+    // Pre-pass: a TLSGD/TLSLD sequence is relaxed to local-exec in
+    // place, which overwrites the paired `call __tls_get_addr` and its
+    // PLT32 relocation. Collect those paired reloc offsets so the apply
+    // loop skips them (they may precede the TLS reloc in the table).
+    let mut suppressed: HashSet<(usize, usize, u64)> = HashSet::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sec) in obj.sections.iter().enumerate() {
+            for r in &sec.relas {
+                match r.r_type {
+                    R_X86_64_TLSGD => {
+                        suppressed.insert((oi, si, r.offset + 8));
+                    }
+                    R_X86_64_TLSLD => {
+                        suppressed.insert((oi, si, r.offset + 5));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     // ---- Apply relocations into the merged section bytes.
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
-            let &(out_idx, base) = &place[&(oi, si)];
+            // TLS sections form the PT_TLS image and are not in the
+            // normal placement map; they carry no relocations we apply.
+            let Some(&(out_idx, base)) = place.get(&(oi, si)) else {
+                if !sec.relas.is_empty() {
+                    return err(format!(
+                        "relocations in unplaced section '{}' ({}) are unsupported",
+                        sec.name, obj.name
+                    ));
+                }
+                continue;
+            };
             for r in &sec.relas {
-                let s = sym_vaddr(oi, r.sym as usize)?;
+                if suppressed.contains(&(oi, si, r.offset)) {
+                    continue;
+                }
+                // TLS symbols live in the TLS block, not the section
+                // placement map, so resolve their address only for
+                // non-TLS relocations.
+                let is_tls = matches!(
+                    r.r_type,
+                    R_X86_64_TPOFF32
+                        | R_X86_64_GOTTPOFF
+                        | R_X86_64_TLSGD
+                        | R_X86_64_TLSLD
+                        | R_X86_64_DTPOFF32
+                        | R_X86_64_DTPOFF64
+                );
+                let s = if is_tls {
+                    0
+                } else {
+                    sym_vaddr(oi, r.sym as usize)?
+                };
                 let p = out_vaddrs[out_idx] + base + r.offset;
                 let spot = (base + r.offset) as usize;
                 match r.r_type {
@@ -667,7 +832,7 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
                     // displacement to point at the target's GOT slot.
                     t if is_gotpcrel(t) => {
                         let def = resolve_def(oi, r.sym as usize)?;
-                        let ga = out_vaddrs[got_out.unwrap()] + (got_slot(def) * 8) as u64;
+                        let ga = out_vaddrs[got_out.unwrap()] + (got_addr_slot(def) * 8) as u64;
                         let v = ga as i64 + r.addend - p as i64;
                         if v < i32::MIN as i64 || v > i32::MAX as i64 {
                             return err(format!("GOTPCREL displacement overflow at {:#x}", p));
@@ -675,9 +840,45 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
                         outs[out_idx].data[spot..spot + 4]
                             .copy_from_slice(&(v as i32).to_le_bytes());
                     }
+                    // TLS local-exec: the offset is a signed constant from
+                    // the thread pointer.
+                    R_X86_64_TPOFF32 | R_X86_64_DTPOFF32 => {
+                        let v = tls_offset(oi, r.sym as usize)? + r.addend;
+                        if v < i32::MIN as i64 || v > i32::MAX as i64 {
+                            return err(format!("TLS offset overflow at {:#x}", p));
+                        }
+                        outs[out_idx].data[spot..spot + 4]
+                            .copy_from_slice(&(v as i32).to_le_bytes());
+                    }
+                    R_X86_64_DTPOFF64 => {
+                        let v = tls_offset(oi, r.sym as usize)? + r.addend;
+                        outs[out_idx].data[spot..spot + 8]
+                            .copy_from_slice(&v.to_le_bytes());
+                    }
+                    // TLS initial-exec: load the tpoff from a GOT slot.
+                    R_X86_64_GOTTPOFF => {
+                        let d = resolve_def(oi, r.sym as usize)?
+                            .ok_or_else(|| ElfError("TLS IE against undefined symbol".into()))?;
+                        let ga = out_vaddrs[got_out.unwrap()] + (got_tpoff_of[&d] * 8) as u64;
+                        let v = ga as i64 + r.addend - p as i64;
+                        if v < i32::MIN as i64 || v > i32::MAX as i64 {
+                            return err(format!("GOTTPOFF displacement overflow at {:#x}", p));
+                        }
+                        outs[out_idx].data[spot..spot + 4]
+                            .copy_from_slice(&(v as i32).to_le_bytes());
+                    }
+                    // TLS general/local dynamic: relax the __tls_get_addr
+                    // call sequence to local-exec in place.
+                    R_X86_64_TLSGD => {
+                        let tp = tls_offset(oi, r.sym as usize)? + r.addend;
+                        relax_tlsgd_to_le(&mut outs[out_idx].data, base + r.offset, tp)?;
+                    }
+                    R_X86_64_TLSLD => {
+                        relax_tlsld_to_le(&mut outs[out_idx].data, base + r.offset)?;
+                    }
                     other => {
                         return err(format!(
-                            "relocation type {} is out of rung-2 scope (TLS/IFUNC pending)",
+                            "relocation type {} is out of rung-2 scope (IFUNC pending)",
                             other
                         ))
                     }
@@ -735,21 +936,22 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
     image[54..56].copy_from_slice(&56u16.to_le_bytes()); // phentsize
     image[56..58].copy_from_slice(&(phnum as u16).to_le_bytes());
 
-    // PT_LOAD RX: file [0, rx_end) at BASE_VADDR.
+    // Program headers: RX PT_LOAD, RW PT_LOAD, then PT_TLS if present.
     let mut ph = Vec::new();
-    let phdr = |p_type: u32, flags: u32, off: u64, vaddr: u64, filesz: u64, memsz: u64| {
-        let mut e = Vec::with_capacity(56);
-        e.extend_from_slice(&p_type.to_le_bytes());
-        e.extend_from_slice(&flags.to_le_bytes());
-        e.extend_from_slice(&off.to_le_bytes());
-        e.extend_from_slice(&vaddr.to_le_bytes());
-        e.extend_from_slice(&vaddr.to_le_bytes()); // paddr
-        e.extend_from_slice(&filesz.to_le_bytes());
-        e.extend_from_slice(&memsz.to_le_bytes());
-        e.extend_from_slice(&PAGE.to_le_bytes());
-        e
-    };
-    ph.extend(phdr(PT_LOAD, PF_R | PF_X, 0, BASE_VADDR, rx_end, rx_end));
+    let phdr =
+        |p_type: u32, flags: u32, off: u64, vaddr: u64, filesz: u64, memsz: u64, align: u64| {
+            let mut e = Vec::with_capacity(56);
+            e.extend_from_slice(&p_type.to_le_bytes());
+            e.extend_from_slice(&flags.to_le_bytes());
+            e.extend_from_slice(&off.to_le_bytes());
+            e.extend_from_slice(&vaddr.to_le_bytes());
+            e.extend_from_slice(&vaddr.to_le_bytes()); // paddr
+            e.extend_from_slice(&filesz.to_le_bytes());
+            e.extend_from_slice(&memsz.to_le_bytes());
+            e.extend_from_slice(&align.to_le_bytes());
+            e
+        };
+    ph.extend(phdr(PT_LOAD, PF_R | PF_X, 0, BASE_VADDR, rx_end, rx_end, PAGE));
     if rw_pos < order.len() {
         ph.extend(phdr(
             PT_LOAD,
@@ -758,11 +960,26 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
             rw_vaddr_start,
             rw_file_end - rw_file_start,
             rw_mem_end - rw_vaddr_start,
+            PAGE,
         ));
     } else {
-        // Keep phnum fixed at 2 for layout determinism: an empty RW
-        // segment at the end of the RX image.
-        ph.extend(phdr(PT_LOAD, PF_R | PF_W, rx_end, BASE_VADDR + rx_end, 0, 0));
+        // An empty RW segment at the end of the RX image keeps the base
+        // phdr count at 2 for layout determinism.
+        ph.extend(phdr(PT_LOAD, PF_R | PF_W, rx_end, BASE_VADDR + rx_end, 0, 0, PAGE));
+    }
+    if let Some(ti) = tls_out {
+        let tls_file_off = outs[ti].file_off;
+        let tls_vaddr = outs[ti].vaddr;
+        let tls_filesz = outs[ti].data.len() as u64;
+        ph.extend(phdr(
+            PT_TLS,
+            PF_R,
+            tls_file_off,
+            tls_vaddr,
+            tls_filesz,
+            tls_memsz,
+            tls_align,
+        ));
     }
     image[64..64 + ph.len()].copy_from_slice(&ph);
 
@@ -844,4 +1061,58 @@ fn is_gotpcrel(t: u32) -> bool {
         t,
         R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX
     )
+}
+
+/// Relax a general-dynamic TLS sequence to local-exec in place. The
+/// reloc marks the disp32 of `leaq x@tlsgd(%rip),%rdi`; the 16-byte
+/// sequence starting 4 bytes earlier becomes
+/// `movq %fs:0,%rax; leaq x@tpoff(%rax),%rax` (psABI TLS transition).
+fn relax_tlsgd_to_le(data: &mut [u8], reloc_off: u64, tpoff: i64) -> Result<(), ElfError> {
+    if !(i32::MIN as i64..=i32::MAX as i64).contains(&tpoff) {
+        return err(format!("TLS GD offset overflow at {:#x}", reloc_off));
+    }
+    let ro = reloc_off as usize;
+    if ro < 4 || ro + 12 > data.len() {
+        return err(format!("TLS GD sequence out of bounds at {:#x}", reloc_off));
+    }
+    let start = ro - 4;
+    if data[start..start + 4] != [0x66, 0x48, 0x8d, 0x3d] {
+        return err(format!(
+            "unexpected TLS GD prologue at {:#x}: {:02x?}",
+            reloc_off,
+            &data[start..start + 4]
+        ));
+    }
+    // movq %fs:0,%rax ; leaq <disp32>(%rax),%rax
+    let le: [u8; 12] = [
+        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x80,
+    ];
+    data[start..start + 12].copy_from_slice(&le);
+    data[start + 12..start + 16].copy_from_slice(&(tpoff as i32).to_le_bytes());
+    Ok(())
+}
+
+/// Relax a local-dynamic TLS sequence to local-exec in place. The reloc
+/// marks the disp32 of `leaq x@tlsld(%rip),%rdi`; the 12-byte sequence
+/// starting 3 bytes earlier becomes `movq %fs:0,%rax` (prefix-padded).
+/// Paired DTPOFF relocations then patch as local-exec offsets.
+fn relax_tlsld_to_le(data: &mut [u8], reloc_off: u64) -> Result<(), ElfError> {
+    let ro = reloc_off as usize;
+    if ro < 3 || ro + 9 > data.len() {
+        return err(format!("TLS LD sequence out of bounds at {:#x}", reloc_off));
+    }
+    let start = ro - 3;
+    if data[start..start + 3] != [0x48, 0x8d, 0x3d] {
+        return err(format!(
+            "unexpected TLS LD prologue at {:#x}: {:02x?}",
+            reloc_off,
+            &data[start..start + 3]
+        ));
+    }
+    // data16 data16 data16 movq %fs:0,%rax
+    let le: [u8; 12] = [
+        0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
+    ];
+    data[start..start + 12].copy_from_slice(&le);
+    Ok(())
 }

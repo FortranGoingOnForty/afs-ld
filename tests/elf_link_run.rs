@@ -509,6 +509,105 @@ fn archive_member_selection_links_only_used_members() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Data import through the GOT: afs-ld links against a `.so` exporting a
+/// function `base()`->40 and a data object `extra`=2. `main` calls
+/// `base@plt` (JUMP_SLOT) and reads `extra@GOTPCREL` (GLOB_DAT via .got +
+/// .rela.dyn); the loader must resolve both for the program to exit 42.
+/// A *direct* (non-GOT) reference to shared data is out of scope and must
+/// fail loudly (it needs a COPY relocation).
+#[test]
+fn dynamic_data_import_binds_through_got_glob_dat() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_data_import_binds_through_got_glob_dat count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let Some(ld) = system_ld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_data_import_binds_through_got_glob_dat count=1 reason=\"no system ld to build the reference .so\"");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_data_import_binds_through_got_glob_dat count=1 reason=\"no standard dynamic loader on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_globdat_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    // Reference .so: function base()->40, data object extra=2.
+    let lib_obj = dir.join("lib.o");
+    assemble(
+        &gas,
+        ".text\n.globl base\n.type base,@function\nbase:\n    movl $40, %eax\n    ret\n.data\n.globl extra\n.type extra,@object\n.size extra,4\nextra:\n    .long 2\n",
+        &dir.join("lib.s"),
+        &lib_obj,
+    );
+    let so = dir.join("libboth.so.1");
+    let r = Command::new(&ld)
+        .args(["-shared", "-soname", "libboth.so.1", "-o"])
+        .arg(&so)
+        .arg(&lib_obj)
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "ld -shared: {}", String::from_utf8_lossy(&r.stderr));
+
+    // main.o: exit(base() + extra) = 42. base via PLT, extra via GOT.
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(".text\n.globl _start\n_start:\n    call base@plt\n    movq extra@GOTPCREL(%rip), %rcx\n    addl (%rcx), %eax\n    movl %eax, %edi\n    movl ${exit_nr}, %eax\n    syscall\n"),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+    let out = dir.join("both");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&out)
+        .arg(&main_obj)
+        .arg(&so)
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "afs-ld func+data dynamic: {}", String::from_utf8_lossy(&r.stderr));
+    let run = Command::new(&out).env("LD_LIBRARY_PATH", &dir).output().unwrap();
+    assert_eq!(run.status.code(), Some(42), "func+data exe exit: {}", String::from_utf8_lossy(&run.stderr));
+
+    // Determinism.
+    let out2 = dir.join("both2");
+    assert!(Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&out2)
+        .arg(&main_obj)
+        .arg(&so)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&out2).unwrap(), "func+data link must be deterministic");
+
+    // A direct (non-GOT) reference to shared data needs a COPY relocation
+    // — out of scope, must fail loudly naming COPY.
+    let direct_obj = dir.join("direct.o");
+    assemble(
+        &gas,
+        &format!(".text\n.globl _start\n_start:\n    movl extra(%rip), %edi\n    movl ${exit_nr}, %eax\n    syscall\n"),
+        &dir.join("direct.s"),
+        &direct_obj,
+    );
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(dir.join("direct_out"))
+        .arg(&direct_obj)
+        .arg(&so)
+        .output()
+        .unwrap();
+    assert!(!r.status.success(), "direct data reference must fail (needs COPY)");
+    assert!(
+        String::from_utf8_lossy(&r.stderr).contains("COPY"),
+        "error must name the COPY relocation: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Versioned dynamic import: afs-ld links against a `.so` that exports
 /// `answer@@VERS_2.0` (default) and `answer@VERS_1.0`. A plain `answer`
 /// reference binds to the default; the exe must *declare* it needs

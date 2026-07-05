@@ -25,6 +25,15 @@ pub const SHT_DYNSYM: u32 = 11;
 pub const SHT_INIT_ARRAY: u32 = 14;
 pub const SHT_FINI_ARRAY: u32 = 15;
 pub const SHT_PREINIT_ARRAY: u32 = 16;
+pub const SHT_GNU_VERDEF: u32 = 0x6fff_fffd;
+pub const SHT_GNU_VERNEED: u32 = 0x6fff_fffe;
+pub const SHT_GNU_VERSYM: u32 = 0x6fff_ffff;
+
+/// Non-default (hidden) bit in a `.gnu.version` entry.
+const VERSYM_HIDDEN: u16 = 0x8000;
+/// Reserved `.gnu.version` indices: local symbol, and the base (global)
+/// version. Assigned version indices start at 2.
+const VER_NDX_GLOBAL: u16 = 1;
 
 pub const ET_DYN: u16 = 3;
 pub const STT_FUNC: u8 = 2;
@@ -87,6 +96,9 @@ const DT_SYMENT: i64 = 11;
 const DT_PLTREL: i64 = 20;
 const DT_JMPREL: i64 = 23;
 const DT_FLAGS: i64 = 30;
+const DT_VERSYM: i64 = 0x6fff_fff0;
+const DT_VERNEED: i64 = 0x6fff_fffe;
+const DT_VERNEEDNUM: i64 = 0x6fff_ffff;
 const DF_BIND_NOW: u64 = 0x8;
 
 /// Symbols the linker itself provides, bracketing the matching output
@@ -368,9 +380,13 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
     }
     let sh = |i: usize| -> &[u8] { &bytes[shoff + i * shentsize..shoff + (i + 1) * shentsize] };
 
-    // Locate .dynsym (with its linked string table) and .dynamic.
+    // Locate .dynsym (with its linked string table), .dynamic, and the
+    // version sections (.gnu.version / .gnu.version_d) so exported
+    // symbols carry their default version.
     let mut dynsym: Option<(usize, usize, usize, usize)> = None; // off,size,link,entsize
     let mut dynamic: Option<(usize, usize)> = None; // off,size
+    let mut versym_off: Option<usize> = None;
+    let mut verdef: Option<(usize, usize)> = None; // off,size
     for i in 0..shnum {
         let h = sh(i);
         match ru32(h, 4) {
@@ -383,6 +399,8 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
                 ));
             }
             SHT_DYNAMIC => dynamic = Some((ru64(h, 24) as usize, ru64(h, 32) as usize)),
+            SHT_GNU_VERSYM => versym_off = Some(ru64(h, 24) as usize),
+            SHT_GNU_VERDEF => verdef = Some((ru64(h, 24) as usize, ru64(h, 32) as usize)),
             _ => {}
         }
     }
@@ -415,9 +433,33 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
             .unwrap_or_else(|| name.to_string());
     }
 
+    // Version index -> version name, from .gnu.version_d. Indices 0/1 are
+    // reserved (local, base); real versions start at 2.
+    let mut verdef_names: HashMap<u16, String> = HashMap::new();
+    if let Some((doff, dsz)) = verdef {
+        let mut p = doff;
+        let end = doff + dsz;
+        while p + 20 <= end {
+            let cnt = ru16(&bytes[p..], 6);
+            let aux = ru32(&bytes[p..], 12) as usize;
+            let vd_next = ru32(&bytes[p..], 16) as usize;
+            let ndx = ru16(&bytes[p..], 4);
+            if cnt >= 1 && p + aux + 8 <= end {
+                let vda_name = ru32(&bytes[p + aux..], 0) as usize;
+                verdef_names.insert(ndx, cstr(dynstr, vda_name));
+            }
+            if vd_next == 0 {
+                break;
+            }
+            p += vd_next;
+        }
+    }
+
     let sent = if sent == 0 { 24 } else { sent };
-    let mut exports = HashMap::new();
-    for k in 0..ssize / sent {
+    let mut exports: HashMap<String, Export> = HashMap::new();
+    let mut is_default_export: HashMap<String, bool> = HashMap::new();
+    let nsyms = ssize / sent;
+    for k in 0..nsyms {
         let e = &bytes[soff + k * sent..soff + k * sent + 24];
         let shndx = ru16(e, 6);
         let bind = e[4] >> 4;
@@ -429,10 +471,27 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
         if nm.is_empty() {
             continue;
         }
-        exports.entry(nm).or_insert(Export {
-            version: String::new(),
-            func: typ == STT_FUNC,
-        });
+        // Version + default-ness from .gnu.version (one u16 per dynsym).
+        let (version, default) = match versym_off {
+            Some(vo) if vo + k * 2 + 2 <= bytes.len() => {
+                let raw = ru16(&bytes[vo + k * 2..], 0);
+                let idx = raw & !VERSYM_HIDDEN;
+                if idx >= 2 {
+                    (verdef_names.get(&idx).cloned().unwrap_or_default(), raw & VERSYM_HIDDEN == 0)
+                } else {
+                    (String::new(), true)
+                }
+            }
+            _ => (String::new(), true),
+        };
+        // Prefer the default-versioned definition when a name repeats:
+        // replace only when the new def is default and the stored isn't.
+        let prev_default = is_default_export.get(&nm).copied().unwrap_or(false);
+        if exports.contains_key(&nm) && (prev_default || !default) {
+            continue;
+        }
+        is_default_export.insert(nm.clone(), default);
+        exports.insert(nm, Export { version, func: typ == STT_FUNC });
     }
     Ok(SharedLib { soname, exports })
 }
@@ -1551,8 +1610,12 @@ pub fn link_dynamic_exec(
     }
 
     // ---- Imports: undefined strong globals a shared library exports.
-    // Functions get a PLT slot; anything else is out of 3a scope.
+    // Functions get a PLT slot; anything else is out of 3a scope. Each
+    // import records its owning library and the default version the
+    // library binds it to (empty when the library is unversioned).
     let mut imports: Vec<String> = Vec::new();
+    let mut import_lib: Vec<usize> = Vec::new();
+    let mut import_ver: Vec<String> = Vec::new();
     let mut import_index: HashMap<String, usize> = HashMap::new();
     let mut used_lib = vec![false; shared.len()];
     for obj in objects {
@@ -1571,7 +1634,8 @@ pub fn link_dynamic_exec(
                     sym.name, obj.name
                 ));
             };
-            if !shared[li].exports[&sym.name].func {
+            let export = &shared[li].exports[&sym.name];
+            if !export.func {
                 return err(format!(
                     "data import '{}' (GLOB_DAT) is out of rung-3a scope",
                     sym.name
@@ -1579,10 +1643,37 @@ pub fn link_dynamic_exec(
             }
             used_lib[li] = true;
             import_index.insert(sym.name.clone(), imports.len());
+            import_lib.push(li);
+            import_ver.push(export.version.clone());
             imports.push(sym.name.clone());
         }
     }
     let n_imp = imports.len();
+
+    // ---- Version requirements. Assign a `.gnu.version` index (>=2) per
+    // distinct (library, version) among versioned imports, in first-seen
+    // order; `import_vidx[i]` is the index a versioned import references.
+    let mut import_vidx: Vec<u16> = vec![0; n_imp];
+    // (library index, version name) for each distinct requirement.
+    let mut ver_reqs: Vec<(usize, String)> = Vec::new();
+    let mut next_vidx: u16 = 2;
+    for i in 0..n_imp {
+        if import_ver[i].is_empty() {
+            continue;
+        }
+        let key = (import_lib[i], import_ver[i].clone());
+        let idx = match ver_reqs.iter().position(|r| *r == key) {
+            Some(j) => (j as u16) + 2,
+            None => {
+                ver_reqs.push(key);
+                let idx = next_vidx;
+                next_vidx += 1;
+                idx
+            }
+        };
+        import_vidx[i] = idx;
+    }
+    let versioned = !ver_reqs.is_empty();
 
     // ---- Build .dynstr (soname + import name strings) and note offsets.
     let mut dynstr: Vec<u8> = vec![0];
@@ -1593,14 +1684,22 @@ pub fn link_dynamic_exec(
         off
     };
     let mut needed_offsets: Vec<u32> = Vec::new();
+    let mut soname_off: Vec<u32> = vec![0; shared.len()];
     for (li, lib) in shared.iter().enumerate() {
         if used_lib[li] {
-            needed_offsets.push(str_off(&lib.soname, &mut dynstr));
+            let off = str_off(&lib.soname, &mut dynstr);
+            soname_off[li] = off;
+            needed_offsets.push(off);
         }
     }
     let import_name_off: Vec<u32> = imports
         .iter()
         .map(|n| str_off(n, &mut dynstr))
+        .collect();
+    // Version-name strings (parallel to ver_reqs) for VERNEED.
+    let ver_name_off: Vec<u32> = ver_reqs
+        .iter()
+        .map(|(_, ver)| str_off(ver, &mut dynstr))
         .collect();
 
     // ---- .dynsym: null entry then one UND FUNC per import.
@@ -1633,6 +1732,52 @@ pub fn link_dynamic_exec(
         hash.extend_from_slice(&c.to_le_bytes());
     }
 
+    // ---- .gnu.version (VERSYM): one u16 per .dynsym entry giving the
+    // version index a versioned import requires. Emitted only when the
+    // link has versioned imports.
+    let mut versym: Vec<u8> = Vec::new();
+    if versioned {
+        versym.extend_from_slice(&0u16.to_le_bytes()); // null entry
+        for &vidx in &import_vidx {
+            let vx = if vidx != 0 { vidx } else { VER_NDX_GLOBAL };
+            versym.extend_from_slice(&vx.to_le_bytes());
+        }
+    }
+
+    // ---- .gnu.version_r (VERNEED): one Verneed per library that has a
+    // version requirement, each with a Vernaux per distinct version.
+    let mut verneed: Vec<u8> = Vec::new();
+    let mut verneed_count: u32 = 0;
+    if versioned {
+        let mut libs_with_ver: Vec<usize> = Vec::new();
+        for (li, _) in &ver_reqs {
+            if !libs_with_ver.contains(li) {
+                libs_with_ver.push(*li);
+            }
+        }
+        verneed_count = libs_with_ver.len() as u32;
+        for (vi, &li) in libs_with_ver.iter().enumerate() {
+            let aux_idxs: Vec<usize> = (0..ver_reqs.len()).filter(|&j| ver_reqs[j].0 == li).collect();
+            let last_vn = vi + 1 == libs_with_ver.len();
+            let vn_next = if last_vn { 0u32 } else { (16 + aux_idxs.len() * 16) as u32 };
+            verneed.extend_from_slice(&1u16.to_le_bytes()); // vn_version
+            verneed.extend_from_slice(&(aux_idxs.len() as u16).to_le_bytes()); // vn_cnt
+            verneed.extend_from_slice(&soname_off[li].to_le_bytes()); // vn_file
+            verneed.extend_from_slice(&16u32.to_le_bytes()); // vn_aux
+            verneed.extend_from_slice(&vn_next.to_le_bytes()); // vn_next
+            for (ai, &j) in aux_idxs.iter().enumerate() {
+                let last_aux = ai + 1 == aux_idxs.len();
+                let vna_next = if last_aux { 0u32 } else { 16u32 };
+                let vidx = (j as u16) + 2;
+                verneed.extend_from_slice(&elf_hash(ver_reqs[j].1.as_bytes()).to_le_bytes()); // vna_hash
+                verneed.extend_from_slice(&0u16.to_le_bytes()); // vna_flags
+                verneed.extend_from_slice(&vidx.to_le_bytes()); // vna_other
+                verneed.extend_from_slice(&ver_name_off[j].to_le_bytes()); // vna_name
+                verneed.extend_from_slice(&vna_next.to_le_bytes()); // vna_next
+            }
+        }
+    }
+
     // Section byte sizes now known; build .interp, size .plt/.got.plt/
     // .rela.plt/.dynamic (contents filled after vaddrs are assigned).
     let mut interp_bytes = interp.as_bytes().to_vec();
@@ -1641,12 +1786,14 @@ pub fn link_dynamic_exec(
     let gotplt_size = ((n_imp + 3) * 8) as u64; // 3 reserved + one per import
     let relaplt_size = (n_imp * 24) as u64;
     let n_needed = needed_offsets.len();
-    // .dynamic entry count: NEEDED* + the fixed tags + NULL.
+    // .dynamic entry count: NEEDED* + the fixed tags + versioning tags
+    // (VERSYM/VERNEED/VERNEEDNUM) + NULL.
     let dyn_fixed = [
         DT_HASH, DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT, DT_PLTGOT, DT_PLTRELSZ, DT_PLTREL,
         DT_JMPREL, DT_FLAGS,
     ];
-    let dynamic_count = n_needed + dyn_fixed.len() + 1; // +NULL
+    let n_ver_dyn = if versioned { 3 } else { 0 };
+    let dynamic_count = n_needed + dyn_fixed.len() + n_ver_dyn + 1; // +NULL
     let dynamic_size = (dynamic_count * 16) as u64;
 
     // ---- Layout. Fixed section order across three load segments.
@@ -1669,6 +1816,8 @@ pub fn link_dynamic_exec(
     let (dynsym_v, dynsym_fo) = place_ro(dynsym.len() as u64, 8, &mut v, &mut fo);
     let (hash_v, hash_fo) = place_ro(hash.len() as u64, 8, &mut v, &mut fo);
     let (dynstr_v, dynstr_fo) = place_ro(dynstr.len() as u64, 1, &mut v, &mut fo);
+    let (versym_v, versym_fo) = place_ro(versym.len() as u64, 2, &mut v, &mut fo);
+    let (verneed_v, verneed_fo) = place_ro(verneed.len() as u64, 4, &mut v, &mut fo);
     let (relaplt_v, relaplt_fo) = place_ro(relaplt_size, 8, &mut v, &mut fo);
     // Merged rodata (read-only, non-writable, non-exec) joins the RO seg.
     let ro_order: Vec<usize> = (0..outs.len())
@@ -1875,6 +2024,11 @@ pub fn link_dynamic_exec(
     dyn_push(DT_PLTREL, DT_RELA as u64, &mut dynamic);
     dyn_push(DT_JMPREL, relaplt_v, &mut dynamic);
     dyn_push(DT_FLAGS, DF_BIND_NOW, &mut dynamic);
+    if versioned {
+        dyn_push(DT_VERSYM, versym_v, &mut dynamic);
+        dyn_push(DT_VERNEED, verneed_v, &mut dynamic);
+        dyn_push(DT_VERNEEDNUM, verneed_count as u64, &mut dynamic);
+    }
     dyn_push(DT_NULL, 0, &mut dynamic);
 
     let e_entry = {
@@ -1929,6 +2083,10 @@ pub fn link_dynamic_exec(
     put(&mut image, dynsym_fo, &dynsym);
     put(&mut image, hash_fo, &hash);
     put(&mut image, dynstr_fo, &dynstr);
+    if versioned {
+        put(&mut image, versym_fo, &versym);
+        put(&mut image, verneed_fo, &verneed);
+    }
     put(&mut image, relaplt_fo, &relaplt);
     put(&mut image, plt_fo, &plt);
     put(&mut image, gotplt_fo, &gotplt);
@@ -1993,6 +2151,11 @@ pub fn link_dynamic_exec(
     let dynstr_idx =
         mk(&mut shstr, &mut shdrs, ".dynstr", SHT_STRTAB, SHF_ALLOC, dynstr_v, dynstr_fo, dynstr.len() as u64, 0, 0, 1, 0) as u32;
     shdrs[dynsym_idx as usize][40..44].copy_from_slice(&dynstr_idx.to_le_bytes());
+    // Version sections, in file-offset order (only when versioned).
+    if versioned {
+        mk(&mut shstr, &mut shdrs, ".gnu.version", SHT_GNU_VERSYM, SHF_ALLOC, versym_v, versym_fo, versym.len() as u64, dynsym_idx, 0, 2, 2);
+        mk(&mut shstr, &mut shdrs, ".gnu.version_r", SHT_GNU_VERNEED, SHF_ALLOC, verneed_v, verneed_fo, verneed.len() as u64, dynstr_idx, verneed_count, 4, 0);
+    }
     // .rela.plt.info → .got.plt; patched once .got.plt's index is known.
     let relaplt_idx = mk(
         &mut shstr, &mut shdrs, ".rela.plt", SHT_RELA, SHF_ALLOC | SHF_INFO_LINK, relaplt_v, relaplt_fo,

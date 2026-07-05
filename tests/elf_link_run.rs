@@ -167,6 +167,107 @@ fn assemble(gas: &std::path::Path, src: &str, s: &std::path::Path, obj: &std::pa
     assert!(out.status.success(), "gas: {}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// IFUNC: a `call` to an STT_GNU_IFUNC symbol routes through a
+/// synthesized IPLT stub whose GOT.PLT slot is filled by the
+/// R_X86_64_IRELATIVE table between __rela_iplt_start/end. The program
+/// applies that table itself (as the static csu would), then calls the
+/// ifunc, which resolves to an impl returning 42.
+#[test]
+fn ifunc_resolves_through_iplt_and_irelative() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=ifunc_resolves_through_iplt_and_irelative count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_ifunc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let obj = dir.join("if.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n    leaq __rela_iplt_start(%rip), %rbx\n    leaq __rela_iplt_end(%rip), %r12\n1:  cmpq %r12, %rbx\n    jae 2f\n    movq (%rbx), %r13\n    movq 16(%rbx), %rax\n    call *%rax\n    movq %rax, (%r13)\n    addq $24, %rbx\n    jmp 1b\n2:  call myfunc\n    movl %eax, %edi\n    movl ${exit_nr}, %eax\n    syscall\n.globl myfunc\n.type myfunc, @gnu_indirect_function\nmyfunc:\n    leaq impl(%rip), %rax\n    ret\nimpl:\n    movl $42, %eax\n    ret\n"
+        ),
+        &dir.join("if.s"),
+        &obj,
+    );
+    let out = dir.join("if");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld")).arg("-o").arg(&out).arg(&obj).output().unwrap();
+    assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Init-array bracketing and priority: __init_array_start/end cover
+/// every .init_array contribution, ordered by numeric priority
+/// (.init_array.00100 before the default .init_array). The program runs
+/// the constructors itself: ctor@100 sets 2, default ctor adds 40 -> 42.
+#[test]
+fn init_array_priority_merge_and_brackets() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=init_array_priority_merge_and_brackets count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_ia_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let obj = dir.join("ia.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n    leaq __init_array_start(%rip), %rbx\n    leaq __init_array_end(%rip), %r12\n1:  cmpq %r12, %rbx\n    jae 2f\n    call *(%rbx)\n    addq $8, %rbx\n    jmp 1b\n2:  movl code(%rip), %edi\n    movl ${exit_nr}, %eax\n    syscall\nctor2:\n    movl $2, code(%rip)\n    ret\nctor40:\n    addl $40, code(%rip)\n    ret\n.section .init_array.00100,\"aw\"\n    .quad ctor2\n.section .init_array,\"aw\"\n    .quad ctor40\n.data\ncode: .long 0\n"
+        ),
+        &dir.join("ia.s"),
+        &obj,
+    );
+    let out = dir.join("ia");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld")).arg("-o").arg(&out).arg(&obj).output().unwrap();
+    assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Symbol versioning: an archive whose only definitions of `real_answer`
+/// carry version suffixes (`real_answer@@VERS_2.0`, `@VERS_1.0`) still
+/// satisfies a plain `real_answer` reference — the default (`@@`) version
+/// answers the base name, both in archive selection and resolution.
+#[test]
+fn versioned_symbol_answers_plain_reference() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=versioned_symbol_answers_plain_reference count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let ar = ["/usr/bin/ar", "/usr/local/bin/ar"].iter().map(std::path::PathBuf::from).find(|p| p.exists());
+    let Some(ar) = ar else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=versioned_symbol_answers_plain_reference count=1 reason=\"no ar on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_ver_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let impl_obj = dir.join("impl.o");
+    assemble(
+        &gas,
+        ".text\n.globl real_answer_impl\nreal_answer_impl:\n    movl $42, %eax\n    ret\n.symver real_answer_impl, real_answer@@VERS_2.0\n.symver real_answer_impl, real_answer@VERS_1.0\n",
+        &dir.join("impl.s"),
+        &impl_obj,
+    );
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(".text\n.globl _start\n_start:\n    call real_answer\n    movl %eax, %edi\n    movl ${exit_nr}, %eax\n    syscall\n"),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+    let archive = dir.join("libimpl.a");
+    let _ = std::fs::remove_file(&archive);
+    assert!(Command::new(&ar).arg("rcs").arg(&archive).arg(&impl_obj).output().unwrap().status.success());
+    let out = dir.join("ver");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld")).arg("-o").arg(&out).arg(&main_obj).arg(&archive).output().unwrap();
+    assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+    assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Prologue that installs a thread pointer so freestanding TLS accesses
 /// work: TP = &tcb+64 with a TCB self-pointer at [TP], then the
 /// per-OS set-fsbase syscall. `%r15` holds TP on return.

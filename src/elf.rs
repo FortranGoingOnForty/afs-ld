@@ -19,6 +19,14 @@ pub const SHT_SYMTAB: u32 = 2;
 pub const SHT_STRTAB: u32 = 3;
 pub const SHT_RELA: u32 = 4;
 pub const SHT_NOBITS: u32 = 8;
+pub const SHT_INIT_ARRAY: u32 = 14;
+pub const SHT_FINI_ARRAY: u32 = 15;
+pub const SHT_PREINIT_ARRAY: u32 = 16;
+
+/// `st_info` symbol type for an indirect (ifunc) function.
+pub const STT_GNU_IFUNC: u8 = 10;
+
+pub const R_X86_64_IRELATIVE: u32 = 37;
 
 pub const SHF_WRITE: u64 = 0x1;
 pub const SHF_ALLOC: u64 = 0x2;
@@ -49,6 +57,27 @@ pub const R_X86_64_GOTPCRELX: u32 = 41;
 pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
 
 const PT_TLS: u32 = 7;
+
+/// Symbols the linker itself provides, bracketing the matching output
+/// section (an empty range when the section is absent). The index into
+/// this slice is the pseudo symbol paired with [`LINKER_MARK`].
+const LINKER_SYMS: &[&str] = &[
+    "__preinit_array_start",
+    "__preinit_array_end",
+    "__init_array_start",
+    "__init_array_end",
+    "__fini_array_start",
+    "__fini_array_end",
+    "__rela_iplt_start",
+    "__rela_iplt_end",
+    "_GLOBAL_OFFSET_TABLE_",
+    "__bss_start",
+    "_edata",
+    "_end",
+];
+/// Sentinel object index marking a linker-provided pseudo definition;
+/// the paired symbol index is an offset into [`LINKER_SYMS`].
+const LINKER_MARK: usize = usize::MAX;
 
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
@@ -96,6 +125,8 @@ pub struct Section {
 pub struct Symbol {
     pub name: String,
     pub bind: u8,
+    /// `st_info & 0xf`: STT_FUNC, STT_OBJECT, STT_GNU_IFUNC, ...
+    pub typ: u8,
     pub shndx: u16,
     /// Object-local section index remapped to `sections` index for
     /// ordinary sections; SHN_* specials keep their meaning via shndx.
@@ -193,7 +224,10 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
     let mut sections = Vec::new();
     let mut remap: HashMap<usize, usize> = HashMap::new();
     for (i, r) in raws.iter().enumerate() {
-        let keep = matches!(r.sh_type, SHT_PROGBITS | SHT_NOBITS) && (r.flags & SHF_ALLOC) != 0;
+        let keep = matches!(
+            r.sh_type,
+            SHT_PROGBITS | SHT_NOBITS | SHT_INIT_ARRAY | SHT_FINI_ARRAY | SHT_PREINIT_ARRAY
+        ) && (r.flags & SHF_ALLOC) != 0;
         if !keep {
             continue;
         }
@@ -231,6 +265,7 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
             symbols.push(Symbol {
                 name: cstr(strdat, ru32(e, 0) as usize),
                 bind: e[4] >> 4,
+                typ: e[4] & 0xf,
                 shndx,
                 section: remap.get(&(shndx as usize)).copied(),
                 value: ru64(e, 8),
@@ -308,14 +343,47 @@ pub struct Library {
     pub bytes: Vec<u8>,
 }
 
+/// The base of a versioned symbol name (`foo@V` or `foo@@V` -> `foo`);
+/// `None` for an unversioned name.
+fn version_base(name: &str) -> Option<&str> {
+    name.find('@').map(|at| &name[..at])
+}
+
 /// Names a symtab entry defines (global/weak, section-bound, non-empty).
+/// A versioned definition (`foo@@V`) also answers the plain base `foo`,
+/// so a later reference to `foo` counts as satisfied.
 fn defined_names(obj: &ElfObject, out: &mut HashSet<String>) {
     for sym in &obj.symbols {
         if sym.name.is_empty() || sym.bind == STB_LOCAL || sym.shndx == SHN_UNDEF {
             continue;
         }
         out.insert(sym.name.clone());
+        if let Some(base) = version_base(&sym.name) {
+            out.insert(base.to_string());
+        }
     }
+}
+
+/// Resolve a symbol name to its defining member's header offset in an
+/// archive, tolerant of symbol versioning: an exact hit wins, else a
+/// default-version (`name@@V`) entry, else any versioned (`name@V`).
+fn armap_offset(ar: &crate::archive::Archive, name: &str) -> Option<u32> {
+    let si = ar.symbol_index()?;
+    if let Some(o) = si.first_defining_offset(name) {
+        return Some(o);
+    }
+    let mut any = None;
+    for e in &si.entries {
+        let Some(at) = e.name.find('@') else { continue };
+        if &e.name[..at] != name {
+            continue;
+        }
+        if e.name[at..].starts_with("@@") {
+            return Some(e.member_header_offset);
+        }
+        any.get_or_insert(e.member_header_offset);
+    }
+    any
 }
 
 /// Strong-undefined names an object references, in first-seen order,
@@ -330,6 +398,7 @@ fn undefined_demand(objects: &[ElfObject], defined: &HashSet<String>) -> Vec<Str
                 || sym.bind != STB_GLOBAL
                 || sym.name.is_empty()
                 || defined.contains(&sym.name)
+                || LINKER_SYMS.contains(&sym.name.as_str())
             {
                 continue;
             }
@@ -373,10 +442,7 @@ pub fn link_static(
         let mut changed = false;
         for name in &demand {
             for (ai, ar) in archives.iter().enumerate() {
-                let Some(off) = ar
-                    .symbol_index()
-                    .and_then(|si| si.first_defining_offset(name))
-                else {
+                let Some(off) = armap_offset(ar, name) else {
                     continue;
                 };
                 // First archive to define the symbol wins; stop scanning
@@ -429,6 +495,11 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
             if sec.sh_flags & SHF_TLS != 0 {
                 continue;
             }
+            // Init/fini arrays merge priority-ordered in a separate pass
+            // so their bracket symbols cover every contribution.
+            if array_kind(&sec.name).is_some() {
+                continue;
+            }
             let is_bss = sec.sh_type == SHT_NOBITS;
             let key = sec.name.clone();
             let idx = *out_index.entry(key).or_insert_with(|| {
@@ -463,6 +534,49 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
                 c
             };
             place.insert((oi, si), (idx, cursor));
+        }
+    }
+
+    // ---- Init/fini arrays: merge each kind priority-ordered into one
+    // output section so __{init,fini,preinit}_array_{start,end} bracket
+    // every constructor/destructor.
+    for base in [".preinit_array", ".init_array", ".fini_array"] {
+        let mut parts: Vec<(u64, usize, usize, usize)> = Vec::new(); // (prio, oi, si, orig_idx)
+        for (oi, obj) in objects.iter().enumerate() {
+            for (si, sec) in obj.sections.iter().enumerate() {
+                if let Some((b, prio)) = array_kind(&sec.name) {
+                    if b == base {
+                        parts.push((prio, oi, si, parts.len()));
+                    }
+                }
+            }
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        // Stable order: priority ascending, ties keep input order.
+        parts.sort_by_key(|&(prio, _, _, orig)| (prio, orig));
+        let mut align = 8u64;
+        for &(_, oi, si, _) in &parts {
+            align = align.max(objects[oi].sections[si].sh_addralign);
+        }
+        let idx = outs.len();
+        outs.push(OutSec {
+            name: base.to_string(),
+            flags: SHF_ALLOC | SHF_WRITE,
+            align,
+            data: Vec::new(),
+            bss_size: 0,
+            vaddr: 0,
+            file_off: 0,
+            is_bss: false,
+        });
+        for &(_, oi, si, _) in &parts {
+            let sec = &objects[oi].sections[si];
+            let c = next_multiple(outs[idx].data.len() as u64, sec.sh_addralign);
+            outs[idx].data.resize(c as usize, 0);
+            outs[idx].data.extend_from_slice(&sec.data);
+            place.insert((oi, si), (idx, c));
         }
     }
 
@@ -562,23 +676,45 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
         }
     }
 
+    // Version aliasing: a default-version definition (`foo@@V`) answers
+    // the plain base `foo`; a non-default (`foo@V`) answers it only if
+    // nothing else does. An explicit unversioned definition always wins.
+    let mut base_default: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut base_other: HashMap<String, (usize, usize)> = HashMap::new();
+    for (full, &def) in &globals {
+        let Some(at) = full.find('@') else { continue };
+        let base = full[..at].to_string();
+        if full[at..].starts_with("@@") {
+            base_default.entry(base).or_insert(def);
+        } else {
+            base_other.entry(base).or_insert(def);
+        }
+    }
+    for (base, def) in base_default.into_iter().chain(base_other) {
+        globals.entry(base).or_insert(def);
+    }
+
     // Reference -> definition identity. None means an unsatisfied weak
     // reference (address 0). Depends only on `globals`, so it is valid
     // before layout — the GOT pre-scan uses it.
     let resolve_def = |oi: usize, si: usize| -> Result<Option<(usize, usize)>, ElfError> {
         let sym = &objects[oi].symbols[si];
-        if sym.shndx == SHN_UNDEF {
-            match globals.get(&sym.name) {
-                Some(&d) => Ok(Some(d)),
-                None if sym.bind == STB_WEAK => Ok(None),
-                None => err(format!(
-                    "undefined symbol '{}' (referenced from {})",
-                    sym.name, objects[oi].name
-                )),
-            }
-        } else {
-            Ok(Some((oi, si)))
+        if sym.shndx != SHN_UNDEF {
+            return Ok(Some((oi, si)));
         }
+        if let Some(&d) = globals.get(&sym.name) {
+            return Ok(Some(d));
+        }
+        if let Some(idx) = LINKER_SYMS.iter().position(|&n| n == sym.name) {
+            return Ok(Some((LINKER_MARK, idx)));
+        }
+        if sym.bind == STB_WEAK {
+            return Ok(None);
+        }
+        err(format!(
+            "undefined symbol '{}' (referenced from {})",
+            sym.name, objects[oi].name
+        ))
     };
 
     // TLS reference -> TP-relative offset (tpoff). Undefined-weak TLS is
@@ -665,6 +801,66 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
         }
     };
 
+    // ---- IFUNC / IPLT synthesis. FreeBSD's amd64 string/memory
+    // routines are STT_GNU_IFUNC: a reference resolves to an IPLT stub
+    // (`jmp *slot`) whose GOT.PLT slot the static startup fills by
+    // running the resolver (an R_X86_64_IRELATIVE the csu applies over
+    // __rela_iplt_start..__rela_iplt_end).
+    let mut iplt_of: HashMap<(usize, usize), usize> = HashMap::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for sec in &obj.sections {
+            for r in &sec.relas {
+                // Only defined ifuncs matter here; a symbol that fails to
+                // resolve (e.g. a suppressed __tls_get_addr) surfaces its
+                // error later in the apply loop, if at all.
+                if let Ok(Some(d)) = resolve_def(oi, r.sym as usize) {
+                    if d.0 != LINKER_MARK && objects[d.0].symbols[d.1].typ == STT_GNU_IFUNC {
+                        let next = iplt_of.len();
+                        iplt_of.entry(d).or_insert(next);
+                    }
+                }
+            }
+        }
+    }
+    let n_iplt = iplt_of.len();
+    let (iplt_out, gotplt_out, relaplt_out) = if n_iplt == 0 {
+        (None, None, None)
+    } else {
+        outs.push(OutSec {
+            name: ".iplt".to_string(),
+            flags: SHF_ALLOC | SHF_EXECINSTR,
+            align: 16,
+            data: vec![0u8; n_iplt * 16],
+            bss_size: 0,
+            vaddr: 0,
+            file_off: 0,
+            is_bss: false,
+        });
+        let iplt = outs.len() - 1;
+        outs.push(OutSec {
+            name: ".got.plt".to_string(),
+            flags: SHF_ALLOC | SHF_WRITE,
+            align: 8,
+            data: vec![0u8; n_iplt * 8],
+            bss_size: 0,
+            vaddr: 0,
+            file_off: 0,
+            is_bss: false,
+        });
+        let gotplt = outs.len() - 1;
+        outs.push(OutSec {
+            name: ".rela.plt".to_string(),
+            flags: SHF_ALLOC,
+            align: 8,
+            data: vec![0u8; n_iplt * 24],
+            bss_size: 0,
+            vaddr: 0,
+            file_off: 0,
+            is_bss: false,
+        });
+        (Some(iplt), Some(gotplt), Some(outs.len() - 1))
+    };
+
     // Deterministic segment order: text, rodata, data, bss (synthetic
     // GOT/TLS sections included).
     let mut order: Vec<usize> = (0..outs.len()).collect();
@@ -704,27 +900,112 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
         }
     }
 
-    // Symbol address resolver (vaddr snapshot avoids borrowing
-    // `outs` inside the mutating relocation loop). An unsatisfied weak
-    // reference resolves to 0.
+    // Snapshot vaddrs so address resolution doesn't borrow the section
+    // vector while relocations mutate it.
     let out_vaddrs: Vec<u64> = outs.iter().map(|o| o.vaddr).collect();
-    let sym_vaddr = |oi: usize, si: usize| -> Result<u64, ElfError> {
-        let (doi, dsi) = match resolve_def(oi, si)? {
-            Some(d) => d,
-            None => return Ok(0),
-        };
+
+    // Linker-provided symbol addresses. Absent sections yield an empty
+    // range at the image's end so bracket loops iterate zero times.
+    let anchor = order
+        .iter()
+        .map(|&i| out_vaddrs[i] + if outs[i].is_bss { outs[i].bss_size } else { outs[i].data.len() as u64 })
+        .max()
+        .unwrap_or(BASE_VADDR);
+    let bounds = |name: &str| -> Option<(u64, u64)> {
+        outs.iter().enumerate().find(|(_, o)| o.name == name).map(|(i, o)| {
+            let sz = if o.is_bss { o.bss_size } else { o.data.len() as u64 };
+            (out_vaddrs[i], out_vaddrs[i] + sz)
+        })
+    };
+    let (pre_s, pre_e) = bounds(".preinit_array").unwrap_or((anchor, anchor));
+    let (ini_s, ini_e) = bounds(".init_array").unwrap_or((anchor, anchor));
+    let (fin_s, fin_e) = bounds(".fini_array").unwrap_or((anchor, anchor));
+    let (rip_s, rip_e) = bounds(".rela.plt").unwrap_or((anchor, anchor));
+    let got_base = bounds(".got").map(|(s, _)| s).unwrap_or(anchor);
+    let bss_start = order
+        .iter()
+        .find(|&&i| outs[i].is_bss)
+        .map(|&i| out_vaddrs[i])
+        .unwrap_or(anchor);
+    let edata = order
+        .iter()
+        .filter(|&&i| !outs[i].is_bss && outs[i].flags & SHF_WRITE != 0)
+        .map(|&i| out_vaddrs[i] + outs[i].data.len() as u64)
+        .max()
+        .unwrap_or(anchor);
+    // Parallel to LINKER_SYMS.
+    let linker_addr: [u64; 12] = [
+        pre_s, pre_e, ini_s, ini_e, fin_s, fin_e, rip_s, rip_e, got_base, bss_start, edata, anchor,
+    ];
+
+    // Raw definition address, bypassing ifunc indirection (used for the
+    // IRELATIVE resolver addend).
+    let raw_addr = |doi: usize, dsi: usize| -> Result<u64, ElfError> {
         let d = &objects[doi].symbols[dsi];
         if d.shndx == SHN_ABS {
             return Ok(d.value);
         }
-        let Some(sec) = d.section else {
-            return err(format!("symbol '{}' has no section", d.name));
-        };
+        let sec = d
+            .section
+            .ok_or_else(|| ElfError(format!("symbol '{}' has no section", d.name)))?;
         let &(out_idx, sec_base) = place
             .get(&(doi, sec))
             .ok_or_else(|| ElfError(format!("unplaced section for symbol '{}'", d.name)))?;
         Ok(out_vaddrs[out_idx] + sec_base + d.value)
     };
+    // Reference address: linker pseudo-symbols and ifunc stubs first,
+    // then the ordinary definition address. Unsatisfied weak -> 0.
+    let sym_vaddr = |oi: usize, si: usize| -> Result<u64, ElfError> {
+        let (doi, dsi) = match resolve_def(oi, si)? {
+            Some(d) => d,
+            None => return Ok(0),
+        };
+        if doi == LINKER_MARK {
+            return Ok(linker_addr[dsi]);
+        }
+        if objects[doi].symbols[dsi].typ == STT_GNU_IFUNC {
+            if let Some(&idx) = iplt_of.get(&(doi, dsi)) {
+                return Ok(out_vaddrs[iplt_out.unwrap()] + (idx * 16) as u64);
+            }
+        }
+        raw_addr(doi, dsi)
+    };
+
+    // Fill IPLT stubs, their GOT.PLT slots, and the IRELATIVE table the
+    // static startup applies.
+    if let (Some(ii), Some(gi), Some(ri)) = (iplt_out, gotplt_out, relaplt_out) {
+        let iplt_base = out_vaddrs[ii];
+        let gotplt_base = out_vaddrs[gi];
+        let mut entries: Vec<((usize, usize), usize)> =
+            iplt_of.iter().map(|(&k, &v)| (k, v)).collect();
+        entries.sort_by_key(|&(_, v)| v);
+        for (def, idx) in entries {
+            let slot_addr = gotplt_base + (idx * 8) as u64;
+            let stub_addr = iplt_base + (idx * 16) as u64;
+            let resolver = raw_addr(def.0, def.1)?;
+            // jmp *slot(%rip) ; nop-padded to 16 bytes.
+            let disp = (slot_addr as i64 - (stub_addr as i64 + 6)) as i32;
+            let so = idx * 16;
+            outs[ii].data[so] = 0xff;
+            outs[ii].data[so + 1] = 0x25;
+            outs[ii].data[so + 2..so + 6].copy_from_slice(&disp.to_le_bytes());
+            for b in outs[ii].data[so + 6..so + 16].iter_mut() {
+                *b = 0x90;
+            }
+            // GOT.PLT slot: the resolver installs the real address; seed
+            // with the resolver so a pre-startup call still lands somewhere
+            // valid.
+            let go = idx * 8;
+            outs[gi].data[go..go + 8].copy_from_slice(&resolver.to_le_bytes());
+            // RELA IRELATIVE: r_offset = slot, r_info = IRELATIVE, r_addend
+            // = resolver.
+            let ro = idx * 24;
+            outs[ri].data[ro..ro + 8].copy_from_slice(&slot_addr.to_le_bytes());
+            outs[ri].data[ro + 8..ro + 16]
+                .copy_from_slice(&(R_X86_64_IRELATIVE as u64).to_le_bytes());
+            outs[ri].data[ro + 16..ro + 24].copy_from_slice(&(resolver as i64).to_le_bytes());
+        }
+    }
 
     // Fill GOT slots now that every definition has a final address /
     // tpoff.
@@ -1054,6 +1335,23 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
 fn next_multiple(v: u64, a: u64) -> u64 {
     let a = a.max(1);
     v.div_ceil(a) * a
+}
+
+/// If `name` is an init/fini/preinit array (with optional `.NNN`
+/// priority), the base section name and its priority. Unnumbered arrays
+/// run last (priority u64::MAX), matching the GNU linker convention.
+fn array_kind(name: &str) -> Option<(&'static str, u64)> {
+    for base in [".init_array", ".fini_array", ".preinit_array"] {
+        if name == base {
+            return Some((base, u64::MAX));
+        }
+        if let Some(rest) = name.strip_prefix(base) {
+            if let Some(num) = rest.strip_prefix('.') {
+                return Some((base, num.parse::<u64>().unwrap_or(u64::MAX)));
+            }
+        }
+    }
+    None
 }
 
 fn is_gotpcrel(t: u32) -> bool {

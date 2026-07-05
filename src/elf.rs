@@ -36,6 +36,7 @@ const VERSYM_HIDDEN: u16 = 0x8000;
 const VER_NDX_GLOBAL: u16 = 1;
 
 pub const ET_DYN: u16 = 3;
+pub const STT_OBJECT: u8 = 1;
 pub const STT_FUNC: u8 = 2;
 /// `.dynamic` tag: shared-object name.
 pub const DT_SONAME: i64 = 14;
@@ -93,6 +94,8 @@ const DT_SYMTAB: i64 = 6;
 const DT_RELA: i64 = 7;
 const DT_STRSZ: i64 = 10;
 const DT_SYMENT: i64 = 11;
+const DT_RELASZ: i64 = 8;
+const DT_RELAENT: i64 = 9;
 const DT_PLTREL: i64 = 20;
 const DT_JMPREL: i64 = 23;
 const DT_FLAGS: i64 = 30;
@@ -518,6 +521,17 @@ type Placement = HashMap<(usize, usize), (usize, u64)>;
 enum GotEntry {
     Addr(Option<(usize, usize)>),
     TpOff((usize, usize)),
+}
+
+/// A `.got` slot in a dynamic executable, sized before layout and filled
+/// after. `GlobDat` is a runtime import (loader writes the address via an
+/// `R_X86_64_GLOB_DAT` in `.rela.dyn`); `Defined` holds an in-image
+/// symbol's absolute address (non-PIE, known at link time); `Zero` is an
+/// unsatisfied weak reference.
+enum GotSlot {
+    GlobDat(u32),
+    Defined(usize, usize),
+    Zero,
 }
 
 fn output_rank(flags: u64, is_bss: bool) -> u32 {
@@ -1610,12 +1624,13 @@ pub fn link_dynamic_exec(
     }
 
     // ---- Imports: undefined strong globals a shared library exports.
-    // Functions get a PLT slot; anything else is out of 3a scope. Each
-    // import records its owning library and the default version the
-    // library binds it to (empty when the library is unversioned).
+    // Function imports get a PLT slot (JUMP_SLOT); data imports get a
+    // GOT slot (GLOB_DAT). Each import records its owning library and the
+    // default version the library binds it to (empty when unversioned).
     let mut imports: Vec<String> = Vec::new();
     let mut import_lib: Vec<usize> = Vec::new();
     let mut import_ver: Vec<String> = Vec::new();
+    let mut import_is_func: Vec<bool> = Vec::new();
     let mut import_index: HashMap<String, usize> = HashMap::new();
     let mut used_lib = vec![false; shared.len()];
     for obj in objects {
@@ -1623,6 +1638,7 @@ pub fn link_dynamic_exec(
             if sym.shndx != SHN_UNDEF
                 || sym.bind != STB_GLOBAL
                 || sym.name.is_empty()
+                || sym.name == "_GLOBAL_OFFSET_TABLE_" // linker-defined, not an import
                 || globals.contains_key(&sym.name)
                 || import_index.contains_key(&sym.name)
             {
@@ -1635,20 +1651,70 @@ pub fn link_dynamic_exec(
                 ));
             };
             let export = &shared[li].exports[&sym.name];
-            if !export.func {
-                return err(format!(
-                    "data import '{}' (GLOB_DAT) is out of rung-3a scope",
-                    sym.name
-                ));
-            }
             used_lib[li] = true;
             import_index.insert(sym.name.clone(), imports.len());
             import_lib.push(li);
             import_ver.push(export.version.clone());
+            import_is_func.push(export.func);
             imports.push(sym.name.clone());
         }
     }
     let n_imp = imports.len();
+
+    // Function imports drive the PLT; `func_slot[i]` is the k-th function
+    // import's dense PLT/`.got.plt` slot (data imports have None).
+    let mut func_slot: Vec<Option<usize>> = vec![None; n_imp];
+    let mut n_func = 0usize;
+    for i in 0..n_imp {
+        if import_is_func[i] {
+            func_slot[i] = Some(n_func);
+            n_func += 1;
+        }
+    }
+    // No function imports ⇒ no PLT/.got.plt/.rela.plt at all (a data-only
+    // dynamic executable), matching what a reference linker emits.
+    let has_plt = n_func > 0;
+
+    // ---- GOT pre-pass: one `.got` slot per distinct GOTPCREL target.
+    // Imports become GLOB_DAT (loader fills); in-image symbols hold their
+    // absolute address. Sizes the `.got`/`.rela.dyn` sections before
+    // layout; contents are filled once addresses are known.
+    let got_key = |oi: usize, r: &Rela| -> Result<(String, GotSlot), ElfError> {
+        let sym = &objects[oi].symbols[r.sym as usize];
+        if sym.shndx == SHN_UNDEF {
+            if let Some(&ii) = import_index.get(&sym.name) {
+                Ok((format!("i:{}", sym.name), GotSlot::GlobDat((ii as u32) + 1)))
+            } else if let Some(&(doi, dsi)) = globals.get(&sym.name) {
+                Ok((format!("d:{doi}:{dsi}"), GotSlot::Defined(doi, dsi)))
+            } else if sym.bind == STB_WEAK {
+                Ok((format!("w:{}", sym.name), GotSlot::Zero))
+            } else {
+                err(format!("undefined symbol '{}' (GOTPCREL)", sym.name))
+            }
+        } else {
+            Ok((format!("d:{oi}:{}", r.sym), GotSlot::Defined(oi, r.sym as usize)))
+        }
+    };
+    let mut got_slot_of: HashMap<String, usize> = HashMap::new();
+    let mut got_kind: Vec<GotSlot> = Vec::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for sec in &obj.sections {
+            for r in &sec.relas {
+                if !is_gotpcrel(r.r_type) {
+                    continue;
+                }
+                let (key, kind) = got_key(oi, r)?;
+                if let std::collections::hash_map::Entry::Vacant(e) = got_slot_of.entry(key) {
+                    e.insert(got_kind.len());
+                    got_kind.push(kind);
+                }
+            }
+        }
+    }
+    let n_got = got_kind.len();
+    let got_size = (n_got * 8) as u64;
+    let n_glob_dat = got_kind.iter().filter(|k| matches!(k, GotSlot::GlobDat(_))).count();
+    let reladyn_size = (n_glob_dat * 24) as u64;
 
     // ---- Version requirements. Assign a `.gnu.version` index (>=2) per
     // distinct (library, version) among versioned imports, in first-seen
@@ -1702,13 +1768,14 @@ pub fn link_dynamic_exec(
         .map(|(_, ver)| str_off(ver, &mut dynstr))
         .collect();
 
-    // ---- .dynsym: null entry then one UND FUNC per import.
+    // ---- .dynsym: null entry then one UND import each (FUNC or OBJECT).
     let n_dynsym = n_imp + 1;
     let mut dynsym = vec![0u8; n_dynsym * 24];
     for (i, &noff) in import_name_off.iter().enumerate() {
         let e = (i + 1) * 24;
+        let styp = if import_is_func[i] { STT_FUNC } else { STT_OBJECT };
         dynsym[e..e + 4].copy_from_slice(&noff.to_le_bytes());
-        dynsym[e + 4] = (STB_GLOBAL << 4) | STT_FUNC; // st_info
+        dynsym[e + 4] = (STB_GLOBAL << 4) | styp; // st_info
         // st_other=0, st_shndx=0 (UND), value/size=0 already zeroed.
     }
 
@@ -1782,18 +1849,19 @@ pub fn link_dynamic_exec(
     // .rela.plt/.dynamic (contents filled after vaddrs are assigned).
     let mut interp_bytes = interp.as_bytes().to_vec();
     interp_bytes.push(0);
-    let plt_size = ((n_imp + 1) * 16) as u64; // PLT0 + one stub per import
-    let gotplt_size = ((n_imp + 3) * 8) as u64; // 3 reserved + one per import
-    let relaplt_size = (n_imp * 24) as u64;
+    let plt_size = if has_plt { ((n_func + 1) * 16) as u64 } else { 0 }; // PLT0 + stub/func
+    let gotplt_size = if has_plt { ((n_func + 3) * 8) as u64 } else { 0 }; // 3 reserved + func
+    let relaplt_size = (n_func * 24) as u64;
     let n_needed = needed_offsets.len();
-    // .dynamic entry count: NEEDED* + the fixed tags + versioning tags
-    // (VERSYM/VERNEED/VERNEEDNUM) + NULL.
-    let dyn_fixed = [
-        DT_HASH, DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT, DT_PLTGOT, DT_PLTRELSZ, DT_PLTREL,
-        DT_JMPREL, DT_FLAGS,
-    ];
+    // .dynamic entry count: NEEDED* + base tags (HASH/STRTAB/SYMTAB/STRSZ/
+    // SYMENT/FLAGS) + PLT tags (PLTGOT/PLTRELSZ/PLTREL/JMPREL, only with a
+    // PLT) + versioning tags (VERSYM/VERNEED/VERNEEDNUM) + .rela.dyn tags
+    // (RELA/RELASZ/RELAENT) + NULL.
+    let n_base_dyn = 6;
+    let n_plt_dyn = if has_plt { 4 } else { 0 };
     let n_ver_dyn = if versioned { 3 } else { 0 };
-    let dynamic_count = n_needed + dyn_fixed.len() + n_ver_dyn + 1; // +NULL
+    let n_reladyn_dyn = if reladyn_size > 0 { 3 } else { 0 };
+    let dynamic_count = n_needed + n_base_dyn + n_plt_dyn + n_ver_dyn + n_reladyn_dyn + 1;
     let dynamic_size = (dynamic_count * 16) as u64;
 
     // ---- Layout. Fixed section order across three load segments.
@@ -1818,6 +1886,7 @@ pub fn link_dynamic_exec(
     let (dynstr_v, dynstr_fo) = place_ro(dynstr.len() as u64, 1, &mut v, &mut fo);
     let (versym_v, versym_fo) = place_ro(versym.len() as u64, 2, &mut v, &mut fo);
     let (verneed_v, verneed_fo) = place_ro(verneed.len() as u64, 4, &mut v, &mut fo);
+    let (reladyn_v, reladyn_fo) = place_ro(reladyn_size, 8, &mut v, &mut fo);
     let (relaplt_v, relaplt_fo) = place_ro(relaplt_size, 8, &mut v, &mut fo);
     // Merged rodata (read-only, non-writable, non-exec) joins the RO seg.
     let ro_order: Vec<usize> = (0..outs.len())
@@ -1865,6 +1934,10 @@ pub fn link_dynamic_exec(
     }
     let rw_file_end = rw_start_fo + (next_multiple(v, 8) - rw_start_v);
     v = next_multiple(v, 8);
+    let got_v = v;
+    let got_fo = rw_start_fo + (got_v - rw_start_v);
+    v += got_size;
+    v = next_multiple(v, 8);
     let gotplt_v = v;
     let gotplt_fo = rw_start_fo + (gotplt_v - rw_start_v);
     v += gotplt_size;
@@ -1880,11 +1953,20 @@ pub fn link_dynamic_exec(
         v = outs[i].vaddr + outs[i].bss_size;
     }
     let rw_mem_end_v = v;
-    let rw_file_end = rw_file_end.max(gotplt_fo + gotplt_size).max(dynamic_fo + dynamic_size);
+    let rw_file_end = rw_file_end
+        .max(got_fo + got_size)
+        .max(gotplt_fo + gotplt_size)
+        .max(dynamic_fo + dynamic_size);
 
-    // Import n resolves to its PLT stub (PLT0 is index 0, imports 1..).
-    let plt_stub = |imp_idx: usize| plt_v + ((imp_idx + 1) * 16) as u64;
-    let gotplt_slot = |imp_idx: usize| gotplt_v + ((imp_idx + 3) * 8) as u64;
+    // Function import k resolves to its PLT stub (PLT0 is slot 0, funcs
+    // 1..); its lazy `.got.plt` slot is k+3 (3 reserved). A `.got` slot
+    // (data imports, GOTPCREL targets) is addressed by slot index.
+    let plt_stub = |func_k: usize| plt_v + ((func_k + 1) * 16) as u64;
+    let gotplt_slot = |func_k: usize| gotplt_v + ((func_k + 3) * 8) as u64;
+    let got_slot_v = |slot: usize| got_v + (slot * 8) as u64;
+    // `_GLOBAL_OFFSET_TABLE_` base: .got.plt when there's a PLT (its slot 0
+    // holds _DYNAMIC), otherwise the plain .got.
+    let got_base = if has_plt { gotplt_v } else { got_v };
 
     // ---- Address resolver (vaddr snapshot avoids borrowing `outs`
     // while the relocation loop mutates it).
@@ -1892,10 +1974,20 @@ pub fn link_dynamic_exec(
     let sym_vaddr = |oi: usize, si: usize| -> Result<u64, ElfError> {
         let sym = &objects[oi].symbols[si];
         let (doi, dsi) = if sym.shndx == SHN_UNDEF {
-            if let Some(&d) = globals.get(&sym.name) {
+            if sym.name == "_GLOBAL_OFFSET_TABLE_" {
+                return Ok(got_base);
+            } else if let Some(&d) = globals.get(&sym.name) {
                 d
             } else if let Some(&ii) = import_index.get(&sym.name) {
-                return Ok(plt_stub(ii));
+                return match func_slot[ii] {
+                    Some(k) => Ok(plt_stub(k)),
+                    // A data import referenced directly (not via GOT) would
+                    // need an R_X86_64_COPY relocation — a later rung.
+                    None => err(format!(
+                        "direct reference to data import '{}' needs a COPY relocation (later rung)",
+                        sym.name
+                    )),
+                };
             } else if sym.bind == STB_WEAK {
                 return Ok(0);
             } else {
@@ -1922,9 +2014,20 @@ pub fn link_dynamic_exec(
         for (si, sec) in obj.sections.iter().enumerate() {
             let &(out_idx, base) = &place[&(oi, si)];
             for r in &sec.relas {
-                let s = sym_vaddr(oi, r.sym as usize)?;
                 let p = out_vaddrs[out_idx] + base + r.offset;
                 let spot = (base + r.offset) as usize;
+                // GOTPCREL targets resolve to a `.got` slot, not the symbol.
+                if is_gotpcrel(r.r_type) {
+                    let (key, _) = got_key(oi, r)?;
+                    let slot = got_slot_of[&key];
+                    let val = got_slot_v(slot) as i64 + r.addend - p as i64;
+                    if !(i32::MIN as i64..=i32::MAX as i64).contains(&val) {
+                        return err(format!("GOTPCREL overflow at {:#x}", p));
+                    }
+                    outs[out_idx].data[spot..spot + 4].copy_from_slice(&(val as i32).to_le_bytes());
+                    continue;
+                }
+                let s = sym_vaddr(oi, r.sym as usize)?;
                 match r.r_type {
                     R_X86_64_64 => {
                         let val = (s as i64 + r.addend) as u64;
@@ -1950,7 +2053,7 @@ pub fn link_dynamic_exec(
                     }
                     other => {
                         return err(format!(
-                            "relocation type {} is out of rung-3a scope",
+                            "relocation type {} is out of the dynamic-link scope",
                             other
                         ))
                     }
@@ -1961,48 +2064,76 @@ pub fn link_dynamic_exec(
 
     // ---- Build .plt. PLT0 pushes GOT[1] and jumps GOT[2]; each stub
     // jumps through its GOT.PLT slot, else falls to the lazy trampoline.
-    let mut plt = vec![0u8; plt_size as usize];
-    // PLT0: ff 35 <gotplt+8> ; ff 25 <gotplt+16> ; nop nop nop nop
     let disp = |from_end: u64, to: u64| (to as i64 - from_end as i64) as i32;
-    plt[0] = 0xff;
-    plt[1] = 0x35;
-    plt[2..6].copy_from_slice(&disp(plt_v + 6, gotplt_v + 8).to_le_bytes());
-    plt[6] = 0xff;
-    plt[7] = 0x25;
-    plt[8..12].copy_from_slice(&disp(plt_v + 12, gotplt_v + 16).to_le_bytes());
-    plt[12..16].copy_from_slice(&[0x0f, 0x1f, 0x40, 0x00]);
-    for i in 0..n_imp {
-        let o = (i + 1) * 16;
-        let stub = plt_v + o as u64;
-        let slot = gotplt_slot(i);
-        // jmp *slot(%rip)
-        plt[o] = 0xff;
-        plt[o + 1] = 0x25;
-        plt[o + 2..o + 6].copy_from_slice(&disp(stub + 6, slot).to_le_bytes());
-        // push $i
-        plt[o + 6] = 0x68;
-        plt[o + 7..o + 11].copy_from_slice(&(i as u32).to_le_bytes());
-        // jmp PLT0
-        plt[o + 11] = 0xe9;
-        plt[o + 12..o + 16].copy_from_slice(&disp(stub + 16, plt_v).to_le_bytes());
-    }
-
-    // ---- Build .got.plt: [0]=&_DYNAMIC, [1]=[2]=0, [3+i]=stub push insn.
+    let mut plt = vec![0u8; plt_size as usize];
     let mut gotplt = vec![0u8; gotplt_size as usize];
-    gotplt[0..8].copy_from_slice(&dynamic_v.to_le_bytes());
-    for i in 0..n_imp {
-        let slot = (i + 3) * 8;
-        gotplt[slot..slot + 8].copy_from_slice(&(plt_stub(i) + 6).to_le_bytes());
+    if has_plt {
+        // PLT0: ff 35 <gotplt+8> ; ff 25 <gotplt+16> ; nop nop nop nop
+        plt[0] = 0xff;
+        plt[1] = 0x35;
+        plt[2..6].copy_from_slice(&disp(plt_v + 6, gotplt_v + 8).to_le_bytes());
+        plt[6] = 0xff;
+        plt[7] = 0x25;
+        plt[8..12].copy_from_slice(&disp(plt_v + 12, gotplt_v + 16).to_le_bytes());
+        plt[12..16].copy_from_slice(&[0x0f, 0x1f, 0x40, 0x00]);
+        for &fs in &func_slot {
+            let Some(k) = fs else { continue };
+            let o = (k + 1) * 16;
+            let stub = plt_v + o as u64;
+            let slot = gotplt_slot(k);
+            // jmp *slot(%rip)
+            plt[o] = 0xff;
+            plt[o + 1] = 0x25;
+            plt[o + 2..o + 6].copy_from_slice(&disp(stub + 6, slot).to_le_bytes());
+            // push $k (the .rela.plt index)
+            plt[o + 6] = 0x68;
+            plt[o + 7..o + 11].copy_from_slice(&(k as u32).to_le_bytes());
+            // jmp PLT0
+            plt[o + 11] = 0xe9;
+            plt[o + 12..o + 16].copy_from_slice(&disp(stub + 16, plt_v).to_le_bytes());
+        }
+        // .got.plt: [0]=&_DYNAMIC, [1]=[2]=0, [3+k]=stub push insn.
+        gotplt[0..8].copy_from_slice(&dynamic_v.to_le_bytes());
+        for &fs in &func_slot {
+            let Some(k) = fs else { continue };
+            let slot = (k + 3) * 8;
+            gotplt[slot..slot + 8].copy_from_slice(&(plt_stub(k) + 6).to_le_bytes());
+        }
     }
 
-    // ---- Build .rela.plt: one JUMP_SLOT per import.
+    // ---- Build .rela.plt: one JUMP_SLOT per function import.
     let mut relaplt = vec![0u8; relaplt_size as usize];
-    for i in 0..n_imp {
-        let e = i * 24;
-        relaplt[e..e + 8].copy_from_slice(&gotplt_slot(i).to_le_bytes());
-        let info = ((i as u64 + 1) << 32) | R_X86_64_JUMP_SLOT as u64;
+    for (i, &fs) in func_slot.iter().enumerate() {
+        let Some(k) = fs else { continue };
+        let e = k * 24;
+        relaplt[e..e + 8].copy_from_slice(&gotplt_slot(k).to_le_bytes());
+        let info = ((i as u64 + 1) << 32) | R_X86_64_JUMP_SLOT as u64; // dynsym index i+1
         relaplt[e + 8..e + 16].copy_from_slice(&info.to_le_bytes());
         // addend 0.
+    }
+
+    // ---- Build .got and .rela.dyn. Data imports (and address-taken
+    // function imports) get a GLOB_DAT the loader fills; in-image
+    // GOTPCREL targets hold their absolute address directly (non-PIE).
+    let mut got = vec![0u8; got_size as usize];
+    for (slot, kind) in got_kind.iter().enumerate() {
+        let val = match kind {
+            GotSlot::GlobDat(_) | GotSlot::Zero => 0,
+            GotSlot::Defined(doi, dsi) => sym_vaddr(*doi, *dsi)?,
+        };
+        got[slot * 8..slot * 8 + 8].copy_from_slice(&val.to_le_bytes());
+    }
+    let mut reladyn = vec![0u8; reladyn_size as usize];
+    {
+        let mut e = 0;
+        for (slot, kind) in got_kind.iter().enumerate() {
+            if let GotSlot::GlobDat(dynidx) = kind {
+                reladyn[e..e + 8].copy_from_slice(&got_slot_v(slot).to_le_bytes());
+                let info = ((*dynidx as u64) << 32) | R_X86_64_GLOB_DAT as u64;
+                reladyn[e + 8..e + 16].copy_from_slice(&info.to_le_bytes());
+                e += 24; // addend 0
+            }
+        }
     }
 
     // ---- Build .dynamic.
@@ -2019,11 +2150,18 @@ pub fn link_dynamic_exec(
     dyn_push(DT_SYMTAB, dynsym_v, &mut dynamic);
     dyn_push(DT_STRSZ, dynstr.len() as u64, &mut dynamic);
     dyn_push(DT_SYMENT, 24, &mut dynamic);
-    dyn_push(DT_PLTGOT, gotplt_v, &mut dynamic);
-    dyn_push(DT_PLTRELSZ, relaplt_size, &mut dynamic);
-    dyn_push(DT_PLTREL, DT_RELA as u64, &mut dynamic);
-    dyn_push(DT_JMPREL, relaplt_v, &mut dynamic);
+    if has_plt {
+        dyn_push(DT_PLTGOT, gotplt_v, &mut dynamic);
+        dyn_push(DT_PLTRELSZ, relaplt_size, &mut dynamic);
+        dyn_push(DT_PLTREL, DT_RELA as u64, &mut dynamic);
+        dyn_push(DT_JMPREL, relaplt_v, &mut dynamic);
+    }
     dyn_push(DT_FLAGS, DF_BIND_NOW, &mut dynamic);
+    if reladyn_size > 0 {
+        dyn_push(DT_RELA, reladyn_v, &mut dynamic);
+        dyn_push(DT_RELASZ, reladyn_size, &mut dynamic);
+        dyn_push(DT_RELAENT, 24, &mut dynamic);
+    }
     if versioned {
         dyn_push(DT_VERSYM, versym_v, &mut dynamic);
         dyn_push(DT_VERNEED, verneed_v, &mut dynamic);
@@ -2087,8 +2225,14 @@ pub fn link_dynamic_exec(
         put(&mut image, versym_fo, &versym);
         put(&mut image, verneed_fo, &verneed);
     }
+    if reladyn_size > 0 {
+        put(&mut image, reladyn_fo, &reladyn);
+    }
     put(&mut image, relaplt_fo, &relaplt);
     put(&mut image, plt_fo, &plt);
+    if got_size > 0 {
+        put(&mut image, got_fo, &got);
+    }
     put(&mut image, gotplt_fo, &gotplt);
     put(&mut image, dynamic_fo, &dynamic);
     let _ = rw_data_end_v;
@@ -2156,11 +2300,19 @@ pub fn link_dynamic_exec(
         mk(&mut shstr, &mut shdrs, ".gnu.version", SHT_GNU_VERSYM, SHF_ALLOC, versym_v, versym_fo, versym.len() as u64, dynsym_idx, 0, 2, 2);
         mk(&mut shstr, &mut shdrs, ".gnu.version_r", SHT_GNU_VERNEED, SHF_ALLOC, verneed_v, verneed_fo, verneed.len() as u64, dynstr_idx, verneed_count, 4, 0);
     }
+    if reladyn_size > 0 {
+        mk(&mut shstr, &mut shdrs, ".rela.dyn", SHT_RELA, SHF_ALLOC, reladyn_v, reladyn_fo, reladyn_size, dynsym_idx, 0, 8, 24);
+    }
     // .rela.plt.info → .got.plt; patched once .got.plt's index is known.
-    let relaplt_idx = mk(
-        &mut shstr, &mut shdrs, ".rela.plt", SHT_RELA, SHF_ALLOC | SHF_INFO_LINK, relaplt_v, relaplt_fo,
-        relaplt_size, dynsym_idx, 0, 8, 24,
-    );
+    // The whole PLT trio is present only with function imports.
+    let relaplt_idx = if has_plt {
+        Some(mk(
+            &mut shstr, &mut shdrs, ".rela.plt", SHT_RELA, SHF_ALLOC | SHF_INFO_LINK, relaplt_v,
+            relaplt_fo, relaplt_size, dynsym_idx, 0, 8, 24,
+        ))
+    } else {
+        None
+    };
     for &i in &ro_order {
         let o = &outs[i];
         mk(&mut shstr, &mut shdrs, &o.name, SHT_PROGBITS, o.flags, o.vaddr, o.file_off, o.data.len() as u64, 0, 0, o.align, 0);
@@ -2169,14 +2321,23 @@ pub fn link_dynamic_exec(
         let o = &outs[i];
         mk(&mut shstr, &mut shdrs, &o.name, SHT_PROGBITS, o.flags, o.vaddr, o.file_off, o.data.len() as u64, 0, 0, o.align, 0);
     }
-    mk(&mut shstr, &mut shdrs, ".plt", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, plt_v, plt_fo, plt_size, 0, 0, 16, 16);
+    if has_plt {
+        mk(&mut shstr, &mut shdrs, ".plt", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, plt_v, plt_fo, plt_size, 0, 0, 16, 16);
+    }
     for &i in &data_order {
         let o = &outs[i];
         mk(&mut shstr, &mut shdrs, &o.name, SHT_PROGBITS, o.flags, o.vaddr, o.file_off, o.data.len() as u64, 0, 0, o.align, 0);
     }
-    let gotplt_idx =
-        mk(&mut shstr, &mut shdrs, ".got.plt", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, gotplt_v, gotplt_fo, gotplt_size, 0, 0, 8, 8) as u32;
-    shdrs[relaplt_idx][44..48].copy_from_slice(&gotplt_idx.to_le_bytes());
+    if got_size > 0 {
+        mk(&mut shstr, &mut shdrs, ".got", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, got_v, got_fo, got_size, 0, 0, 8, 8);
+    }
+    if has_plt {
+        let gotplt_idx =
+            mk(&mut shstr, &mut shdrs, ".got.plt", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, gotplt_v, gotplt_fo, gotplt_size, 0, 0, 8, 8) as u32;
+        if let Some(ri) = relaplt_idx {
+            shdrs[ri][44..48].copy_from_slice(&gotplt_idx.to_le_bytes());
+        }
+    }
     mk(&mut shstr, &mut shdrs, ".dynamic", SHT_DYNAMIC, SHF_ALLOC | SHF_WRITE, dynamic_v, dynamic_fo, dynamic_size, dynstr_idx, 0, 8, 16);
     for &i in &bss_order {
         let o = &outs[i];

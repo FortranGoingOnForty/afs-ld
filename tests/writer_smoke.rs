@@ -78,9 +78,22 @@ fn empty_executable_writer_emits_parseable_macho() {
     }
     if have_tool("file") {
         let desc = run_file(&path).expect("file");
-        assert!(desc.contains("Mach-O 64-bit executable arm64"));
+        // Token order varies by `file` implementation: macOS says
+        // "…executable arm64", FreeBSD's file-5.46 says "…arm64
+        // executable". Assert the tokens, not the order.
+        assert!(macho_desc_matches(&desc, "executable"), "unexpected file desc: {desc}");
     }
     let _ = fs::remove_file(path);
+}
+
+/// True when `desc` names a Mach-O 64-bit arm64 image of the given kind
+/// ("executable" or "dynamically linked shared library"), tolerant of
+/// the token ordering different `file` builds emit.
+fn macho_desc_matches(desc: &str, kind: &str) -> bool {
+    desc.contains("Mach-O")
+        && desc.contains("64-bit")
+        && desc.contains("arm64")
+        && desc.contains(kind)
 }
 
 #[test]
@@ -110,7 +123,10 @@ fn empty_dylib_writer_emits_parseable_macho() {
     }
     if have_tool("file") {
         let desc = run_file(&path).expect("file");
-        assert!(desc.contains("dynamically linked shared library arm64"));
+        assert!(
+            macho_desc_matches(&desc, "dynamically linked shared library"),
+            "unexpected file desc: {desc}"
+        );
     }
     let _ = fs::remove_file(path);
 }

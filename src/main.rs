@@ -156,6 +156,7 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
     let mut lib_names: Vec<String> = Vec::new();
     let mut unsupported: Vec<String> = Vec::new();
     let mut dynamic_linker: Option<String> = None;
+    let mut eh_frame_hdr = false;
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -173,12 +174,15 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
             "--dynamic-linker" | "-dynamic-linker" => {
                 dynamic_linker = it.next().cloned();
             }
+            // `--eh-frame-hdr` requests the `.eh_frame_hdr` unwind index +
+            // PT_GNU_EH_FRAME (GNU semantics: emitted only when asked).
+            "--eh-frame-hdr" => eh_frame_hdr = true,
+            "--no-eh-frame-hdr" => eh_frame_hdr = false,
             // Flags we honor or safely ignore. Group markers are no-ops
             // (selection iterates to a global fixed point); -static and a
             // target emulation are the expected mode.
             "-static" | "-Bstatic" | "-Bdynamic" | "--start-group" | "--end-group" | "-("
-            | "-)" | "--eh-frame-hdr" | "-melf_x86_64" | "-znow" | "--no-as-needed"
-            | "--as-needed" => {}
+            | "-)" | "-melf_x86_64" | "-znow" | "--no-as-needed" | "--as-needed" => {}
             "-m" => {
                 it.next();
             }
@@ -221,12 +225,12 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
     };
 
     let image = if let Some(interp) = dynamic_linker {
-        match link_dynamic(&inputs, &lib_dirs, &lib_names, &interp, read_bytes) {
+        match link_dynamic(&inputs, &lib_dirs, &lib_names, &interp, eh_frame_hdr, read_bytes) {
             Ok(img) => img,
             Err(code) => return Some(code),
         }
     } else {
-        match link_static(&inputs, &lib_dirs, &lib_names, read_bytes) {
+        match link_static(&inputs, &lib_dirs, &lib_names, eh_frame_hdr, read_bytes) {
             Ok(img) => img,
             Err(code) => return Some(code),
         }
@@ -250,6 +254,7 @@ fn link_static(
     inputs: &[std::path::PathBuf],
     lib_dirs: &[std::path::PathBuf],
     lib_names: &[String],
+    eh_frame_hdr: bool,
     read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
 ) -> Result<Vec<u8>, ExitCode> {
     const AR_MAGIC: &[u8] = b"!<arch>\n";
@@ -274,7 +279,7 @@ fn link_static(
         };
         libs.push(elf::Library { name: p.display().to_string(), bytes: read_bytes(&p)? });
     }
-    elf::link_static(objects, &libs, "_start").map_err(|e| {
+    elf::link_static(objects, &libs, "_start", eh_frame_hdr).map_err(|e| {
         diag::error(&e.to_string());
         ExitCode::from(1)
     })
@@ -287,6 +292,7 @@ fn link_dynamic(
     lib_dirs: &[std::path::PathBuf],
     lib_names: &[String],
     interp: &str,
+    eh_frame_hdr: bool,
     read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
 ) -> Result<Vec<u8>, ExitCode> {
     let mut objects = Vec::new();
@@ -316,7 +322,7 @@ fn link_dynamic(
         let bytes = read_bytes(&p)?;
         push_input(&p, &bytes)?;
     }
-    elf::link_dynamic_exec(&objects, &shared, "_start", interp).map_err(|e| {
+    elf::link_dynamic_exec(&objects, &shared, "_start", interp, eh_frame_hdr).map_err(|e| {
         diag::error(&e.to_string());
         ExitCode::from(1)
     })

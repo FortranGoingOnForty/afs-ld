@@ -935,3 +935,107 @@ fn dynamic_executable_calls_shared_answer_through_plt() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The ELF64 program header for a given `p_type`, or None. Returns
+/// `(p_offset, p_vaddr, p_filesz)`.
+fn find_phdr(img: &[u8], p_type: u32) -> Option<(u64, u64, u64)> {
+    let rd32 = |o: usize| u32::from_le_bytes(img[o..o + 4].try_into().unwrap());
+    let rd16 = |o: usize| u16::from_le_bytes(img[o..o + 2].try_into().unwrap());
+    let rd64 = |o: usize| u64::from_le_bytes(img[o..o + 8].try_into().unwrap());
+    let phoff = rd64(32) as usize;
+    let phentsize = rd16(54) as usize;
+    let phnum = rd16(56) as usize;
+    for i in 0..phnum {
+        let e = phoff + i * phentsize;
+        if rd32(e) == p_type {
+            return Some((rd64(e + 8), rd64(e + 16), rd64(e + 32)));
+        }
+    }
+    None
+}
+
+/// The `sh_addr` of a named ELF64 section, or None.
+fn section_addr(img: &[u8], name: &str) -> Option<u64> {
+    let rd16 = |o: usize| u16::from_le_bytes(img[o..o + 2].try_into().unwrap());
+    let rd32 = |o: usize| u32::from_le_bytes(img[o..o + 4].try_into().unwrap());
+    let rd64 = |o: usize| u64::from_le_bytes(img[o..o + 8].try_into().unwrap());
+    let shoff = rd64(40) as usize;
+    let shentsize = rd16(58) as usize;
+    let shnum = rd16(60) as usize;
+    let shstrndx = rd16(62) as usize;
+    let shstr_off = rd64(shoff + shstrndx * shentsize + 24) as usize;
+    for i in 0..shnum {
+        let sh = shoff + i * shentsize;
+        let noff = shstr_off + rd32(sh) as usize;
+        let end = img[noff..].iter().position(|&b| b == 0).unwrap();
+        if &img[noff..noff + end] == name.as_bytes() {
+            return Some(rd64(sh + 16));
+        }
+    }
+    None
+}
+
+/// Audit T1: `--eh-frame-hdr` must synthesize `.eh_frame_hdr` +
+/// PT_GNU_EH_FRAME (it used to be silently ignored), and its absence must
+/// not (GNU semantics). The header's `eh_frame_ptr` must point at the
+/// retained `.eh_frame`, and the binary must still run.
+#[test]
+fn eh_frame_hdr_emitted_only_when_requested() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=eh_frame_hdr_emitted_only_when_requested count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_ehframe_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    // _start wrapped in CFI so gas emits `.eh_frame` with an FDE for it.
+    let asm = format!(
+        ".text\n.globl _start\n.type _start,@function\n_start:\n    .cfi_startproc\n    movl $42, %edi\n    movl ${exit_nr}, %eax\n    syscall\n    .cfi_endproc\n.size _start,.-_start\n"
+    );
+    let s = dir.join("cfi.s");
+    let obj = dir.join("cfi.o");
+    assemble(&gas, &asm, &s, &obj);
+
+    let link = |flag: bool, out: &std::path::Path| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_afs-ld"));
+        if flag {
+            c.arg("--eh-frame-hdr");
+        }
+        c.arg("-o").arg(out).arg(&obj).output().unwrap()
+    };
+
+    // With the flag: header present, table well-formed and pointing at
+    // `.eh_frame`, one FDE, and the binary runs.
+    let with = dir.join("with");
+    assert!(link(true, &with).status.success());
+    let img = std::fs::read(&with).unwrap();
+    let (fo, va, fsz) = find_phdr(&img, 0x6474_e550)
+        .expect("PT_GNU_EH_FRAME must be present with --eh-frame-hdr");
+    let hdr = &img[fo as usize..(fo + fsz) as usize];
+    assert_eq!(&hdr[0..4], &[1, 0x1b, 0x03, 0x3b], "eh_frame_hdr encodings");
+    let eh_ptr = i32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    let eh_frame_va = (va as i64 + 4 + eh_ptr as i64) as u64;
+    assert_eq!(
+        eh_frame_va,
+        section_addr(&img, ".eh_frame").expect(".eh_frame section"),
+        "eh_frame_ptr must point at the retained .eh_frame"
+    );
+    assert_eq!(
+        u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]),
+        1,
+        "one FDE for _start"
+    );
+    assert_eq!(Command::new(&with).output().unwrap().status.code(), Some(42));
+
+    // Without the flag: no header (GNU default), still runs.
+    let without = dir.join("without");
+    assert!(link(false, &without).status.success());
+    let img2 = std::fs::read(&without).unwrap();
+    assert!(
+        find_phdr(&img2, 0x6474_e550).is_none(),
+        "no PT_GNU_EH_FRAME without --eh-frame-hdr"
+    );
+    assert_eq!(Command::new(&without).output().unwrap().status.code(), Some(42));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

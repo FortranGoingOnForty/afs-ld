@@ -28,6 +28,9 @@ pub const SHT_PREINIT_ARRAY: u32 = 16;
 pub const SHT_GNU_VERDEF: u32 = 0x6fff_fffd;
 pub const SHT_GNU_VERNEED: u32 = 0x6fff_fffe;
 pub const SHT_GNU_VERSYM: u32 = 0x6fff_ffff;
+/// `.eh_frame` on x86_64 (SHF_ALLOC unwind data). gcc/clang/rustc stamp
+/// it as this, not SHT_PROGBITS; the output section is emitted PROGBITS.
+pub const SHT_X86_64_UNWIND: u32 = 0x7000_0001;
 
 /// Non-default (hidden) bit in a `.gnu.version` entry.
 const VERSYM_HIDDEN: u16 = 0x8000;
@@ -79,6 +82,8 @@ const PT_TLS: u32 = 7;
 const PT_INTERP: u32 = 3;
 const PT_DYNAMIC: u32 = 2;
 const PT_GNU_STACK: u32 = 0x6474_e551;
+/// Points the unwinder at `.eh_frame_hdr` (its binary-search table).
+const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
 
 pub const R_X86_64_GLOB_DAT: u32 = 6;
 pub const R_X86_64_JUMP_SLOT: u32 = 7;
@@ -272,7 +277,12 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
     for (i, r) in raws.iter().enumerate() {
         let keep = matches!(
             r.sh_type,
-            SHT_PROGBITS | SHT_NOBITS | SHT_INIT_ARRAY | SHT_FINI_ARRAY | SHT_PREINIT_ARRAY
+            SHT_PROGBITS
+                | SHT_NOBITS
+                | SHT_INIT_ARRAY
+                | SHT_FINI_ARRAY
+                | SHT_PREINIT_ARRAY
+                | SHT_X86_64_UNWIND
         ) && (r.flags & SHF_ALLOC) != 0;
         if !keep {
             continue;
@@ -573,6 +583,173 @@ fn version_base(name: &str) -> Option<&str> {
     name.find('@').map(|at| &name[..at])
 }
 
+/// The only FDE pointer encoding we decode: `DW_EH_PE_pcrel |
+/// DW_EH_PE_sdata4`. It is what gcc/clang/rustc emit on x86_64 and the
+/// only shape an `R_X86_64_PC32` relocation on the initial-location
+/// field can produce, so a CIE declaring anything else is a hard error
+/// rather than a silently-wrong PC.
+const DW_EH_PE_PCREL_SDATA4: u8 = 0x1b;
+
+/// One FDE, for the `.eh_frame_hdr` search table: its function start PC
+/// and the file offset of the FDE record within `.eh_frame`.
+struct FdeEntry {
+    pc: u64,
+    fde_off: u64,
+}
+
+/// Extract the FDE pointer encoding a CIE advertises through its
+/// augmentation (`DW_EH_PE_absptr` = 0 when it carries no `R`). `content`
+/// is the offset of the CIE id; `rec_end` bounds the record.
+fn cie_fde_encoding(eh: &[u8], content: usize, rec_end: usize) -> Result<u8, ElfError> {
+    let slice_uleb = |p: usize| -> Result<usize, ElfError> {
+        let (_, n) = crate::leb::read_uleb(&eh[p..rec_end])
+            .map_err(|_| ElfError(".eh_frame: bad ULEB in CIE".into()))?;
+        Ok(p + n)
+    };
+    let mut p = content + 4; // past the CIE id
+    if p >= rec_end {
+        return err(".eh_frame: CIE truncated at version");
+    }
+    let version = eh[p];
+    p += 1;
+    let aug_start = p;
+    while p < rec_end && eh[p] != 0 {
+        p += 1;
+    }
+    if p >= rec_end {
+        return err(".eh_frame: unterminated CIE augmentation string");
+    }
+    let aug = eh[aug_start..p].to_vec();
+    p += 1; // past NUL
+    p = slice_uleb(p)?; // code alignment factor
+    let (_, n) = crate::leb::read_sleb(&eh[p..rec_end])
+        .map_err(|_| ElfError(".eh_frame: bad SLEB in CIE".into()))?;
+    p += n; // data alignment factor
+    if version >= 3 {
+        p = slice_uleb(p)?; // return-address register (ULEB)
+    } else {
+        p += 1; // return-address register (single byte)
+    }
+    if aug.first() != Some(&b'z') {
+        return Ok(0); // DW_EH_PE_absptr
+    }
+    p = slice_uleb(p)?; // augmentation data length
+    for &c in &aug[1..] {
+        match c {
+            b'R' => {
+                if p >= rec_end {
+                    return err(".eh_frame: CIE 'R' augmentation missing its byte");
+                }
+                return Ok(eh[p]);
+            }
+            b'L' => p += 1, // LSDA encoding byte
+            b'P' => {
+                // personality encoding byte, then a pointer of that size.
+                if p >= rec_end {
+                    return err(".eh_frame: CIE 'P' augmentation truncated");
+                }
+                let penc = eh[p];
+                p += 1;
+                p += match penc & 0x07 {
+                    0x00 => 8, // absptr
+                    0x02 => 2, // udata2
+                    0x03 => 4, // udata4
+                    0x04 => 8, // udata8
+                    _ => return err(".eh_frame: unsupported personality encoding"),
+                };
+            }
+            _ => return err(".eh_frame: unsupported CIE augmentation char"),
+        }
+    }
+    Ok(0)
+}
+
+/// Parse a linked `.eh_frame` (relocations already applied) into its FDE
+/// entries. `eh_vaddr` is the section's final virtual address; each FDE's
+/// initial-location field then holds a pcrel `sdata4` whose target PC is
+/// `field_vaddr + value`.
+fn parse_eh_frame_fdes(eh: &[u8], eh_vaddr: u64) -> Result<Vec<FdeEntry>, ElfError> {
+    let mut cie_enc: HashMap<u64, u8> = HashMap::new();
+    let mut fdes = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= eh.len() {
+        let len = ru32(eh, off) as usize;
+        if len == 0 {
+            break; // CIE-id terminator
+        }
+        if len == 0xffff_ffff {
+            return err(".eh_frame: 64-bit DWARF length unsupported");
+        }
+        let content = off + 4;
+        let rec_end = content.checked_add(len).filter(|&e| e <= eh.len()).ok_or_else(|| {
+            ElfError(".eh_frame: record length runs past the section".into())
+        })?;
+        if content + 4 > eh.len() {
+            return err(".eh_frame: record truncated at id");
+        }
+        let id = ru32(eh, content);
+        if id == 0 {
+            cie_enc.insert(off as u64, cie_fde_encoding(eh, content, rec_end)?);
+        } else {
+            // cie_pointer is a backward offset from its own field to the
+            // owning CIE record.
+            let cie_off = (content as u64)
+                .checked_sub(id as u64)
+                .ok_or_else(|| ElfError(".eh_frame: FDE CIE pointer underflows".into()))?;
+            let enc = *cie_enc
+                .get(&cie_off)
+                .ok_or_else(|| ElfError(".eh_frame: FDE references an unknown CIE".into()))?;
+            if enc != DW_EH_PE_PCREL_SDATA4 {
+                return err(format!(
+                    ".eh_frame: FDE pointer encoding {enc:#04x} unsupported (only pcrel|sdata4)"
+                ));
+            }
+            let il = content + 4; // initial_location, right after cie_pointer
+            if il + 4 > eh.len() {
+                return err(".eh_frame: FDE truncated before initial_location");
+            }
+            let rel = ru32(eh, il) as i32 as i64;
+            let pc = ((eh_vaddr + il as u64) as i64 + rel) as u64;
+            fdes.push(FdeEntry {
+                pc,
+                fde_off: off as u64,
+            });
+        }
+        off = rec_end;
+    }
+    Ok(fdes)
+}
+
+/// Build the `.eh_frame_hdr` contents: the 12-byte header (version,
+/// pcrel|sdata4 `eh_frame_ptr`, udata4 `fde_count`, datarel|sdata4 table
+/// encoding) followed by the FDE search table — `(pc, fde)` pairs each
+/// datarel `sdata4`, sorted by PC — that the unwinder binary-searches.
+/// `hdr_vaddr`/`eh_vaddr` are the final addresses of the two sections.
+fn build_eh_frame_hdr(eh: &[u8], eh_vaddr: u64, hdr_vaddr: u64) -> Result<Vec<u8>, ElfError> {
+    let mut fdes = parse_eh_frame_fdes(eh, eh_vaddr)?;
+    fdes.sort_by_key(|f| f.pc);
+    let datarel = |v: u64| -> Result<i32, ElfError> {
+        i32::try_from(v as i64 - hdr_vaddr as i64)
+            .map_err(|_| ElfError(".eh_frame_hdr: table entry out of sdata4 range".into()))
+    };
+    let mut out = Vec::with_capacity(12 + fdes.len() * 8);
+    out.push(1); // version
+    out.push(DW_EH_PE_PCREL_SDATA4); // eh_frame_ptr encoding
+    out.push(0x03); // fde_count encoding: DW_EH_PE_udata4
+    out.push(0x3b); // table encoding: DW_EH_PE_datarel | DW_EH_PE_sdata4
+    // eh_frame_ptr: pcrel sdata4 to the start of .eh_frame, relative to
+    // its own field (hdr_vaddr + 4).
+    let eh_ptr = i32::try_from(eh_vaddr as i64 - (hdr_vaddr as i64 + 4))
+        .map_err(|_| ElfError(".eh_frame_hdr: eh_frame_ptr out of sdata4 range".into()))?;
+    out.extend_from_slice(&eh_ptr.to_le_bytes());
+    out.extend_from_slice(&(fdes.len() as u32).to_le_bytes());
+    for f in &fdes {
+        out.extend_from_slice(&datarel(f.pc)?.to_le_bytes());
+        out.extend_from_slice(&datarel(eh_vaddr + f.fde_off)?.to_le_bytes());
+    }
+    Ok(out)
+}
+
 /// Names a symtab entry defines (global/weak, section-bound, non-empty).
 /// A versioned definition (`foo@@V`) also answers the plain base `foo`,
 /// so a later reference to `foo` counts as satisfied.
@@ -716,6 +893,7 @@ pub fn link_static(
     mut objects: Vec<ElfObject>,
     libs: &[Library],
     entry: &str,
+    eh_frame_hdr: bool,
 ) -> Result<Vec<u8>, ElfError> {
     use crate::archive::Archive as ArContainer;
 
@@ -770,14 +948,20 @@ pub fn link_static(
         }
     }
 
-    link_static_exec(&objects, entry)
+    link_static_exec(&objects, entry, eh_frame_hdr)
 }
 
 /// Link relocatable objects into a static ET_EXEC image. Explicit
 /// objects only — undefined strong globals are an error; use
 /// [`link_static`] to pull definitions from library archives. Undefined
-/// *weak* references resolve to 0.
-pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, ElfError> {
+/// *weak* references resolve to 0. `eh_frame_hdr` requests the
+/// `.eh_frame_hdr` + PT_GNU_EH_FRAME unwind index (GNU `--eh-frame-hdr`);
+/// `.eh_frame` itself is retained regardless.
+pub fn link_static_exec(
+    objects: &[ElfObject],
+    entry: &str,
+    eh_frame_hdr: bool,
+) -> Result<Vec<u8>, ElfError> {
     // ---- Merge input sections by (name, flags) in first-seen order,
     // ranked text / rodata / data / bss for segment assignment.
     let mut outs: Vec<OutSec> = Vec::new();
@@ -1104,6 +1288,35 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
         (Some(iplt), Some(gotplt), Some(outs.len() - 1))
     };
 
+    // ---- .eh_frame_hdr: `.eh_frame` is now retained (rodata); when
+    // `--eh-frame-hdr` is requested, synthesize the binary-search header
+    // the unwinder expects. Sized from the FDE count now (structure is
+    // reloc-invariant); filled once addresses are fixed. Both land in the
+    // RX/rodata segment.
+    let eh_frame_idx = if eh_frame_hdr {
+        outs.iter()
+            .position(|o| o.name == ".eh_frame" && !o.data.is_empty())
+    } else {
+        None
+    };
+    let eh_hdr_idx = match eh_frame_idx {
+        Some(ei) => {
+            let n_fde = parse_eh_frame_fdes(&outs[ei].data, 0)?.len();
+            outs.push(OutSec {
+                name: ".eh_frame_hdr".to_string(),
+                flags: SHF_ALLOC,
+                align: 4,
+                data: vec![0u8; 12 + n_fde * 8],
+                bss_size: 0,
+                vaddr: 0,
+                file_off: 0,
+                is_bss: false,
+            });
+            Some(outs.len() - 1)
+        }
+        None => None,
+    };
+
     // Deterministic segment order: text, rodata, data, bss (synthetic
     // GOT/TLS sections included).
     let mut order: Vec<usize> = (0..outs.len()).collect();
@@ -1115,7 +1328,7 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
     // lld does with a small freestanding input closely enough for
     // behavioral parity.)
     let ehsize = 64u64;
-    let phnum = 2u64 + if has_tls { 1 } else { 0 };
+    let phnum = 2u64 + if has_tls { 1 } else { 0 } + if eh_hdr_idx.is_some() { 1 } else { 0 };
     let phsize = 56 * phnum;
     let mut cursor_file = ehsize + phsize;
     let mut cursor_vaddr = BASE_VADDR + cursor_file;
@@ -1411,6 +1624,14 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
         }
     }
 
+    // ---- Fill .eh_frame_hdr now that .eh_frame carries its relocated
+    // FDE PCs and both sections have final addresses.
+    if let (Some(ei), Some(hi)) = (eh_frame_idx, eh_hdr_idx) {
+        let hdr = build_eh_frame_hdr(&outs[ei].data, out_vaddrs[ei], out_vaddrs[hi])?;
+        debug_assert_eq!(hdr.len(), outs[hi].data.len());
+        outs[hi].data = hdr;
+    }
+
     // ---- Entry.
     let &(eoi, esi) = globals
         .get(entry)
@@ -1503,6 +1724,18 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
             tls_filesz,
             tls_memsz,
             tls_align,
+        ));
+    }
+    if let Some(hi) = eh_hdr_idx {
+        let len = outs[hi].data.len() as u64;
+        ph.extend(phdr(
+            PT_GNU_EH_FRAME,
+            PF_R,
+            outs[hi].file_off,
+            outs[hi].vaddr,
+            len,
+            len,
+            4,
         ));
     }
     image[64..64 + ph.len()].copy_from_slice(&ph);
@@ -1598,6 +1831,7 @@ pub fn link_dynamic_exec(
     shared: &[SharedLib],
     entry: &str,
     interp: &str,
+    eh_frame_hdr: bool,
 ) -> Result<Vec<u8>, ElfError> {
     const DBASE: u64 = 0x20_0000;
 
@@ -1945,8 +2179,23 @@ pub fn link_dynamic_exec(
     let dynamic_size = (dynamic_count * 16) as u64;
 
     // ---- Layout. Fixed section order across three load segments.
+    // `.eh_frame` (now retained) gets a synthesized `.eh_frame_hdr` +
+    // PT_GNU_EH_FRAME when `--eh-frame-hdr` is requested; size it here
+    // (structure is reloc-invariant) so phnum and the RO layout account
+    // for it.
+    let eh_frame_idx = if eh_frame_hdr {
+        outs.iter()
+            .position(|o| o.name == ".eh_frame" && !o.data.is_empty())
+    } else {
+        None
+    };
+    let eh_hdr_size = match eh_frame_idx {
+        Some(ei) => 12 + parse_eh_frame_fdes(&outs[ei].data, 0)?.len() as u64 * 8,
+        None => 0,
+    };
     let ehsize = 64u64;
-    let phnum = 6u64; // 3 LOAD + INTERP + DYNAMIC + GNU_STACK
+    // 3 LOAD + INTERP + DYNAMIC + GNU_STACK, plus GNU_EH_FRAME when present.
+    let phnum = 6u64 + if eh_hdr_size > 0 { 1 } else { 0 };
     let phsize = 56 * phnum;
 
     // Metadata region (PF_R): synthetic sections in a fixed order.
@@ -1968,6 +2217,12 @@ pub fn link_dynamic_exec(
     let (verneed_v, verneed_fo) = place_ro(verneed.len() as u64, 4, &mut v, &mut fo);
     let (reladyn_v, reladyn_fo) = place_ro(reladyn_size, 8, &mut v, &mut fo);
     let (relaplt_v, relaplt_fo) = place_ro(relaplt_size, 8, &mut v, &mut fo);
+    let (eh_hdr_v, eh_hdr_fo) = if eh_hdr_size > 0 {
+        let (vv, ff) = place_ro(eh_hdr_size, 4, &mut v, &mut fo);
+        (Some(vv), Some(ff))
+    } else {
+        (None, None)
+    };
     // Merged rodata (read-only, non-writable, non-exec) joins the RO seg.
     let ro_order: Vec<usize> = (0..outs.len())
         .filter(|&i| outs[i].flags & SHF_EXECINSTR == 0 && outs[i].flags & SHF_WRITE == 0)
@@ -2142,6 +2397,13 @@ pub fn link_dynamic_exec(
         }
     }
 
+    // ---- .eh_frame_hdr contents: .eh_frame now carries its relocated
+    // FDE PCs and both sections have final addresses.
+    let eh_hdr_bytes = match (eh_frame_idx, eh_hdr_v) {
+        (Some(ei), Some(hv)) => build_eh_frame_hdr(&outs[ei].data, outs[ei].vaddr, hv)?,
+        _ => Vec::new(),
+    };
+
     // ---- Build .plt. PLT0 pushes GOT[1] and jumps GOT[2]; each stub
     // jumps through its GOT.PLT slot, else falls to the lazy trampoline.
     let disp = |from_end: u64, to: u64| (to as i64 - from_end as i64) as i32;
@@ -2297,6 +2559,10 @@ pub fn link_dynamic_exec(
     phdr(PT_LOAD, PF_R | PF_X, rx_start_fo, rx_start_v, (plt_fo + plt_size) - rx_start_fo, rx_end_v - rx_start_v, PAGE);
     phdr(PT_LOAD, PF_R | PF_W, rw_start_fo, rw_start_v, rw_file_end - rw_start_fo, rw_mem_end_v - rw_start_v, PAGE);
     phdr(PT_DYNAMIC, PF_R | PF_W, dynamic_fo, dynamic_v, dynamic_size, dynamic_size, 8);
+    if let (Some(hv), Some(hfo)) = (eh_hdr_v, eh_hdr_fo) {
+        let len = eh_hdr_bytes.len() as u64;
+        phdr(PT_GNU_EH_FRAME, PF_R, hfo, hv, len, len, 4);
+    }
     phdr(PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0);
     image[64..64 + ph.len()].copy_from_slice(&ph);
 
@@ -2322,6 +2588,9 @@ pub fn link_dynamic_exec(
     }
     put(&mut image, gotplt_fo, &gotplt);
     put(&mut image, dynamic_fo, &dynamic);
+    if let Some(hfo) = eh_hdr_fo {
+        put(&mut image, hfo, &eh_hdr_bytes);
+    }
     let _ = rw_data_end_v;
 
     // Write merged object sections (skip bss).
@@ -2400,6 +2669,9 @@ pub fn link_dynamic_exec(
     } else {
         None
     };
+    if let (Some(hv), Some(hfo)) = (eh_hdr_v, eh_hdr_fo) {
+        mk(&mut shstr, &mut shdrs, ".eh_frame_hdr", SHT_PROGBITS, SHF_ALLOC, hv, hfo, eh_hdr_bytes.len() as u64, 0, 0, 4, 0);
+    }
     for &i in &ro_order {
         let o = &outs[i];
         mk(&mut shstr, &mut shdrs, &o.name, SHT_PROGBITS, o.flags, o.vaddr, o.file_off, o.data.len() as u64, 0, 0, o.align, 0);
@@ -2629,5 +2901,80 @@ mod resolve_globals_tests {
         for _ in 0..64 {
             assert_eq!(resolve_globals(&build()).unwrap()["foo"], (0, 0));
         }
+    }
+}
+
+#[cfg(test)]
+mod eh_frame_hdr_tests {
+    use super::*;
+
+    /// A real "zR" CIE from `cc -O1` on x86_64: version 1, augmentation
+    /// "zR", FDE pointer encoding 0x1b (pcrel|sdata4) at byte 16.
+    const CIE: [u8; 24] = [
+        0x14, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x7a, 0x52, 0x00, 0x01, 0x78, 0x10, 0x01, 0x1b, 0x0c,
+        0x07, 0x08, 0x90, 0x01, 0x00, 0x00,
+    ];
+
+    /// A 32-byte FDE at record offset `at` whose function starts at `pc`,
+    /// given the section's final vaddr (so the pcrel field can be filled
+    /// as a linked `.eh_frame` would carry it).
+    fn fde(at: usize, pc: u64, eh_vaddr: u64) -> [u8; 32] {
+        let mut f = [0u8; 32];
+        f[0..4].copy_from_slice(&0x1cu32.to_le_bytes()); // length
+        f[4..8].copy_from_slice(&((at as u32) + 4).to_le_bytes()); // cie_ptr -> CIE at 0
+        let field_vaddr = eh_vaddr + at as u64 + 8;
+        let rel = (pc as i64 - field_vaddr as i64) as i32;
+        f[8..12].copy_from_slice(&rel.to_le_bytes()); // initial_location (pcrel)
+        f[12..16].copy_from_slice(&16u32.to_le_bytes()); // address_range
+        f // aug_len byte + CFI left zero (nops); parser skips by length
+    }
+
+    #[test]
+    fn parses_fdes_and_builds_sorted_hdr() {
+        let eh_vaddr = 0x2000u64;
+        let hdr_vaddr = 0x1000u64;
+        let mut eh = CIE.to_vec();
+        let f1 = eh.len();
+        eh.extend_from_slice(&fde(f1, 0x1500, eh_vaddr)); // higher PC first
+        let f2 = eh.len();
+        eh.extend_from_slice(&fde(f2, 0x1100, eh_vaddr)); // lower PC second
+        eh.extend_from_slice(&0u32.to_le_bytes()); // terminator
+
+        let fdes = parse_eh_frame_fdes(&eh, eh_vaddr).unwrap();
+        let pcs: Vec<u64> = fdes.iter().map(|f| f.pc).collect();
+        assert_eq!(pcs.len(), 2);
+        assert!(pcs.contains(&0x1500) && pcs.contains(&0x1100));
+
+        let hdr = build_eh_frame_hdr(&eh, eh_vaddr, hdr_vaddr).unwrap();
+        assert_eq!(&hdr[0..4], &[1, 0x1b, 0x03, 0x3b]);
+        let eh_ptr = i32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        assert_eq!(eh_ptr as i64, eh_vaddr as i64 - (hdr_vaddr as i64 + 4));
+        assert_eq!(u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]), 2);
+        // Table is sorted by PC: entry 0 is the lower PC.
+        let e0 = i32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
+        let e1 = i32::from_le_bytes([hdr[20], hdr[21], hdr[22], hdr[23]]);
+        assert_eq!(e0 as i64, 0x1100i64 - hdr_vaddr as i64);
+        assert_eq!(e1 as i64, 0x1500i64 - hdr_vaddr as i64);
+        assert_eq!(hdr.len(), 12 + 2 * 8);
+    }
+
+    #[test]
+    fn rejects_unsupported_fde_encoding() {
+        // Flip the CIE FDE-encoding byte to absptr — must error, not
+        // silently misread an 8-byte field as 4.
+        let mut cie = CIE;
+        cie[16] = 0x00;
+        let mut eh = cie.to_vec();
+        let at = eh.len();
+        eh.extend_from_slice(&fde(at, 0x1200, 0x2000));
+        eh.extend_from_slice(&0u32.to_le_bytes());
+        assert!(parse_eh_frame_fdes(&eh, 0x2000).is_err());
+    }
+
+    #[test]
+    fn empty_eh_frame_yields_empty_table() {
+        let hdr = build_eh_frame_hdr(&[], 0x2000, 0x1000).unwrap();
+        assert_eq!(u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]), 0);
+        assert_eq!(hdr.len(), 12);
     }
 }

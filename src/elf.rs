@@ -356,11 +356,15 @@ pub struct Export {
     pub func: bool,
 }
 
-/// A parsed shared object: its runtime name and the symbols it exports.
+/// A parsed shared object: its runtime name, the symbols it exports, and
+/// the symbols it references undefined (which the executable may have to
+/// define and export back so the loader can bind them).
 #[derive(Debug)]
 pub struct SharedLib {
     pub soname: String,
     pub exports: HashMap<String, Export>,
+    /// Undefined dynamic-symbol names, in dynsym order (deterministic).
+    pub undefs: Vec<String>,
 }
 
 /// Read an ET_DYN shared object's SONAME and exported dynamic symbols
@@ -461,17 +465,26 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
     let sent = if sent == 0 { 24 } else { sent };
     let mut exports: HashMap<String, Export> = HashMap::new();
     let mut is_default_export: HashMap<String, bool> = HashMap::new();
+    let mut undefs: Vec<String> = Vec::new();
     let nsyms = ssize / sent;
     for k in 0..nsyms {
         let e = &bytes[soff + k * sent..soff + k * sent + 24];
         let shndx = ru16(e, 6);
         let bind = e[4] >> 4;
         let typ = e[4] & 0xf;
-        if shndx == SHN_UNDEF || bind == STB_LOCAL {
-            continue;
-        }
         let nm = cstr(dynstr, ru32(e, 0) as usize);
         if nm.is_empty() {
+            continue;
+        }
+        // An undefined non-local dynsym is something this library needs
+        // the executable (or another library) to provide.
+        if shndx == SHN_UNDEF {
+            if bind != STB_LOCAL {
+                undefs.push(nm);
+            }
+            continue;
+        }
+        if bind == STB_LOCAL {
             continue;
         }
         // Version + default-ness from .gnu.version (one u16 per dynsym).
@@ -496,7 +509,7 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
         is_default_export.insert(nm.clone(), default);
         exports.insert(nm, Export { version, func: typ == STT_FUNC });
     }
-    Ok(SharedLib { soname, exports })
+    Ok(SharedLib { soname, exports, undefs })
 }
 
 // ---- Static layout + link ----
@@ -1741,6 +1754,33 @@ pub fn link_dynamic_exec(
     }
     let versioned = !ver_reqs.is_empty();
 
+    // ---- Exe exports. A symbol the executable defines that a used
+    // shared library references undefined must appear as a DEFINED
+    // .dynsym entry, so the loader binds the library's reference back to
+    // the executable (e.g. crt1.o's `environ`/`__progname`, which libc
+    // needs). Driven by library-undef order for determinism.
+    let mut export_names: Vec<String> = Vec::new();
+    let mut export_def: Vec<(usize, usize)> = Vec::new(); // (obj, sym) of the definition
+    {
+        let mut seen: HashSet<String> = HashSet::new();
+        for (li, lib) in shared.iter().enumerate() {
+            if !used_lib[li] {
+                continue;
+            }
+            for u in &lib.undefs {
+                if seen.contains(u) {
+                    continue;
+                }
+                if let Some(&(doi, dsi)) = globals.get(u) {
+                    seen.insert(u.clone());
+                    export_names.push(u.clone());
+                    export_def.push((doi, dsi));
+                }
+            }
+        }
+    }
+    let n_exp = export_names.len();
+
     // ---- Build .dynstr (soname + import name strings) and note offsets.
     let mut dynstr: Vec<u8> = vec![0];
     let str_off = |s: &str, dynstr: &mut Vec<u8>| -> u32 {
@@ -1767,9 +1807,15 @@ pub fn link_dynamic_exec(
         .iter()
         .map(|(_, ver)| str_off(ver, &mut dynstr))
         .collect();
+    let export_name_off: Vec<u32> = export_names
+        .iter()
+        .map(|n| str_off(n, &mut dynstr))
+        .collect();
 
-    // ---- .dynsym: null entry then one UND import each (FUNC or OBJECT).
-    let n_dynsym = n_imp + 1;
+    // ---- .dynsym: null, then UND imports (FUNC/OBJECT), then DEFINED
+    // exports. Export st_value is patched once addresses are known;
+    // st_shndx=SHN_ABS (non-PIE — the value is already the final address).
+    let n_dynsym = 1 + n_imp + n_exp;
     let mut dynsym = vec![0u8; n_dynsym * 24];
     for (i, &noff) in import_name_off.iter().enumerate() {
         let e = (i + 1) * 24;
@@ -1778,16 +1824,33 @@ pub fn link_dynamic_exec(
         dynsym[e + 4] = (STB_GLOBAL << 4) | styp; // st_info
         // st_other=0, st_shndx=0 (UND), value/size=0 already zeroed.
     }
+    for (j, &(doi, dsi)) in export_def.iter().enumerate() {
+        let e = (1 + n_imp + j) * 24;
+        let sym = &objects[doi].symbols[dsi];
+        dynsym[e..e + 4].copy_from_slice(&export_name_off[j].to_le_bytes());
+        dynsym[e + 4] = (STB_GLOBAL << 4) | sym.typ; // st_info
+        dynsym[e + 6..e + 8].copy_from_slice(&SHN_ABS.to_le_bytes()); // st_shndx
+        dynsym[e + 16..e + 24].copy_from_slice(&sym.size.to_le_bytes()); // st_size
+        // st_value (e+8..e+16) patched post-layout.
+    }
 
-    // ---- .hash (SysV): buckets + chains over .dynsym.
+    // The name for .dynsym index i (1-based, imports then exports).
+    let dynsym_name = |i: usize| -> &str {
+        if i <= n_imp {
+            &imports[i - 1]
+        } else {
+            &export_names[i - 1 - n_imp]
+        }
+    };
+
+    // ---- .hash (SysV): buckets + chains over every named .dynsym entry.
     let nbucket = (n_dynsym.max(1)) as u32;
     let mut buckets = vec![0u32; nbucket as usize];
     let mut chain = vec![0u32; n_dynsym];
-    for (i, name) in imports.iter().enumerate() {
-        let si = (i + 1) as u32;
-        let b = (elf_hash(name.as_bytes()) % nbucket) as usize;
-        chain[si as usize] = buckets[b];
-        buckets[b] = si;
+    for (si, c) in chain.iter_mut().enumerate().skip(1) {
+        let b = (elf_hash(dynsym_name(si).as_bytes()) % nbucket) as usize;
+        *c = buckets[b];
+        buckets[b] = si as u32;
     }
     let mut hash: Vec<u8> = Vec::new();
     hash.extend_from_slice(&nbucket.to_le_bytes());
@@ -1799,15 +1862,18 @@ pub fn link_dynamic_exec(
         hash.extend_from_slice(&c.to_le_bytes());
     }
 
-    // ---- .gnu.version (VERSYM): one u16 per .dynsym entry giving the
-    // version index a versioned import requires. Emitted only when the
-    // link has versioned imports.
+    // ---- .gnu.version (VERSYM): one u16 per .dynsym entry. Versioned
+    // imports carry their assigned index; everything else (unversioned
+    // imports, defined exports) is the global base version.
     let mut versym: Vec<u8> = Vec::new();
     if versioned {
         versym.extend_from_slice(&0u16.to_le_bytes()); // null entry
         for &vidx in &import_vidx {
             let vx = if vidx != 0 { vidx } else { VER_NDX_GLOBAL };
             versym.extend_from_slice(&vx.to_le_bytes());
+        }
+        for _ in 0..n_exp {
+            versym.extend_from_slice(&VER_NDX_GLOBAL.to_le_bytes());
         }
     }
 
@@ -2134,6 +2200,13 @@ pub fn link_dynamic_exec(
                 e += 24; // addend 0
             }
         }
+    }
+
+    // Patch exported symbols' st_value now that addresses are resolved.
+    for (j, &(doi, dsi)) in export_def.iter().enumerate() {
+        let e = (1 + n_imp + j) * 24;
+        let addr = sym_vaddr(doi, dsi)?;
+        dynsym[e + 8..e + 16].copy_from_slice(&addr.to_le_bytes());
     }
 
     // ---- Build .dynamic.

@@ -509,6 +509,95 @@ fn archive_member_selection_links_only_used_members() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The FreeBSD C startup objects and shared libc, when all present.
+fn freebsd_crt_libc() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
+    if !cfg!(target_os = "freebsd") {
+        return None;
+    }
+    let paths = [
+        PathBuf::from("/usr/lib/crt1.o"),
+        PathBuf::from("/usr/lib/crti.o"),
+        PathBuf::from("/usr/lib/crtn.o"),
+        PathBuf::from("/lib/libc.so.7"),
+    ];
+    if paths.iter().all(|p| p.exists()) {
+        let [a, b, c, d] = paths;
+        Some((a, b, c, d))
+    } else {
+        None
+    }
+}
+
+/// Full dynamic executable against the real system libc: afs-ld links
+/// crt1/crti + a `main` that calls `write@plt` + libc.so.7 + crtn into a
+/// running program. This exercises the whole 3d stack — the C startup
+/// drives `main` via `__libc_start1`, the exe exports `environ`/
+/// `__progname` back to libc, and `write` binds through a versioned PLT
+/// slot. Output, determinism, and behavioral parity with the system
+/// linker are all checked. FreeBSD-scoped; skips where the crt/libc
+/// layout differs.
+#[test]
+fn dynamic_hello_links_against_system_libc() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_hello_links_against_system_libc count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let Some((crt1, crti, crtn, libc)) = freebsd_crt_libc() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_hello_links_against_system_libc count=1 reason=\"no FreeBSD crt/libc.so.7 layout on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_hello_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // main() { write(1, "hello afs-ld\n", 13); return 0; }
+    let main_obj = dir.join("hi.o");
+    assemble(
+        &gas,
+        ".text\n.globl main\n.type main,@function\nmain:\n    pushq %rbp\n    movq %rsp, %rbp\n    leaq msg(%rip), %rsi\n    movl $1, %edi\n    movl $13, %edx\n    call write@plt\n    xorl %eax, %eax\n    popq %rbp\n    ret\n.section .rodata\nmsg:\n    .ascii \"hello afs-ld\\n\"\n",
+        &dir.join("hi.s"),
+        &main_obj,
+    );
+
+    let link = |out: &std::path::Path, linker: &str| -> std::process::Output {
+        Command::new(linker)
+            .args(["--dynamic-linker", "/libexec/ld-elf.so.1", "-o"])
+            .arg(out)
+            .arg(&crt1)
+            .arg(&crti)
+            .arg(&main_obj)
+            .arg(&libc)
+            .arg(&crtn)
+            .output()
+            .unwrap()
+    };
+
+    let out = dir.join("hi");
+    let r = link(&out, env!("CARGO_BIN_EXE_afs-ld"));
+    assert!(r.status.success(), "afs-ld dynamic hello: {}", String::from_utf8_lossy(&r.stderr));
+    let run = Command::new(&out).output().unwrap();
+    assert_eq!(run.status.code(), Some(0), "hello exit: {}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "hello afs-ld\n", "hello stdout");
+
+    // Determinism.
+    let out2 = dir.join("hi2");
+    assert!(link(&out2, env!("CARGO_BIN_EXE_afs-ld")).status.success());
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&out2).unwrap(), "dynamic hello must be deterministic");
+
+    // Behavioral parity with the system linker, if present.
+    for ld in ["/usr/bin/ld", "/usr/local/bin/ld"] {
+        if !std::path::Path::new(ld).exists() {
+            continue;
+        }
+        let theirs = dir.join(format!("hi_{}", ld.replace('/', "_")));
+        if link(&theirs, ld).status.success() {
+            let run = Command::new(&theirs).output().unwrap();
+            assert_eq!(run.status.code(), Some(0), "{ld} hello exit");
+            assert_eq!(String::from_utf8_lossy(&run.stdout), "hello afs-ld\n", "{ld} hello stdout");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Data import through the GOT: afs-ld links against a `.so` exporting a
 /// function `base()`->40 and a data object `extra`=2. `main` calls
 /// `base@plt` (JUMP_SLOT) and reads `extra@GOTPCREL` (GLOB_DAT via .got +

@@ -634,6 +634,78 @@ fn undefined_demand(objects: &[ElfObject], defined: &HashSet<String>) -> Vec<Str
     demand
 }
 
+/// Resolve the defined globals across all input objects into
+/// `name -> (object index, symbol index)`.
+///
+/// Coalescing: a strong definition beats a weak one regardless of order;
+/// two strong definitions of one name are an error; a duplicate weak is
+/// ignored. Then version aliasing lets a default-version definition
+/// (`foo@@V`) answer the plain base `foo`, and a non-default (`foo@V`)
+/// answer it only when nothing else does; an explicit unversioned
+/// definition always wins.
+///
+/// Deterministic by construction: among competing versioned definitions
+/// the base winner is the earliest in link order (object index, then
+/// symbol index), never HashMap iteration order — the byte-determinism
+/// gate depends on this.
+fn resolve_globals(objects: &[ElfObject]) -> Result<HashMap<String, (usize, usize)>, ElfError> {
+    let mut globals: HashMap<String, (usize, usize)> = HashMap::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sym) in obj.symbols.iter().enumerate() {
+            if sym.name.is_empty() || sym.bind == STB_LOCAL || sym.shndx == SHN_UNDEF {
+                continue;
+            }
+            if sym.shndx == SHN_COMMON {
+                return err(format!(
+                    "{}: COMMON symbol '{}' — COMMON allocation lands in rung 2",
+                    obj.name, sym.name
+                ));
+            }
+            match globals.get(&sym.name) {
+                None => {
+                    globals.insert(sym.name.clone(), (oi, si));
+                }
+                Some(&(poi, psi)) => {
+                    let prev = &objects[poi].symbols[psi];
+                    match (prev.bind, sym.bind) {
+                        (STB_WEAK, STB_GLOBAL) => {
+                            globals.insert(sym.name.clone(), (oi, si));
+                        }
+                        (STB_GLOBAL, STB_WEAK) => {}
+                        (STB_GLOBAL, STB_GLOBAL) => {
+                            return err(format!(
+                                "duplicate symbol '{}' in {} and {}",
+                                sym.name, objects[poi].name, obj.name
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Version aliasing. Collect the versioned definitions and apply them
+    // in a fixed order — default (`@@`) versions first, then by link
+    // order — so the base winner never depends on HashMap iteration. An
+    // explicit unversioned definition already in `globals` is left
+    // untouched by `or_insert`.
+    let mut versioned: Vec<(bool, usize, usize, String)> = Vec::new();
+    for (full, &(oi, si)) in &globals {
+        let Some(at) = full.find('@') else { continue };
+        let is_default = full[at..].starts_with("@@");
+        versioned.push((is_default, oi, si, full[..at].to_string()));
+    }
+    // `true` sorts before `false` via reverse on the flag; ties break by
+    // link order (object, then symbol index).
+    versioned.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    for (_is_default, oi, si, base) in versioned {
+        globals.entry(base).or_insert((oi, si));
+    }
+
+    Ok(globals)
+}
+
 /// Link relocatable objects plus library archives into a static
 /// ET_EXEC. Explicit objects load unconditionally, in order; archive
 /// members load lazily, pulled to satisfy strong-undefined symbols and
@@ -861,62 +933,9 @@ pub fn link_static_exec(objects: &[ElfObject], entry: &str) -> Result<Vec<u8>, E
         None
     };
 
-    // ---- Global symbol resolution.
-    // name -> (object, symbol index); strong duplicates are errors,
-    // weak yields to strong.
-    let mut globals: HashMap<String, (usize, usize)> = HashMap::new();
-    for (oi, obj) in objects.iter().enumerate() {
-        for (si, sym) in obj.symbols.iter().enumerate() {
-            if sym.name.is_empty() || sym.bind == STB_LOCAL || sym.shndx == SHN_UNDEF {
-                continue;
-            }
-            if sym.shndx == SHN_COMMON {
-                return err(format!(
-                    "{}: COMMON symbol '{}' — COMMON allocation lands in rung 2",
-                    obj.name, sym.name
-                ));
-            }
-            match globals.get(&sym.name) {
-                None => {
-                    globals.insert(sym.name.clone(), (oi, si));
-                }
-                Some(&(poi, psi)) => {
-                    let prev = &objects[poi].symbols[psi];
-                    match (prev.bind, sym.bind) {
-                        (STB_WEAK, STB_GLOBAL) => {
-                            globals.insert(sym.name.clone(), (oi, si));
-                        }
-                        (STB_GLOBAL, STB_WEAK) => {}
-                        (STB_GLOBAL, STB_GLOBAL) => {
-                            return err(format!(
-                                "duplicate symbol '{}' in {} and {}",
-                                sym.name, objects[poi].name, obj.name
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    // Version aliasing: a default-version definition (`foo@@V`) answers
-    // the plain base `foo`; a non-default (`foo@V`) answers it only if
-    // nothing else does. An explicit unversioned definition always wins.
-    let mut base_default: HashMap<String, (usize, usize)> = HashMap::new();
-    let mut base_other: HashMap<String, (usize, usize)> = HashMap::new();
-    for (full, &def) in &globals {
-        let Some(at) = full.find('@') else { continue };
-        let base = full[..at].to_string();
-        if full[at..].starts_with("@@") {
-            base_default.entry(base).or_insert(def);
-        } else {
-            base_other.entry(base).or_insert(def);
-        }
-    }
-    for (base, def) in base_default.into_iter().chain(base_other) {
-        globals.entry(base).or_insert(def);
-    }
+    // ---- Global symbol resolution: weak/strong coalescing plus
+    // deterministic version aliasing (see resolve_globals).
+    let globals = resolve_globals(objects)?;
 
     // Reference -> definition identity. None means an unsatisfied weak
     // reference (address 0). Depends only on `globals`, so it is valid
@@ -1625,16 +1644,11 @@ pub fn link_dynamic_exec(
         }
     }
 
-    // ---- Resolve defined globals.
-    let mut globals: HashMap<String, (usize, usize)> = HashMap::new();
-    for (oi, obj) in objects.iter().enumerate() {
-        for (si, sym) in obj.symbols.iter().enumerate() {
-            if sym.name.is_empty() || sym.bind == STB_LOCAL || sym.shndx == SHN_UNDEF {
-                continue;
-            }
-            globals.entry(sym.name.clone()).or_insert((oi, si));
-        }
-    }
+    // ---- Resolve defined globals: weak/strong coalescing plus
+    // deterministic version aliasing (see resolve_globals). The old
+    // first-def-wins pass ignored binding, so a weak def shadowed a
+    // later strong one (audit L1).
+    let globals = resolve_globals(objects)?;
 
     // ---- Imports: undefined strong globals a shared library exports.
     // Function imports get a PLT slot (JUMP_SLOT); data imports get a
@@ -2521,4 +2535,99 @@ fn relax_tlsld_to_le(data: &mut [u8], reloc_off: u64) -> Result<(), ElfError> {
     ];
     data[start..start + 12].copy_from_slice(&le);
     Ok(())
+}
+
+#[cfg(test)]
+mod resolve_globals_tests {
+    use super::*;
+
+    /// A defined (non-special) section index for synthetic symbols.
+    const DEF: u16 = 1;
+
+    fn sym(name: &str, bind: u8, shndx: u16) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            bind,
+            typ: 0,
+            shndx,
+            section: if shndx == SHN_UNDEF { None } else { Some(0) },
+            value: 0,
+            size: 0,
+        }
+    }
+
+    fn obj(name: &str, symbols: Vec<Symbol>) -> ElfObject {
+        ElfObject {
+            name: name.to_string(),
+            sections: Vec::new(),
+            symbols,
+        }
+    }
+
+    #[test]
+    fn strong_beats_weak_regardless_of_order() {
+        // Weak first, strong second: the strong def wins (audit L1 — the
+        // old dynamic path took the first definition and kept the weak).
+        let objs = vec![
+            obj("a.o", vec![sym("foo", STB_WEAK, DEF)]),
+            obj("b.o", vec![sym("foo", STB_GLOBAL, DEF)]),
+        ];
+        assert_eq!(resolve_globals(&objs).unwrap()["foo"], (1, 0));
+
+        // Strong first, weak second: the strong def keeps winning.
+        let objs = vec![
+            obj("a.o", vec![sym("foo", STB_GLOBAL, DEF)]),
+            obj("b.o", vec![sym("foo", STB_WEAK, DEF)]),
+        ];
+        assert_eq!(resolve_globals(&objs).unwrap()["foo"], (0, 0));
+    }
+
+    #[test]
+    fn duplicate_strong_is_an_error() {
+        let objs = vec![
+            obj("a.o", vec![sym("foo", STB_GLOBAL, DEF)]),
+            obj("b.o", vec![sym("foo", STB_GLOBAL, DEF)]),
+        ];
+        assert!(resolve_globals(&objs).is_err());
+    }
+
+    #[test]
+    fn default_version_beats_nondefault_for_base() {
+        // Non-default first, default second: the default answers `foo`.
+        let objs = vec![
+            obj("a.o", vec![sym("foo@V1", STB_GLOBAL, DEF)]),
+            obj("b.o", vec![sym("foo@@V2", STB_GLOBAL, DEF)]),
+        ];
+        assert_eq!(resolve_globals(&objs).unwrap()["foo"], (1, 0));
+    }
+
+    #[test]
+    fn explicit_unversioned_wins_over_alias() {
+        // A plain `foo` definition must not be overwritten by a `foo@@V`
+        // alias, whichever order they appear in.
+        let objs = vec![
+            obj("a.o", vec![sym("foo@@V", STB_GLOBAL, DEF)]),
+            obj("b.o", vec![sym("foo", STB_GLOBAL, DEF)]),
+        ];
+        assert_eq!(resolve_globals(&objs).unwrap()["foo"], (1, 0));
+    }
+
+    #[test]
+    fn base_alias_winner_is_deterministic() {
+        // Two competing non-default versions of one base with no default
+        // and no explicit unversioned def: the base must resolve to the
+        // earliest-link-order definition on every run, independent of
+        // HashMap iteration order (audit L2). Fresh objects each pass so
+        // each `globals` HashMap gets a different seed.
+        let build = || {
+            vec![
+                obj("a.o", vec![sym("foo@V1", STB_GLOBAL, DEF)]),
+                obj("b.o", vec![sym("foo@V2", STB_GLOBAL, DEF)]),
+            ]
+        };
+        assert_eq!(resolve_globals(&build()).unwrap()["foo"], (0, 0));
+        for _ in 0..64 {
+            assert_eq!(resolve_globals(&build()).unwrap()["foo"], (0, 0));
+        }
+    }
 }

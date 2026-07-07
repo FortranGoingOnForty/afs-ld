@@ -143,17 +143,27 @@ fn main() -> ExitCode {
     }
 }
 
+/// A command-line link input, tagged so its position relative to other
+/// inputs is preserved. GNU ld resolves archives left-to-right, so
+/// `pmain.o -lb ./liba.a` searches `libb` before `liba`; keeping a single
+/// ordered list (rather than draining all positional files before all
+/// `-l` requests) is what makes that ordering hold (audit L3).
+enum LinkInput {
+    /// A positional path: an object, an archive, or a shared object.
+    File(std::path::PathBuf),
+    /// A `-lfoo` request, resolved against the search dirs in link order.
+    Lib(String),
+}
+
 /// Detect and run the ELF link path. Returns None when no input is
 /// an ELF object (Mach-O flow continues unchanged).
 fn elf_mode(args: &[String]) -> Option<ExitCode> {
     let mut output: Option<std::path::PathBuf> = None;
-    // Positional inputs, in command-line order: an object, an archive,
-    // or a shared object.
-    let mut inputs: Vec<std::path::PathBuf> = Vec::new();
+    // Inputs in command-line order, positional files and `-l` requests
+    // interleaved. `-L` search dirs accumulate separately and apply to
+    // every `-l` regardless of relative position.
+    let mut link_inputs: Vec<LinkInput> = Vec::new();
     let mut lib_dirs: Vec<std::path::PathBuf> = Vec::new();
-    // `-lfoo` requests, resolved against `lib_dirs` after arg parsing so
-    // a `-L` that follows a `-l` on the command line still applies.
-    let mut lib_names: Vec<String> = Vec::new();
     let mut unsupported: Vec<String> = Vec::new();
     let mut dynamic_linker: Option<String> = None;
     let mut eh_frame_hdr = false;
@@ -168,7 +178,7 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
             }
             "-l" => {
                 if let Some(n) = it.next() {
-                    lib_names.push(n.clone());
+                    link_inputs.push(LinkInput::Lib(n.clone()));
                 }
             }
             "--dynamic-linker" | "-dynamic-linker" => {
@@ -192,9 +202,9 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
             // PIE and shared-object output are later rungs.
             "-pie" | "--pie" | "-shared" | "-Bshareable" => unsupported.push(a.to_string()),
             s if s.starts_with("-L") => lib_dirs.push(std::path::PathBuf::from(&s[2..])),
-            s if s.starts_with("-l") => lib_names.push(s[2..].to_string()),
+            s if s.starts_with("-l") => link_inputs.push(LinkInput::Lib(s[2..].to_string())),
             s if s.starts_with('-') => unsupported.push(s.to_string()),
-            _ => inputs.push(std::path::PathBuf::from(a)),
+            _ => link_inputs.push(LinkInput::File(std::path::PathBuf::from(a))),
         }
     }
     let is_elf = |p: &std::path::Path| {
@@ -202,7 +212,10 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
             .map(|b| b.len() >= 4 && &b[0..4] == b"\x7fELF")
             .unwrap_or(false)
     };
-    if !inputs.iter().any(|p| is_elf(p)) {
+    if !link_inputs
+        .iter()
+        .any(|li| matches!(li, LinkInput::File(p) if is_elf(p)))
+    {
         return None;
     }
     if !unsupported.is_empty() {
@@ -225,12 +238,12 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
     };
 
     let image = if let Some(interp) = dynamic_linker {
-        match link_dynamic(&inputs, &lib_dirs, &lib_names, &interp, eh_frame_hdr, read_bytes) {
+        match link_dynamic(&link_inputs, &lib_dirs, &interp, eh_frame_hdr, read_bytes) {
             Ok(img) => img,
             Err(code) => return Some(code),
         }
     } else {
-        match link_static(&inputs, &lib_dirs, &lib_names, eh_frame_hdr, read_bytes) {
+        match link_static(&link_inputs, &lib_dirs, eh_frame_hdr, read_bytes) {
             Ok(img) => img,
             Err(code) => return Some(code),
         }
@@ -248,36 +261,47 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
     Some(ExitCode::SUCCESS)
 }
 
+/// Resolve a `-lfoo` request to `lib<name>.<ext>` against the search
+/// dirs, in `-L` order. Returns None when nothing matches; the caller
+/// emits the mode-appropriate diagnostic.
+fn resolve_lib(name: &str, ext: &str, lib_dirs: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    lib_dirs.iter().find_map(|d| {
+        let cand = d.join(format!("lib{name}.{ext}"));
+        cand.exists().then_some(cand)
+    })
+}
+
 /// Static link: objects load eagerly, `ar` archives feed lazy member
-/// selection. `-lfoo` resolves to `libfoo.a`.
+/// selection. `-lfoo` resolves to `libfoo.a`. Inputs are consumed in
+/// command-line order so archive symbol resolution matches GNU ld
+/// left-to-right (audit L3): the first archive that defines a symbol
+/// wins, and interleaving `-l` with positional archives is honored.
 fn link_static(
-    inputs: &[std::path::PathBuf],
+    link_inputs: &[LinkInput],
     lib_dirs: &[std::path::PathBuf],
-    lib_names: &[String],
     eh_frame_hdr: bool,
     read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
 ) -> Result<Vec<u8>, ExitCode> {
     const AR_MAGIC: &[u8] = b"!<arch>\n";
     let mut objects = Vec::new();
     let mut libs: Vec<elf::Library> = Vec::new();
-    for p in inputs {
-        let bytes = read_bytes(p)?;
+    for input in link_inputs {
+        let p = match input {
+            LinkInput::File(p) => p.clone(),
+            LinkInput::Lib(name) => match resolve_lib(name, "a", lib_dirs) {
+                Some(p) => p,
+                None => {
+                    diag::error(&format!("unable to find library -l{name}"));
+                    return Err(ExitCode::from(1));
+                }
+            },
+        };
+        let bytes = read_bytes(&p)?;
         if bytes.starts_with(AR_MAGIC) {
             libs.push(elf::Library { name: p.display().to_string(), bytes });
         } else {
-            objects.push(parse_object(p, &bytes)?);
+            objects.push(parse_object(&p, &bytes)?);
         }
-    }
-    for name in lib_names {
-        let found = lib_dirs.iter().find_map(|d| {
-            let cand = d.join(format!("lib{name}.a"));
-            cand.exists().then_some(cand)
-        });
-        let Some(p) = found else {
-            diag::error(&format!("unable to find library -l{name}"));
-            return Err(ExitCode::from(1));
-        };
-        libs.push(elf::Library { name: p.display().to_string(), bytes: read_bytes(&p)? });
     }
     elf::link_static(objects, &libs, "_start", eh_frame_hdr).map_err(|e| {
         diag::error(&e.to_string());
@@ -286,11 +310,11 @@ fn link_static(
 }
 
 /// Dynamic link: objects load eagerly; `.so` inputs (positional or from
-/// `-lfoo` → `libfoo.so`) provide imports resolved at runtime.
+/// `-lfoo` → `libfoo.so`) provide imports resolved at runtime. Inputs are
+/// consumed in command-line order (audit L3).
 fn link_dynamic(
-    inputs: &[std::path::PathBuf],
+    link_inputs: &[LinkInput],
     lib_dirs: &[std::path::PathBuf],
-    lib_names: &[String],
     interp: &str,
     eh_frame_hdr: bool,
     read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
@@ -306,18 +330,17 @@ fn link_dynamic(
         }
         Ok(())
     };
-    for p in inputs {
-        let bytes = read_bytes(p)?;
-        push_input(p, &bytes)?;
-    }
-    for name in lib_names {
-        let found = lib_dirs.iter().find_map(|d| {
-            let cand = d.join(format!("lib{name}.so"));
-            cand.exists().then_some(cand)
-        });
-        let Some(p) = found else {
-            diag::error(&format!("unable to find shared library -l{name}"));
-            return Err(ExitCode::from(1));
+    for input in link_inputs {
+        let p = match input {
+            LinkInput::File(p) => p.clone(),
+            // A `-lfoo` in dynamic mode resolves to the shared object.
+            LinkInput::Lib(name) => match resolve_lib(name, "so", lib_dirs) {
+                Some(p) => p,
+                None => {
+                    diag::error(&format!("unable to find shared library -l{name}"));
+                    return Err(ExitCode::from(1));
+                }
+            },
         };
         let bytes = read_bytes(&p)?;
         push_input(&p, &bytes)?;

@@ -151,6 +151,66 @@ fn err<T>(msg: impl Into<String>) -> Result<T, ElfError> {
     Err(ElfError(msg.into()))
 }
 
+/// Bounds-checked `bytes[off .. off+len]`, or a diagnostic naming the input
+/// and the region. The ELF readers indexed raw section/table offsets
+/// directly, so a truncated or malformed object panicked with a slice
+/// out-of-bounds instead of reporting the bad file (audit L8).
+fn subslice<'a>(
+    bytes: &'a [u8],
+    off: usize,
+    len: usize,
+    name: &str,
+    what: &str,
+) -> Result<&'a [u8], ElfError> {
+    match off.checked_add(len) {
+        Some(end) if end <= bytes.len() => Ok(&bytes[off..end]),
+        _ => err(format!(
+            "{name}: {what} out of range (offset {off:#x}, len {len:#x}, file size {:#x})",
+            bytes.len()
+        )),
+    }
+}
+
+/// EI_OSABI byte for the ELF being produced. The kernel image activator uses
+/// it to pick syscall semantics: FreeBSD wants `ELFOSABI_FREEBSD` (9), Linux
+/// and generic SysV want `ELFOSABI_NONE` (0). The output runs on the host
+/// afs-ld runs on, so this is a host property — but it must reflect the
+/// running kernel, not the OS afs-ld was *compiled* for. On this dev box
+/// afs-ld is sometimes built as a Linux binary under the FreeBSD linuxulator;
+/// a compile-time `cfg!(target_os)` would then brand a FreeBSD-hosted output
+/// as OSABI 0 and the native kernel would misread it. The FreeBSD run-time
+/// linker `/libexec/ld-elf.so.1` is present on a FreeBSD host (native or
+/// linuxulator) and absent on Linux, so it is the reliable runtime signal
+/// (audit L9). Deterministic for a given host, so the byte-identical link
+/// invariant holds.
+fn host_osabi() -> u8 {
+    if std::path::Path::new("/libexec/ld-elf.so.1").exists() {
+        9 // ELFOSABI_FREEBSD
+    } else {
+        0 // ELFOSABI_NONE (Linux / generic SysV)
+    }
+}
+
+/// Encode the 4 bytes of an absolute 32-bit relocation, erroring on overflow
+/// rather than silently dropping the high bits. `R_X86_64_32` is unsigned and
+/// must fit `u32`; `R_X86_64_32S` is signed and must fit `i32`. Shared by the
+/// static and dynamic relocation appliers so the range checks can never drift
+/// apart again — the dynamic path had lost the check and truncated silently
+/// (audit L4).
+fn encode_abs32(value: i64, signed: bool, p: u64) -> Result<[u8; 4], ElfError> {
+    if signed {
+        if value < i32::MIN as i64 || value > i32::MAX as i64 {
+            return err(format!("R_X86_64_32S overflow at {:#x}", p));
+        }
+        Ok((value as i32).to_le_bytes())
+    } else {
+        if value < 0 || value > u32::MAX as i64 {
+            return err(format!("R_X86_64_32 overflow at {:#x}", p));
+        }
+        Ok((value as u32).to_le_bytes())
+    }
+}
+
 // ---- ET_REL model ----
 
 #[derive(Debug, Clone)]
@@ -238,10 +298,22 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
     if shoff == 0 || shnum == 0 {
         return err(format!("{}: no section headers", name));
     }
+    if shentsize < 64 {
+        return err(format!("{}: section header entry size {} too small", name, shentsize));
+    }
+    if shstrndx >= shnum {
+        return err(format!("{}: section-header string-table index out of range", name));
+    }
+    // Validate the whole section-header table lies within the file so `sh(i)`
+    // for i in 0..shnum never indexes past the end (audit L8).
+    match shnum.checked_mul(shentsize).and_then(|n| shoff.checked_add(n)) {
+        Some(end) if end <= bytes.len() => {}
+        _ => return err(format!("{}: section header table out of range", name)),
+    }
     let sh = |i: usize| -> &[u8] { &bytes[shoff + i * shentsize..shoff + (i + 1) * shentsize] };
     let shstr_off = ru64(sh(shstrndx), 24) as usize;
     let shstr_size = ru64(sh(shstrndx), 32) as usize;
-    let shstr = &bytes[shstr_off..shstr_off + shstr_size];
+    let shstr = subslice(bytes, shstr_off, shstr_size, name, "section-header string table")?;
 
     // First pass: raw headers.
     struct Raw {
@@ -296,7 +368,8 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
             data: if r.sh_type == SHT_NOBITS {
                 Vec::new()
             } else {
-                bytes[r.off..r.off + r.size].to_vec()
+                subslice(bytes, r.off, r.size, name, &format!("section '{}' data", r.name))?
+                    .to_vec()
             },
             nobits_size: if r.sh_type == SHT_NOBITS {
                 r.size as u64
@@ -312,9 +385,16 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
     let symtab = raws.iter().position(|r| r.sh_type == SHT_SYMTAB);
     if let Some(si) = symtab {
         let r = &raws[si];
-        let strtab = &raws[r.link];
-        let strdat = &bytes[strtab.off..strtab.off + strtab.size];
-        let n = r.size.checked_div(r.entsize).unwrap_or(0);
+        if r.entsize == 0 {
+            return err(format!("{}: .symtab has zero entry size", name));
+        }
+        let Some(strtab) = raws.get(r.link) else {
+            return err(format!("{}: .symtab links to a nonexistent string table", name));
+        };
+        let strdat = subslice(bytes, strtab.off, strtab.size, name, ".strtab")?;
+        let n = r.size / r.entsize;
+        // The whole symbol table must fit; each entry is 24 bytes.
+        subslice(bytes, r.off, n.saturating_mul(24), name, ".symtab")?;
         for k in 0..n {
             let e = &bytes[r.off + k * 24..r.off + (k + 1) * 24];
             let shndx = ru16(e, 6);
@@ -335,7 +415,11 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
         let Some(&target) = remap.get(&r.info) else {
             continue; // relocations for a dropped section (.eh_frame etc.)
         };
-        let n = r.size.checked_div(r.entsize).unwrap_or(0);
+        if r.entsize == 0 {
+            return err(format!("{}: RELA section '{}' has zero entry size", name, r.name));
+        }
+        let n = r.size / r.entsize;
+        subslice(bytes, r.off, n.saturating_mul(24), name, &format!("RELA '{}'", r.name))?;
         for k in 0..n {
             let e = &bytes[r.off + k * 24..r.off + (k + 1) * 24];
             let info = ru64(e, 8);
@@ -395,6 +479,13 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
     if shoff == 0 || shnum == 0 {
         return err(format!("{}: shared object has no section headers", name));
     }
+    if shentsize < 64 {
+        return err(format!("{}: section header entry size {} too small", name, shentsize));
+    }
+    match shnum.checked_mul(shentsize).and_then(|n| shoff.checked_add(n)) {
+        Some(end) if end <= bytes.len() => {}
+        _ => return err(format!("{}: section header table out of range", name)),
+    }
     let sh = |i: usize| -> &[u8] { &bytes[shoff + i * shentsize..shoff + (i + 1) * shentsize] };
 
     // Locate .dynsym (with its linked string table), .dynamic, and the
@@ -424,16 +515,20 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
     let Some((soff, ssize, slink, sent)) = dynsym else {
         return err(format!("{}: shared object has no .dynsym", name));
     };
+    if slink >= shnum {
+        return err(format!("{}: .dynsym link {} out of range", name, slink));
+    }
     let link_h = sh(slink);
     let stroff = ru64(link_h, 24) as usize;
     let strsz = ru64(link_h, 32) as usize;
-    let dynstr = &bytes[stroff..stroff + strsz];
+    let dynstr = subslice(bytes, stroff, strsz, name, ".dynstr")?;
 
     // SONAME from .dynamic, else the file's own name.
     let mut soname = String::new();
     if let Some((doff, dsz)) = dynamic {
+        let dyn_tab = subslice(bytes, doff, dsz, name, ".dynamic")?;
         for k in 0..dsz / 16 {
-            let e = &bytes[doff + k * 16..doff + (k + 1) * 16];
+            let e = &dyn_tab[k * 16..(k + 1) * 16];
             let tag = ru64(e, 0) as i64;
             if tag == 0 {
                 break;
@@ -455,7 +550,7 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
     let mut verdef_names: HashMap<u16, String> = HashMap::new();
     if let Some((doff, dsz)) = verdef {
         let mut p = doff;
-        let end = doff + dsz;
+        let end = doff.saturating_add(dsz).min(bytes.len());
         while p + 20 <= end {
             let cnt = ru16(&bytes[p..], 6);
             let aux = ru32(&bytes[p..], 12) as usize;
@@ -472,13 +567,19 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
         }
     }
 
-    let sent = if sent == 0 { 24 } else { sent };
+    // A real Elf64_Sym is 24 bytes; anything smaller makes the per-entry read
+    // overrun the table. The old code silently substituted 24 for a zero
+    // entsize, masking a malformed input.
+    if sent < 24 {
+        return err(format!("{}: .dynsym entry size {} invalid (need >= 24)", name, sent));
+    }
+    let sym_tab = subslice(bytes, soff, ssize, name, ".dynsym")?;
     let mut exports: HashMap<String, Export> = HashMap::new();
     let mut is_default_export: HashMap<String, bool> = HashMap::new();
     let mut undefs: Vec<String> = Vec::new();
     let nsyms = ssize / sent;
     for k in 0..nsyms {
-        let e = &bytes[soff + k * sent..soff + k * sent + 24];
+        let e = &sym_tab[k * sent..k * sent + 24];
         let shndx = ru16(e, 6);
         let bind = e[4] >> 4;
         let typ = e[4] & 0xf;
@@ -1328,7 +1429,12 @@ pub fn link_static_exec(
     // lld does with a small freestanding input closely enough for
     // behavioral parity.)
     let ehsize = 64u64;
-    let phnum = 2u64 + if has_tls { 1 } else { 0 } + if eh_hdr_idx.is_some() { 1 } else { 0 };
+    // 2 PT_LOAD + PT_GNU_STACK marker, plus PT_TLS / PT_GNU_EH_FRAME when
+    // present. PT_GNU_STACK (non-exec) is required so Linux does not fall
+    // back to READ_IMPLIES_EXEC and grant an executable stack (audit L9);
+    // the dynamic path already emits it.
+    let phnum =
+        3u64 + if has_tls { 1 } else { 0 } + if eh_hdr_idx.is_some() { 1 } else { 0 };
     let phsize = 56 * phnum;
     let mut cursor_file = ehsize + phsize;
     let mut cursor_vaddr = BASE_VADDR + cursor_file;
@@ -1412,6 +1518,14 @@ pub fn link_static_exec(
     // Reference address: linker pseudo-symbols and ifunc stubs first,
     // then the ordinary definition address. Unsatisfied weak -> 0.
     let sym_vaddr = |oi: usize, si: usize| -> Result<u64, ElfError> {
+        // `oi` may already be a resolved definition rather than a raw
+        // reference: a GOT/GOT.PLT slot built for a linker-defined symbol
+        // (`_end`, `__bss_start`, …) carries `(LINKER_MARK, idx)`. Short-
+        // circuit before resolve_def, which would index objects[LINKER_MARK]
+        // and panic on a GOTPCREL against such a symbol (audit L7).
+        if oi == LINKER_MARK {
+            return Ok(linker_addr[si]);
+        }
         let (doi, dsi) = match resolve_def(oi, si)? {
             Some(d) => d,
             None => return Ok(0),
@@ -1541,20 +1655,12 @@ pub fn link_static_exec(
                         outs[out_idx].data[spot..spot + 8].copy_from_slice(&v.to_le_bytes());
                     }
                     R_X86_64_32 => {
-                        let v = s as i64 + r.addend;
-                        if v < 0 || v > u32::MAX as i64 {
-                            return err(format!("R_X86_64_32 overflow at {:#x}", p));
-                        }
-                        outs[out_idx].data[spot..spot + 4]
-                            .copy_from_slice(&(v as u32).to_le_bytes());
+                        let bytes = encode_abs32(s as i64 + r.addend, false, p)?;
+                        outs[out_idx].data[spot..spot + 4].copy_from_slice(&bytes);
                     }
                     R_X86_64_32S => {
-                        let v = s as i64 + r.addend;
-                        if v < i32::MIN as i64 || v > i32::MAX as i64 {
-                            return err(format!("R_X86_64_32S overflow at {:#x}", p));
-                        }
-                        outs[out_idx].data[spot..spot + 4]
-                            .copy_from_slice(&(v as i32).to_le_bytes());
+                        let bytes = encode_abs32(s as i64 + r.addend, true, p)?;
+                        outs[out_idx].data[spot..spot + 4].copy_from_slice(&bytes);
                     }
                     // Static link, target defined: PLT32 == PC32.
                     R_X86_64_PC32 | R_X86_64_PLT32 => {
@@ -1671,7 +1777,7 @@ pub fn link_static_exec(
     image[4] = 2; // 64-bit
     image[5] = 1; // little-endian
     image[6] = 1; // EV_CURRENT
-    image[7] = if cfg!(target_os = "freebsd") { 9 } else { 0 };
+    image[7] = host_osabi();
     image[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
     image[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
     image[20..24].copy_from_slice(&1u32.to_le_bytes());
@@ -1738,6 +1844,9 @@ pub fn link_static_exec(
             4,
         ));
     }
+    // Non-executable stack marker (RW, no PF_X). Its absence makes Linux
+    // grant an executable stack via READ_IMPLIES_EXEC.
+    ph.extend(phdr(PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0));
     image[64..64 + ph.len()].copy_from_slice(&ph);
 
     // Section bytes.
@@ -1935,6 +2044,34 @@ pub fn link_dynamic_exec(
     // No function imports ⇒ no PLT/.got.plt/.rela.plt at all (a data-only
     // dynamic executable), matching what a reference linker emits.
     let has_plt = n_func > 0;
+
+    // Canonical PLT (audit L6): when a non-PIE executable takes the address
+    // of a function defined in a shared object, `&func` must have one
+    // identity on both sides of the .so boundary. The psABI ("Function
+    // Addresses") resolves this by giving the import's .dynsym entry a
+    // non-zero st_value pointing at the executable's own PLT stub, while
+    // keeping st_shndx=SHN_UNDEF. A plain `call func@plt` (R_X86_64_PLT32)
+    // does not need this; any other relocation against a function import is
+    // a direct address-take that does.
+    let mut addr_taken = vec![false; n_imp];
+    for obj in objects.iter() {
+        for sec in &obj.sections {
+            for r in &sec.relas {
+                if r.r_type == R_X86_64_PLT32 {
+                    continue;
+                }
+                let sym = &obj.symbols[r.sym as usize];
+                if sym.shndx != SHN_UNDEF {
+                    continue;
+                }
+                if let Some(&ii) = import_index.get(&sym.name) {
+                    if import_is_func[ii] {
+                        addr_taken[ii] = true;
+                    }
+                }
+            }
+        }
+    }
 
     // ---- GOT pre-pass: one `.got` slot per distinct GOTPCREL target.
     // Imports become GLOB_DAT (loader fills); in-image symbols hold their
@@ -2369,14 +2506,12 @@ pub fn link_dynamic_exec(
                         outs[out_idx].data[spot..spot + 8].copy_from_slice(&val.to_le_bytes());
                     }
                     R_X86_64_32 => {
-                        let val = s as i64 + r.addend;
-                        outs[out_idx].data[spot..spot + 4]
-                            .copy_from_slice(&(val as u32).to_le_bytes());
+                        let bytes = encode_abs32(s as i64 + r.addend, false, p)?;
+                        outs[out_idx].data[spot..spot + 4].copy_from_slice(&bytes);
                     }
                     R_X86_64_32S => {
-                        let val = s as i64 + r.addend;
-                        outs[out_idx].data[spot..spot + 4]
-                            .copy_from_slice(&(val as i32).to_le_bytes());
+                        let bytes = encode_abs32(s as i64 + r.addend, true, p)?;
+                        outs[out_idx].data[spot..spot + 4].copy_from_slice(&bytes);
                     }
                     R_X86_64_PC32 | R_X86_64_PLT32 => {
                         let val = s as i64 + r.addend - p as i64;
@@ -2485,6 +2620,21 @@ pub fn link_dynamic_exec(
         dynsym[e + 8..e + 16].copy_from_slice(&addr.to_le_bytes());
     }
 
+    // Canonical-PLT st_value (audit L6): point each address-taken function
+    // import at its own PLT stub. st_shndx stays SHN_UNDEF, so the exe's
+    // JUMP_SLOT (resolved with need_def) still binds to the real definition
+    // in the shared object — no self-referential loop. Every non-PLT
+    // reference (from the exe or another library) instead binds to this
+    // stub, giving `&func` a single identity across the boundary.
+    for i in 0..n_imp {
+        if addr_taken[i] {
+            if let Some(k) = func_slot[i] {
+                let e = (i + 1) * 24;
+                dynsym[e + 8..e + 16].copy_from_slice(&plt_stub(k).to_le_bytes());
+            }
+        }
+    }
+
     // ---- Build .dynamic.
     let mut dynamic: Vec<u8> = Vec::with_capacity(dynamic_size as usize);
     let dyn_push = |tag: i64, val: u64, d: &mut Vec<u8>| {
@@ -2532,7 +2682,7 @@ pub fn link_dynamic_exec(
     image[4] = 2;
     image[5] = 1;
     image[6] = 1;
-    image[7] = if cfg!(target_os = "freebsd") { 9 } else { 0 };
+    image[7] = host_osabi();
     image[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
     image[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
     image[20..24].copy_from_slice(&1u32.to_le_bytes());
@@ -2807,6 +2957,49 @@ fn relax_tlsld_to_le(data: &mut [u8], reloc_off: u64) -> Result<(), ElfError> {
     ];
     data[start..start + 12].copy_from_slice(&le);
     Ok(())
+}
+
+#[cfg(test)]
+mod abs32_reloc_tests {
+    use super::*;
+
+    #[test]
+    fn r32_unsigned_range() {
+        // In range: 0 and u32::MAX both encode.
+        assert_eq!(encode_abs32(0, false, 0).unwrap(), [0, 0, 0, 0]);
+        assert_eq!(
+            encode_abs32(u32::MAX as i64, false, 0).unwrap(),
+            [0xff, 0xff, 0xff, 0xff]
+        );
+        // Out of range: negative and > u32::MAX are errors, not truncation.
+        assert!(encode_abs32(-1, false, 0).is_err());
+        assert!(encode_abs32(u32::MAX as i64 + 1, false, 0).is_err());
+    }
+
+    #[test]
+    fn r32s_signed_range() {
+        // In range: i32::MIN..=i32::MAX encode.
+        assert_eq!(
+            encode_abs32(i32::MIN as i64, true, 0).unwrap(),
+            (i32::MIN).to_le_bytes()
+        );
+        assert_eq!(
+            encode_abs32(i32::MAX as i64, true, 0).unwrap(),
+            (i32::MAX).to_le_bytes()
+        );
+        // Just outside i32 on both ends is an error.
+        assert!(encode_abs32(i32::MAX as i64 + 1, true, 0).is_err());
+        assert!(encode_abs32(i32::MIN as i64 - 1, true, 0).is_err());
+    }
+
+    #[test]
+    fn overflow_message_names_the_kind_and_offset() {
+        let e = encode_abs32(1 << 40, false, 0xdead).unwrap_err();
+        assert!(e.to_string().contains("R_X86_64_32 overflow"));
+        assert!(e.to_string().contains("0xdead"));
+        let e = encode_abs32(1 << 40, true, 0xbeef).unwrap_err();
+        assert!(e.to_string().contains("R_X86_64_32S overflow"));
+    }
 }
 
 #[cfg(test)]

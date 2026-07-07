@@ -2017,6 +2017,34 @@ pub fn link_dynamic_exec(
     // dynamic executable), matching what a reference linker emits.
     let has_plt = n_func > 0;
 
+    // Canonical PLT (audit L6): when a non-PIE executable takes the address
+    // of a function defined in a shared object, `&func` must have one
+    // identity on both sides of the .so boundary. The psABI ("Function
+    // Addresses") resolves this by giving the import's .dynsym entry a
+    // non-zero st_value pointing at the executable's own PLT stub, while
+    // keeping st_shndx=SHN_UNDEF. A plain `call func@plt` (R_X86_64_PLT32)
+    // does not need this; any other relocation against a function import is
+    // a direct address-take that does.
+    let mut addr_taken = vec![false; n_imp];
+    for obj in objects.iter() {
+        for sec in &obj.sections {
+            for r in &sec.relas {
+                if r.r_type == R_X86_64_PLT32 {
+                    continue;
+                }
+                let sym = &obj.symbols[r.sym as usize];
+                if sym.shndx != SHN_UNDEF {
+                    continue;
+                }
+                if let Some(&ii) = import_index.get(&sym.name) {
+                    if import_is_func[ii] {
+                        addr_taken[ii] = true;
+                    }
+                }
+            }
+        }
+    }
+
     // ---- GOT pre-pass: one `.got` slot per distinct GOTPCREL target.
     // Imports become GLOB_DAT (loader fills); in-image symbols hold their
     // absolute address. Sizes the `.got`/`.rela.dyn` sections before
@@ -2562,6 +2590,21 @@ pub fn link_dynamic_exec(
         let e = (1 + n_imp + j) * 24;
         let addr = sym_vaddr(doi, dsi)?;
         dynsym[e + 8..e + 16].copy_from_slice(&addr.to_le_bytes());
+    }
+
+    // Canonical-PLT st_value (audit L6): point each address-taken function
+    // import at its own PLT stub. st_shndx stays SHN_UNDEF, so the exe's
+    // JUMP_SLOT (resolved with need_def) still binds to the real definition
+    // in the shared object — no self-referential loop. Every non-PLT
+    // reference (from the exe or another library) instead binds to this
+    // stub, giving `&func` a single identity across the boundary.
+    for i in 0..n_imp {
+        if addr_taken[i] {
+            if let Some(k) = func_slot[i] {
+                let e = (i + 1) * 24;
+                dynsym[e + 8..e + 16].copy_from_slice(&plt_stub(k).to_le_bytes());
+            }
+        }
     }
 
     // ---- Build .dynamic.

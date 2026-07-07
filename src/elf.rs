@@ -151,6 +151,26 @@ fn err<T>(msg: impl Into<String>) -> Result<T, ElfError> {
     Err(ElfError(msg.into()))
 }
 
+/// Bounds-checked `bytes[off .. off+len]`, or a diagnostic naming the input
+/// and the region. The ELF readers indexed raw section/table offsets
+/// directly, so a truncated or malformed object panicked with a slice
+/// out-of-bounds instead of reporting the bad file (audit L8).
+fn subslice<'a>(
+    bytes: &'a [u8],
+    off: usize,
+    len: usize,
+    name: &str,
+    what: &str,
+) -> Result<&'a [u8], ElfError> {
+    match off.checked_add(len) {
+        Some(end) if end <= bytes.len() => Ok(&bytes[off..end]),
+        _ => err(format!(
+            "{name}: {what} out of range (offset {off:#x}, len {len:#x}, file size {:#x})",
+            bytes.len()
+        )),
+    }
+}
+
 /// Encode the 4 bytes of an absolute 32-bit relocation, erroring on overflow
 /// rather than silently dropping the high bits. `R_X86_64_32` is unsigned and
 /// must fit `u32`; `R_X86_64_32S` is signed and must fit `i32`. Shared by the
@@ -258,10 +278,22 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
     if shoff == 0 || shnum == 0 {
         return err(format!("{}: no section headers", name));
     }
+    if shentsize < 64 {
+        return err(format!("{}: section header entry size {} too small", name, shentsize));
+    }
+    if shstrndx >= shnum {
+        return err(format!("{}: section-header string-table index out of range", name));
+    }
+    // Validate the whole section-header table lies within the file so `sh(i)`
+    // for i in 0..shnum never indexes past the end (audit L8).
+    match shnum.checked_mul(shentsize).and_then(|n| shoff.checked_add(n)) {
+        Some(end) if end <= bytes.len() => {}
+        _ => return err(format!("{}: section header table out of range", name)),
+    }
     let sh = |i: usize| -> &[u8] { &bytes[shoff + i * shentsize..shoff + (i + 1) * shentsize] };
     let shstr_off = ru64(sh(shstrndx), 24) as usize;
     let shstr_size = ru64(sh(shstrndx), 32) as usize;
-    let shstr = &bytes[shstr_off..shstr_off + shstr_size];
+    let shstr = subslice(bytes, shstr_off, shstr_size, name, "section-header string table")?;
 
     // First pass: raw headers.
     struct Raw {
@@ -316,7 +348,8 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
             data: if r.sh_type == SHT_NOBITS {
                 Vec::new()
             } else {
-                bytes[r.off..r.off + r.size].to_vec()
+                subslice(bytes, r.off, r.size, name, &format!("section '{}' data", r.name))?
+                    .to_vec()
             },
             nobits_size: if r.sh_type == SHT_NOBITS {
                 r.size as u64
@@ -332,9 +365,16 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
     let symtab = raws.iter().position(|r| r.sh_type == SHT_SYMTAB);
     if let Some(si) = symtab {
         let r = &raws[si];
-        let strtab = &raws[r.link];
-        let strdat = &bytes[strtab.off..strtab.off + strtab.size];
-        let n = r.size.checked_div(r.entsize).unwrap_or(0);
+        if r.entsize == 0 {
+            return err(format!("{}: .symtab has zero entry size", name));
+        }
+        let Some(strtab) = raws.get(r.link) else {
+            return err(format!("{}: .symtab links to a nonexistent string table", name));
+        };
+        let strdat = subslice(bytes, strtab.off, strtab.size, name, ".strtab")?;
+        let n = r.size / r.entsize;
+        // The whole symbol table must fit; each entry is 24 bytes.
+        subslice(bytes, r.off, n.saturating_mul(24), name, ".symtab")?;
         for k in 0..n {
             let e = &bytes[r.off + k * 24..r.off + (k + 1) * 24];
             let shndx = ru16(e, 6);
@@ -355,7 +395,11 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
         let Some(&target) = remap.get(&r.info) else {
             continue; // relocations for a dropped section (.eh_frame etc.)
         };
-        let n = r.size.checked_div(r.entsize).unwrap_or(0);
+        if r.entsize == 0 {
+            return err(format!("{}: RELA section '{}' has zero entry size", name, r.name));
+        }
+        let n = r.size / r.entsize;
+        subslice(bytes, r.off, n.saturating_mul(24), name, &format!("RELA '{}'", r.name))?;
         for k in 0..n {
             let e = &bytes[r.off + k * 24..r.off + (k + 1) * 24];
             let info = ru64(e, 8);
@@ -415,6 +459,13 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
     if shoff == 0 || shnum == 0 {
         return err(format!("{}: shared object has no section headers", name));
     }
+    if shentsize < 64 {
+        return err(format!("{}: section header entry size {} too small", name, shentsize));
+    }
+    match shnum.checked_mul(shentsize).and_then(|n| shoff.checked_add(n)) {
+        Some(end) if end <= bytes.len() => {}
+        _ => return err(format!("{}: section header table out of range", name)),
+    }
     let sh = |i: usize| -> &[u8] { &bytes[shoff + i * shentsize..shoff + (i + 1) * shentsize] };
 
     // Locate .dynsym (with its linked string table), .dynamic, and the
@@ -444,16 +495,20 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
     let Some((soff, ssize, slink, sent)) = dynsym else {
         return err(format!("{}: shared object has no .dynsym", name));
     };
+    if slink >= shnum {
+        return err(format!("{}: .dynsym link {} out of range", name, slink));
+    }
     let link_h = sh(slink);
     let stroff = ru64(link_h, 24) as usize;
     let strsz = ru64(link_h, 32) as usize;
-    let dynstr = &bytes[stroff..stroff + strsz];
+    let dynstr = subslice(bytes, stroff, strsz, name, ".dynstr")?;
 
     // SONAME from .dynamic, else the file's own name.
     let mut soname = String::new();
     if let Some((doff, dsz)) = dynamic {
+        let dyn_tab = subslice(bytes, doff, dsz, name, ".dynamic")?;
         for k in 0..dsz / 16 {
-            let e = &bytes[doff + k * 16..doff + (k + 1) * 16];
+            let e = &dyn_tab[k * 16..(k + 1) * 16];
             let tag = ru64(e, 0) as i64;
             if tag == 0 {
                 break;
@@ -475,7 +530,7 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
     let mut verdef_names: HashMap<u16, String> = HashMap::new();
     if let Some((doff, dsz)) = verdef {
         let mut p = doff;
-        let end = doff + dsz;
+        let end = doff.saturating_add(dsz).min(bytes.len());
         while p + 20 <= end {
             let cnt = ru16(&bytes[p..], 6);
             let aux = ru32(&bytes[p..], 12) as usize;
@@ -492,13 +547,19 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
         }
     }
 
-    let sent = if sent == 0 { 24 } else { sent };
+    // A real Elf64_Sym is 24 bytes; anything smaller makes the per-entry read
+    // overrun the table. The old code silently substituted 24 for a zero
+    // entsize, masking a malformed input.
+    if sent < 24 {
+        return err(format!("{}: .dynsym entry size {} invalid (need >= 24)", name, sent));
+    }
+    let sym_tab = subslice(bytes, soff, ssize, name, ".dynsym")?;
     let mut exports: HashMap<String, Export> = HashMap::new();
     let mut is_default_export: HashMap<String, bool> = HashMap::new();
     let mut undefs: Vec<String> = Vec::new();
     let nsyms = ssize / sent;
     for k in 0..nsyms {
-        let e = &bytes[soff + k * sent..soff + k * sent + 24];
+        let e = &sym_tab[k * sent..k * sent + 24];
         let shndx = ru16(e, 6);
         let bind = e[4] >> 4;
         let typ = e[4] & 0xf;

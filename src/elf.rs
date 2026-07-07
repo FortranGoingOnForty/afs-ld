@@ -151,6 +151,26 @@ fn err<T>(msg: impl Into<String>) -> Result<T, ElfError> {
     Err(ElfError(msg.into()))
 }
 
+/// Encode the 4 bytes of an absolute 32-bit relocation, erroring on overflow
+/// rather than silently dropping the high bits. `R_X86_64_32` is unsigned and
+/// must fit `u32`; `R_X86_64_32S` is signed and must fit `i32`. Shared by the
+/// static and dynamic relocation appliers so the range checks can never drift
+/// apart again — the dynamic path had lost the check and truncated silently
+/// (audit L4).
+fn encode_abs32(value: i64, signed: bool, p: u64) -> Result<[u8; 4], ElfError> {
+    if signed {
+        if value < i32::MIN as i64 || value > i32::MAX as i64 {
+            return err(format!("R_X86_64_32S overflow at {:#x}", p));
+        }
+        Ok((value as i32).to_le_bytes())
+    } else {
+        if value < 0 || value > u32::MAX as i64 {
+            return err(format!("R_X86_64_32 overflow at {:#x}", p));
+        }
+        Ok((value as u32).to_le_bytes())
+    }
+}
+
 // ---- ET_REL model ----
 
 #[derive(Debug, Clone)]
@@ -1541,20 +1561,12 @@ pub fn link_static_exec(
                         outs[out_idx].data[spot..spot + 8].copy_from_slice(&v.to_le_bytes());
                     }
                     R_X86_64_32 => {
-                        let v = s as i64 + r.addend;
-                        if v < 0 || v > u32::MAX as i64 {
-                            return err(format!("R_X86_64_32 overflow at {:#x}", p));
-                        }
-                        outs[out_idx].data[spot..spot + 4]
-                            .copy_from_slice(&(v as u32).to_le_bytes());
+                        let bytes = encode_abs32(s as i64 + r.addend, false, p)?;
+                        outs[out_idx].data[spot..spot + 4].copy_from_slice(&bytes);
                     }
                     R_X86_64_32S => {
-                        let v = s as i64 + r.addend;
-                        if v < i32::MIN as i64 || v > i32::MAX as i64 {
-                            return err(format!("R_X86_64_32S overflow at {:#x}", p));
-                        }
-                        outs[out_idx].data[spot..spot + 4]
-                            .copy_from_slice(&(v as i32).to_le_bytes());
+                        let bytes = encode_abs32(s as i64 + r.addend, true, p)?;
+                        outs[out_idx].data[spot..spot + 4].copy_from_slice(&bytes);
                     }
                     // Static link, target defined: PLT32 == PC32.
                     R_X86_64_PC32 | R_X86_64_PLT32 => {
@@ -2369,14 +2381,12 @@ pub fn link_dynamic_exec(
                         outs[out_idx].data[spot..spot + 8].copy_from_slice(&val.to_le_bytes());
                     }
                     R_X86_64_32 => {
-                        let val = s as i64 + r.addend;
-                        outs[out_idx].data[spot..spot + 4]
-                            .copy_from_slice(&(val as u32).to_le_bytes());
+                        let bytes = encode_abs32(s as i64 + r.addend, false, p)?;
+                        outs[out_idx].data[spot..spot + 4].copy_from_slice(&bytes);
                     }
                     R_X86_64_32S => {
-                        let val = s as i64 + r.addend;
-                        outs[out_idx].data[spot..spot + 4]
-                            .copy_from_slice(&(val as i32).to_le_bytes());
+                        let bytes = encode_abs32(s as i64 + r.addend, true, p)?;
+                        outs[out_idx].data[spot..spot + 4].copy_from_slice(&bytes);
                     }
                     R_X86_64_PC32 | R_X86_64_PLT32 => {
                         let val = s as i64 + r.addend - p as i64;
@@ -2807,6 +2817,49 @@ fn relax_tlsld_to_le(data: &mut [u8], reloc_off: u64) -> Result<(), ElfError> {
     ];
     data[start..start + 12].copy_from_slice(&le);
     Ok(())
+}
+
+#[cfg(test)]
+mod abs32_reloc_tests {
+    use super::*;
+
+    #[test]
+    fn r32_unsigned_range() {
+        // In range: 0 and u32::MAX both encode.
+        assert_eq!(encode_abs32(0, false, 0).unwrap(), [0, 0, 0, 0]);
+        assert_eq!(
+            encode_abs32(u32::MAX as i64, false, 0).unwrap(),
+            [0xff, 0xff, 0xff, 0xff]
+        );
+        // Out of range: negative and > u32::MAX are errors, not truncation.
+        assert!(encode_abs32(-1, false, 0).is_err());
+        assert!(encode_abs32(u32::MAX as i64 + 1, false, 0).is_err());
+    }
+
+    #[test]
+    fn r32s_signed_range() {
+        // In range: i32::MIN..=i32::MAX encode.
+        assert_eq!(
+            encode_abs32(i32::MIN as i64, true, 0).unwrap(),
+            (i32::MIN).to_le_bytes()
+        );
+        assert_eq!(
+            encode_abs32(i32::MAX as i64, true, 0).unwrap(),
+            (i32::MAX).to_le_bytes()
+        );
+        // Just outside i32 on both ends is an error.
+        assert!(encode_abs32(i32::MAX as i64 + 1, true, 0).is_err());
+        assert!(encode_abs32(i32::MIN as i64 - 1, true, 0).is_err());
+    }
+
+    #[test]
+    fn overflow_message_names_the_kind_and_offset() {
+        let e = encode_abs32(1 << 40, false, 0xdead).unwrap_err();
+        assert!(e.to_string().contains("R_X86_64_32 overflow"));
+        assert!(e.to_string().contains("0xdead"));
+        let e = encode_abs32(1 << 40, true, 0xbeef).unwrap_err();
+        assert!(e.to_string().contains("R_X86_64_32S overflow"));
+    }
 }
 
 #[cfg(test)]

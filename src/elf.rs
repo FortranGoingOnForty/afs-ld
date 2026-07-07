@@ -1432,6 +1432,14 @@ pub fn link_static_exec(
     // Reference address: linker pseudo-symbols and ifunc stubs first,
     // then the ordinary definition address. Unsatisfied weak -> 0.
     let sym_vaddr = |oi: usize, si: usize| -> Result<u64, ElfError> {
+        // `oi` may already be a resolved definition rather than a raw
+        // reference: a GOT/GOT.PLT slot built for a linker-defined symbol
+        // (`_end`, `__bss_start`, …) carries `(LINKER_MARK, idx)`. Short-
+        // circuit before resolve_def, which would index objects[LINKER_MARK]
+        // and panic on a GOTPCREL against such a symbol (audit L7).
+        if oi == LINKER_MARK {
+            return Ok(linker_addr[si]);
+        }
         let (doi, dsi) = match resolve_def(oi, si)? {
             Some(d) => d,
             None => return Ok(0),

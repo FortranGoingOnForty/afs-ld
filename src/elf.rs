@@ -171,6 +171,26 @@ fn subslice<'a>(
     }
 }
 
+/// EI_OSABI byte for the ELF being produced. The kernel image activator uses
+/// it to pick syscall semantics: FreeBSD wants `ELFOSABI_FREEBSD` (9), Linux
+/// and generic SysV want `ELFOSABI_NONE` (0). The output runs on the host
+/// afs-ld runs on, so this is a host property — but it must reflect the
+/// running kernel, not the OS afs-ld was *compiled* for. On this dev box
+/// afs-ld is sometimes built as a Linux binary under the FreeBSD linuxulator;
+/// a compile-time `cfg!(target_os)` would then brand a FreeBSD-hosted output
+/// as OSABI 0 and the native kernel would misread it. The FreeBSD run-time
+/// linker `/libexec/ld-elf.so.1` is present on a FreeBSD host (native or
+/// linuxulator) and absent on Linux, so it is the reliable runtime signal
+/// (audit L9). Deterministic for a given host, so the byte-identical link
+/// invariant holds.
+fn host_osabi() -> u8 {
+    if std::path::Path::new("/libexec/ld-elf.so.1").exists() {
+        9 // ELFOSABI_FREEBSD
+    } else {
+        0 // ELFOSABI_NONE (Linux / generic SysV)
+    }
+}
+
 /// Encode the 4 bytes of an absolute 32-bit relocation, erroring on overflow
 /// rather than silently dropping the high bits. `R_X86_64_32` is unsigned and
 /// must fit `u32`; `R_X86_64_32S` is signed and must fit `i32`. Shared by the
@@ -1409,7 +1429,12 @@ pub fn link_static_exec(
     // lld does with a small freestanding input closely enough for
     // behavioral parity.)
     let ehsize = 64u64;
-    let phnum = 2u64 + if has_tls { 1 } else { 0 } + if eh_hdr_idx.is_some() { 1 } else { 0 };
+    // 2 PT_LOAD + PT_GNU_STACK marker, plus PT_TLS / PT_GNU_EH_FRAME when
+    // present. PT_GNU_STACK (non-exec) is required so Linux does not fall
+    // back to READ_IMPLIES_EXEC and grant an executable stack (audit L9);
+    // the dynamic path already emits it.
+    let phnum =
+        3u64 + if has_tls { 1 } else { 0 } + if eh_hdr_idx.is_some() { 1 } else { 0 };
     let phsize = 56 * phnum;
     let mut cursor_file = ehsize + phsize;
     let mut cursor_vaddr = BASE_VADDR + cursor_file;
@@ -1752,7 +1777,7 @@ pub fn link_static_exec(
     image[4] = 2; // 64-bit
     image[5] = 1; // little-endian
     image[6] = 1; // EV_CURRENT
-    image[7] = if cfg!(target_os = "freebsd") { 9 } else { 0 };
+    image[7] = host_osabi();
     image[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
     image[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
     image[20..24].copy_from_slice(&1u32.to_le_bytes());
@@ -1819,6 +1844,9 @@ pub fn link_static_exec(
             4,
         ));
     }
+    // Non-executable stack marker (RW, no PF_X). Its absence makes Linux
+    // grant an executable stack via READ_IMPLIES_EXEC.
+    ph.extend(phdr(PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0));
     image[64..64 + ph.len()].copy_from_slice(&ph);
 
     // Section bytes.
@@ -2654,7 +2682,7 @@ pub fn link_dynamic_exec(
     image[4] = 2;
     image[5] = 1;
     image[6] = 1;
-    image[7] = if cfg!(target_os = "freebsd") { 9 } else { 0 };
+    image[7] = host_osabi();
     image[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
     image[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
     image[20..24].copy_from_slice(&1u32.to_le_bytes());

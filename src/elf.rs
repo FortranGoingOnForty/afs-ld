@@ -265,13 +265,22 @@ fn ru64(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-fn cstr(tab: &[u8], off: usize) -> String {
+fn cstr(tab: &[u8], off: usize, name: &str, table: &str) -> Result<String, ElfError> {
+    if off >= tab.len() {
+        return err(format!(
+            "{}: {} string offset {:#x} out of range (table size {:#x})",
+            name,
+            table,
+            off,
+            tab.len()
+        ));
+    }
     let end = tab[off..]
         .iter()
         .position(|&c| c == 0)
         .map(|p| off + p)
         .unwrap_or(tab.len());
-    String::from_utf8_lossy(&tab[off..end]).into_owned()
+    Ok(String::from_utf8_lossy(&tab[off..end]).into_owned())
 }
 
 /// Parse an ET_REL object. Section indices in symbols are remapped to
@@ -331,7 +340,7 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
     for i in 0..shnum {
         let h = sh(i);
         raws.push(Raw {
-            name: cstr(shstr, ru32(h, 0) as usize),
+            name: cstr(shstr, ru32(h, 0) as usize, name, "section-header string table")?,
             sh_type: ru32(h, 4),
             flags: ru64(h, 8),
             off: ru64(h, 24) as usize,
@@ -399,7 +408,7 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
             let e = &bytes[r.off + k * 24..r.off + (k + 1) * 24];
             let shndx = ru16(e, 6);
             symbols.push(Symbol {
-                name: cstr(strdat, ru32(e, 0) as usize),
+                name: cstr(strdat, ru32(e, 0) as usize, name, ".strtab")?,
                 bind: e[4] >> 4,
                 typ: e[4] & 0xf,
                 shndx,
@@ -534,7 +543,7 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
                 break;
             }
             if tag == DT_SONAME {
-                soname = cstr(dynstr, ru64(e, 8) as usize);
+                soname = cstr(dynstr, ru64(e, 8) as usize, name, ".dynstr")?;
             }
         }
     }
@@ -558,7 +567,7 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
             let ndx = ru16(&bytes[p..], 4);
             if cnt >= 1 && p + aux + 8 <= end {
                 let vda_name = ru32(&bytes[p + aux..], 0) as usize;
-                verdef_names.insert(ndx, cstr(dynstr, vda_name));
+                verdef_names.insert(ndx, cstr(dynstr, vda_name, name, ".dynstr")?);
             }
             if vd_next == 0 {
                 break;
@@ -583,7 +592,7 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
         let shndx = ru16(e, 6);
         let bind = e[4] >> 4;
         let typ = e[4] & 0xf;
-        let nm = cstr(dynstr, ru32(e, 0) as usize);
+        let nm = cstr(dynstr, ru32(e, 0) as usize, name, ".dynstr")?;
         if nm.is_empty() {
             continue;
         }

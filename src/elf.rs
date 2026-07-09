@@ -1543,15 +1543,13 @@ pub fn link_static_exec(
         ))
     };
 
-    // TLS reference -> TP-relative offset (tpoff). Undefined-weak TLS is
-    // not meaningful; treat it as an error.
+    // TLS reference -> TP-relative offset (tpoff). GNU ld resolves
+    // undefined weak TLS local-exec references to zero; glibc uses this
+    // for optional locale TLS state in static links.
     let tls_offset = |oi: usize, si: usize| -> Result<i64, ElfError> {
-        let (doi, dsi) = resolve_def(oi, si)?.ok_or_else(|| {
-            ElfError(format!(
-                "TLS relocation against undefined symbol in {}",
-                objects[oi].name
-            ))
-        })?;
+        let Some((doi, dsi)) = resolve_def(oi, si)? else {
+            return Ok(0);
+        };
         let d = &objects[doi].symbols[dsi];
         let sec = d
             .section
@@ -1933,9 +1931,23 @@ pub fn link_static_exec(
     // ---- Apply relocations into the merged section bytes.
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
-            // TLS sections form the PT_TLS image and are not in the
-            // normal placement map; they carry no relocations we apply.
-            let Some(&(out_idx, base)) = place.get(&(oi, si)) else {
+            let (out_idx, base) = if let Some(&placed) = place.get(&(oi, si)) {
+                placed
+            } else if sec.sh_flags & SHF_TLS != 0 && sec.sh_type != SHT_NOBITS {
+                let out_idx = tls_out.ok_or_else(|| {
+                    ElfError(format!(
+                        "relocations in TLS section '{}' ({}) have no PT_TLS image",
+                        sec.name, obj.name
+                    ))
+                })?;
+                let base = *tls_place.get(&(oi, si)).ok_or_else(|| {
+                    ElfError(format!(
+                        "TLS section '{}' ({}) is unplaced",
+                        sec.name, obj.name
+                    ))
+                })?;
+                (out_idx, base)
+            } else {
                 if !sec.relas.is_empty() {
                     return err(format!(
                         "relocations in unplaced section '{}' ({}) are unsupported",
@@ -3127,7 +3139,23 @@ pub fn link_dynamic_exec(
     // ---- Apply relocations into the merged section bytes.
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
-            let Some(&(out_idx, base)) = place.get(&(oi, si)) else {
+            let (out_idx, base) = if let Some(&placed) = place.get(&(oi, si)) {
+                placed
+            } else if sec.sh_flags & SHF_TLS != 0 && sec.sh_type != SHT_NOBITS {
+                let out_idx = tls_out.ok_or_else(|| {
+                    ElfError(format!(
+                        "relocations in TLS section '{}' ({}) have no PT_TLS image",
+                        sec.name, obj.name
+                    ))
+                })?;
+                let base = *tls_place.get(&(oi, si)).ok_or_else(|| {
+                    ElfError(format!(
+                        "TLS section '{}' ({}) is unplaced",
+                        sec.name, obj.name
+                    ))
+                })?;
+                (out_idx, base)
+            } else {
                 if !sec.relas.is_empty() {
                     return err(format!(
                         "relocations in unplaced section '{}' ({}) are unsupported",

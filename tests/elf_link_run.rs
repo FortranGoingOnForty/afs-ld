@@ -542,6 +542,93 @@ fn tls_local_exec_and_initial_exec_read_back() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Relocations in the initialized TLS image are applied before PT_TLS is
+/// emitted. glibc's static `malloc.o` has this shape: `.tdata` contains
+/// an absolute pointer into `.rodata`.
+#[test]
+fn tls_initial_image_applies_absolute_relocations() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=tls_initial_image_applies_absolute_relocations count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_tls_rela_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let obj = dir.join("t.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n    movl ${exit_nr}, %eax\n    xorl %edi, %edi\n    syscall\n.section .rodata,\"a\",@progbits\n.globl target\ntarget:\n    .quad 0x1122334455667788\n.section .tdata,\"awT\",@progbits\n.globl tptr\ntptr:\n    .quad target\n"
+        ),
+        &dir.join("t.s"),
+        &obj,
+    );
+
+    let out = dir.join("t");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let img = std::fs::read(&out).unwrap();
+    let target = section_addr(&img, ".rodata").expect(".rodata section");
+    let tdata = section_bytes(&img, ".tdata").expect(".tdata section");
+    assert!(
+        tdata.len() >= 8,
+        ".tdata should hold relocated pointer, got {} bytes",
+        tdata.len()
+    );
+    let got = u64::from_le_bytes(tdata[0..8].try_into().unwrap());
+    assert_eq!(got, target, ".tdata pointer initializer");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Undefined weak TLS local-exec references resolve to offset zero.
+/// glibc's static locale objects use this for optional per-category TLS
+/// state, and GNU ld accepts the link.
+#[test]
+fn tls_undefined_weak_local_exec_links() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=tls_undefined_weak_local_exec_links count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_tls_weak_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let obj = dir.join("weak.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n.weak missing\n.type missing,@tls_object\n_start:\n    movl %fs:missing@tpoff, %edi\n    movl ${exit_nr}, %eax\n    syscall\n"
+        ),
+        &dir.join("weak.s"),
+        &obj,
+    );
+
+    let out = dir.join("weak");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// TLS general-dynamic (TLSGD) and local-dynamic (TLSLD+DTPOFF32) call
 /// sequences relax to local-exec in place — no `__tls_get_addr` needed.
 /// Each computes &tvar, stores 42, reads it back.
@@ -1534,8 +1621,8 @@ fn find_phdr(img: &[u8], p_type: u32) -> Option<(u64, u64, u64)> {
     None
 }
 
-/// The `sh_addr` of a named ELF64 section, or None.
-fn section_addr(img: &[u8], name: &str) -> Option<u64> {
+/// `(sh_addr, sh_offset, sh_size)` of a named ELF64 section, or None.
+fn section_info(img: &[u8], name: &str) -> Option<(u64, u64, u64)> {
     let rd16 = |o: usize| u16::from_le_bytes(img[o..o + 2].try_into().unwrap());
     let rd32 = |o: usize| u32::from_le_bytes(img[o..o + 4].try_into().unwrap());
     let rd64 = |o: usize| u64::from_le_bytes(img[o..o + 8].try_into().unwrap());
@@ -1549,10 +1636,23 @@ fn section_addr(img: &[u8], name: &str) -> Option<u64> {
         let noff = shstr_off + rd32(sh) as usize;
         let end = img[noff..].iter().position(|&b| b == 0).unwrap();
         if &img[noff..noff + end] == name.as_bytes() {
-            return Some(rd64(sh + 16));
+            return Some((rd64(sh + 16), rd64(sh + 24), rd64(sh + 32)));
         }
     }
     None
+}
+
+/// The `sh_addr` of a named ELF64 section, or None.
+fn section_addr(img: &[u8], name: &str) -> Option<u64> {
+    section_info(img, name).map(|(addr, _, _)| addr)
+}
+
+/// File-backed bytes of a named ELF64 section, or None.
+fn section_bytes<'a>(img: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let (_, off, size) = section_info(img, name)?;
+    let start = off as usize;
+    let end = start.checked_add(size as usize)?;
+    img.get(start..end)
 }
 
 /// Audit T1: `--eh-frame-hdr` must synthesize `.eh_frame_hdr` +

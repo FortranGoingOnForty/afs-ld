@@ -147,12 +147,16 @@ fn main() -> ExitCode {
 /// inputs is preserved. GNU ld resolves archives left-to-right, so
 /// `pmain.o -lb ./liba.a` searches `libb` before `liba`; keeping a single
 /// ordered list (rather than draining all positional files before all
-/// `-l` requests) is what makes that ordering hold (audit L3).
+/// `-l` requests) is what makes that ordering hold.
 enum LinkInput {
     /// A positional path: an object, an archive, or a shared object.
     File(std::path::PathBuf),
     /// A `-lfoo` request, resolved against the search dirs in link order.
     Lib(String),
+    /// Start a repeated archive search group.
+    GroupStart,
+    /// End a repeated archive search group.
+    GroupEnd,
 }
 
 /// Detect and run the ELF link path. Returns None when no input is
@@ -188,12 +192,12 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
             // PT_GNU_EH_FRAME (GNU semantics: emitted only when asked).
             "--eh-frame-hdr" => eh_frame_hdr = true,
             "--no-eh-frame-hdr" => eh_frame_hdr = false,
-            // Flags we honor or safely ignore. Group markers are no-ops
-            // (selection iterates to a global fixed point); -static and a
-            // target emulation are the expected mode.
-            "-static" | "-Bstatic" | "-Bdynamic" | "--start-group" | "--end-group" | "-("
-            | "-)" | "-melf_x86_64" | "-znow" | "--no-as-needed" | "--as-needed"
-            | "--gc-sections" => {}
+            "--start-group" | "-(" => link_inputs.push(LinkInput::GroupStart),
+            "--end-group" | "-)" => link_inputs.push(LinkInput::GroupEnd),
+            // Flags we honor or safely ignore. -static and a target
+            // emulation are the expected mode.
+            "-static" | "-Bstatic" | "-Bdynamic" | "-melf_x86_64" | "-znow" | "--no-as-needed"
+            | "--as-needed" | "--gc-sections" => {}
             "-m" => {
                 it.next();
             }
@@ -371,7 +375,17 @@ fn collect_script_inputs(
     let mut i = 0;
     while i < tokens.len() {
         match tokens[i].as_str() {
-            "GROUP" | "INPUT" | "AS_NEEDED" => {
+            "GROUP" => {
+                if let Some((inner, next)) = parenthesized(tokens, i + 1) {
+                    out.push(LinkInput::GroupStart);
+                    collect_script_inputs(inner, script, lib_dirs, out);
+                    out.push(LinkInput::GroupEnd);
+                    i = next;
+                } else {
+                    i += 1;
+                }
+            }
+            "INPUT" | "AS_NEEDED" => {
                 if let Some((inner, next)) = parenthesized(tokens, i + 1) {
                     collect_script_inputs(inner, script, lib_dirs, out);
                     i = next;
@@ -417,7 +431,17 @@ fn linker_script_inputs(
     let mut i = 0;
     while i < tokens.len() {
         match tokens[i].as_str() {
-            "GROUP" | "INPUT" => {
+            "GROUP" => {
+                if let Some((inner, next)) = parenthesized(&tokens, i + 1) {
+                    out.push(LinkInput::GroupStart);
+                    collect_script_inputs(inner, script, lib_dirs, &mut out);
+                    out.push(LinkInput::GroupEnd);
+                    i = next;
+                } else {
+                    i += 1;
+                }
+            }
+            "INPUT" => {
                 if let Some((inner, next)) = parenthesized(&tokens, i + 1) {
                     collect_script_inputs(inner, script, lib_dirs, &mut out);
                     i = next;
@@ -434,16 +458,15 @@ fn linker_script_inputs(
 /// Static link: objects load eagerly, `ar` archives feed lazy member
 /// selection. `-lfoo` resolves to `libfoo.a`. Inputs are consumed in
 /// command-line order so archive symbol resolution matches GNU ld
-/// left-to-right (audit L3): the first archive that defines a symbol
-/// wins, and interleaving `-l` with positional archives is honored.
+/// left-to-right: the first eligible archive that defines a symbol wins,
+/// and interleaving `-l` with positional archives is honored.
 fn link_static(
     link_inputs: &[LinkInput],
     lib_dirs: &[std::path::PathBuf],
     eh_frame_hdr: bool,
     read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
 ) -> Result<Vec<u8>, ExitCode> {
-    let mut objects = Vec::new();
-    let mut libs: Vec<elf::Library> = Vec::new();
+    let mut inputs = Vec::new();
     for input in link_inputs {
         let p = match input {
             LinkInput::File(p) => p.clone(),
@@ -454,18 +477,26 @@ fn link_static(
                     return Err(ExitCode::from(1));
                 }
             },
+            LinkInput::GroupStart => {
+                inputs.push(elf::LinkInput::GroupStart);
+                continue;
+            }
+            LinkInput::GroupEnd => {
+                inputs.push(elf::LinkInput::GroupEnd);
+                continue;
+            }
         };
         let bytes = read_bytes(&p)?;
-        if bytes.starts_with(archive::AR_MAGIC) {
-            libs.push(elf::Library {
+        if bytes.starts_with(archive::AR_MAGIC) || bytes.starts_with(archive::AR_MAGIC_THIN) {
+            inputs.push(elf::LinkInput::Archive(elf::Library {
                 name: p.display().to_string(),
                 bytes,
-            });
+            }));
         } else {
-            objects.push(parse_object(&p, &bytes)?);
+            inputs.push(elf::LinkInput::Object(parse_object(&p, &bytes)?));
         }
     }
-    elf::link_static(objects, &libs, "_start", eh_frame_hdr).map_err(|e| {
+    elf::link_static(inputs, "_start", eh_frame_hdr).map_err(|e| {
         diag::error(&e.to_string());
         ExitCode::from(1)
     })
@@ -474,7 +505,7 @@ fn link_static(
 /// Dynamic link: objects load eagerly; `.a` inputs feed lazy member
 /// selection; `.so` inputs (positional, script-expanded, or from
 /// `-lfoo`) provide imports resolved at runtime. Inputs are consumed in
-/// command-line order (audit L3).
+/// command-line order.
 fn link_dynamic(
     link_inputs: &[LinkInput],
     lib_dirs: &[std::path::PathBuf],
@@ -482,20 +513,11 @@ fn link_dynamic(
     eh_frame_hdr: bool,
     read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
 ) -> Result<Vec<u8>, ExitCode> {
-    let mut objects = Vec::new();
-    let mut libs: Vec<elf::Library> = Vec::new();
-    let mut shared = Vec::new();
+    let mut inputs = Vec::new();
     for input in link_inputs {
-        push_dynamic_input(
-            input,
-            lib_dirs,
-            &read_bytes,
-            &mut objects,
-            &mut libs,
-            &mut shared,
-        )?;
+        push_dynamic_input(input, lib_dirs, &read_bytes, &mut inputs)?;
     }
-    elf::link_dynamic(objects, &libs, &shared, "_start", interp, eh_frame_hdr).map_err(|e| {
+    elf::link_dynamic(inputs, "_start", interp, eh_frame_hdr).map_err(|e| {
         diag::error(&e.to_string());
         ExitCode::from(1)
     })
@@ -509,9 +531,7 @@ fn push_dynamic_input(
     input: &LinkInput,
     lib_dirs: &[std::path::PathBuf],
     read_bytes: &impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
-    objects: &mut Vec<elf::ElfObject>,
-    libs: &mut Vec<elf::Library>,
-    shared: &mut Vec<elf::SharedLib>,
+    inputs: &mut Vec<elf::DynamicLinkInput>,
 ) -> Result<(), ExitCode> {
     let p = match input {
         LinkInput::File(p) => p.clone(),
@@ -522,42 +542,48 @@ fn push_dynamic_input(
                 return Err(ExitCode::from(1));
             }
         },
+        LinkInput::GroupStart => {
+            inputs.push(elf::DynamicLinkInput::GroupStart);
+            return Ok(());
+        }
+        LinkInput::GroupEnd => {
+            inputs.push(elf::DynamicLinkInput::GroupEnd);
+            return Ok(());
+        }
     };
-    push_dynamic_path(&p, lib_dirs, read_bytes, objects, libs, shared)
+    push_dynamic_path(&p, lib_dirs, read_bytes, inputs)
 }
 
 fn push_dynamic_path(
     p: &std::path::Path,
     lib_dirs: &[std::path::PathBuf],
     read_bytes: &impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
-    objects: &mut Vec<elf::ElfObject>,
-    libs: &mut Vec<elf::Library>,
-    shared: &mut Vec<elf::SharedLib>,
+    inputs: &mut Vec<elf::DynamicLinkInput>,
 ) -> Result<(), ExitCode> {
     let bytes = read_bytes(p)?;
     if bytes.starts_with(archive::AR_MAGIC) || bytes.starts_with(archive::AR_MAGIC_THIN) {
-        libs.push(elf::Library {
+        inputs.push(elf::DynamicLinkInput::Archive(elf::Library {
             name: p.display().to_string(),
             bytes,
-        });
+        }));
         return Ok(());
     }
     if bytes.len() >= 18 && &bytes[0..4] == b"\x7fELF" {
         // ET_DYN (e_type == 3) is a shared object; otherwise a relocatable.
         if bytes[16] == 3 && bytes[17] == 0 {
-            shared.push(parse_shared_lib(p, &bytes)?);
+            inputs.push(elf::DynamicLinkInput::Shared(parse_shared_lib(p, &bytes)?));
         } else {
-            objects.push(parse_object(p, &bytes)?);
+            inputs.push(elf::DynamicLinkInput::Object(parse_object(p, &bytes)?));
         }
         return Ok(());
     }
-    if let Some(inputs) = linker_script_inputs(p, &bytes, lib_dirs) {
-        for input in inputs {
-            push_dynamic_input(&input, lib_dirs, read_bytes, objects, libs, shared)?;
+    if let Some(script_inputs) = linker_script_inputs(p, &bytes, lib_dirs) {
+        for input in script_inputs {
+            push_dynamic_input(&input, lib_dirs, read_bytes, inputs)?;
         }
         return Ok(());
     }
-    objects.push(parse_object(p, &bytes)?);
+    inputs.push(elf::DynamicLinkInput::Object(parse_object(p, &bytes)?));
     Ok(())
 }
 

@@ -749,6 +749,48 @@ pub struct Library {
     pub bytes: Vec<u8>,
 }
 
+/// Ordered static-link input. Objects load when encountered; archives
+/// are searched lazily against the undefined set that exists at that
+/// point. Group markers request GNU ld-style repeated scans within the
+/// delimited range.
+pub enum LinkInput {
+    Object(ElfObject),
+    Archive(Library),
+    GroupStart,
+    GroupEnd,
+}
+
+/// Ordered dynamic-link input. Shared libraries contribute their exports
+/// only when encountered, so earlier archives are not suppressed by later
+/// `.so` files.
+pub enum DynamicLinkInput {
+    Object(ElfObject),
+    Archive(Library),
+    Shared(SharedLib),
+    GroupStart,
+    GroupEnd,
+}
+
+struct ArchiveInput {
+    lib: Library,
+    pulled: HashSet<usize>,
+}
+
+enum StaticInput {
+    Object(Option<ElfObject>),
+    Archive(ArchiveInput),
+    GroupStart,
+    GroupEnd,
+}
+
+enum DynamicInput {
+    Object(Option<ElfObject>),
+    Archive(ArchiveInput),
+    Shared(Option<SharedLib>),
+    GroupStart,
+    GroupEnd,
+}
+
 /// The base of a versioned symbol name (`foo@V` or `foo@@V` -> `foo`);
 /// `None` for an unversioned name.
 fn version_base(name: &str) -> Option<&str> {
@@ -1056,70 +1098,156 @@ fn resolve_globals(objects: &[ElfObject]) -> Result<HashMap<String, (usize, usiz
     Ok(globals)
 }
 
-/// Link relocatable objects plus library archives into a static
-/// ET_EXEC. Explicit objects load unconditionally, in order; archive
-/// members load lazily, pulled to satisfy strong-undefined symbols and
-/// iterated to a fixed point (global `--start-group` semantics, so
-/// mutually-referencing archives resolve regardless of order). The
-/// first archive to define a symbol wins.
-pub fn link_static(
-    mut objects: Vec<ElfObject>,
-    libs: &[Library],
-    entry: &str,
-    eh_frame_hdr: bool,
-) -> Result<Vec<u8>, ElfError> {
+fn static_state(input: LinkInput) -> StaticInput {
+    match input {
+        LinkInput::Object(obj) => StaticInput::Object(Some(obj)),
+        LinkInput::Archive(lib) => StaticInput::Archive(ArchiveInput {
+            lib,
+            pulled: HashSet::new(),
+        }),
+        LinkInput::GroupStart => StaticInput::GroupStart,
+        LinkInput::GroupEnd => StaticInput::GroupEnd,
+    }
+}
+
+fn dynamic_state(input: DynamicLinkInput) -> DynamicInput {
+    match input {
+        DynamicLinkInput::Object(obj) => DynamicInput::Object(Some(obj)),
+        DynamicLinkInput::Archive(lib) => DynamicInput::Archive(ArchiveInput {
+            lib,
+            pulled: HashSet::new(),
+        }),
+        DynamicLinkInput::Shared(lib) => DynamicInput::Shared(Some(lib)),
+        DynamicLinkInput::GroupStart => DynamicInput::GroupStart,
+        DynamicLinkInput::GroupEnd => DynamicInput::GroupEnd,
+    }
+}
+
+fn add_object(obj: ElfObject, objects: &mut Vec<ElfObject>, defined: &mut HashSet<String>) {
+    defined_names(&obj, defined);
+    objects.push(obj);
+}
+
+fn scan_archive(
+    input: &mut ArchiveInput,
+    objects: &mut Vec<ElfObject>,
+    defined: &mut HashSet<String>,
+    mode: &str,
+) -> Result<bool, ElfError> {
     use crate::archive::Archive as ArContainer;
 
-    let archives: Vec<ArContainer> = libs
-        .iter()
-        .map(|l| {
-            ArContainer::open(l.name.clone(), &l.bytes)
-                .map_err(|e| ElfError(format!("{}: {}", l.name, e)))
-        })
-        .collect::<Result<_, _>>()?;
-
-    let mut defined: HashSet<String> = HashSet::new();
-    for obj in &objects {
-        defined_names(obj, &mut defined);
-    }
-    let mut pulled: Vec<HashSet<usize>> = vec![HashSet::new(); archives.len()];
-
+    let archive = ArContainer::open(input.lib.name.clone(), &input.lib.bytes)
+        .map_err(|e| ElfError(format!("{}: {}", input.lib.name, e)))?;
+    let mut pulled_any = false;
     loop {
-        let demand = undefined_demand(&objects, &defined);
+        let demand = undefined_demand(objects, defined);
         let mut changed = false;
         for name in &demand {
-            for (ai, ar) in archives.iter().enumerate() {
-                let Some(off) = armap_offset(ar, name) else {
-                    continue;
-                };
-                // First archive to define the symbol wins; stop scanning
-                // once found whether or not its member is freshly pulled.
-                if pulled[ai].insert(off as usize) {
-                    let member = ar.member_at_offset(off).ok_or_else(|| {
-                        ElfError(format!(
-                            "{}: symbol index points at offset {:#x} with no member",
-                            libs[ai].name, off
-                        ))
-                    })?;
-                    if member.body.is_empty() {
-                        return err(format!(
-                            "{}({}): thin-archive members are out of scope for ELF static linking",
-                            libs[ai].name, member.name
-                        ));
-                    }
-                    let logical = format!("{}({})", libs[ai].name, member.name);
-                    let obj = parse_rel(&logical, member.body)?;
-                    defined_names(&obj, &mut defined);
-                    objects.push(obj);
-                    changed = true;
-                }
-                break;
+            let Some(off) = armap_offset(&archive, name) else {
+                continue;
+            };
+            if !input.pulled.insert(off as usize) {
+                continue;
             }
+            let member = archive.member_at_offset(off).ok_or_else(|| {
+                ElfError(format!(
+                    "{}: symbol index points at offset {:#x} with no member",
+                    input.lib.name, off
+                ))
+            })?;
+            if member.body.is_empty() {
+                return err(format!(
+                    "{}({}): thin-archive members are out of scope for ELF {} linking",
+                    input.lib.name, member.name, mode
+                ));
+            }
+            let logical = format!("{}({})", input.lib.name, member.name);
+            let obj = parse_rel(&logical, member.body)?;
+            add_object(obj, objects, defined);
+            changed = true;
+            pulled_any = true;
         }
         if !changed {
             break;
         }
     }
+    Ok(pulled_any)
+}
+
+fn find_static_group_end(
+    inputs: &[StaticInput],
+    start: usize,
+    end: usize,
+) -> Result<usize, ElfError> {
+    let mut depth = 0usize;
+    for (i, input) in inputs.iter().enumerate().take(end).skip(start) {
+        match input {
+            StaticInput::GroupStart => depth += 1,
+            StaticInput::GroupEnd if depth == 0 => return Ok(i),
+            StaticInput::GroupEnd => depth -= 1,
+            _ => {}
+        }
+    }
+    err("ELF link has --start-group without matching --end-group")
+}
+
+fn process_static_range(
+    inputs: &mut [StaticInput],
+    start: usize,
+    end: usize,
+    objects: &mut Vec<ElfObject>,
+    defined: &mut HashSet<String>,
+) -> Result<bool, ElfError> {
+    let mut changed = false;
+    let mut i = start;
+    while i < end {
+        if matches!(inputs[i], StaticInput::GroupStart) {
+            let group_end = find_static_group_end(inputs, i + 1, end)?;
+            loop {
+                let pass_changed =
+                    process_static_range(inputs, i + 1, group_end, objects, defined)?;
+                if !pass_changed {
+                    break;
+                }
+                changed = true;
+            }
+            i = group_end + 1;
+            continue;
+        }
+        if matches!(inputs[i], StaticInput::GroupEnd) {
+            return err("ELF link has --end-group without matching --start-group");
+        }
+        match &mut inputs[i] {
+            StaticInput::Object(obj) => {
+                if let Some(obj) = obj.take() {
+                    add_object(obj, objects, defined);
+                    changed = true;
+                }
+            }
+            StaticInput::Archive(archive) => {
+                changed |= scan_archive(archive, objects, defined, "static")?;
+            }
+            StaticInput::GroupStart | StaticInput::GroupEnd => unreachable!(),
+        }
+        i += 1;
+    }
+    Ok(changed)
+}
+
+/// Link ordered objects and library archives into a static ET_EXEC.
+/// Explicit objects load when encountered; archives are searched once
+/// left-to-right unless bracketed by group markers, where the group is
+/// rescanned until no new members are needed.
+pub fn link_static(
+    inputs: Vec<LinkInput>,
+    entry: &str,
+    eh_frame_hdr: bool,
+) -> Result<Vec<u8>, ElfError> {
+    let mut inputs: Vec<StaticInput> = inputs.into_iter().map(static_state).collect();
+    let mut objects = Vec::new();
+    let mut defined = HashSet::new();
+    let end = inputs.len();
+    process_static_range(&mut inputs, 0, end, &mut objects, &mut defined)?;
 
     link_static_exec(&objects, entry, eh_frame_hdr)
 }
@@ -2046,73 +2174,91 @@ fn elf_hash(name: &[u8]) -> u32 {
     h
 }
 
-/// Link relocatable objects into a dynamically-linked ET_EXEC that runs
-/// under `interp`, importing undefined functions from `shared`. Rung-3a
-/// scope: non-PIE, eager binding, function imports via PLT/JUMP_SLOT —
-/// no data imports (GLOB_DAT), TLS, or symbol versioning yet.
+fn find_dynamic_group_end(
+    inputs: &[DynamicInput],
+    start: usize,
+    end: usize,
+) -> Result<usize, ElfError> {
+    let mut depth = 0usize;
+    for (i, input) in inputs.iter().enumerate().take(end).skip(start) {
+        match input {
+            DynamicInput::GroupStart => depth += 1,
+            DynamicInput::GroupEnd if depth == 0 => return Ok(i),
+            DynamicInput::GroupEnd => depth -= 1,
+            _ => {}
+        }
+    }
+    err("ELF link has --start-group without matching --end-group")
+}
+
+fn process_dynamic_range(
+    inputs: &mut [DynamicInput],
+    start: usize,
+    end: usize,
+    objects: &mut Vec<ElfObject>,
+    defined: &mut HashSet<String>,
+    shared: &mut Vec<SharedLib>,
+) -> Result<bool, ElfError> {
+    let mut changed = false;
+    let mut i = start;
+    while i < end {
+        if matches!(inputs[i], DynamicInput::GroupStart) {
+            let group_end = find_dynamic_group_end(inputs, i + 1, end)?;
+            loop {
+                let pass_changed =
+                    process_dynamic_range(inputs, i + 1, group_end, objects, defined, shared)?;
+                if !pass_changed {
+                    break;
+                }
+                changed = true;
+            }
+            i = group_end + 1;
+            continue;
+        }
+        if matches!(inputs[i], DynamicInput::GroupEnd) {
+            return err("ELF link has --end-group without matching --start-group");
+        }
+        match &mut inputs[i] {
+            DynamicInput::Object(obj) => {
+                if let Some(obj) = obj.take() {
+                    add_object(obj, objects, defined);
+                    changed = true;
+                }
+            }
+            DynamicInput::Archive(archive) => {
+                changed |= scan_archive(archive, objects, defined, "dynamic")?;
+            }
+            DynamicInput::Shared(lib) => {
+                if let Some(lib) = lib.take() {
+                    defined.extend(lib.exports.keys().cloned());
+                    shared.push(lib);
+                    changed = true;
+                }
+            }
+            DynamicInput::GroupStart | DynamicInput::GroupEnd => unreachable!(),
+        }
+        i += 1;
+    }
+    Ok(changed)
+}
+
+/// Link ordered inputs into a dynamically-linked ET_EXEC that runs under
+/// `interp`. Archives are searched at their command-line position and
+/// shared libraries satisfy imports only after they are encountered.
 pub fn link_dynamic(
-    mut objects: Vec<ElfObject>,
-    libs: &[Library],
-    shared: &[SharedLib],
+    inputs: Vec<DynamicLinkInput>,
     entry: &str,
     interp: &str,
     eh_frame_hdr: bool,
 ) -> Result<Vec<u8>, ElfError> {
-    use crate::archive::Archive as ArContainer;
+    let mut inputs: Vec<DynamicInput> = inputs.into_iter().map(dynamic_state).collect();
+    let mut objects = Vec::new();
+    let mut defined = HashSet::new();
+    let mut shared = Vec::new();
+    let end = inputs.len();
+    process_dynamic_range(&mut inputs, 0, end, &mut objects, &mut defined, &mut shared)?;
 
-    let archives: Vec<ArContainer> = libs
-        .iter()
-        .map(|l| {
-            ArContainer::open(l.name.clone(), &l.bytes)
-                .map_err(|e| ElfError(format!("{}: {}", l.name, e)))
-        })
-        .collect::<Result<_, _>>()?;
-
-    let mut defined: HashSet<String> = HashSet::new();
-    for obj in &objects {
-        defined_names(obj, &mut defined);
-    }
-    for lib in shared {
-        defined.extend(lib.exports.keys().cloned());
-    }
-
-    let mut pulled: Vec<HashSet<usize>> = vec![HashSet::new(); archives.len()];
-    loop {
-        let demand = undefined_demand(&objects, &defined);
-        let mut changed = false;
-        for name in &demand {
-            for (ai, ar) in archives.iter().enumerate() {
-                let Some(off) = armap_offset(ar, name) else {
-                    continue;
-                };
-                if pulled[ai].insert(off as usize) {
-                    let member = ar.member_at_offset(off).ok_or_else(|| {
-                        ElfError(format!(
-                            "{}: symbol index points at offset {:#x} with no member",
-                            libs[ai].name, off
-                        ))
-                    })?;
-                    if member.body.is_empty() {
-                        return err(format!(
-                            "{}({}): thin-archive members are out of scope for ELF dynamic linking",
-                            libs[ai].name, member.name
-                        ));
-                    }
-                    let logical = format!("{}({})", libs[ai].name, member.name);
-                    let obj = parse_rel(&logical, member.body)?;
-                    defined_names(&obj, &mut defined);
-                    objects.push(obj);
-                    changed = true;
-                }
-                break;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    link_dynamic_exec(&objects, shared, entry, interp, eh_frame_hdr)
+    link_dynamic_exec(&objects, &shared, entry, interp, eh_frame_hdr)
 }
 
 pub fn link_dynamic_exec(

@@ -148,6 +148,87 @@ fn freestanding_exit42_matches_system_linkers() {
 }
 
 #[test]
+fn common_symbols_allocate_zeroed_bss_in_static_and_dynamic_links() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=common_symbols_allocate_zeroed_bss_in_static_and_dynamic_links count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_common_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(
+            ".comm shared,16,16\n\
+             .text\n\
+             .globl _start\n\
+             .type _start,@function\n\
+             _start:\n\
+                 movl shared(%rip), %eax\n\
+                 testl %eax, %eax\n\
+                 jne 1f\n\
+                 movl $42, shared(%rip)\n\
+                 movl shared(%rip), %edi\n\
+                 jmp 2f\n\
+             1:  movl $7, %edi\n\
+             2:  movl ${exit_nr}, %eax\n\
+                 syscall\n\
+             .size _start,.-_start\n"
+        ),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+
+    let static_out = dir.join("common_static");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&static_out)
+        .arg(&main_obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld static COMMON: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let run = Command::new(&static_out).output().unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "static COMMON exe exit: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    if let Some(interp) = rtld() {
+        let dynamic_out = dir.join("common_dynamic");
+        let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .args(["--dynamic-linker", interp, "-o"])
+            .arg(&dynamic_out)
+            .arg(&main_obj)
+            .output()
+            .unwrap();
+        assert!(
+            r.status.success(),
+            "afs-ld dynamic COMMON: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let run = Command::new(&dynamic_out).output().unwrap();
+        assert_eq!(
+            run.status.code(),
+            Some(42),
+            "dynamic COMMON exe exit: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    } else {
+        eprintln!("skipping dynamic COMMON leg: no standard dynamic loader on this host");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn static_ehdr_start_resolves_to_image_base() {
     let Some(gas) = gas() else {
         eprintln!("\nHARNESS_SKIP suite=elf_link_run test=static_ehdr_start_resolves_to_image_base count=1 reason=\"no GNU assembler on this host\"");
@@ -1203,6 +1284,92 @@ fn dynamic_executable_calls_shared_answer_through_plt() {
         std::fs::read(&out1).unwrap(),
         std::fs::read(&out3).unwrap(),
         "dynamic link must be byte-deterministic"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// GNU IFUNC exports are callable function imports too. glibc exposes
+/// optimized routines such as memcpy/memset this way; treating them as
+/// data imports sends ordinary PLT calls down the COPY-relocation error
+/// path.
+#[test]
+fn dynamic_executable_calls_shared_ifunc_through_plt() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_calls_shared_ifunc_through_plt count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let Some(ld) = system_ld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_calls_shared_ifunc_through_plt count=1 reason=\"no system ld to build the reference .so\"");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_calls_shared_ifunc_through_plt count=1 reason=\"no standard dynamic loader on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_ifunc_dyn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    let answer_obj = dir.join("answer.o");
+    assemble(
+        &gas,
+        ".text\n\
+         .type answer_impl,@function\n\
+         answer_impl:\n\
+             movl $42, %eax\n\
+             ret\n\
+         .globl answer\n\
+         .type answer,@gnu_indirect_function\n\
+         answer:\n\
+             leaq answer_impl(%rip), %rax\n\
+             ret\n",
+        &dir.join("answer.s"),
+        &answer_obj,
+    );
+    let so = dir.join("libanswer.so.1");
+    let r = Command::new(&ld)
+        .args(["-shared", "-soname", "libanswer.so.1", "-o"])
+        .arg(&so)
+        .arg(&answer_obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "ld -shared: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n    call answer@plt\n    movl %eax, %edi\n    movl ${exit_nr}, %eax\n    syscall\n"
+        ),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+    let out = dir.join("ifunc_dyn");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&out)
+        .arg(&main_obj)
+        .arg(&so)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld IFUNC dynamic: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let run = Command::new(&out)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "IFUNC exe exit: {}",
+        String::from_utf8_lossy(&run.stderr)
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

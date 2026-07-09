@@ -682,7 +682,7 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
             nm,
             Export {
                 version,
-                func: typ == STT_FUNC,
+                func: typ == STT_FUNC || typ == STT_GNU_IFUNC,
             },
         );
     }
@@ -708,6 +708,10 @@ struct OutSec {
 
 /// (object index, section index) -> (output section, offset within it)
 type Placement = HashMap<(usize, usize), (usize, u64)>;
+
+/// (object index, symbol index) for an allocated SHN_COMMON definition
+/// -> (output section, offset within it).
+type CommonPlacement = HashMap<(usize, usize), (usize, u64)>;
 
 /// A synthesized GOT slot. `Addr` holds a symbol's final address
 /// (`None` = an unsatisfied weak reference, i.e. 0); `TpOff` holds a
@@ -1026,6 +1030,83 @@ fn undefined_demand(objects: &[ElfObject], defined: &HashSet<String>) -> Vec<Str
     demand
 }
 
+fn common_align(sym: &Symbol) -> u64 {
+    sym.value.max(1)
+}
+
+fn prefer_common_symbol(new_sym: &Symbol, old_sym: &Symbol) -> bool {
+    new_sym.size > old_sym.size
+        || (new_sym.size == old_sym.size && common_align(new_sym) > common_align(old_sym))
+}
+
+fn resolve_defined_identity(
+    objects: &[ElfObject],
+    globals: &HashMap<String, (usize, usize)>,
+    oi: usize,
+    si: usize,
+) -> (usize, usize) {
+    let sym = &objects[oi].symbols[si];
+    if sym.shndx == SHN_COMMON && sym.bind != STB_LOCAL {
+        globals.get(&sym.name).copied().unwrap_or((oi, si))
+    } else {
+        (oi, si)
+    }
+}
+
+fn ensure_common_bss(
+    outs: &mut Vec<OutSec>,
+    out_index: &mut HashMap<String, usize>,
+) -> Result<usize, ElfError> {
+    if let Some(&idx) = out_index.get(".bss") {
+        if !outs[idx].is_bss {
+            return err("section '.bss' is PROGBITS but COMMON allocation needs NOBITS .bss");
+        }
+        return Ok(idx);
+    }
+    outs.push(OutSec {
+        name: ".bss".to_string(),
+        flags: SHF_ALLOC | SHF_WRITE,
+        align: 1,
+        data: Vec::new(),
+        bss_size: 0,
+        vaddr: 0,
+        file_off: 0,
+        is_bss: true,
+    });
+    let idx = outs.len() - 1;
+    out_index.insert(".bss".to_string(), idx);
+    Ok(idx)
+}
+
+fn place_common_symbols(
+    objects: &[ElfObject],
+    globals: &HashMap<String, (usize, usize)>,
+    outs: &mut Vec<OutSec>,
+    out_index: &mut HashMap<String, usize>,
+) -> Result<CommonPlacement, ElfError> {
+    let mut common_place = HashMap::new();
+    let mut allocated = HashSet::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, sym) in obj.symbols.iter().enumerate() {
+            if sym.shndx != SHN_COMMON {
+                continue;
+            }
+            let def = resolve_defined_identity(objects, globals, oi, si);
+            if def != (oi, si) || !allocated.insert(def) {
+                continue;
+            }
+            let idx = ensure_common_bss(outs, out_index)?;
+            let align = common_align(sym);
+            let out = &mut outs[idx];
+            out.align = out.align.max(align);
+            let cursor = next_multiple(out.bss_size, align);
+            out.bss_size = cursor + sym.size;
+            common_place.insert(def, (idx, cursor));
+        }
+    }
+    Ok(common_place)
+}
+
 /// Resolve the defined globals across all input objects into
 /// `name -> (object index, symbol index)`.
 ///
@@ -1047,30 +1128,41 @@ fn resolve_globals(objects: &[ElfObject]) -> Result<HashMap<String, (usize, usiz
             if sym.name.is_empty() || sym.bind == STB_LOCAL || sym.shndx == SHN_UNDEF {
                 continue;
             }
-            if sym.shndx == SHN_COMMON {
-                return err(format!(
-                    "{}: COMMON symbol '{}' — COMMON allocation lands in rung 2",
-                    obj.name, sym.name
-                ));
-            }
             match globals.get(&sym.name) {
                 None => {
                     globals.insert(sym.name.clone(), (oi, si));
                 }
                 Some(&(poi, psi)) => {
                     let prev = &objects[poi].symbols[psi];
-                    match (prev.bind, sym.bind) {
-                        (STB_WEAK, STB_GLOBAL) => {
-                            globals.insert(sym.name.clone(), (oi, si));
+                    match (prev.shndx == SHN_COMMON, sym.shndx == SHN_COMMON) {
+                        (true, true) => {
+                            if prefer_common_symbol(sym, prev) {
+                                globals.insert(sym.name.clone(), (oi, si));
+                            }
                         }
-                        (STB_GLOBAL, STB_WEAK) => {}
-                        (STB_GLOBAL, STB_GLOBAL) => {
-                            return err(format!(
-                                "duplicate symbol '{}' in {} and {}",
-                                sym.name, objects[poi].name, obj.name
-                            ));
+                        (true, false) => {
+                            if sym.bind == STB_GLOBAL {
+                                globals.insert(sym.name.clone(), (oi, si));
+                            }
                         }
-                        _ => {}
+                        (false, true) => {
+                            if prev.bind == STB_WEAK {
+                                globals.insert(sym.name.clone(), (oi, si));
+                            }
+                        }
+                        (false, false) => match (prev.bind, sym.bind) {
+                            (STB_WEAK, STB_GLOBAL) => {
+                                globals.insert(sym.name.clone(), (oi, si));
+                            }
+                            (STB_GLOBAL, STB_WEAK) => {}
+                            (STB_GLOBAL, STB_GLOBAL) => {
+                                return err(format!(
+                                    "duplicate symbol '{}' in {} and {}",
+                                    sym.name, objects[poi].name, obj.name
+                                ));
+                            }
+                            _ => {}
+                        },
                     }
                 }
             }
@@ -1318,6 +1410,12 @@ pub fn link_static_exec(
         }
     }
 
+    // ---- Global symbol resolution and COMMON allocation. SHN_COMMON is
+    // a tentative definition: coalesced globally, then allocated as zeroed
+    // storage in .bss before layout.
+    let globals = resolve_globals(objects)?;
+    let common_place = place_common_symbols(objects, &globals, &mut outs, &mut out_index)?;
+
     // ---- Init/fini arrays: merge each kind priority-ordered into one
     // output section so __{init,fini,preinit}_array_{start,end} bracket
     // every constructor/destructor.
@@ -1422,17 +1520,13 @@ pub fn link_static_exec(
         None
     };
 
-    // ---- Global symbol resolution: weak/strong coalescing plus
-    // deterministic version aliasing (see resolve_globals).
-    let globals = resolve_globals(objects)?;
-
     // Reference -> definition identity. None means an unsatisfied weak
     // reference (address 0). Depends only on `globals`, so it is valid
     // before layout — the GOT pre-scan uses it.
     let resolve_def = |oi: usize, si: usize| -> Result<Option<(usize, usize)>, ElfError> {
         let sym = &objects[oi].symbols[si];
         if sym.shndx != SHN_UNDEF {
-            return Ok(Some((oi, si)));
+            return Ok(Some(resolve_defined_identity(objects, &globals, oi, si)));
         }
         if let Some(&d) = globals.get(&sym.name) {
             return Ok(Some(d));
@@ -1724,6 +1818,12 @@ pub fn link_static_exec(
         let d = &objects[doi].symbols[dsi];
         if d.shndx == SHN_ABS {
             return Ok(d.value);
+        }
+        if d.shndx == SHN_COMMON {
+            let &(out_idx, base) = common_place
+                .get(&(doi, dsi))
+                .ok_or_else(|| ElfError(format!("unplaced COMMON symbol '{}'", d.name)))?;
+            return Ok(out_vaddrs[out_idx] + base);
         }
         let sec = d
             .section
@@ -2317,6 +2417,12 @@ pub fn link_dynamic_exec(
         }
     }
 
+    // ---- Resolve defined globals: weak/strong coalescing plus
+    // deterministic version aliasing (see resolve_globals), then allocate
+    // coalesced COMMON storage into .bss before layout.
+    let globals = resolve_globals(objects)?;
+    let common_place = place_common_symbols(objects, &globals, &mut outs, &mut out_index)?;
+
     for base in [".preinit_array", ".init_array", ".fini_array"] {
         let mut parts: Vec<(u64, usize, usize, usize)> = Vec::new();
         for (oi, obj) in objects.iter().enumerate() {
@@ -2407,16 +2513,10 @@ pub fn link_dynamic_exec(
         None
     };
 
-    // ---- Resolve defined globals: weak/strong coalescing plus
-    // deterministic version aliasing (see resolve_globals). The old
-    // first-def-wins pass ignored binding, so a weak def shadowed a
-    // later strong one (audit L1).
-    let globals = resolve_globals(objects)?;
-
     let tls_def = |oi: usize, si: usize| -> Result<(usize, usize), ElfError> {
         let sym = &objects[oi].symbols[si];
         if sym.shndx != SHN_UNDEF {
-            return Ok((oi, si));
+            return Ok(resolve_defined_identity(objects, &globals, oi, si));
         }
         if let Some(&d) = globals.get(&sym.name) {
             return Ok(d);
@@ -2541,10 +2641,8 @@ pub fn link_dynamic_exec(
                 err(format!("undefined symbol '{}' (GOTPCREL)", sym.name))
             }
         } else {
-            Ok((
-                format!("d:{oi}:{}", r.sym),
-                GotSlot::Defined(oi, r.sym as usize),
-            ))
+            let (doi, dsi) = resolve_defined_identity(objects, &globals, oi, r.sym as usize);
+            Ok((format!("d:{doi}:{dsi}"), GotSlot::Defined(doi, dsi)))
         }
     };
     let mut got_slot_of: HashMap<String, usize> = HashMap::new();
@@ -2988,11 +3086,17 @@ pub fn link_dynamic_exec(
                 return err(format!("undefined symbol '{}'", sym.name));
             }
         } else {
-            (oi, si)
+            resolve_defined_identity(objects, &globals, oi, si)
         };
         let d = &objects[doi].symbols[dsi];
         if d.shndx == SHN_ABS {
             return Ok(d.value);
+        }
+        if d.shndx == SHN_COMMON {
+            let &(oidx, base) = common_place
+                .get(&(doi, dsi))
+                .ok_or_else(|| ElfError(format!("unplaced COMMON symbol '{}'", d.name)))?;
+            return Ok(out_vaddrs[oidx] + base);
         }
         let sec = d
             .section
@@ -3879,9 +3983,21 @@ mod resolve_globals_tests {
             bind,
             typ: 0,
             shndx,
-            section: if shndx == SHN_UNDEF { None } else { Some(0) },
+            section: if shndx == DEF { Some(0) } else { None },
             value: 0,
             size: 0,
+        }
+    }
+
+    fn common(name: &str, size: u64, align: u64) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            bind: STB_GLOBAL,
+            typ: STT_OBJECT,
+            shndx: SHN_COMMON,
+            section: None,
+            value: align,
+            size,
         }
     }
 
@@ -3918,6 +4034,34 @@ mod resolve_globals_tests {
             obj("b.o", vec![sym("foo", STB_GLOBAL, DEF)]),
         ];
         assert!(resolve_globals(&objs).is_err());
+    }
+
+    #[test]
+    fn strong_definition_beats_common() {
+        let objs = vec![
+            obj("a.o", vec![common("foo", 64, 16)]),
+            obj("b.o", vec![sym("foo", STB_GLOBAL, DEF)]),
+        ];
+        assert_eq!(resolve_globals(&objs).unwrap()["foo"], (1, 0));
+
+        let objs = vec![
+            obj("a.o", vec![sym("foo", STB_GLOBAL, DEF)]),
+            obj("b.o", vec![common("foo", 64, 16)]),
+        ];
+        assert_eq!(resolve_globals(&objs).unwrap()["foo"], (0, 0));
+    }
+
+    #[test]
+    fn common_coalesces_to_largest_size_then_alignment() {
+        let objs = vec![
+            obj("a.o", vec![common("foo", 8, 32)]),
+            obj("b.o", vec![common("foo", 16, 8)]),
+            obj("c.o", vec![common("bar", 8, 4)]),
+            obj("d.o", vec![common("bar", 8, 16)]),
+        ];
+        let globals = resolve_globals(&objs).unwrap();
+        assert_eq!(globals["foo"], (1, 0));
+        assert_eq!(globals["bar"], (3, 0));
     }
 
     #[test]

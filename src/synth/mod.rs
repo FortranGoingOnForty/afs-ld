@@ -213,9 +213,7 @@ impl SyntheticPlan {
                         if let Some(symbol_id) =
                             symbol_referent_id(obj, reloc.referent, sym_table, input_symbols)
                         {
-                            if tlv_symbol_needs_got(sym_table, symbol_id) {
-                                got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
-                            } else if tlv_symbol_needs_thread_pointer(sym_table, symbol_id) {
+                            if tlv_symbol_needs_thread_pointer(sym_table, symbol_id) {
                                 thread_pointers.intern(symbol_id);
                             }
                         }
@@ -258,7 +256,7 @@ impl SyntheticPlan {
             binder_symbol = Some(binder);
             needs_dyld_private = true;
         }
-        if !thread_pointers.entries.is_empty() || inputs_have_tlv_descriptors(inputs) {
+        if inputs_have_tlv_descriptors(inputs) {
             tlv_bootstrap_symbol = ensure_tlv_support(sym_table, dylibs)?;
         }
 
@@ -576,13 +574,6 @@ fn dylib_import_is_weak(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
 }
 
 fn tlv_symbol_needs_thread_pointer(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
-    matches!(
-        sym_table.get(symbol_id),
-        Symbol::LazyArchive { .. } | Symbol::LazyObject { .. }
-    )
-}
-
-fn tlv_symbol_needs_got(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
     matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. })
 }
 
@@ -1005,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_plan_routes_imported_tlvp_through_got() {
+    fn synthetic_plan_routes_imported_tlvp_through_thread_pointers() {
         let mut sym_table = SymbolTable::new();
         let name = sym_table.intern("_ext_tls");
         let input_id = InputId(0);
@@ -1073,9 +1064,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(plan.got.entries.len(), 1);
-        assert_eq!(plan.got.entries[0].symbol, import);
-        assert!(plan.thread_pointers.entries.is_empty());
+        assert!(plan.got.entries.is_empty());
+        assert_eq!(plan.thread_pointers.entries.len(), 1);
+        assert_eq!(plan.thread_pointers.entries[0].symbol, import);
         assert!(plan.direct_binds.is_empty());
         assert!(plan.tlv_bootstrap_symbol.is_none());
     }

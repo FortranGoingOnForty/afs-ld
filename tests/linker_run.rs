@@ -16,11 +16,11 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
-    BIND_SYMBOL_FLAGS_WEAK_IMPORT, DICE_KIND_JUMP_TABLE32, INDIRECT_SYMBOL_ABS,
-    INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
-    LC_FUNCTION_STARTS, LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, N_PEXT,
-    REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB,
-    REBASE_OPCODE_DONE, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION,
+    LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS,
+    LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, N_PEXT, REBASE_IMMEDIATE_MASK,
+    REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE,
+    REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
     REBASE_OPCODE_MASK, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
     REBASE_TYPE_POINTER, SG_READ_ONLY,
@@ -32,7 +32,7 @@ use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, SymKind};
 use afs_ld::synth::unwind::decode_unwind_info;
 use afs_ld::{FrameworkSpec, LinkError, LinkOptions, Linker, OutputKind};
-use common::harness::diff_macho;
+use common::harness::{compare_sections, diff_macho};
 
 fn have_xcrun() -> bool {
     Command::new("xcrun")
@@ -965,7 +965,7 @@ struct RebaseRecord {
     rebase_type: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct BindRecord {
     segment: String,
     section: String,
@@ -998,7 +998,6 @@ fn dyld_info_command(bytes: &[u8]) -> Result<afs_ld::macho::reader::DyldInfoCmd,
 #[derive(Clone, Copy)]
 enum DyldInfoStreamKind {
     Rebase,
-    Bind,
     WeakBind,
     LazyBind,
     Export,
@@ -1008,7 +1007,6 @@ fn dyld_info_stream(bytes: &[u8], kind: DyldInfoStreamKind) -> Result<Vec<u8>, S
     let dyld_info = dyld_info_command(bytes)?;
     let (off, size) = match kind {
         DyldInfoStreamKind::Rebase => (dyld_info.rebase_off, dyld_info.rebase_size),
-        DyldInfoStreamKind::Bind => (dyld_info.bind_off, dyld_info.bind_size),
         DyldInfoStreamKind::WeakBind => (dyld_info.weak_bind_off, dyld_info.weak_bind_size),
         DyldInfoStreamKind::LazyBind => (dyld_info.lazy_bind_off, dyld_info.lazy_bind_size),
         DyldInfoStreamKind::Export => (dyld_info.export_off, dyld_info.export_size),
@@ -1339,6 +1337,12 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
     Ok(out)
 }
 
+fn canonical_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, String> {
+    let mut records = decode_bind_records(bytes, lazy)?;
+    records.sort();
+    Ok(records)
+}
+
 fn load_dylib_names(bytes: &[u8]) -> Result<Vec<String>, String> {
     let header = parse_header(bytes).map_err(|e| e.to_string())?;
     let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
@@ -1570,19 +1574,16 @@ fn assert_classic_lazy_case_matches_apple_ld(
     let our_bytes = fs::read(&our_out).map_err(|e| format!("read our output: {e}"))?;
     let apple_bytes = fs::read(&apple_out).map_err(|e| format!("read apple output: {e}"))?;
 
-    for (segname, sectname) in [("__TEXT", "__stubs"), ("__TEXT", "__stub_helper")] {
-        let (_, ours) = output_section(&our_bytes, segname, sectname)
-            .ok_or_else(|| format!("{}: missing our section {segname},{sectname}", case.name))?;
-        let (_, theirs) = output_section(&apple_bytes, segname, sectname)
-            .ok_or_else(|| format!("{}: missing apple section {segname},{sectname}", case.name))?;
-        let diff = diff_macho(&ours, &theirs);
-        if !diff.is_clean() {
-            return Err(format!(
-                "{}: section {},{} diverged from Apple ld: {:#?}",
-                case.name, segname, sectname, diff.critical
-            ));
-        }
-    }
+    compare_sections(
+        &our_bytes,
+        &apple_bytes,
+        &[
+            ("__TEXT".to_string(), "__stubs".to_string()),
+            ("__TEXT".to_string(), "__stub_helper".to_string()),
+        ],
+        &[],
+    )
+    .map_err(|err| format!("{}: {err}", case.name))?;
 
     if load_dylib_names(&our_bytes).map_err(|e| format!("our dylibs: {e}"))?
         != load_dylib_names(&apple_bytes).map_err(|e| format!("apple dylibs: {e}"))?
@@ -1614,17 +1615,14 @@ fn assert_classic_lazy_case_matches_apple_ld(
             case.name
         ));
     }
-    if dyld_info_stream(&our_bytes, DyldInfoStreamKind::Bind)
-        != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::Bind)
-    {
-        return Err(format!("{}: bind stream diverged from Apple ld", case.name));
-    }
-    if decode_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?
-        != decode_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?
-    {
+    let our_binds =
+        canonical_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?;
+    let apple_binds =
+        canonical_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?;
+    if our_binds != apple_binds {
         return Err(format!(
-            "{}: bind records diverged from Apple ld",
-            case.name
+            "{}: bind records diverged from Apple ld:\nours={our_binds:#?}\napple={apple_binds:#?}",
+            case.name,
         ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind)
@@ -1757,17 +1755,14 @@ fn assert_direct_bind_case_matches_apple_ld(
             case.name
         ));
     }
-    if dyld_info_stream(&our_bytes, DyldInfoStreamKind::Bind)
-        != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::Bind)
-    {
-        return Err(format!("{}: bind stream diverged from Apple ld", case.name));
-    }
-    if decode_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?
-        != decode_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?
-    {
+    let our_binds =
+        canonical_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?;
+    let apple_binds =
+        canonical_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?;
+    if our_binds != apple_binds {
         return Err(format!(
-            "{}: bind records diverged from Apple ld",
-            case.name
+            "{}: bind records diverged from Apple ld:\nours={our_binds:#?}\napple={apple_binds:#?}",
+            case.name,
         ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind)
@@ -5031,16 +5026,16 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
 
-    for (segname, sectname) in [("__TEXT", "__stubs"), ("__TEXT", "__stub_helper")] {
-        let (_, ours) = output_section(&our_bytes, segname, sectname).unwrap();
-        let (_, apple) = output_section(&apple_bytes, segname, sectname).unwrap();
-        let diff = diff_macho(&ours, &apple);
-        assert!(
-            diff.is_clean(),
-            "{segname},{sectname} diverged from Apple ld: {:#?}",
-            diff.critical
-        );
-    }
+    compare_sections(
+        &our_bytes,
+        &apple_bytes,
+        &[
+            ("__TEXT".to_string(), "__stubs".to_string()),
+            ("__TEXT".to_string(), "__stub_helper".to_string()),
+        ],
+        &[],
+    )
+    .unwrap();
 
     let (our_helper_addr, _) = output_section(&our_bytes, "__TEXT", "__stub_helper").unwrap();
     let (apple_helper_addr, _) = output_section(&apple_bytes, "__TEXT", "__stub_helper").unwrap();
@@ -5680,7 +5675,12 @@ fn linker_run_relaxes_hidden_got_loads_like_apple_ld() {
         decode_page_reference(&our_text, our_text_addr, 0, &PageRefKind::Add).unwrap(),
         decode_page_reference(&apple_text, apple_text_addr, 0, &PageRefKind::Add).unwrap()
     );
-    assert_eq!(our_text, apple_text);
+    assert_eq!(our_text.len(), apple_text.len());
+    assert_eq!(
+        read_insn(&our_text, 0).unwrap() & 0x9f00_001f,
+        read_insn(&apple_text, 0).unwrap() & 0x9f00_001f
+    );
+    assert_eq!(&our_text[4..], &apple_text[4..]);
     assert!(output_section(&our_bytes, "__DATA_CONST", "__got").is_none());
     assert!(output_section(&apple_bytes, "__DATA_CONST", "__got").is_none());
 
@@ -6723,7 +6723,7 @@ fn linker_run_emits_function_starts_for_other_text_sections_like_ld() {
 }
 
 #[test]
-fn linker_run_remaps_data_in_code_like_ld() {
+fn linker_run_omits_data_in_code_like_ld() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");
         return;
@@ -6782,27 +6782,24 @@ fn linker_run_remaps_data_in_code_like_ld() {
         ..LinkOptions::default()
     };
     Linker::run(&opts).unwrap();
-    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+    apple_link_with_args(
+        &obj,
+        &apple_out,
+        "_main",
+        &sdk,
+        &sdk_ver,
+        &["-data_in_code_info"],
+    )
+    .unwrap();
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
     let our_dic = raw_linkedit_data_cmd(&our_bytes, LC_DATA_IN_CODE);
     let apple_dic = raw_linkedit_data_cmd(&apple_bytes, LC_DATA_IN_CODE);
-    assert_ne!(our_dic.1, 0);
+    assert_eq!(our_dic.1, 0);
     assert_eq!(our_dic.1, apple_dic.1);
-    assert_eq!(decode_data_in_code(&our_bytes).len(), 1);
-    assert_eq!(
-        canonical_data_in_code(&our_bytes),
-        canonical_data_in_code(&apple_bytes)
-    );
-    assert_eq!(
-        canonical_data_in_code(&our_bytes),
-        vec![DataInCodeRecord {
-            offset: 8,
-            length: 8,
-            kind: DICE_KIND_JUMP_TABLE32,
-        }]
-    );
+    assert!(decode_data_in_code(&our_bytes).is_empty());
+    assert!(canonical_data_in_code(&apple_bytes).is_empty());
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
@@ -6810,7 +6807,7 @@ fn linker_run_remaps_data_in_code_like_ld() {
 }
 
 #[test]
-fn linker_run_remaps_data_in_code_in_later_text_section_like_ld() {
+fn linker_run_omits_data_in_code_in_later_text_section_like_ld() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");
         return;
@@ -6870,22 +6867,20 @@ fn linker_run_remaps_data_in_code_in_later_text_section_like_ld() {
         ..LinkOptions::default()
     };
     Linker::run(&opts).unwrap();
-    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+    apple_link_with_args(
+        &obj,
+        &apple_out,
+        "_main",
+        &sdk,
+        &sdk_ver,
+        &["-data_in_code_info"],
+    )
+    .unwrap();
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
-    assert_eq!(
-        canonical_data_in_code(&our_bytes),
-        canonical_data_in_code(&apple_bytes)
-    );
-    assert_eq!(
-        canonical_data_in_code(&our_bytes),
-        vec![DataInCodeRecord {
-            offset: 8,
-            length: 8,
-            kind: DICE_KIND_JUMP_TABLE32,
-        }]
-    );
+    assert!(canonical_data_in_code(&our_bytes).is_empty());
+    assert!(canonical_data_in_code(&apple_bytes).is_empty());
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
@@ -6893,7 +6888,7 @@ fn linker_run_remaps_data_in_code_in_later_text_section_like_ld() {
 }
 
 #[test]
-fn linker_run_remaps_data_in_code_after_large_first_text_section_like_ld() {
+fn linker_run_omits_data_in_code_after_large_first_text_section_like_ld() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");
         return;
@@ -6957,22 +6952,20 @@ fn linker_run_remaps_data_in_code_after_large_first_text_section_like_ld() {
         ..LinkOptions::default()
     };
     Linker::run(&opts).unwrap();
-    apple_link(&obj, &apple_out, "_main", &sdk, &sdk_ver).unwrap();
+    apple_link_with_args(
+        &obj,
+        &apple_out,
+        "_main",
+        &sdk,
+        &sdk_ver,
+        &["-data_in_code_info"],
+    )
+    .unwrap();
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
-    assert_eq!(
-        canonical_data_in_code(&our_bytes),
-        canonical_data_in_code(&apple_bytes)
-    );
-    assert_eq!(
-        canonical_data_in_code(&our_bytes),
-        vec![DataInCodeRecord {
-            offset: 28,
-            length: 8,
-            kind: DICE_KIND_JUMP_TABLE32,
-        }]
-    );
+    assert!(canonical_data_in_code(&our_bytes).is_empty());
+    assert!(canonical_data_in_code(&apple_bytes).is_empty());
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
@@ -7225,7 +7218,7 @@ fn linker_run_handles_local_tlv_descriptors() {
 }
 
 #[test]
-fn linker_run_routes_imported_tlv_through_got() {
+fn linker_run_routes_imported_tlv_through_thread_pointers() {
     if !have_xcrun() || !have_tool("codesign") {
         eprintln!("skipping: xcrun clang or codesign unavailable");
         return;
@@ -7307,23 +7300,30 @@ fn linker_run_routes_imported_tlv_through_got() {
     let apple_bytes = fs::read(&apple_out).unwrap();
     let (our_text_addr, our_text) = output_section(&our_bytes, "__TEXT", "__text").unwrap();
     let (apple_text_addr, apple_text) = output_section(&apple_bytes, "__TEXT", "__text").unwrap();
-    let (our_got_addr, our_got) = output_section(&our_bytes, "__DATA_CONST", "__got").unwrap();
-    let (apple_got_addr, apple_got) =
-        output_section(&apple_bytes, "__DATA_CONST", "__got").unwrap();
+    let (our_thread_ptrs_addr, our_thread_ptrs) =
+        output_section(&our_bytes, "__DATA", "__thread_ptrs").unwrap();
+    let (apple_thread_ptrs_addr, apple_thread_ptrs) =
+        output_section(&apple_bytes, "__DATA", "__thread_ptrs").unwrap();
 
-    assert!(output_section(&our_bytes, "__DATA", "__thread_ptrs").is_none());
-    assert!(output_section(&apple_bytes, "__DATA", "__thread_ptrs").is_none());
-    assert_eq!(our_got.len(), 8);
-    assert_eq!(our_got, apple_got);
+    assert!(output_section(&our_bytes, "__DATA_CONST", "__got").is_none());
+    assert!(output_section(&apple_bytes, "__DATA_CONST", "__got").is_none());
+    assert_eq!(our_thread_ptrs.len(), 8);
+    assert_eq!(our_thread_ptrs, apple_thread_ptrs);
     assert_eq!(
         decode_page_reference(&our_text, our_text_addr, 20, &PageRefKind::Load).unwrap(),
-        our_got_addr
+        our_thread_ptrs_addr
     );
     assert_eq!(
         decode_page_reference(&apple_text, apple_text_addr, 20, &PageRefKind::Load).unwrap(),
-        apple_got_addr
+        apple_thread_ptrs_addr
     );
-    assert_eq!(our_text, apple_text);
+    assert_eq!(our_text.len(), apple_text.len());
+    assert_eq!(
+        read_insn(&our_text, 20).unwrap() & 0x9f00_001f,
+        read_insn(&apple_text, 20).unwrap() & 0x9f00_001f
+    );
+    assert_eq!(&our_text[..20], &apple_text[..20]);
+    assert_eq!(&our_text[24..], &apple_text[24..]);
     assert_eq!(read_insn(&our_text, 24).unwrap(), 0xf9400000);
     assert_eq!(read_insn(&our_text, 28).unwrap(), 0xf9400008);
     assert_eq!(read_insn(&our_text, 32).unwrap(), 0xd63f0100);

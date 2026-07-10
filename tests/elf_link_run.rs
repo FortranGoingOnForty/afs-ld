@@ -46,7 +46,11 @@ fn freestanding_exit42_matches_system_linkers() {
         .arg(&s)
         .output()
         .unwrap();
-    assert!(out.status.success(), "gas: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gas: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // afs-ld link + run.
     let ours = dir.join("x_afsld");
@@ -56,7 +60,11 @@ fn freestanding_exit42_matches_system_linkers() {
         .arg(&obj)
         .output()
         .unwrap();
-    assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "afs-ld: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
     let run = Command::new(&ours).output().unwrap();
     assert_eq!(run.status.code(), Some(42), "afs-ld binary exit code");
 
@@ -120,12 +128,135 @@ fn freestanding_exit42_matches_system_linkers() {
             continue;
         }
         let theirs = dir.join(format!("x_{}", ld.replace('/', "_")));
-        let r = Command::new(ld).arg("-o").arg(&theirs).arg(&obj).output().unwrap();
-        assert!(r.status.success(), "{}: {}", ld, String::from_utf8_lossy(&r.stderr));
+        let r = Command::new(ld)
+            .arg("-o")
+            .arg(&theirs)
+            .arg(&obj)
+            .output()
+            .unwrap();
+        assert!(
+            r.status.success(),
+            "{}: {}",
+            ld,
+            String::from_utf8_lossy(&r.stderr)
+        );
         let run = Command::new(&theirs).output().unwrap();
         assert_eq!(run.status.code(), Some(42), "{} binary exit code", ld);
     }
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn common_symbols_allocate_zeroed_bss_in_static_and_dynamic_links() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=common_symbols_allocate_zeroed_bss_in_static_and_dynamic_links count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_common_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(
+            ".comm shared,16,16\n\
+             .text\n\
+             .globl _start\n\
+             .type _start,@function\n\
+             _start:\n\
+                 movl shared(%rip), %eax\n\
+                 testl %eax, %eax\n\
+                 jne 1f\n\
+                 movl $42, shared(%rip)\n\
+                 movl shared(%rip), %edi\n\
+                 jmp 2f\n\
+             1:  movl $7, %edi\n\
+             2:  movl ${exit_nr}, %eax\n\
+                 syscall\n\
+             .size _start,.-_start\n"
+        ),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+
+    let static_out = dir.join("common_static");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&static_out)
+        .arg(&main_obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld static COMMON: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let run = Command::new(&static_out).output().unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "static COMMON exe exit: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    if let Some(interp) = rtld() {
+        let dynamic_out = dir.join("common_dynamic");
+        let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .args(["--dynamic-linker", interp, "-o"])
+            .arg(&dynamic_out)
+            .arg(&main_obj)
+            .output()
+            .unwrap();
+        assert!(
+            r.status.success(),
+            "afs-ld dynamic COMMON: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let run = Command::new(&dynamic_out).output().unwrap();
+        assert_eq!(
+            run.status.code(),
+            Some(42),
+            "dynamic COMMON exe exit: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    } else {
+        eprintln!("skipping dynamic COMMON leg: no standard dynamic loader on this host");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn static_ehdr_start_resolves_to_image_base() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=static_ehdr_start_resolves_to_image_base count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_ehdr_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let obj = dir.join("ehdr.o");
+    assemble(
+        &gas,
+        &format!(".text\n.globl _start\n_start:\n    leaq __ehdr_start(%rip), %rax\n    movl $42, %edi\n    cmpq $0x400000, %rax\n    je 1f\n    movl $7, %edi\n1:  movl ${exit_nr}, %eax\n    syscall\n"),
+        &dir.join("ehdr.s"),
+        &obj,
+    );
+    let out = dir.join("ehdr");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -140,7 +271,14 @@ fn elf_mode_rejects_unsupported_flags_loudly() {
     let s = dir.join("y.s");
     let obj = dir.join("y.o");
     std::fs::write(&s, ".text\n.globl _start\n_start:\n    ret\n").unwrap();
-    assert!(Command::new(&gas).args(["--64", "-o"]).arg(&obj).arg(&s).output().unwrap().status.success());
+    assert!(Command::new(&gas)
+        .args(["--64", "-o"])
+        .arg(&obj)
+        .arg(&s)
+        .output()
+        .unwrap()
+        .status
+        .success());
 
     // `-pie` is not yet supported (PIE lands in a later rung); reject loudly.
     let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
@@ -156,6 +294,18 @@ fn elf_mode_rejects_unsupported_flags_loudly() {
         "must name the unsupported flag: {}",
         stderr
     );
+
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--gc-sections", "-o"])
+        .arg(dir.join("gc_out"))
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "--gc-sections is part of the ELF driver contract: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -168,7 +318,11 @@ fn assemble(gas: &std::path::Path, src: &str, s: &std::path::Path, obj: &std::pa
         .arg(s)
         .output()
         .unwrap();
-    assert!(out.status.success(), "gas: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gas: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// IFUNC: a `call` to an STT_GNU_IFUNC symbol routes through a
@@ -195,8 +349,17 @@ fn ifunc_resolves_through_iplt_and_irelative() {
         &obj,
     );
     let out = dir.join("if");
-    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld")).arg("-o").arg(&out).arg(&obj).output().unwrap();
-    assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
     assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -224,8 +387,17 @@ fn init_array_priority_merge_and_brackets() {
         &obj,
     );
     let out = dir.join("ia");
-    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld")).arg("-o").arg(&out).arg(&obj).output().unwrap();
-    assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
     assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -240,7 +412,10 @@ fn versioned_symbol_answers_plain_reference() {
         eprintln!("\nHARNESS_SKIP suite=elf_link_run test=versioned_symbol_answers_plain_reference count=1 reason=\"no GNU assembler on this host\"");
         return;
     };
-    let ar = ["/usr/bin/ar", "/usr/local/bin/ar"].iter().map(std::path::PathBuf::from).find(|p| p.exists());
+    let ar = ["/usr/bin/ar", "/usr/local/bin/ar"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists());
     let Some(ar) = ar else {
         eprintln!("\nHARNESS_SKIP suite=elf_link_run test=versioned_symbol_answers_plain_reference count=1 reason=\"no ar on this host\"");
         return;
@@ -264,10 +439,27 @@ fn versioned_symbol_answers_plain_reference() {
     );
     let archive = dir.join("libimpl.a");
     let _ = std::fs::remove_file(&archive);
-    assert!(Command::new(&ar).arg("rcs").arg(&archive).arg(&impl_obj).output().unwrap().status.success());
+    assert!(Command::new(&ar)
+        .arg("rcs")
+        .arg(&archive)
+        .arg(&impl_obj)
+        .output()
+        .unwrap()
+        .status
+        .success());
     let out = dir.join("ver");
-    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld")).arg("-o").arg(&out).arg(&main_obj).arg(&archive).output().unwrap();
-    assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&main_obj)
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
     assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -314,17 +506,126 @@ fn tls_local_exec_and_initial_exec_read_back() {
     );
     let out = dir.join("t");
     let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
-        .arg("-o").arg(&out).arg(&obj).output().unwrap();
-    assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+        .arg("-o")
+        .arg(&out)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
     assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
     // Behavioral parity with the reference static linker, if present.
     for ld in ["/usr/bin/ld", "/usr/local/bin/ld"] {
-        if !std::path::Path::new(ld).exists() { continue; }
+        if !std::path::Path::new(ld).exists() {
+            continue;
+        }
         let theirs = dir.join(format!("t_{}", ld.replace('/', "_")));
-        if Command::new(ld).args(["-static", "-o"]).arg(&theirs).arg(&obj).output().unwrap().status.success() {
-            assert_eq!(Command::new(&theirs).output().unwrap().status.code(), Some(42), "{ld} static TLS");
+        if Command::new(ld)
+            .args(["-static", "-o"])
+            .arg(&theirs)
+            .arg(&obj)
+            .output()
+            .unwrap()
+            .status
+            .success()
+        {
+            assert_eq!(
+                Command::new(&theirs).output().unwrap().status.code(),
+                Some(42),
+                "{ld} static TLS"
+            );
         }
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Relocations in the initialized TLS image are applied before PT_TLS is
+/// emitted. glibc's static `malloc.o` has this shape: `.tdata` contains
+/// an absolute pointer into `.rodata`.
+#[test]
+fn tls_initial_image_applies_absolute_relocations() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=tls_initial_image_applies_absolute_relocations count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_tls_rela_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let obj = dir.join("t.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n    movl ${exit_nr}, %eax\n    xorl %edi, %edi\n    syscall\n.section .rodata,\"a\",@progbits\n.globl target\ntarget:\n    .quad 0x1122334455667788\n.section .tdata,\"awT\",@progbits\n.globl tptr\ntptr:\n    .quad target\n"
+        ),
+        &dir.join("t.s"),
+        &obj,
+    );
+
+    let out = dir.join("t");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let img = std::fs::read(&out).unwrap();
+    let target = section_addr(&img, ".rodata").expect(".rodata section");
+    let tdata = section_bytes(&img, ".tdata").expect(".tdata section");
+    assert!(
+        tdata.len() >= 8,
+        ".tdata should hold relocated pointer, got {} bytes",
+        tdata.len()
+    );
+    let got = u64::from_le_bytes(tdata[0..8].try_into().unwrap());
+    assert_eq!(got, target, ".tdata pointer initializer");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Undefined weak TLS local-exec references resolve to offset zero.
+/// glibc's static locale objects use this for optional per-category TLS
+/// state, and GNU ld accepts the link.
+#[test]
+fn tls_undefined_weak_local_exec_links() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=tls_undefined_weak_local_exec_links count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_tls_weak_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let obj = dir.join("weak.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n.weak missing\n.type missing,@tls_object\n_start:\n    movl %fs:missing@tpoff, %edi\n    movl ${exit_nr}, %eax\n    syscall\n"
+        ),
+        &dir.join("weak.s"),
+        &obj,
+    );
+
+    let out = dir.join("weak");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -353,8 +654,19 @@ fn tls_general_and_local_dynamic_relax_to_local_exec() {
         &gd,
     );
     let gd_out = dir.join("gd");
-    assert!(Command::new(env!("CARGO_BIN_EXE_afs-ld")).arg("-o").arg(&gd_out).arg(&gd).output().unwrap().status.success());
-    assert_eq!(Command::new(&gd_out).output().unwrap().status.code(), Some(42), "GD relax");
+    assert!(Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&gd_out)
+        .arg(&gd)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert_eq!(
+        Command::new(&gd_out).output().unwrap().status.code(),
+        Some(42),
+        "GD relax"
+    );
 
     // Local dynamic.
     let ld = dir.join("ld.o");
@@ -368,8 +680,19 @@ fn tls_general_and_local_dynamic_relax_to_local_exec() {
         &ld,
     );
     let ld_out = dir.join("ld");
-    assert!(Command::new(env!("CARGO_BIN_EXE_afs-ld")).arg("-o").arg(&ld_out).arg(&ld).output().unwrap().status.success());
-    assert_eq!(Command::new(&ld_out).output().unwrap().status.code(), Some(42), "LD relax");
+    assert!(Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&ld_out)
+        .arg(&ld)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert_eq!(
+        Command::new(&ld_out).output().unwrap().status.code(),
+        Some(42),
+        "LD relax"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -402,13 +725,23 @@ fn gotpcrel_loads_through_synthesized_got() {
         .arg(&obj)
         .output()
         .unwrap();
-    assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "afs-ld: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
     assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
 
     // Determinism.
     let out2 = dir.join("g2");
     assert!(Command::new(env!("CARGO_BIN_EXE_afs-ld"))
-        .arg("-o").arg(&out2).arg(&obj).output().unwrap().status.success());
+        .arg("-o")
+        .arg(&out2)
+        .arg(&obj)
+        .output()
+        .unwrap()
+        .status
+        .success());
     assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&out2).unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -476,7 +809,11 @@ fn archive_member_selection_links_only_used_members() {
         .arg(&used_obj)
         .output()
         .unwrap();
-    assert!(r.status.success(), "ar: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "ar: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
 
     // Positional-archive form: main.o libstuff.a.
     let out1 = dir.join("sel_positional");
@@ -487,8 +824,15 @@ fn archive_member_selection_links_only_used_members() {
         .arg(&archive)
         .output()
         .unwrap();
-    assert!(r.status.success(), "afs-ld positional archive: {}", String::from_utf8_lossy(&r.stderr));
-    assert_eq!(Command::new(&out1).output().unwrap().status.code(), Some(42));
+    assert!(
+        r.status.success(),
+        "afs-ld positional archive: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert_eq!(
+        Command::new(&out1).output().unwrap().status.code(),
+        Some(42)
+    );
 
     // `-L <dir> -l stuff` form resolves the same archive by name.
     let out2 = dir.join("sel_dashl");
@@ -501,8 +845,15 @@ fn archive_member_selection_links_only_used_members() {
         .arg("-lstuff")
         .output()
         .unwrap();
-    assert!(r.status.success(), "afs-ld -l form: {}", String::from_utf8_lossy(&r.stderr));
-    assert_eq!(Command::new(&out2).output().unwrap().status.code(), Some(42));
+    assert!(
+        r.status.success(),
+        "afs-ld -l form: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert_eq!(
+        Command::new(&out2).output().unwrap().status.code(),
+        Some(42)
+    );
 
     // Both forms are byte-identical (determinism + form equivalence).
     assert_eq!(std::fs::read(&out1).unwrap(), std::fs::read(&out2).unwrap());
@@ -573,15 +924,32 @@ fn dynamic_hello_links_against_system_libc() {
 
     let out = dir.join("hi");
     let r = link(&out, env!("CARGO_BIN_EXE_afs-ld"));
-    assert!(r.status.success(), "afs-ld dynamic hello: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "afs-ld dynamic hello: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
     let run = Command::new(&out).output().unwrap();
-    assert_eq!(run.status.code(), Some(0), "hello exit: {}", String::from_utf8_lossy(&run.stderr));
-    assert_eq!(String::from_utf8_lossy(&run.stdout), "hello afs-ld\n", "hello stdout");
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "hello exit: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "hello afs-ld\n",
+        "hello stdout"
+    );
 
     // Determinism.
     let out2 = dir.join("hi2");
     assert!(link(&out2, env!("CARGO_BIN_EXE_afs-ld")).status.success());
-    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&out2).unwrap(), "dynamic hello must be deterministic");
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        std::fs::read(&out2).unwrap(),
+        "dynamic hello must be deterministic"
+    );
 
     // Behavioral parity with the system linker, if present.
     for ld in ["/usr/bin/ld", "/usr/local/bin/ld"] {
@@ -592,7 +960,11 @@ fn dynamic_hello_links_against_system_libc() {
         if link(&theirs, ld).status.success() {
             let run = Command::new(&theirs).output().unwrap();
             assert_eq!(run.status.code(), Some(0), "{ld} hello exit");
-            assert_eq!(String::from_utf8_lossy(&run.stdout), "hello afs-ld\n", "{ld} hello stdout");
+            assert_eq!(
+                String::from_utf8_lossy(&run.stdout),
+                "hello afs-ld\n",
+                "{ld} hello stdout"
+            );
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -637,7 +1009,11 @@ fn dynamic_data_import_binds_through_got_glob_dat() {
         .arg(&lib_obj)
         .output()
         .unwrap();
-    assert!(r.status.success(), "ld -shared: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "ld -shared: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
 
     // main.o: exit(base() + extra) = 42. base via PLT, extra via GOT.
     let main_obj = dir.join("main.o");
@@ -655,9 +1031,21 @@ fn dynamic_data_import_binds_through_got_glob_dat() {
         .arg(&so)
         .output()
         .unwrap();
-    assert!(r.status.success(), "afs-ld func+data dynamic: {}", String::from_utf8_lossy(&r.stderr));
-    let run = Command::new(&out).env("LD_LIBRARY_PATH", &dir).output().unwrap();
-    assert_eq!(run.status.code(), Some(42), "func+data exe exit: {}", String::from_utf8_lossy(&run.stderr));
+    assert!(
+        r.status.success(),
+        "afs-ld func+data dynamic: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let run = Command::new(&out)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "func+data exe exit: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 
     // Determinism.
     let out2 = dir.join("both2");
@@ -670,7 +1058,11 @@ fn dynamic_data_import_binds_through_got_glob_dat() {
         .unwrap()
         .status
         .success());
-    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&out2).unwrap(), "func+data link must be deterministic");
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        std::fs::read(&out2).unwrap(),
+        "func+data link must be deterministic"
+    );
 
     // A direct (non-GOT) reference to shared data needs a COPY relocation
     // — out of scope, must fail loudly naming COPY.
@@ -688,7 +1080,10 @@ fn dynamic_data_import_binds_through_got_glob_dat() {
         .arg(&so)
         .output()
         .unwrap();
-    assert!(!r.status.success(), "direct data reference must fail (needs COPY)");
+    assert!(
+        !r.status.success(),
+        "direct data reference must fail (needs COPY)"
+    );
     assert!(
         String::from_utf8_lossy(&r.stderr).contains("COPY"),
         "error must name the COPY relocation: {}",
@@ -731,7 +1126,11 @@ fn versioned_dynamic_import_declares_and_binds_default_version() {
         &lib_obj,
     );
     let vmap = dir.join("ver.map");
-    std::fs::write(&vmap, "VERS_1.0 { global: answer; };\nVERS_2.0 { global: answer; } VERS_1.0;\n").unwrap();
+    std::fs::write(
+        &vmap,
+        "VERS_1.0 { global: answer; };\nVERS_2.0 { global: answer; } VERS_1.0;\n",
+    )
+    .unwrap();
     let so = dir.join("libver.so.1");
     let r = Command::new(&ld)
         .args(["-shared", "-soname", "libver.so.1", "--version-script"])
@@ -741,7 +1140,11 @@ fn versioned_dynamic_import_declares_and_binds_default_version() {
         .arg(&lib_obj)
         .output()
         .unwrap();
-    assert!(r.status.success(), "ld -shared --version-script: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "ld -shared --version-script: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
 
     // main.o: exit(answer()) — plain reference binds the default version.
     let main_obj = dir.join("main.o");
@@ -760,7 +1163,11 @@ fn versioned_dynamic_import_declares_and_binds_default_version() {
         .arg(&so)
         .output()
         .unwrap();
-    assert!(r.status.success(), "afs-ld versioned dynamic: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "afs-ld versioned dynamic: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
 
     // Structural: the required version string is present in the output
     // (it reaches .dynstr only via the VERNEED path — rung-3a never
@@ -772,8 +1179,16 @@ fn versioned_dynamic_import_declares_and_binds_default_version() {
     );
 
     // Behavioral: binds the default (VERS_2.0 -> 42), not VERS_1.0 -> 7.
-    let run = Command::new(&out).env("LD_LIBRARY_PATH", &dir).output().unwrap();
-    assert_eq!(run.status.code(), Some(42), "versioned exe exit: {}", String::from_utf8_lossy(&run.stderr));
+    let run = Command::new(&out)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "versioned exe exit: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 
     // Determinism.
     let out2 = dir.join("ver_dyn2");
@@ -786,7 +1201,11 @@ fn versioned_dynamic_import_declares_and_binds_default_version() {
         .unwrap()
         .status
         .success());
-    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&out2).unwrap(), "versioned link must be deterministic");
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        std::fs::read(&out2).unwrap(),
+        "versioned link must be deterministic"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -817,7 +1236,10 @@ fn rtld() -> Option<&'static str> {
     } else {
         &[]
     };
-    cands.iter().copied().find(|p| std::path::Path::new(p).exists())
+    cands
+        .iter()
+        .copied()
+        .find(|p| std::path::Path::new(p).exists())
 }
 
 /// Dynamic executable: afs-ld links a freestanding `_start` that calls
@@ -859,7 +1281,11 @@ fn dynamic_executable_calls_shared_answer_through_plt() {
         .arg(&answer_obj)
         .output()
         .unwrap();
-    assert!(r.status.success(), "ld -shared: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "ld -shared: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
     // Dev symlink libanswer.so -> libanswer.so.1 for the -lanswer form.
     let so_link = dir.join("libanswer.so");
     let _ = std::fs::remove_file(&so_link);
@@ -886,7 +1312,11 @@ fn dynamic_executable_calls_shared_answer_through_plt() {
         .arg(&so)
         .output()
         .unwrap();
-    assert!(r.status.success(), "afs-ld dynamic positional: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "afs-ld dynamic positional: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
 
     // `-L <dir> -lanswer` form resolves libanswer.so on the search path.
     let out2 = dir.join("dyn_dashl");
@@ -899,7 +1329,11 @@ fn dynamic_executable_calls_shared_answer_through_plt() {
         .arg("-lanswer")
         .output()
         .unwrap();
-    assert!(r.status.success(), "afs-ld dynamic -l form: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "afs-ld dynamic -l form: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
 
     // Both input forms name the same DT_NEEDED (the soname), so the
     // linked images are byte-identical.
@@ -915,7 +1349,12 @@ fn dynamic_executable_calls_shared_answer_through_plt() {
         .env("LD_LIBRARY_PATH", &dir)
         .output()
         .unwrap();
-    assert_eq!(run.status.code(), Some(42), "dynamic exe exit code: {}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "dynamic exe exit code: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 
     // Determinism: a fresh link is byte-identical.
     let out3 = dir.join("dyn_again");
@@ -933,6 +1372,234 @@ fn dynamic_executable_calls_shared_answer_through_plt() {
         std::fs::read(&out3).unwrap(),
         "dynamic link must be byte-deterministic"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// GNU IFUNC exports are callable function imports too. glibc exposes
+/// optimized routines such as memcpy/memset this way; treating them as
+/// data imports sends ordinary PLT calls down the COPY-relocation error
+/// path.
+#[test]
+fn dynamic_executable_calls_shared_ifunc_through_plt() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_calls_shared_ifunc_through_plt count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let Some(ld) = system_ld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_calls_shared_ifunc_through_plt count=1 reason=\"no system ld to build the reference .so\"");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_calls_shared_ifunc_through_plt count=1 reason=\"no standard dynamic loader on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_ifunc_dyn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    let answer_obj = dir.join("answer.o");
+    assemble(
+        &gas,
+        ".text\n\
+         .type answer_impl,@function\n\
+         answer_impl:\n\
+             movl $42, %eax\n\
+             ret\n\
+         .globl answer\n\
+         .type answer,@gnu_indirect_function\n\
+         answer:\n\
+             leaq answer_impl(%rip), %rax\n\
+             ret\n",
+        &dir.join("answer.s"),
+        &answer_obj,
+    );
+    let so = dir.join("libanswer.so.1");
+    let r = Command::new(&ld)
+        .args(["-shared", "-soname", "libanswer.so.1", "-o"])
+        .arg(&so)
+        .arg(&answer_obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "ld -shared: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n    call answer@plt\n    movl %eax, %edi\n    movl ${exit_nr}, %eax\n    syscall\n"
+        ),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+    let out = dir.join("ifunc_dyn");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&out)
+        .arg(&main_obj)
+        .arg(&so)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld IFUNC dynamic: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let run = Command::new(&out)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "IFUNC exe exit: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Dynamic mode consumes the glibc-style inputs the driver emits:
+/// `--gc-sections`, linker-script-expanded `.so` groups, positional
+/// archive members, `-l` archive fallback, and linker-defined
+/// `__ehdr_start`.
+#[test]
+fn dynamic_mode_expands_scripts_and_archive_fallbacks() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_mode_expands_scripts_and_archive_fallbacks count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let Some(ld) = system_ld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_mode_expands_scripts_and_archive_fallbacks count=1 reason=\"no system ld to build the reference .so\"");
+        return;
+    };
+    let ar = ["/usr/bin/ar", "/usr/local/bin/ar"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists());
+    let Some(ar) = ar else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_mode_expands_scripts_and_archive_fallbacks count=1 reason=\"no ar on this host\"");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_mode_expands_scripts_and_archive_fallbacks count=1 reason=\"no standard dynamic loader on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_dyn_script_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    let dyn_obj = dir.join("dyn.o");
+    assemble(
+        &gas,
+        ".text\n.globl shared_answer\n.type shared_answer,@function\nshared_answer:\n    movl $40, %eax\n    ret\n",
+        &dir.join("dyn.s"),
+        &dyn_obj,
+    );
+    let so = dir.join("libdyn.so.1");
+    let r = Command::new(&ld)
+        .args(["-shared", "-soname", "libdyn.so.1", "-o"])
+        .arg(&so)
+        .arg(&dyn_obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "ld -shared: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let static_obj = dir.join("static.o");
+    assemble(
+        &gas,
+        ".text\n.globl static_answer\n.type static_answer,@function\nstatic_answer:\n    movl $2, %eax\n    ret\n",
+        &dir.join("static.s"),
+        &static_obj,
+    );
+    let archive = dir.join("libstatic.a");
+    let _ = std::fs::remove_file(&archive);
+    let r = Command::new(&ar)
+        .arg("rcs")
+        .arg(&archive)
+        .arg(&static_obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "ar: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(".text\n.globl _start\n_start:\n    leaq __ehdr_start(%rip), %rcx\n    cmpq $0x200000, %rcx\n    jne 1f\n    call shared_answer@plt\n    movl %eax, %ebx\n    call static_answer\n    addl %ebx, %eax\n    movl %eax, %edi\n    jmp 2f\n1:  movl $7, %edi\n2:  movl ${exit_nr}, %eax\n    syscall\n"),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+
+    let script = dir.join("libcombo.so");
+    std::fs::write(
+        &script,
+        "/* GNU ld script */\nGROUP ( libdyn.so.1 AS_NEEDED ( libstatic.a ) )\n",
+    )
+    .unwrap();
+
+    let script_out = dir.join("script");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--gc-sections", "--dynamic-linker", interp, "-o"])
+        .arg(&script_out)
+        .arg(&main_obj)
+        .arg("-L")
+        .arg(&dir)
+        .arg("-lcombo")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld script group: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let run = Command::new(&script_out)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "script-expanded dynamic exe: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let fallback_out = dir.join("fallback");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&fallback_out)
+        .arg(&main_obj)
+        .arg("-L")
+        .arg(&dir)
+        .arg("-lstatic")
+        .arg(&so)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld -l archive fallback: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let run = Command::new(&fallback_out)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "-l archive fallback dynamic exe: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -954,8 +1621,8 @@ fn find_phdr(img: &[u8], p_type: u32) -> Option<(u64, u64, u64)> {
     None
 }
 
-/// The `sh_addr` of a named ELF64 section, or None.
-fn section_addr(img: &[u8], name: &str) -> Option<u64> {
+/// `(sh_addr, sh_offset, sh_size)` of a named ELF64 section, or None.
+fn section_info(img: &[u8], name: &str) -> Option<(u64, u64, u64)> {
     let rd16 = |o: usize| u16::from_le_bytes(img[o..o + 2].try_into().unwrap());
     let rd32 = |o: usize| u32::from_le_bytes(img[o..o + 4].try_into().unwrap());
     let rd64 = |o: usize| u64::from_le_bytes(img[o..o + 8].try_into().unwrap());
@@ -969,10 +1636,23 @@ fn section_addr(img: &[u8], name: &str) -> Option<u64> {
         let noff = shstr_off + rd32(sh) as usize;
         let end = img[noff..].iter().position(|&b| b == 0).unwrap();
         if &img[noff..noff + end] == name.as_bytes() {
-            return Some(rd64(sh + 16));
+            return Some((rd64(sh + 16), rd64(sh + 24), rd64(sh + 32)));
         }
     }
     None
+}
+
+/// The `sh_addr` of a named ELF64 section, or None.
+fn section_addr(img: &[u8], name: &str) -> Option<u64> {
+    section_info(img, name).map(|(addr, _, _)| addr)
+}
+
+/// File-backed bytes of a named ELF64 section, or None.
+fn section_bytes<'a>(img: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let (_, off, size) = section_info(img, name)?;
+    let start = off as usize;
+    let end = start.checked_add(size as usize)?;
+    img.get(start..end)
 }
 
 /// Audit T1: `--eh-frame-hdr` must synthesize `.eh_frame_hdr` +
@@ -1009,8 +1689,8 @@ fn eh_frame_hdr_emitted_only_when_requested() {
     let with = dir.join("with");
     assert!(link(true, &with).status.success());
     let img = std::fs::read(&with).unwrap();
-    let (fo, va, fsz) = find_phdr(&img, 0x6474_e550)
-        .expect("PT_GNU_EH_FRAME must be present with --eh-frame-hdr");
+    let (fo, va, fsz) =
+        find_phdr(&img, 0x6474_e550).expect("PT_GNU_EH_FRAME must be present with --eh-frame-hdr");
     let hdr = &img[fo as usize..(fo + fsz) as usize];
     assert_eq!(&hdr[0..4], &[1, 0x1b, 0x03, 0x3b], "eh_frame_hdr encodings");
     let eh_ptr = i32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
@@ -1025,7 +1705,10 @@ fn eh_frame_hdr_emitted_only_when_requested() {
         1,
         "one FDE for _start"
     );
-    assert_eq!(Command::new(&with).output().unwrap().status.code(), Some(42));
+    assert_eq!(
+        Command::new(&with).output().unwrap().status.code(),
+        Some(42)
+    );
 
     // Without the flag: no header (GNU default), still runs.
     let without = dir.join("without");
@@ -1035,7 +1718,10 @@ fn eh_frame_hdr_emitted_only_when_requested() {
         find_phdr(&img2, 0x6474_e550).is_none(),
         "no PT_GNU_EH_FRAME without --eh-frame-hdr"
     );
-    assert_eq!(Command::new(&without).output().unwrap().status.code(), Some(42));
+    assert_eq!(
+        Command::new(&without).output().unwrap().status.code(),
+        Some(42)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

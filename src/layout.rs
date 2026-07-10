@@ -264,7 +264,12 @@ impl Layout {
         insert_extra_sections(&mut sections, extra_layout.extra_sections);
 
         for section in &mut sections {
-            let mut size = 0u64;
+            let synthetic_prefix = synthetic_data_precedes_atoms(section);
+            let mut size = if synthetic_prefix {
+                section.synthetic_data.len() as u64
+            } else {
+                0
+            };
             for placed in &mut section.atoms {
                 let atom = atoms.get(placed.atom);
                 let align = 1u64 << atom.align_pow2.min(63);
@@ -272,14 +277,16 @@ impl Layout {
                 placed.offset = size;
                 size += placed.size;
             }
-            section.synthetic_offset =
-                if section.synthetic_data.is_empty() || section.atoms.is_empty() {
-                    0
-                } else {
-                    let align = 1u64 << section.align_pow2.min(63);
-                    align_up(size, align)
-                };
-            section.size = if section.synthetic_data.is_empty() {
+            section.synthetic_offset = if synthetic_prefix
+                || section.synthetic_data.is_empty()
+                || section.atoms.is_empty()
+            {
+                0
+            } else {
+                let align = 1u64 << section.align_pow2.min(63);
+                align_up(size, align)
+            };
+            section.size = if section.synthetic_data.is_empty() || synthetic_prefix {
                 size
             } else {
                 section.synthetic_offset + section.synthetic_data.len() as u64
@@ -554,6 +561,10 @@ fn merge_synthetic_section(existing: &mut OutputSection, synthetic: OutputSectio
             .synthetic_data
             .extend_from_slice(&synthetic.synthetic_data);
     }
+}
+
+fn synthetic_data_precedes_atoms(section: &OutputSection) -> bool {
+    section.segment == "__DATA" && section.name == "__data" && !section.synthetic_data.is_empty()
 }
 
 fn normalize_output_alignment(kind: crate::section::SectionKind, align_pow2: u8) -> u8 {
@@ -1265,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_dyld_private_merges_into_existing_data_section() {
+    fn synthetic_dyld_private_precedes_existing_data() {
         let object = ObjectFile {
             path: PathBuf::from("/tmp/layout-data.o"),
             header: MachHeader64 {
@@ -1347,8 +1358,9 @@ mod tests {
             .find(|section| section.segment == "__DATA" && section.name == "__data")
             .unwrap();
         assert_eq!(data.atoms.len(), 1);
-        assert_eq!(data.synthetic_offset, 16);
+        assert_eq!(data.synthetic_offset, 0);
         assert_eq!(data.synthetic_data.len(), 8);
+        assert_eq!(data.atoms[0].offset, 8);
         assert_eq!(data.size, 24);
     }
 

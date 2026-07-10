@@ -2423,7 +2423,7 @@ fn read_c_string(bytes: &[u8]) -> Result<(String, usize), String> {
     Ok((value, end + 1))
 }
 
-fn canonical_stub_targets(bytes: &[u8]) -> Result<Vec<u64>, String> {
+fn canonical_stub_targets(bytes: &[u8]) -> Result<Vec<CanonicalSectionLocation>, String> {
     let header = output_section_header(bytes, "__TEXT", "__stubs")
         .ok_or_else(|| "missing __TEXT,__stubs section".to_string())?;
     let (section_addr, section_bytes) = output_section(bytes, "__TEXT", "__stubs")
@@ -2444,10 +2444,8 @@ fn canonical_stub_targets(bytes: &[u8]) -> Result<Vec<u64>, String> {
     }
     let mut out = Vec::new();
     for (idx, chunk) in section_bytes.chunks_exact(stub_size).enumerate() {
-        out.push(decode_stub_target(
-            chunk,
-            section_addr + (idx * stub_size) as u64,
-        )?);
+        let target = decode_stub_target(chunk, section_addr + (idx * stub_size) as u64)?;
+        out.push(canonical_section_location(bytes, target)?);
     }
     Ok(out)
 }

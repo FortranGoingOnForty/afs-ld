@@ -65,10 +65,9 @@ fn empty_executable_writer_emits_parseable_macho() {
     let hdr = parse_header(&bytes).expect("header parses");
     assert_eq!(hdr.filetype, MH_EXECUTE);
     let cmds = parse_commands(&hdr, &bytes).expect("commands parse");
-    assert!(
-        cmds.iter()
-            .any(|cmd| matches!(cmd, LoadCommand::Segment64(seg) if seg.segname_str() == "__TEXT"))
-    );
+    assert!(cmds
+        .iter()
+        .any(|cmd| matches!(cmd, LoadCommand::Segment64(seg) if seg.segname_str() == "__TEXT")));
 
     let path = write_temp("empty-exec", &bytes);
     if have_tool("otool") {
@@ -81,7 +80,10 @@ fn empty_executable_writer_emits_parseable_macho() {
         // Token order varies by `file` implementation: macOS says
         // "…executable arm64", FreeBSD's file-5.46 says "…arm64
         // executable". Assert the tokens, not the order.
-        assert!(macho_desc_matches(&desc, "executable"), "unexpected file desc: {desc}");
+        assert!(
+            macho_desc_matches(&desc, "executable"),
+            "unexpected file desc: {desc}"
+        );
     }
     let _ = fs::remove_file(path);
 }

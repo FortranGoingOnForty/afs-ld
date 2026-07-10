@@ -1615,12 +1615,14 @@ fn assert_classic_lazy_case_matches_apple_ld(
             case.name
         ));
     }
-    if canonical_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?
-        != canonical_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?
-    {
+    let our_binds =
+        canonical_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?;
+    let apple_binds =
+        canonical_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?;
+    if our_binds != apple_binds {
         return Err(format!(
-            "{}: bind records diverged from Apple ld",
-            case.name
+            "{}: bind records diverged from Apple ld:\nours={our_binds:#?}\napple={apple_binds:#?}",
+            case.name,
         ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind)
@@ -1753,12 +1755,14 @@ fn assert_direct_bind_case_matches_apple_ld(
             case.name
         ));
     }
-    if canonical_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?
-        != canonical_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?
-    {
+    let our_binds =
+        canonical_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?;
+    let apple_binds =
+        canonical_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?;
+    if our_binds != apple_binds {
         return Err(format!(
-            "{}: bind records diverged from Apple ld",
-            case.name
+            "{}: bind records diverged from Apple ld:\nours={our_binds:#?}\napple={apple_binds:#?}",
+            case.name,
         ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind)

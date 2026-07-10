@@ -1,31 +1,18 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
 mod common;
 
 use afs_ld::{LinkOptions, LinkProfile, Linker};
+use common::artifacts::workspace_artifact;
 use common::harness::{
     assemble, have_tool, have_xcrun, have_xcrun_tool, scratch, sdk_path, sdk_version,
 };
 
-fn find_runtime_archive() -> Option<PathBuf> {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    for profile in ["debug", "release"] {
-        let candidate = workspace
-            .join("target")
-            .join(profile)
-            .join("libarmfortas_rt.a");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 fn runtime_archive_fixture() -> Result<PathBuf, String> {
-    if let Some(runtime) = find_runtime_archive() {
+    if let Some(runtime) = workspace_artifact("libarmfortas_rt.a") {
         return Ok(runtime);
     }
     build_synthetic_runtime_archive()

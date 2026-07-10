@@ -5,6 +5,11 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+#[path = "common/artifacts.rs"]
+mod artifacts;
+
+use artifacts::workspace_binary;
+
 fn gas() -> Option<PathBuf> {
     let cands: &[&str] = if cfg!(target_os = "freebsd") {
         &["/usr/local/bin/as"]
@@ -87,10 +92,7 @@ fn freestanding_exit42_matches_system_linkers() {
     // (sibling binary in the workspace target dir; crate independence
     // preserved — we shell out, never link against it), then linked
     // by afs-ld. Skip only when the sibling isn't built.
-    let afs_as = ["../target/debug/afs-as", "target/debug/afs-as"]
-        .iter()
-        .map(std::path::PathBuf::from)
-        .find(|p| p.exists());
+    let afs_as = workspace_binary("afs-as");
     if let Some(afs_as) = afs_as {
         let obj2 = dir.join("x_afsas.o");
         let r = Command::new(&afs_as)

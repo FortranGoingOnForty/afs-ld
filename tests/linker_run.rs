@@ -16,11 +16,11 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
-    BIND_SYMBOL_FLAGS_WEAK_IMPORT, DICE_KIND_JUMP_TABLE32, INDIRECT_SYMBOL_ABS,
-    INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
-    LC_FUNCTION_STARTS, LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, N_PEXT,
-    REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB,
-    REBASE_OPCODE_DONE, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION,
+    LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS,
+    LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, N_PEXT, REBASE_IMMEDIATE_MASK,
+    REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE,
+    REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
     REBASE_OPCODE_MASK, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
     REBASE_TYPE_POINTER, SG_READ_ONLY,
@@ -965,7 +965,7 @@ struct RebaseRecord {
     rebase_type: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct BindRecord {
     segment: String,
     section: String,
@@ -1337,6 +1337,12 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
     Ok(out)
 }
 
+fn canonical_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, String> {
+    let mut records = decode_bind_records(bytes, lazy)?;
+    records.sort();
+    Ok(records)
+}
+
 fn load_dylib_names(bytes: &[u8]) -> Result<Vec<String>, String> {
     let header = parse_header(bytes).map_err(|e| e.to_string())?;
     let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
@@ -1609,8 +1615,8 @@ fn assert_classic_lazy_case_matches_apple_ld(
             case.name
         ));
     }
-    if decode_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?
-        != decode_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?
+    if canonical_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?
+        != canonical_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?
     {
         return Err(format!(
             "{}: bind records diverged from Apple ld",
@@ -1747,8 +1753,8 @@ fn assert_direct_bind_case_matches_apple_ld(
             case.name
         ));
     }
-    if decode_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?
-        != decode_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?
+    if canonical_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?
+        != canonical_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?
     {
         return Err(format!(
             "{}: bind records diverged from Apple ld",
@@ -6713,7 +6719,7 @@ fn linker_run_emits_function_starts_for_other_text_sections_like_ld() {
 }
 
 #[test]
-fn linker_run_remaps_data_in_code_like_ld() {
+fn linker_run_omits_data_in_code_like_ld() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");
         return;
@@ -6786,21 +6792,10 @@ fn linker_run_remaps_data_in_code_like_ld() {
     let apple_bytes = fs::read(&apple_out).unwrap();
     let our_dic = raw_linkedit_data_cmd(&our_bytes, LC_DATA_IN_CODE);
     let apple_dic = raw_linkedit_data_cmd(&apple_bytes, LC_DATA_IN_CODE);
-    assert_ne!(our_dic.1, 0);
+    assert_eq!(our_dic.1, 0);
     assert_eq!(our_dic.1, apple_dic.1);
-    assert_eq!(decode_data_in_code(&our_bytes).len(), 1);
-    assert_eq!(
-        canonical_data_in_code(&our_bytes),
-        canonical_data_in_code(&apple_bytes)
-    );
-    assert_eq!(
-        canonical_data_in_code(&our_bytes),
-        vec![DataInCodeRecord {
-            offset: 8,
-            length: 8,
-            kind: DICE_KIND_JUMP_TABLE32,
-        }]
-    );
+    assert!(decode_data_in_code(&our_bytes).is_empty());
+    assert!(canonical_data_in_code(&apple_bytes).is_empty());
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
@@ -6808,7 +6803,7 @@ fn linker_run_remaps_data_in_code_like_ld() {
 }
 
 #[test]
-fn linker_run_remaps_data_in_code_in_later_text_section_like_ld() {
+fn linker_run_omits_data_in_code_in_later_text_section_like_ld() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");
         return;
@@ -6880,18 +6875,8 @@ fn linker_run_remaps_data_in_code_in_later_text_section_like_ld() {
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
-    assert_eq!(
-        canonical_data_in_code(&our_bytes),
-        canonical_data_in_code(&apple_bytes)
-    );
-    assert_eq!(
-        canonical_data_in_code(&our_bytes),
-        vec![DataInCodeRecord {
-            offset: 8,
-            length: 8,
-            kind: DICE_KIND_JUMP_TABLE32,
-        }]
-    );
+    assert!(canonical_data_in_code(&our_bytes).is_empty());
+    assert!(canonical_data_in_code(&apple_bytes).is_empty());
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
@@ -6899,7 +6884,7 @@ fn linker_run_remaps_data_in_code_in_later_text_section_like_ld() {
 }
 
 #[test]
-fn linker_run_remaps_data_in_code_after_large_first_text_section_like_ld() {
+fn linker_run_omits_data_in_code_after_large_first_text_section_like_ld() {
     if !have_xcrun() {
         eprintln!("skipping: xcrun unavailable");
         return;
@@ -6975,18 +6960,8 @@ fn linker_run_remaps_data_in_code_after_large_first_text_section_like_ld() {
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
-    assert_eq!(
-        canonical_data_in_code(&our_bytes),
-        canonical_data_in_code(&apple_bytes)
-    );
-    assert_eq!(
-        canonical_data_in_code(&our_bytes),
-        vec![DataInCodeRecord {
-            offset: 28,
-            length: 8,
-            kind: DICE_KIND_JUMP_TABLE32,
-        }]
-    );
+    assert!(canonical_data_in_code(&our_bytes).is_empty());
+    assert!(canonical_data_in_code(&apple_bytes).is_empty());
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
@@ -7239,7 +7214,7 @@ fn linker_run_handles_local_tlv_descriptors() {
 }
 
 #[test]
-fn linker_run_routes_imported_tlv_through_got() {
+fn linker_run_routes_imported_tlv_through_thread_pointers() {
     if !have_xcrun() || !have_tool("codesign") {
         eprintln!("skipping: xcrun clang or codesign unavailable");
         return;

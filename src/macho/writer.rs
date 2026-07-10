@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::atom::AtomTable;
-use crate::input::{DataInCodeEntry, ObjectFile};
+use crate::input::ObjectFile;
 use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
 use crate::leb::write_uleb;
 use crate::macho::constants::*;
@@ -105,7 +105,6 @@ pub enum WriteError {
     ImportSymbolWrongKind(SymbolId),
     MalformedRelocations(PathBuf, u8, String),
     MalformedLoh(PathBuf, String),
-    MalformedDataInCode(PathBuf, String),
     SymbolListRead(PathBuf, String),
 }
 
@@ -163,13 +162,6 @@ impl fmt::Display for WriteError {
                 write!(
                     f,
                     "failed to remap LC_LINKER_OPTIMIZATION_HINT in {}: {detail}",
-                    path.display()
-                )
-            }
-            WriteError::MalformedDataInCode(path, detail) => {
-                write!(
-                    f,
-                    "failed to remap LC_DATA_IN_CODE in {}: {detail}",
                     path.display()
                 )
             }
@@ -994,12 +986,8 @@ fn build_linkedit_plan_profiled(
     )?;
     let function_starts_bytes =
         build_function_starts(layout, inputs.0.layout_inputs, inputs.0.atom_table)?;
-    let data_in_code_bytes = build_data_in_code(
-        layout,
-        inputs.0.layout_inputs,
-        inputs.0.atom_table,
-        inputs.0.icf_redirects,
-    )?;
+    // Current Apple ld keeps the command but omits the final metadata payload.
+    let data_in_code_bytes = Vec::new();
     timings.metadata_tables += phase_started.elapsed();
 
     let mut cursor = base_off as u64;
@@ -1521,79 +1509,6 @@ fn build_function_start_symbol_index(inputs: &[LayoutInput<'_>]) -> FunctionStar
     out
 }
 
-fn build_data_in_code(
-    layout: &Layout,
-    inputs: &[LayoutInput<'_>],
-    atom_table: &AtomTable,
-    icf_redirects: Option<&HashMap<crate::resolve::AtomId, crate::resolve::AtomId>>,
-) -> Result<Vec<u8>, WriteError> {
-    #[derive(Clone, Copy)]
-    struct RemappedEntry {
-        input_order: usize,
-        input_entry_index: usize,
-        offset: u32,
-        length: u16,
-        kind: u16,
-    }
-
-    let atoms_by_input_section = atom_table.by_input_section();
-    let atom_ranges = build_atom_range_index(atom_table, &atoms_by_input_section, icf_redirects);
-    let mut remapped = Vec::new();
-    for (input_order, input) in inputs.iter().enumerate() {
-        for (input_entry_index, entry) in input.object.data_in_code.iter().copied().enumerate() {
-            let (section_index, section_relative) =
-                remap_data_in_code_to_section(input.object, entry)?;
-            let (atom_id, atom_delta) = find_containing_atom_range(
-                &atom_ranges,
-                input.id,
-                section_index,
-                section_relative,
-                entry.length as u32,
-            )
-            .ok_or_else(|| {
-                WriteError::MalformedDataInCode(
-                    input.object.path.clone(),
-                    format!(
-                        "entry at file offset {} (len {}) did not land inside any atom",
-                        entry.offset, entry.length
-                    ),
-                )
-            })?;
-            let output_offset = layout.atom_file_offset(atom_id).ok_or_else(|| {
-                WriteError::MalformedDataInCode(
-                    input.object.path.clone(),
-                    format!(
-                        "atom {:?} for entry at file offset {} is missing from final layout",
-                        atom_id, entry.offset
-                    ),
-                )
-            })? + atom_delta as u64;
-            remapped.push(RemappedEntry {
-                input_order,
-                input_entry_index,
-                offset: u32_fit(output_offset, "data-in-code output offset")?,
-                length: entry.length,
-                kind: entry.kind,
-            });
-        }
-    }
-
-    remapped.sort_by(|a, b| {
-        a.offset
-            .cmp(&b.offset)
-            .then_with(|| a.input_order.cmp(&b.input_order))
-            .then_with(|| a.input_entry_index.cmp(&b.input_entry_index))
-    });
-
-    let mut out = Vec::with_capacity(remapped.len() * 8);
-    for entry in remapped {
-        out.extend_from_slice(&entry.offset.to_le_bytes());
-        out.extend_from_slice(&entry.length.to_le_bytes());
-        out.extend_from_slice(&entry.kind.to_le_bytes());
-    }
-    Ok(out)
-}
-
 fn build_loh(
     _layout: &Layout,
     _inputs: &[LayoutInput<'_>],
@@ -1603,54 +1518,6 @@ fn build_loh(
     // Current Apple ld omits LC_LINKER_OPTIMIZATION_HINT from final linked
     // executables and dylibs on our parity corpus, so we do the same.
     Ok(Vec::new())
-}
-
-fn remap_data_in_code_to_section(
-    object: &ObjectFile,
-    entry: DataInCodeEntry,
-) -> Result<(u8, u32), WriteError> {
-    let entry_start = entry.offset as u64;
-    let entry_end = entry_start
-        .checked_add(entry.length as u64)
-        .ok_or_else(|| {
-            WriteError::MalformedDataInCode(
-                object.path.clone(),
-                format!(
-                    "entry at input offset {} with len {} overflows u64",
-                    entry.offset, entry.length
-                ),
-            )
-        })?;
-    let mut matches = object
-        .sections
-        .iter()
-        .enumerate()
-        .filter(|(_, section)| !section.data.is_empty() && is_executable(section.kind))
-        .filter_map(|(idx, section)| {
-            let section_start = section.addr;
-            let section_end = section.addr.checked_add(section.size)?;
-            (section_start <= entry_start && entry_end <= section_end)
-                .then_some(((idx + 1) as u8, (entry_start - section_start) as u32))
-        });
-    if let Some(mapped) = matches.next() {
-        if matches.next().is_none() {
-            return Ok(mapped);
-        }
-        return Err(WriteError::MalformedDataInCode(
-            object.path.clone(),
-            format!(
-                "entry at input offset {} (len {}) ambiguously matches multiple executable input sections",
-                entry.offset, entry.length
-            ),
-        ));
-    }
-    Err(WriteError::MalformedDataInCode(
-        object.path.clone(),
-        format!(
-            "entry at input offset {} (len {}) does not map to any executable input section range",
-            entry.offset, entry.length
-        ),
-    ))
 }
 
 fn collect_imports(

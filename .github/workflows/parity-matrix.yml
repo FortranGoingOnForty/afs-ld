@@ -10,9 +10,14 @@ permissions:
   contents: read
 
 jobs:
-  parity-matrix:
-    runs-on: macos-14
-    timeout-minutes: 30
+  full-suite:
+    name: "Full suite (${{ matrix.os }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,28 +25,33 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run parity harness proof tests
-        run: cargo test --test diff_harness_tolerates_known_linkedit --test parity_harness --test parity_canary -- --nocapture
-
-      - name: Run determinism gate
-        run: cargo test --test determinism -- --nocapture
-
-      - name: Run performance budget gate
+      - name: Run all unit and integration targets
         env:
           AFS_LD_HELLO_BUDGET_MS: "20"
           AFS_LD_RUNTIME_BUDGET_MS: "150"
-        run: cargo test --test perf_baseline -- --nocapture
-
-      - name: Run parity matrix
-        env:
           PARITY_MATRIX_ARTIFACT_DIR: ${{ github.workspace }}/parity-matrix-artifacts
           PARITY_MATRIX_MAX_SECONDS: "120"
-        run: cargo test --test parity_matrix -- --nocapture
+        run: cargo test --all-targets -- --nocapture
 
       - name: Upload parity artifacts
-        if: always()
+        if: always() && matrix.os == 'macos-14'
         uses: actions/upload-artifact@v4
         with:
           name: parity-matrix-html
           path: parity-matrix-artifacts
           if-no-files-found: warn
+
+  quality:
+    name: Quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run Clippy on every target
+        run: cargo clippy --all-targets -- -D warnings

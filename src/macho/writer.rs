@@ -956,6 +956,14 @@ fn build_linkedit_plan_profiled(
             indirect_symbol_index(entry.symbol, &import_lookup, &symbol_plan.symbol_indices)
         }),
     );
+    push_indirect_section(
+        &mut indirect_symbols,
+        &mut indirect_starts,
+        ("__DATA", "__thread_ptrs"),
+        synthetic_plan.thread_pointers.entries.iter().map(|entry| {
+            indirect_symbol_index(entry.symbol, &import_lookup, &symbol_plan.symbol_indices)
+        }),
+    );
 
     let mut indirect_bytes = Vec::with_capacity(indirect_symbols.len() * 4);
     for index in &indirect_symbols {
@@ -2436,6 +2444,34 @@ fn build_bind_streams(
             let Some(import) = imports.get(&entry.symbol).copied() else {
                 continue;
             };
+            let slot_addr = section.addr + (idx as u64) * 8;
+            bind_specs.push(BindRecordSpec {
+                segment_index,
+                segment_offset: slot_addr - segment.vm_addr,
+                ordinal: import.ordinal,
+                name: &import.name,
+                weak_import: import.weak_import,
+                addend: 0,
+                terminate: false,
+            });
+        }
+    }
+
+    if !synthetic_plan.thread_pointers.entries.is_empty() {
+        let segment_index = segment_index(layout, "__DATA")?;
+        let segment = layout
+            .segment("__DATA")
+            .ok_or(WriteError::MissingSegment("__DATA"))?;
+        let section = layout
+            .sections
+            .iter()
+            .find(|section| section.segment == "__DATA" && section.name == "__thread_ptrs")
+            .ok_or(WriteError::MissingSegment("__DATA"))?;
+        for (idx, entry) in synthetic_plan.thread_pointers.entries.iter().enumerate() {
+            let import = imports
+                .get(&entry.symbol)
+                .copied()
+                .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
             let slot_addr = section.addr + (idx as u64) * 8;
             bind_specs.push(BindRecordSpec {
                 segment_index,

@@ -1,4 +1,4 @@
-//! Shared test infrastructure. Integration tests that need the harness
-//! declare `mod common;` and then use `common::harness::*`.
+//! Shared integration-test infrastructure.
 
+pub mod artifacts;
 pub mod harness;

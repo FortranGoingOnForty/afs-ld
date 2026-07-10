@@ -6,30 +6,16 @@
 //! If the runtime archive isn't present (a clean clone that has never been
 //! built) the test is skipped with a clear message rather than failing.
 
-use std::path::{Path, PathBuf};
+#[path = "common/artifacts.rs"]
+mod artifacts;
 
 use afs_ld::archive::{Archive, FetchError, SymbolIndex};
 use afs_ld::symbol::SymKind;
-
-fn find_runtime_archive() -> Option<PathBuf> {
-    // afs-ld crate manifest sits at .../armfortas/afs-ld/; target/ lives at
-    // .../armfortas/target/.
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    for profile in ["debug", "release"] {
-        let candidate = workspace
-            .join("target")
-            .join(profile)
-            .join("libarmfortas_rt.a");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
+use artifacts::workspace_artifact;
 
 #[test]
 fn libarmfortas_rt_archive_walks_cleanly() {
-    let Some(path) = find_runtime_archive() else {
+    let Some(path) = workspace_artifact("libarmfortas_rt.a") else {
         eprintln!("skipping: libarmfortas_rt.a not built; run `cargo build -p armfortas-rt` first");
         return;
     };

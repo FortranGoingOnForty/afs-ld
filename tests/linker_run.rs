@@ -32,6 +32,7 @@ use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, SymKind};
 use afs_ld::synth::unwind::decode_unwind_info;
 use afs_ld::{FrameworkSpec, LinkError, LinkOptions, Linker, OutputKind};
+use common::artifacts::workspace_artifact;
 use common::harness::{compare_sections, diff_macho};
 
 fn have_xcrun() -> bool {
@@ -63,20 +64,6 @@ fn sdk_version() -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-fn find_runtime_archive() -> Option<PathBuf> {
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    for profile in ["debug", "release"] {
-        let candidate = workspace
-            .join("target")
-            .join(profile)
-            .join("libarmfortas_rt.a");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 fn have_xcrun_tool(tool: &str) -> bool {
@@ -7364,7 +7351,7 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
         eprintln!("skipping: xcrun or codesign unavailable");
         return;
     }
-    let Some(runtime) = find_runtime_archive() else {
+    let Some(runtime) = workspace_artifact("libarmfortas_rt.a") else {
         eprintln!("skipping: libarmfortas_rt.a not built");
         return;
     };
@@ -7549,7 +7536,7 @@ fn linker_run_rebases_runtime_init_metadata_like_apple_ld() {
         eprintln!("skipping: xcrun or codesign unavailable");
         return;
     }
-    let Some(runtime) = find_runtime_archive() else {
+    let Some(runtime) = workspace_artifact("libarmfortas_rt.a") else {
         eprintln!("skipping: libarmfortas_rt.a not built");
         return;
     };

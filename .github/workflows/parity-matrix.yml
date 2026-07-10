@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TARGET_DIR: .cargo-target
+
 jobs:
   full-suite:
     name: "Full suite (${{ matrix.os }})"

@@ -27,9 +27,7 @@ fn gas() -> Option<PathBuf> {
 
 fn ar() -> Option<PathBuf> {
     for c in ["ar", "/usr/bin/ar", "/usr/local/bin/ar"] {
-        if Command::new(c).arg("--version").output().is_ok()
-            || Command::new(c).output().is_ok()
-        {
+        if Command::new(c).arg("--version").output().is_ok() || Command::new(c).output().is_ok() {
             return Some(PathBuf::from(c));
         }
     }
@@ -46,15 +44,28 @@ fn assemble(gas: &PathBuf, dir: &std::path::Path, name: &str, asm: &str) -> Path
         .arg(&s)
         .output()
         .unwrap();
-    assert!(out.status.success(), "gas {name}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gas {name}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     o
 }
 
 fn archive(ar: &PathBuf, dir: &std::path::Path, libname: &str, obj: &PathBuf) -> PathBuf {
     let a = dir.join(format!("lib{libname}.a"));
     let _ = std::fs::remove_file(&a);
-    let out = Command::new(ar).arg("rcs").arg(&a).arg(obj).output().unwrap();
-    assert!(out.status.success(), "ar {libname}: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(ar)
+        .arg("rcs")
+        .arg(&a)
+        .arg(obj)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "ar {libname}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     a
 }
 
@@ -92,7 +103,11 @@ fn archive_search_follows_command_line_order() {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_afs-ld"));
         cmd.arg("-o").arg(&out).args(args);
         let r = cmd.output().unwrap();
-        assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+        assert!(
+            r.status.success(),
+            "afs-ld: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
         Command::new(&out).status().unwrap().code().unwrap()
     };
 
@@ -108,7 +123,10 @@ fn archive_search_follows_command_line_order() {
         OsStr::new("-lb"),
         liba.as_os_str(),
     ]);
-    assert_eq!(code_b_first, 2, "libb precedes liba on the command line, so its foo wins");
+    assert_eq!(
+        code_b_first, 2,
+        "libb precedes liba on the command line, so its foo wins"
+    );
 
     // liba first (via -la), libb second (positional) => foo == 1.
     let code_a_first = link_and_run(&[
@@ -118,7 +136,10 @@ fn archive_search_follows_command_line_order() {
         OsStr::new("-la"),
         libb.as_os_str(),
     ]);
-    assert_eq!(code_a_first, 1, "liba precedes libb on the command line, so its foo wins");
+    assert_eq!(
+        code_a_first, 1,
+        "liba precedes libb on the command line, so its foo wins"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

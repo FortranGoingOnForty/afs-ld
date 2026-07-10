@@ -12,10 +12,7 @@ fn workspace_artifacts_follow_the_running_test_profile() {
     assert_eq!(deps_dir.file_name(), Some(Path::new("deps").as_os_str()));
 
     let profile_dir = deps_dir.parent().expect("deps has a profile directory");
-    assert_eq!(
-        artifacts::cargo_profile_dir().as_deref(),
-        Some(profile_dir)
-    );
+    assert_eq!(artifacts::cargo_profile_dir().as_deref(), Some(profile_dir));
 
     let linker = artifacts::workspace_binary("afs-ld")
         .expect("afs-ld binary must be built for integration tests");

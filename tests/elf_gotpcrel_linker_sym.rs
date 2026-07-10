@@ -43,8 +43,17 @@ fn gotpcrel_against_linker_defined_end_links_and_runs() {
     let s = dir.join("g.s");
     let obj = dir.join("g.o");
     std::fs::write(&s, asm).unwrap();
-    let out = Command::new(&gas).args(["--64", "-o"]).arg(&obj).arg(&s).output().unwrap();
-    assert!(out.status.success(), "gas: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(&gas)
+        .args(["--64", "-o"])
+        .arg(&obj)
+        .arg(&s)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "gas: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let bin = dir.join("g_afsld");
     let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))

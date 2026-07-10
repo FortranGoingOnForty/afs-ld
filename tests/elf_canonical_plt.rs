@@ -50,15 +50,27 @@ fn rtld() -> Option<&'static str> {
     } else {
         &[]
     };
-    cands.iter().copied().find(|p| std::path::Path::new(p).exists())
+    cands
+        .iter()
+        .copied()
+        .find(|p| std::path::Path::new(p).exists())
 }
 
 fn assemble(gas: &PathBuf, asm: &str, dir: &std::path::Path, name: &str) -> PathBuf {
     let s = dir.join(format!("{name}.s"));
     let o = dir.join(format!("{name}.o"));
     std::fs::write(&s, asm).unwrap();
-    let out = Command::new(gas).args(["--64", "-o"]).arg(&o).arg(&s).output().unwrap();
-    assert!(out.status.success(), "gas {name}: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(gas)
+        .args(["--64", "-o"])
+        .arg(&o)
+        .arg(&s)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "gas {name}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     o
 }
 
@@ -74,7 +86,11 @@ fn ru64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(v)
 }
 fn cstr(b: &[u8], o: usize) -> String {
-    let end = b[o..].iter().position(|&c| c == 0).map(|p| o + p).unwrap_or(b.len());
+    let end = b[o..]
+        .iter()
+        .position(|&c| c == 0)
+        .map(|p| o + p)
+        .unwrap_or(b.len());
     String::from_utf8_lossy(&b[o..end]).into_owned()
 }
 
@@ -154,7 +170,11 @@ fn address_taken_shared_func_gets_canonical_plt_value() {
         .arg(&answer_obj)
         .output()
         .unwrap();
-    assert!(r.status.success(), "ld -shared: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "ld -shared: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
 
     // main.o takes the *address* of answer (`.quad answer` => R_X86_64_64, a
     // direct address-take, not `call answer@plt`) and calls through it. The
@@ -176,7 +196,11 @@ fn address_taken_shared_func_gets_canonical_plt_value() {
         .arg(&so)
         .output()
         .unwrap();
-    assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "afs-ld: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
 
     // Structural check: answer's .dynsym entry is UNDEF with st_value inside
     // the executable's .plt — the canonical-PLT signature.
@@ -184,8 +208,14 @@ fn address_taken_shared_func_gets_canonical_plt_value() {
     let (plt_addr, _, plt_size, _, _) =
         find_section(&elf, ".plt").expect("linked exe must have a .plt");
     let (shndx, value) = dynsym_entry(&elf, "answer").expect("answer must be in .dynsym");
-    assert_eq!(shndx, 0, "canonical-PLT import must stay SHN_UNDEF, got shndx={shndx}");
-    assert!(value != 0, "canonical-PLT import must carry a non-zero st_value");
+    assert_eq!(
+        shndx, 0,
+        "canonical-PLT import must stay SHN_UNDEF, got shndx={shndx}"
+    );
+    assert!(
+        value != 0,
+        "canonical-PLT import must carry a non-zero st_value"
+    );
     assert!(
         value >= plt_addr && value < plt_addr + plt_size,
         "st_value {value:#x} must point into .plt [{plt_addr:#x}, {:#x})",
@@ -193,7 +223,10 @@ fn address_taken_shared_func_gets_canonical_plt_value() {
     );
 
     // End-to-end: calling through the taken address resolves to answer().
-    let run = Command::new(&out).env("LD_LIBRARY_PATH", &dir).output().unwrap();
+    let run = Command::new(&out)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
     assert_eq!(
         run.status.code(),
         Some(42),

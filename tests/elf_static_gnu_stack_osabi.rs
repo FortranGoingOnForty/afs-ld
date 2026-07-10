@@ -71,8 +71,17 @@ fn static_exe_has_nonexec_gnu_stack_and_host_osabi() {
     let s = dir.join("x.s");
     let obj = dir.join("x.o");
     std::fs::write(&s, asm).unwrap();
-    let out = Command::new(&gas).args(["--64", "-o"]).arg(&obj).arg(&s).output().unwrap();
-    assert!(out.status.success(), "gas: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(&gas)
+        .args(["--64", "-o"])
+        .arg(&obj)
+        .arg(&s)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "gas: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let bin = dir.join("x_afsld");
     let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
@@ -81,12 +90,21 @@ fn static_exe_has_nonexec_gnu_stack_and_host_osabi() {
         .arg(&obj)
         .output()
         .unwrap();
-    assert!(r.status.success(), "afs-ld: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "afs-ld: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
 
     let elf = std::fs::read(&bin).unwrap();
 
     // EI_OSABI matches the host the binary will run on.
-    assert_eq!(elf[7], expected_osabi(), "EI_OSABI must match the host, got {}", elf[7]);
+    assert_eq!(
+        elf[7],
+        expected_osabi(),
+        "EI_OSABI must match the host, got {}",
+        elf[7]
+    );
 
     // Exactly one PT_GNU_STACK, RW and never executable.
     let phoff = ru64(&elf, 32) as usize;
@@ -98,11 +116,22 @@ fn static_exe_has_nonexec_gnu_stack_and_host_osabi() {
         if ru32(&elf, p) == PT_GNU_STACK {
             gnu_stack += 1;
             let flags = ru32(&elf, p + 4);
-            assert_eq!(flags & PF_X, 0, "PT_GNU_STACK must not be executable (flags={flags:#x})");
-            assert_eq!(flags, PF_R | PF_W, "PT_GNU_STACK should be RW (flags={flags:#x})");
+            assert_eq!(
+                flags & PF_X,
+                0,
+                "PT_GNU_STACK must not be executable (flags={flags:#x})"
+            );
+            assert_eq!(
+                flags,
+                PF_R | PF_W,
+                "PT_GNU_STACK should be RW (flags={flags:#x})"
+            );
         }
     }
-    assert_eq!(gnu_stack, 1, "static exe must carry exactly one PT_GNU_STACK marker");
+    assert_eq!(
+        gnu_stack, 1,
+        "static exe must carry exactly one PT_GNU_STACK marker"
+    );
 
     // Adding the marker phdr must not have disturbed the layout: it still runs.
     let run = Command::new(&bin).status().unwrap();

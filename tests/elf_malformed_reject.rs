@@ -168,7 +168,10 @@ fn shared_object_dynsym_name_past_dynstr_errors() {
     w32(&mut b, VALID_SO_DYNSYM_OFF + 24, 255);
     let e = parse_shared("bad.so", &b).unwrap_err();
     let msg = e.to_string();
-    assert!(msg.contains(".dynstr") && msg.contains("out of range"), "got {msg}");
+    assert!(
+        msg.contains(".dynstr") && msg.contains("out of range"),
+        "got {msg}"
+    );
 }
 
 #[test]
@@ -203,5 +206,8 @@ fn relocatable_section_table_out_of_range_errors() {
 fn relocatable_symbol_name_past_strtab_errors() {
     let e = parse_rel("bad.o", &relocatable_with_bad_sym_name()).unwrap_err();
     let msg = e.to_string();
-    assert!(msg.contains(".strtab") && msg.contains("out of range"), "got {msg}");
+    assert!(
+        msg.contains(".strtab") && msg.contains("out of range"),
+        "got {msg}"
+    );
 }

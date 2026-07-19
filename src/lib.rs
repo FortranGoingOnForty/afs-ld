@@ -44,10 +44,10 @@ use macho::tbd::{
 };
 use reloc::arm64::RelocError;
 use resolve::{
-    classify_unresolved, drain_fetches, find_archive_by_path, force_load_all, force_load_archive,
-    format_duplicate_diagnostic, format_undefined_diagnostic, format_undefined_warning_diagnostic,
-    seed_all, DrainReport, DylibLoadMeta, InputAddError, InputId, Inputs, Symbol, SymbolTable,
-    UndefinedTreatment,
+    classify_unresolved, find_archive_by_path, force_load_archive, format_duplicate_diagnostic,
+    format_undefined_diagnostic, format_undefined_warning_diagnostic, resolve_inputs_in_order,
+    DrainReport, DylibId, DylibLoadMeta, InputAddError, InputId, Inputs, OrderedInput,
+    OrderedInputEntry, Symbol, SymbolTable, UndefinedTreatment,
 };
 use symbol::SymKind;
 
@@ -85,6 +85,15 @@ pub struct PlatformVersion {
 pub struct FrameworkSpec {
     pub name: String,
     pub weak: bool,
+}
+
+/// One input request in command-line order. Library and framework requests
+/// stay unresolved until all search-path options have been parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputSpec {
+    Path(PathBuf),
+    Library(String),
+    Framework(FrameworkSpec),
 }
 
 /// User-facing linker configuration, populated by the CLI parser.
@@ -430,11 +439,33 @@ impl From<loh::LohError> for LinkError {
 pub struct Linker;
 
 impl Linker {
+    /// Link a programmatically grouped configuration. This preserves the
+    /// historical group order but cannot recover command-line interleaving;
+    /// CLI-style callers should use [`Linker::run_ordered`].
     pub fn run(opts: &LinkOptions) -> Result<(), LinkError> {
         Self::run_profiled(opts).map(|_| ())
     }
 
     pub fn run_profiled(opts: &LinkOptions) -> Result<LinkProfile, LinkError> {
+        let input_specs = legacy_input_specs(opts);
+        Self::run_profiled_with_inputs(opts, &input_specs)
+    }
+
+    pub fn run_ordered(opts: &LinkOptions, input_specs: &[InputSpec]) -> Result<(), LinkError> {
+        Self::run_profiled_with_inputs(opts, input_specs).map(|_| ())
+    }
+
+    pub fn run_profiled_ordered(
+        opts: &LinkOptions,
+        input_specs: &[InputSpec],
+    ) -> Result<LinkProfile, LinkError> {
+        Self::run_profiled_with_inputs(opts, input_specs)
+    }
+
+    fn run_profiled_with_inputs(
+        opts: &LinkOptions,
+        input_specs: &[InputSpec],
+    ) -> Result<LinkProfile, LinkError> {
         let overall_started = Instant::now();
         let mut phases = LinkPhaseTimings::default();
         if opts.relocatable {
@@ -457,7 +488,7 @@ impl Linker {
                 "`-icf=all` is not yet supported; use `-icf=safe` or `-icf=none`".into(),
             ));
         }
-        if opts.inputs.is_empty() && opts.library_names.is_empty() && opts.frameworks.is_empty() {
+        if input_specs.is_empty() {
             return Err(LinkError::NoInputs);
         }
         let parallel_jobs = opts.parallel_jobs();
@@ -484,85 +515,108 @@ impl Linker {
             );
         }
 
-        let mut load_paths = Vec::new();
-        let mut positional_dylibs = Vec::new();
-        for path in &opts.inputs {
-            match path.extension().and_then(|ext| ext.to_str()) {
-                Some("dylib" | "tbd") => positional_dylibs.push(path.clone()),
-                _ => load_paths.push(path.clone()),
-            }
-        }
-        let mut dylib_load_kinds = std::collections::HashMap::new();
-        for name in &opts.library_names {
-            let path = resolve_library_input(opts, name)?;
-            dylib_load_kinds.insert(path.clone(), DylibLoadKind::Normal);
-            load_paths.push(path);
-        }
-        for framework in &opts.frameworks {
-            let path = resolve_framework_input(opts, &framework.name)?;
-            dylib_load_kinds.insert(
-                path.clone(),
-                if framework.weak {
-                    DylibLoadKind::Weak
-                } else {
-                    DylibLoadKind::Normal
-                },
-            );
-            load_paths.push(path);
-        }
-        load_paths.extend(positional_dylibs);
+        let (resolved_inputs, mut first_input_error) = resolve_input_specs(opts, input_specs);
+        let mut dylib_load_kinds: std::collections::HashMap<DylibId, DylibLoadKind> =
+            std::collections::HashMap::new();
+        let mut loaded_inputs = vec![false; resolved_inputs.len()];
 
         let mut inputs = Inputs::new();
+        let mut input_order = Vec::new();
         let mut deferred_dylibs = Vec::new();
         let mut initial_loads = Vec::new();
         let phase_started = Instant::now();
-        for (load_order, path) in load_paths.iter().enumerate() {
+        for (load_order, input) in resolved_inputs.iter().enumerate() {
             if matches!(
-                path.extension().and_then(|ext| ext.to_str()),
+                input.path.extension().and_then(|ext| ext.to_str()),
                 Some("dylib" | "tbd")
             ) {
-                deferred_dylibs.push((load_order, path.clone()));
+                deferred_dylibs.push((load_order, input.path.clone()));
                 continue;
             }
-            if opts.trace_inputs {
-                eprintln!("afs-ld: loading {}", path.display());
-            }
-            initial_loads.push((load_order, path.clone()));
+            initial_loads.push((load_order, input.path.clone()));
         }
-        for loaded in load_initial_inputs(initial_loads, parallel_jobs)? {
-            let timings = register_loaded_initial_input(&mut inputs, loaded);
-            phases.add_input_load(timings);
+        for result in load_initial_inputs(initial_loads, parallel_jobs) {
+            match result {
+                Ok(loaded) => {
+                    let load_order = loaded.load_order();
+                    let registered = register_loaded_initial_input(&mut inputs, loaded);
+                    phases.add_input_load(registered.timings);
+                    input_order.extend(registered.ordered);
+                    loaded_inputs[load_order] = true;
+                }
+                Err(error) => retain_earliest_input_error(&mut first_input_error, error),
+            }
         }
         let include_tbd_exports = inputs_may_need_dylib_exports(&inputs)?;
         for (load_order, path) in &deferred_dylibs {
-            if opts.trace_inputs {
-                eprintln!("afs-ld: loading {}", path.display());
+            match register_input(&mut inputs, path, *load_order, include_tbd_exports) {
+                Ok(registered) => {
+                    for entry in &registered.ordered {
+                        if let OrderedInput::Dylib(id) = entry.input {
+                            dylib_load_kinds.insert(id, resolved_inputs[*load_order].load_kind);
+                        }
+                    }
+                    phases.add_input_load(registered.timings);
+                    input_order.extend(registered.ordered);
+                    loaded_inputs[*load_order] = true;
+                }
+                Err(error) => retain_earliest_input_error(
+                    &mut first_input_error,
+                    InitialLoadError {
+                        load_order: *load_order,
+                        error,
+                    },
+                ),
             }
-            let timings = register_input(&mut inputs, path, *load_order, include_tbd_exports)?;
-            phases.add_input_load(timings);
+        }
+        if let Some(error) = first_input_error {
+            if opts.trace_inputs {
+                for (load_order, input) in resolved_inputs.iter().enumerate() {
+                    if load_order >= error.load_order {
+                        break;
+                    }
+                    if loaded_inputs[load_order] {
+                        eprintln!("afs-ld: loading {}", input.path.display());
+                    }
+                }
+            }
+            return Err(error.error);
         }
         phases.input_parsing = phase_started.elapsed();
 
         let mut sym_table = SymbolTable::new();
         let phase_started = Instant::now();
-        let seed_report = seed_all(&inputs, &mut sym_table)?;
-        if seed_report.has_errors() {
+        let resolution_report = match resolve_inputs_in_order(
+            &mut inputs,
+            &input_order,
+            &mut sym_table,
+            parallel_jobs,
+            opts.all_load,
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                if opts.trace_inputs {
+                    for path in &error.report.loaded_paths {
+                        eprintln!("afs-ld: loading {}", path.display());
+                    }
+                }
+                return Err(LinkError::Fetch(error.error));
+            }
+        };
+        if opts.trace_inputs {
+            for path in &resolution_report.loaded_paths {
+                eprintln!("afs-ld: loading {}", path.display());
+            }
+        }
+        if !resolution_report.duplicates.is_empty() {
             let mut msg = String::new();
-            for err in &seed_report.duplicates {
+            for err in &resolution_report.duplicates {
                 msg.push_str(&format_duplicate_diagnostic(&sym_table, &inputs, err));
             }
             return Err(LinkError::DuplicateSymbols(msg));
         }
 
         let mut force_report = DrainReport::default();
-        if opts.all_load {
-            force_load_all(
-                &mut inputs,
-                &mut sym_table,
-                &mut force_report,
-                parallel_jobs,
-            )?;
-        }
         for archive_path in &opts.force_load_archives {
             let Some(archive_id) = find_archive_by_path(&inputs, archive_path) else {
                 return Err(LinkError::ForceLoadNotArchive(archive_path.clone()));
@@ -588,27 +642,8 @@ impl Linker {
             return Err(LinkError::DuplicateSymbols(msg));
         }
 
-        let drain_report = drain_fetches(
-            &mut inputs,
-            &mut sym_table,
-            seed_report.pending_fetches,
-            parallel_jobs,
-        )?;
-        if opts.trace_inputs {
-            for path in &drain_report.loaded_paths {
-                eprintln!("afs-ld: loading {}", path.display());
-            }
-        }
-        if !drain_report.duplicates.is_empty() {
-            let mut msg = String::new();
-            for err in &drain_report.duplicates {
-                msg.push_str(&format_duplicate_diagnostic(&sym_table, &inputs, err));
-            }
-            return Err(LinkError::DuplicateSymbols(msg));
-        }
-        let mut referrers = seed_report.referrers.clone();
+        let mut referrers = resolution_report.referrers.clone();
         referrers.extend_from(&force_report.referrers);
-        referrers.extend_from(&drain_report.referrers);
         let unresolved = classify_unresolved(&mut sym_table, opts.undefined_treatment);
         if !unresolved.errors.is_empty() {
             return Err(LinkError::UndefinedSymbols(format_undefined_diagnostic(
@@ -654,13 +689,13 @@ impl Linker {
             .collect();
         let mut dylib_loads = Vec::new();
         let mut seen_ordinals = std::collections::BTreeSet::new();
-        for dylib in &inputs.dylibs {
+        for (index, dylib) in inputs.dylibs.iter().enumerate() {
             if !seen_ordinals.insert(dylib.ordinal) {
                 continue;
             }
             dylib_loads.push(DylibDependency {
                 kind: dylib_load_kinds
-                    .get(&dylib.path)
+                    .get(&DylibId(index as u32))
                     .copied()
                     .unwrap_or(DylibLoadKind::Normal),
                 install_name: dylib.load_install_name.clone(),
@@ -927,6 +962,80 @@ impl Linker {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedInput {
+    path: PathBuf,
+    load_kind: DylibLoadKind,
+}
+
+fn legacy_input_specs(opts: &LinkOptions) -> Vec<InputSpec> {
+    let mut input_specs =
+        Vec::with_capacity(opts.inputs.len() + opts.library_names.len() + opts.frameworks.len());
+    let mut positional_dylibs = Vec::new();
+    for path in &opts.inputs {
+        if matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("dylib" | "tbd")
+        ) {
+            positional_dylibs.push(path.clone());
+        } else {
+            input_specs.push(InputSpec::Path(path.clone()));
+        }
+    }
+    input_specs.extend(opts.library_names.iter().cloned().map(InputSpec::Library));
+    input_specs.extend(opts.frameworks.iter().cloned().map(InputSpec::Framework));
+    input_specs.extend(positional_dylibs.into_iter().map(InputSpec::Path));
+    input_specs
+}
+
+fn resolve_input_specs(
+    opts: &LinkOptions,
+    input_specs: &[InputSpec],
+) -> (Vec<ResolvedInput>, Option<InitialLoadError>) {
+    let mut resolved = Vec::with_capacity(input_specs.len());
+    for spec in input_specs {
+        let result = match spec {
+            InputSpec::Path(path) => Ok((path.clone(), DylibLoadKind::Normal)),
+            InputSpec::Library(name) => {
+                resolve_library_input(opts, name).map(|path| (path, DylibLoadKind::Normal))
+            }
+            InputSpec::Framework(framework) => {
+                resolve_framework_input(opts, &framework.name).map(|path| {
+                    (
+                        path,
+                        if framework.weak {
+                            DylibLoadKind::Weak
+                        } else {
+                            DylibLoadKind::Normal
+                        },
+                    )
+                })
+            }
+        };
+        let (path, load_kind) = match result {
+            Ok(resolved_input) => resolved_input,
+            Err(error) => {
+                let load_order = resolved.len();
+                return (resolved, Some(InitialLoadError { load_order, error }));
+            }
+        };
+        resolved.push(ResolvedInput { path, load_kind });
+    }
+    (resolved, None)
+}
+
+fn retain_earliest_input_error(
+    current: &mut Option<InitialLoadError>,
+    candidate: InitialLoadError,
+) {
+    if current
+        .as_ref()
+        .is_none_or(|error| candidate.load_order < error.load_order)
+    {
+        *current = Some(candidate);
+    }
+}
+
 fn resolve_library_input(opts: &LinkOptions, name: &str) -> Result<PathBuf, LinkError> {
     let mut search_dirs = Vec::new();
     for dir in &opts.search_paths {
@@ -1024,10 +1133,24 @@ struct InitialLoadError {
     error: LinkError,
 }
 
+struct RegisteredInput {
+    timings: InputLoadTimings,
+    ordered: Vec<OrderedInputEntry>,
+}
+
+impl RegisteredInput {
+    fn one(timings: InputLoadTimings, ordered: OrderedInputEntry) -> Self {
+        Self {
+            timings,
+            ordered: vec![ordered],
+        }
+    }
+}
+
 fn load_initial_inputs(
     loads: Vec<(usize, PathBuf)>,
     parallel_jobs: usize,
-) -> Result<Vec<LoadedInitialInput>, LinkError> {
+) -> Vec<Result<LoadedInitialInput, InitialLoadError>> {
     let mut results = Vec::new();
     let mut object_jobs = Vec::new();
     for (load_order, path) in loads {
@@ -1043,14 +1166,7 @@ fn load_initial_inputs(
         Err(error) => error.load_order,
     });
 
-    let mut loaded = Vec::with_capacity(results.len());
-    for result in results {
-        match result {
-            Ok(input) => loaded.push(input),
-            Err(error) => return Err(error.error),
-        }
-    }
-    Ok(loaded)
+    results
 }
 
 fn load_objects_parallel(
@@ -1149,15 +1265,22 @@ fn load_archive_input(
 fn register_loaded_initial_input(
     inputs: &mut Inputs,
     loaded: LoadedInitialInput,
-) -> InputLoadTimings {
+) -> RegisteredInput {
     match loaded {
         LoadedInitialInput::Object(input) => {
-            inputs.add_parsed_object(input.path, input.bytes, input.parsed, input.load_order);
-            input.timings
+            let id =
+                inputs.add_parsed_object(input.path, input.bytes, input.parsed, input.load_order);
+            RegisteredInput::one(
+                input.timings,
+                OrderedInputEntry::object(input.load_order, id),
+            )
         }
         LoadedInitialInput::Archive(input) => {
-            inputs.add_validated_archive(input.path, input.bytes, input.load_order);
-            input.timings
+            let id = inputs.add_validated_archive(input.path, input.bytes, input.load_order);
+            RegisteredInput::one(
+                input.timings,
+                OrderedInputEntry::archive(input.load_order, id),
+            )
         }
     }
 }
@@ -1167,20 +1290,23 @@ fn register_input(
     path: &std::path::Path,
     load_order: usize,
     include_tbd_exports: bool,
-) -> Result<InputLoadTimings, LinkError> {
+) -> Result<RegisteredInput, LinkError> {
     let mut timings = InputLoadTimings::default();
+    let mut ordered = Vec::new();
     let phase_started = Instant::now();
     let bytes = fs::read(path)?;
     timings.read = phase_started.elapsed();
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("a") => {
             let phase_started = Instant::now();
-            let _ = inputs.add_archive(path.to_path_buf(), bytes, load_order)?;
+            let id = inputs.add_archive(path.to_path_buf(), bytes, load_order)?;
+            ordered.push(OrderedInputEntry::archive(load_order, id));
             timings.archive_parse = phase_started.elapsed();
         }
         Some("dylib") => {
             let phase_started = Instant::now();
-            let _ = inputs.add_dylib(path.to_path_buf(), bytes)?;
+            let id = inputs.add_dylib(path.to_path_buf(), bytes)?;
+            ordered.push(OrderedInputEntry::dylib(load_order, id));
             timings.dylib_parse = phase_started.elapsed();
         }
         Some("tbd") => {
@@ -1225,18 +1351,20 @@ fn register_input(
             };
             for doc in &docs {
                 let file = DylibFile::from_tbd(path, doc, &target);
-                let _ =
+                let id =
                     inputs.add_dylib_from_file_with_meta(path.to_path_buf(), file, load.clone());
+                ordered.push(OrderedInputEntry::dylib(load_order, id));
             }
             timings.tbd_materialize = phase_started.elapsed();
         }
         _ => {
             let phase_started = Instant::now();
-            let _ = inputs.add_object(path.to_path_buf(), bytes, load_order)?;
+            let id = inputs.add_object(path.to_path_buf(), bytes, load_order)?;
+            ordered.push(OrderedInputEntry::object(load_order, id));
             timings.object_parse = phase_started.elapsed();
         }
     }
-    Ok(timings)
+    Ok(RegisteredInput { timings, ordered })
 }
 
 fn inputs_may_need_dylib_exports(inputs: &Inputs) -> Result<bool, LinkError> {

@@ -182,6 +182,42 @@ pub struct DylibInput {
     pub ordinal: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrderedInput {
+    Object(InputId),
+    Archive(ArchiveId),
+    Dylib(DylibId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OrderedInputEntry {
+    pub(crate) load_order: usize,
+    pub(crate) input: OrderedInput,
+}
+
+impl OrderedInputEntry {
+    pub(crate) fn object(load_order: usize, id: InputId) -> Self {
+        Self {
+            load_order,
+            input: OrderedInput::Object(id),
+        }
+    }
+
+    pub(crate) fn archive(load_order: usize, id: ArchiveId) -> Self {
+        Self {
+            load_order,
+            input: OrderedInput::Archive(id),
+        }
+    }
+
+    pub(crate) fn dylib(load_order: usize, id: DylibId) -> Self {
+        Self {
+            load_order,
+            input: OrderedInput::Dylib(id),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DylibLoadMeta {
     pub install_name: String,
@@ -652,9 +688,8 @@ impl SymbolTable {
         let action = match (existing_kind, new_kind) {
             // --- existing Undefined ---
             (Undefined, Undefined) => Action::Keep,
-            (Undefined, Defined | Common | DylibImport | LazyArchive | LazyObject) => {
-                Action::Replace
-            }
+            (Undefined, Defined | Common | DylibImport | LazyObject) => Action::Replace,
+            (Undefined, LazyArchive) => Action::ReplaceAndPendingArchiveFetch,
 
             // --- existing Defined (strong vs weak resolved inline) ---
             (Defined, Undefined)
@@ -741,6 +776,26 @@ impl SymbolTable {
                     cause: TransitionCause::Replaced,
                 });
                 InsertOutcome::Replaced { id, from, to }
+            }
+            Action::ReplaceAndPendingArchiveFetch => {
+                let (archive, member) = match &sym {
+                    Symbol::LazyArchive {
+                        archive, member, ..
+                    } => (*archive, *member),
+                    _ => unreachable!("archive fetch replacement requires LazyArchive"),
+                };
+                self.symbols[id.0 as usize] = sym;
+                self.transitions.push(Transition {
+                    id,
+                    from,
+                    to,
+                    cause: TransitionCause::Replaced,
+                });
+                InsertOutcome::PendingArchiveFetch {
+                    id,
+                    archive,
+                    member,
+                }
             }
             Action::CoalesceCommon => {
                 self.coalesce_common(id, sym);
@@ -884,6 +939,7 @@ impl SymbolTable {
 enum Action {
     Keep,
     Replace,
+    ReplaceAndPendingArchiveFetch,
     CoalesceCommon,
     PendingArchiveFetch,
     PendingObjectLoad,
@@ -1010,25 +1066,72 @@ pub fn seed_archives(
     table: &mut SymbolTable,
     report: &mut SeedReport,
 ) -> Result<(), SeedError> {
-    for (ai_idx, ai) in inputs.archives.iter().enumerate() {
-        let archive = Archive::open(&ai.path, &ai.bytes)?;
-        let archive_id = ArchiveId(ai_idx as u32);
-        let Some(idx) = archive.symbol_index() else {
-            // Archives without a symbol index are legal (clang produces
-            // them occasionally). They require -all_load to pull anything.
+    for ai_idx in 0..inputs.archives.len() {
+        seed_archive(inputs, ArchiveId(ai_idx as u32), table, report)?;
+    }
+    Ok(())
+}
+
+/// Seed the lazy definitions contributed by one archive at its position in
+/// the top-level input stream.
+fn seed_archive(
+    inputs: &Inputs,
+    archive_id: ArchiveId,
+    table: &mut SymbolTable,
+    report: &mut SeedReport,
+) -> Result<(), SeedError> {
+    let ai = inputs.archive(archive_id);
+    let archive = Archive::open(&ai.path, &ai.bytes)?;
+    let Some(idx) = archive.symbol_index() else {
+        // Archives without a symbol index are legal. They require -all_load
+        // or -force_load to pull members.
+        return Ok(());
+    };
+    for entry in &idx.entries {
+        let name = table.intern(&entry.name);
+        let sym = Symbol::LazyArchive {
+            name,
+            archive: archive_id,
+            member: MemberId(entry.member_header_offset),
+        };
+        match table.insert(sym) {
+            Ok(outcome) => report.record_outcome(outcome),
+            Err(e) => report.record_error(e),
+        }
+    }
+    Ok(())
+}
+
+fn seed_archive_for_unresolved(
+    inputs: &Inputs,
+    archive_id: ArchiveId,
+    table: &mut SymbolTable,
+    report: &mut SeedReport,
+) -> Result<(), SeedError> {
+    let ai = inputs.archive(archive_id);
+    let archive = Archive::open(&ai.path, &ai.bytes)?;
+    let Some(index) = archive.symbol_index() else {
+        return Ok(());
+    };
+
+    for entry in &index.entries {
+        let Some(name) = table.interner.get(&entry.name) else {
             continue;
         };
-        for entry in &idx.entries {
-            let name = table.intern(&entry.name);
-            let sym = Symbol::LazyArchive {
-                name,
-                archive: archive_id,
-                member: MemberId(entry.member_header_offset),
-            };
-            match table.insert(sym) {
-                Ok(outcome) => report.record_outcome(outcome),
-                Err(e) => report.record_error(e),
-            }
+        let Some(id) = table.lookup(name) else {
+            continue;
+        };
+        if !matches!(table.get(id), Symbol::Undefined { .. }) {
+            continue;
+        }
+        let symbol = Symbol::LazyArchive {
+            name,
+            archive: archive_id,
+            member: MemberId(entry.member_header_offset),
+        };
+        match table.insert(symbol) {
+            Ok(outcome) => report.record_outcome(outcome),
+            Err(error) => report.record_error(error),
         }
     }
     Ok(())
@@ -1110,6 +1213,105 @@ pub fn seed_all(inputs: &Inputs, table: &mut SymbolTable) -> Result<SeedReport, 
     Ok(report)
 }
 
+/// Resolve top-level inputs in command-line order. Each archive sees only the
+/// unresolved references that exist when it is encountered, and its members
+/// are fetched to a fixed point before the next top-level input is considered.
+pub(crate) fn resolve_inputs_in_order(
+    inputs: &mut Inputs,
+    ordered_inputs: &[OrderedInputEntry],
+    table: &mut SymbolTable,
+    parallel_jobs: usize,
+    force_all_archives: bool,
+) -> Result<DrainReport, Box<OrderedResolveError>> {
+    let mut report = DrainReport::default();
+    let mut traced_load_order = None;
+    let mut ordered_inputs = ordered_inputs.to_vec();
+    ordered_inputs.sort_by_key(|entry| entry.load_order);
+
+    macro_rules! resolve_or_return {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(Box::new(OrderedResolveError {
+                        error: error.into(),
+                        report,
+                    }));
+                }
+            }
+        };
+    }
+
+    for entry in ordered_inputs {
+        let input_path = match entry.input {
+            OrderedInput::Object(id) => inputs.objects[id.0 as usize].path.clone(),
+            OrderedInput::Archive(id) => inputs.archives[id.0 as usize].path.clone(),
+            OrderedInput::Dylib(id) => inputs.dylibs[id.0 as usize].path.clone(),
+        };
+        if traced_load_order != Some(entry.load_order) {
+            report.loaded_paths.push(input_path);
+            traced_load_order = Some(entry.load_order);
+        }
+
+        let mut step = SeedReport::default();
+        match entry.input {
+            OrderedInput::Object(id) => {
+                resolve_or_return!(seed_object(inputs, id, table, &mut step));
+            }
+            OrderedInput::Archive(id) => {
+                if force_all_archives {
+                    resolve_or_return!(force_load_archive(
+                        inputs,
+                        table,
+                        id,
+                        &mut report,
+                        parallel_jobs,
+                    ));
+                } else {
+                    loop {
+                        resolve_or_return!(seed_archive_for_unresolved(
+                            inputs, id, table, &mut step,
+                        ));
+                        let pending = std::mem::take(&mut step.pending_fetches);
+                        report.duplicates.append(&mut step.duplicates);
+                        report.referrers.extend_from(&step.referrers);
+                        if pending.is_empty() {
+                            break;
+                        }
+                        resolve_or_return!(drain_fetches_into(
+                            inputs,
+                            table,
+                            pending,
+                            parallel_jobs,
+                            &mut report,
+                        ));
+                    }
+                }
+            }
+            OrderedInput::Dylib(id) => {
+                resolve_or_return!(seed_dylib(inputs, id, table, &mut step));
+            }
+        }
+
+        let pending = std::mem::take(&mut step.pending_fetches);
+        report.duplicates.append(&mut step.duplicates);
+        report.referrers.extend_from(&step.referrers);
+
+        if pending.is_empty() {
+            continue;
+        }
+        resolve_or_return!(drain_fetches_into(
+            inputs,
+            table,
+            pending,
+            parallel_jobs,
+            &mut report,
+        ));
+    }
+
+    Ok(report)
+}
+
 // ---------------------------------------------------------------------------
 // Fixed-point fetch loop.
 // ---------------------------------------------------------------------------
@@ -1167,6 +1369,12 @@ pub struct DrainReport {
     pub loaded_paths: Vec<PathBuf>,
     pub duplicates: Vec<InsertError>,
     pub referrers: ReferrerLog,
+}
+
+#[derive(Debug)]
+pub(crate) struct OrderedResolveError {
+    pub(crate) error: FetchError,
+    pub(crate) report: DrainReport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1705,9 +1913,20 @@ pub fn drain_fetches(
     initial: Vec<PendingFetch>,
     parallel_jobs: usize,
 ) -> Result<DrainReport, FetchError> {
+    let mut report = DrainReport::default();
+    drain_fetches_into(inputs, table, initial, parallel_jobs, &mut report)?;
+    Ok(report)
+}
+
+fn drain_fetches_into(
+    inputs: &mut Inputs,
+    table: &mut SymbolTable,
+    initial: Vec<PendingFetch>,
+    parallel_jobs: usize,
+    report: &mut DrainReport,
+) -> Result<(), FetchError> {
     let mut queue = initial;
     let mut prepared = HashMap::new();
-    let mut report = DrainReport::default();
     while let Some(p) = queue.pop() {
         let key = archive_member_key(p);
         let slot_is_still_lazy = matches!(table.get(p.id), Symbol::LazyArchive { .. });
@@ -1728,10 +1947,10 @@ pub fn drain_fetches(
         if !slot_is_still_lazy || archive_member_is_fetched(inputs, key) {
             continue;
         }
-        let new_pending = ingest_loaded_member(inputs, table, loaded, &mut report)?;
+        let new_pending = ingest_loaded_member(inputs, table, loaded, report)?;
         queue.extend(new_pending);
     }
-    Ok(report)
+    Ok(())
 }
 
 fn preparse_pending_fetches(
@@ -1867,6 +2086,512 @@ mod tests {
 
     fn n(i: u32) -> Istr {
         Istr(i)
+    }
+
+    fn object_with_symbol(name: &str, n_type: u8, value: u64) -> Vec<u8> {
+        object_with_symbols(&[(name, n_type, value)])
+    }
+
+    fn object_with_symbols(symbols: &[(&str, u8, u64)]) -> Vec<u8> {
+        use crate::macho::constants::{
+            CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT,
+        };
+        use crate::macho::reader::{write_header, MachHeader64, SymtabCmd};
+        use crate::symbol::RawNlist;
+
+        let mut strings = vec![0];
+        let mut raw_symbols = Vec::with_capacity(symbols.len());
+        for &(name, n_type, value) in symbols {
+            let strx = strings.len() as u32;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            raw_symbols.push(RawNlist {
+                strx,
+                n_type,
+                n_sect: 0,
+                n_desc: 0,
+                n_value: value,
+            });
+        }
+        let symoff = (crate::macho::reader::HEADER_SIZE as u32) + SymtabCmd::WIRE_SIZE;
+        let stroff = symoff + (raw_symbols.len() * crate::symbol::NLIST_SIZE) as u32;
+
+        let mut bytes = Vec::new();
+        write_header(
+            &MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 1,
+                sizeofcmds: SymtabCmd::WIRE_SIZE,
+                flags: 0,
+                reserved: 0,
+            },
+            &mut bytes,
+        );
+        SymtabCmd {
+            symoff,
+            nsyms: raw_symbols.len() as u32,
+            stroff,
+            strsize: strings.len() as u32,
+        }
+        .write(&mut bytes);
+        for symbol in raw_symbols {
+            symbol.write(&mut bytes);
+        }
+        bytes.extend_from_slice(&strings);
+        bytes
+    }
+
+    fn ar_member(raw_name: &str, body: &[u8]) -> Vec<u8> {
+        fn field(out: &mut Vec<u8>, value: &str, width: usize) {
+            assert!(value.len() <= width);
+            out.extend_from_slice(value.as_bytes());
+            out.resize(out.len() + width - value.len(), b' ');
+        }
+
+        let mut out = Vec::new();
+        field(&mut out, raw_name, 16);
+        field(&mut out, "0", 12);
+        field(&mut out, "0", 6);
+        field(&mut out, "0", 6);
+        field(&mut out, "100644", 8);
+        field(&mut out, &body.len().to_string(), 10);
+        out.extend_from_slice(b"`\n");
+        assert_eq!(out.len(), 60);
+        out.extend_from_slice(body);
+        if body.len() & 1 != 0 {
+            out.push(b'\n');
+        }
+        out
+    }
+
+    fn bsd_symbol_index(entries: &[(&str, u32)]) -> Vec<u8> {
+        let mut strings = Vec::new();
+        let mut ranlib = Vec::with_capacity(entries.len());
+        for &(name, member_offset) in entries {
+            let strx = strings.len() as u32;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            ranlib.push((strx, member_offset));
+        }
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&((ranlib.len() * 8) as u32).to_le_bytes());
+        for (strx, member_offset) in ranlib {
+            body.extend_from_slice(&strx.to_le_bytes());
+            body.extend_from_slice(&member_offset.to_le_bytes());
+        }
+        body.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        body.extend_from_slice(&strings);
+        body
+    }
+
+    fn archive_with_members(index: &[(&str, usize)], members: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let encoded_members: Vec<_> = members
+            .iter()
+            .map(|(name, body)| ar_member(name, body))
+            .collect();
+        let placeholder_entries: Vec<_> = index.iter().map(|(name, _)| (*name, 0)).collect();
+        let mut index_body = b"__.SYMDEF".to_vec();
+        index_body.extend_from_slice(&bsd_symbol_index(&placeholder_entries));
+        let placeholder_member = ar_member("#1/9", &index_body);
+
+        let mut member_offsets = Vec::with_capacity(encoded_members.len());
+        let mut offset = crate::archive::AR_MAGIC.len() + placeholder_member.len();
+        for member in &encoded_members {
+            member_offsets.push(offset as u32);
+            offset += member.len();
+        }
+        let resolved_entries: Vec<_> = index
+            .iter()
+            .map(|(name, member)| (*name, member_offsets[*member]))
+            .collect();
+        index_body.truncate(9);
+        index_body.extend_from_slice(&bsd_symbol_index(&resolved_entries));
+        let index_member = ar_member("#1/9", &index_body);
+        assert_eq!(index_member.len(), placeholder_member.len());
+
+        let mut archive = crate::archive::AR_MAGIC.to_vec();
+        archive.extend_from_slice(&index_member);
+        for member in encoded_members {
+            archive.extend_from_slice(&member);
+        }
+        archive
+    }
+
+    fn archive_defining(name: &str, value: u64) -> Vec<u8> {
+        use crate::macho::constants::{N_ABS, N_EXT};
+
+        let object = object_with_symbol(name, N_ABS | N_EXT, value);
+        archive_with_members(&[(name, 0)], &[("choice.o/", object)])
+    }
+
+    fn dylib_exporting(name: &str) -> DylibFile {
+        use crate::macho::tbd::{Arch, Platform, Scoped, SymbolLists, Target, Tbd};
+
+        let target = Target {
+            arch: Arch::Arm64,
+            platform: Platform::MacOs,
+        };
+        let document = Tbd {
+            version: 4,
+            targets: vec![target.clone()],
+            install_name: "/usr/lib/libChoice.dylib".into(),
+            current_version: None,
+            compatibility_version: None,
+            parent_umbrella: Vec::new(),
+            allowable_clients: Vec::new(),
+            reexported_libraries: Vec::new(),
+            exports: vec![Scoped {
+                targets: vec![target.clone()],
+                value: SymbolLists {
+                    symbols: vec![name.into()],
+                    ..SymbolLists::default()
+                },
+            }],
+            reexports: Vec::new(),
+        };
+        DylibFile::from_tbd("libChoice.tbd", &document, &target)
+    }
+
+    fn resolve_first_archive_value(first: u64, second: u64) -> u64 {
+        use crate::macho::constants::{N_EXT, N_UNDF};
+
+        let mut inputs = Inputs::new();
+        let main = inputs
+            .add_object(
+                PathBuf::from("main.o"),
+                object_with_symbol("_choice", N_UNDF | N_EXT, 0),
+                0,
+            )
+            .unwrap();
+        let first_archive = inputs
+            .add_archive(
+                PathBuf::from("libFirst.a"),
+                archive_defining("_choice", first),
+                1,
+            )
+            .unwrap();
+        let second_archive = inputs
+            .add_archive(
+                PathBuf::from("libSecond.a"),
+                archive_defining("_choice", second),
+                2,
+            )
+            .unwrap();
+        let order = [
+            OrderedInputEntry::object(0, main),
+            OrderedInputEntry::archive(1, first_archive),
+            OrderedInputEntry::archive(2, second_archive),
+        ];
+
+        let mut table = SymbolTable::new();
+        let report = resolve_inputs_in_order(&mut inputs, &order, &mut table, 1, false).unwrap();
+        assert!(report.duplicates.is_empty());
+        assert_eq!(report.fetched_members, 1);
+        let symbol = table.lookup_str("_choice").unwrap();
+        match table.get(symbol) {
+            Symbol::Defined { value, .. } => *value,
+            other => panic!("expected fetched definition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordered_resolution_uses_first_archive_provider() {
+        assert_eq!(resolve_first_archive_value(11, 22), 11);
+        assert_eq!(resolve_first_archive_value(22, 11), 22);
+    }
+
+    #[test]
+    fn archive_does_not_resolve_reference_from_later_object() {
+        use crate::macho::constants::{N_EXT, N_UNDF};
+
+        let mut inputs = Inputs::new();
+        let archive = inputs
+            .add_archive(
+                PathBuf::from("libEarly.a"),
+                archive_defining("_choice", 11),
+                0,
+            )
+            .unwrap();
+        let object = inputs
+            .add_object(
+                PathBuf::from("late.o"),
+                object_with_symbol("_choice", N_UNDF | N_EXT, 0),
+                1,
+            )
+            .unwrap();
+        let order = [
+            OrderedInputEntry::archive(0, archive),
+            OrderedInputEntry::object(1, object),
+        ];
+
+        let mut table = SymbolTable::new();
+        let report = resolve_inputs_in_order(&mut inputs, &order, &mut table, 4, false).unwrap();
+        assert!(report.duplicates.is_empty());
+        assert_eq!(report.fetched_members, 0);
+        let symbol = table.lookup_str("_choice").unwrap();
+        assert!(matches!(table.get(symbol), Symbol::Undefined { .. }));
+    }
+
+    #[test]
+    fn ordered_resolution_honors_archive_and_dylib_order() {
+        use crate::macho::constants::{N_EXT, N_UNDF};
+
+        for archive_first in [true, false] {
+            let mut inputs = Inputs::new();
+            let main = inputs
+                .add_object(
+                    PathBuf::from("main.o"),
+                    object_with_symbol("_choice", N_UNDF | N_EXT, 0),
+                    0,
+                )
+                .unwrap();
+            let (archive_order, dylib_order) = if archive_first { (1, 2) } else { (2, 1) };
+            let archive = inputs
+                .add_archive(
+                    PathBuf::from("libChoice.a"),
+                    archive_defining("_choice", 11),
+                    archive_order,
+                )
+                .unwrap();
+            let dylib = inputs.add_dylib_from_file_with_meta(
+                PathBuf::from("libChoice.tbd"),
+                dylib_exporting("_choice"),
+                DylibLoadMeta {
+                    install_name: "/usr/lib/libChoice.dylib".into(),
+                    current_version: 0,
+                    compatibility_version: 0,
+                    ordinal: 1,
+                },
+            );
+            let order = [
+                OrderedInputEntry::object(0, main),
+                OrderedInputEntry::archive(archive_order, archive),
+                OrderedInputEntry::dylib(dylib_order, dylib),
+            ];
+
+            let mut table = SymbolTable::new();
+            let report =
+                resolve_inputs_in_order(&mut inputs, &order, &mut table, 4, false).unwrap();
+            assert!(report.duplicates.is_empty());
+            let symbol = table.lookup_str("_choice").unwrap();
+            if archive_first {
+                assert_eq!(report.fetched_members, 1);
+                assert!(matches!(table.get(symbol), Symbol::Defined { .. }));
+            } else {
+                assert_eq!(report.fetched_members, 0);
+                assert!(matches!(table.get(symbol), Symbol::DylibImport { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_resolution_reaches_same_archive_fixed_point() {
+        use crate::macho::constants::{N_ABS, N_EXT, N_UNDF};
+
+        for jobs in [1, 4] {
+            let first = object_with_symbols(&[
+                ("_first", N_ABS | N_EXT, 11),
+                ("_second", N_UNDF | N_EXT, 0),
+            ]);
+            let second = object_with_symbol("_second", N_ABS | N_EXT, 22);
+            let archive = archive_with_members(
+                &[("_first", 0), ("_second", 1)],
+                &[("first.o/", first), ("second.o/", second)],
+            );
+            let mut inputs = Inputs::new();
+            let main = inputs
+                .add_object(
+                    PathBuf::from("main.o"),
+                    object_with_symbol("_first", N_UNDF | N_EXT, 0),
+                    0,
+                )
+                .unwrap();
+            let archive = inputs
+                .add_archive(PathBuf::from("libChain.a"), archive, 1)
+                .unwrap();
+            let order = [
+                OrderedInputEntry::object(0, main),
+                OrderedInputEntry::archive(1, archive),
+            ];
+
+            let mut table = SymbolTable::new();
+            let report =
+                resolve_inputs_in_order(&mut inputs, &order, &mut table, jobs, false).unwrap();
+            assert!(report.duplicates.is_empty());
+            assert_eq!(report.fetched_members, 2);
+            for (name, expected) in [("_first", 11), ("_second", 22)] {
+                let symbol = table.lookup_str(name).unwrap();
+                assert!(matches!(
+                    table.get(symbol),
+                    Symbol::Defined { value, .. } if *value == expected
+                ));
+            }
+            assert_eq!(
+                report.loaded_paths,
+                vec![
+                    PathBuf::from("main.o"),
+                    PathBuf::from("libChain.a"),
+                    PathBuf::from("libChain.a(first.o)"),
+                    PathBuf::from("libChain.a(second.o)"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_resolution_errors_retain_prior_trace_paths() {
+        use crate::macho::constants::{N_EXT, N_UNDF};
+
+        for jobs in [1, 4] {
+            let mut inputs = Inputs::new();
+            let main = inputs
+                .add_object(
+                    PathBuf::from("main.o"),
+                    object_with_symbol("_bad", N_UNDF | N_EXT, 0),
+                    0,
+                )
+                .unwrap();
+            let archive = inputs
+                .add_archive(
+                    PathBuf::from("libMalformed.a"),
+                    archive_with_members(&[("_bad", 0)], &[("bad.o/", vec![0; 32])]),
+                    1,
+                )
+                .unwrap();
+            let order = [
+                OrderedInputEntry::object(0, main),
+                OrderedInputEntry::archive(1, archive),
+            ];
+
+            let mut table = SymbolTable::new();
+            let error =
+                resolve_inputs_in_order(&mut inputs, &order, &mut table, jobs, false).unwrap_err();
+            assert!(matches!(error.error, FetchError::Read(_)));
+            assert_eq!(
+                error.report.loaded_paths,
+                vec![PathBuf::from("main.o"), PathBuf::from("libMalformed.a")]
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_resolution_accumulates_duplicate_events_in_order() {
+        use crate::macho::constants::{N_ABS, N_EXT, N_UNDF};
+
+        for jobs in [1, 4] {
+            let mut inputs = Inputs::new();
+            let main = inputs
+                .add_object(
+                    PathBuf::from("main.o"),
+                    object_with_symbols(&[
+                        ("_dup_a", N_ABS | N_EXT, 1),
+                        ("_dup_b", N_ABS | N_EXT, 2),
+                        ("_need", N_UNDF | N_EXT, 0),
+                    ]),
+                    0,
+                )
+                .unwrap();
+            let archive = inputs
+                .add_archive(
+                    PathBuf::from("libDuplicate.a"),
+                    archive_with_members(
+                        &[("_need", 0), ("_dup_a", 0)],
+                        &[(
+                            "member.o/",
+                            object_with_symbols(&[
+                                ("_need", N_ABS | N_EXT, 3),
+                                ("_dup_a", N_ABS | N_EXT, 4),
+                            ]),
+                        )],
+                    ),
+                    1,
+                )
+                .unwrap();
+            let tail = inputs
+                .add_object(
+                    PathBuf::from("tail.o"),
+                    object_with_symbol("_dup_b", N_ABS | N_EXT, 5),
+                    2,
+                )
+                .unwrap();
+            let order = [
+                OrderedInputEntry::object(0, main),
+                OrderedInputEntry::archive(1, archive),
+                OrderedInputEntry::object(2, tail),
+            ];
+
+            let mut table = SymbolTable::new();
+            let report =
+                resolve_inputs_in_order(&mut inputs, &order, &mut table, jobs, false).unwrap();
+            let names: Vec<_> = report
+                .duplicates
+                .iter()
+                .map(|error| match error {
+                    InsertError::DuplicateStrong { name, .. } => table.interner.resolve(*name),
+                    other => panic!("expected duplicate symbol error, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(names, vec!["_dup_a", "_dup_b"]);
+        }
+    }
+
+    #[test]
+    fn ordered_resolution_force_loads_unreferenced_members() {
+        let mut inputs = Inputs::new();
+        let archive = inputs
+            .add_archive(
+                PathBuf::from("libUnused.a"),
+                archive_defining("_unused", 17),
+                0,
+            )
+            .unwrap();
+        let order = [OrderedInputEntry::archive(0, archive)];
+
+        let mut table = SymbolTable::new();
+        let report = resolve_inputs_in_order(&mut inputs, &order, &mut table, 4, true).unwrap();
+        assert!(report.duplicates.is_empty());
+        assert_eq!(report.fetched_members, 1);
+        let symbol = table.lookup_str("_unused").unwrap();
+        assert!(matches!(
+            table.get(symbol),
+            Symbol::Defined { value: 17, .. }
+        ));
+    }
+
+    #[test]
+    fn ordered_resolution_force_loads_multiple_archives_in_order() {
+        for jobs in [1, 4] {
+            let mut inputs = Inputs::new();
+            let first = inputs
+                .add_archive(PathBuf::from("libA.a"), archive_defining("_a", 11), 0)
+                .unwrap();
+            let second = inputs
+                .add_archive(PathBuf::from("libB.a"), archive_defining("_b", 22), 1)
+                .unwrap();
+            let order = [
+                OrderedInputEntry::archive(0, first),
+                OrderedInputEntry::archive(1, second),
+            ];
+
+            let mut table = SymbolTable::new();
+            let report =
+                resolve_inputs_in_order(&mut inputs, &order, &mut table, jobs, true).unwrap();
+            assert!(report.duplicates.is_empty());
+            assert_eq!(report.fetched_members, 2);
+            assert_eq!(
+                report.loaded_paths,
+                vec![
+                    PathBuf::from("libA.a"),
+                    PathBuf::from("libA.a(choice.o)"),
+                    PathBuf::from("libB.a"),
+                    PathBuf::from("libB.a(choice.o)"),
+                ]
+            );
+        }
     }
 
     #[test]
@@ -2097,13 +2822,21 @@ mod tests {
     }
 
     #[test]
-    fn undefined_replaced_by_lazy_archive() {
+    fn undefined_followed_by_archive_queues_member_fetch() {
         let mut t = SymbolTable::new();
         let first = undef(&mut t, "_x");
         t.insert(first).unwrap();
         let la = lazy_archive(&mut t, "_x");
         let out = t.insert(la).unwrap();
-        assert!(matches!(out, InsertOutcome::Replaced { .. }));
+        assert!(matches!(
+            out,
+            InsertOutcome::PendingArchiveFetch {
+                archive: ArchiveId(7),
+                member: MemberId(42),
+                ..
+            }
+        ));
+        assert!(matches!(t.get(SymbolId(0)), Symbol::LazyArchive { .. }));
     }
 
     #[test]

@@ -68,13 +68,14 @@ fn main() -> ExitCode {
         return code;
     }
 
-    let opts = match args::parse(&argv[1..]) {
-        Ok(opts) => opts,
+    let parsed = match args::parse_ordered(&argv[1..]) {
+        Ok(parsed) => parsed,
         Err(e) => {
             diag::error(&e.to_string());
             return ExitCode::from(2);
         }
     };
+    let opts = parsed.options;
 
     if opts.show_help {
         print!("{}", usage());
@@ -126,7 +127,7 @@ fn main() -> ExitCode {
         };
     }
 
-    match Linker::run(&opts) {
+    match Linker::run_ordered(&opts, &parsed.input_specs) {
         Ok(()) => ExitCode::SUCCESS,
         Err(LinkError::NoInputs) => {
             diag::error("no input files");

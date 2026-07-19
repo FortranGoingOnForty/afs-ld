@@ -2,8 +2,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use afs_ld::macho::constants::LC_UUID;
-use afs_ld::macho::reader::{parse_commands, parse_header, LoadCommand};
+use afs_ld::macho::constants::{
+    CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_UUID, MH_MAGIC_64, MH_OBJECT, N_EXT, N_UNDF,
+};
+use afs_ld::macho::reader::{
+    parse_commands, parse_header, write_header, LoadCommand, MachHeader64, SymtabCmd,
+};
+use afs_ld::symbol::{RawNlist, NLIST_SIZE};
 
 const EXPECTED_HELP: &str = include_str!("snapshots/help.txt");
 
@@ -64,6 +69,91 @@ fn assemble(src: &str, out: &PathBuf) -> Result<(), String> {
 
 fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-cli-diag-{}-{name}", std::process::id()))
+}
+
+fn synthetic_undefined_object(name: &str) -> Vec<u8> {
+    let mut strings = vec![0];
+    strings.extend_from_slice(name.as_bytes());
+    strings.push(0);
+    let symoff = afs_ld::macho::reader::HEADER_SIZE as u32 + SymtabCmd::WIRE_SIZE;
+    let stroff = symoff + NLIST_SIZE as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 1,
+            sizeofcmds: SymtabCmd::WIRE_SIZE,
+            flags: 0,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    SymtabCmd {
+        symoff,
+        nsyms: 1,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    RawNlist {
+        strx: 1,
+        n_type: N_UNDF | N_EXT,
+        n_sect: 0,
+        n_desc: 0,
+        n_value: 0,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_ar_member(raw_name: &str, body: &[u8]) -> Vec<u8> {
+    fn field(out: &mut Vec<u8>, value: &str, width: usize) {
+        out.extend_from_slice(value.as_bytes());
+        out.resize(out.len() + width - value.len(), b' ');
+    }
+
+    let mut encoded = Vec::new();
+    field(&mut encoded, raw_name, 16);
+    field(&mut encoded, "0", 12);
+    field(&mut encoded, "0", 6);
+    field(&mut encoded, "0", 6);
+    field(&mut encoded, "100644", 8);
+    field(&mut encoded, &body.len().to_string(), 10);
+    encoded.extend_from_slice(b"`\n");
+    encoded.extend_from_slice(body);
+    if body.len() & 1 != 0 {
+        encoded.push(b'\n');
+    }
+    encoded
+}
+
+fn synthetic_malformed_archive(symbol: &str) -> Vec<u8> {
+    fn index_body(symbol: &str, member_offset: u32) -> Vec<u8> {
+        let mut body = b"__.SYMDEF".to_vec();
+        body.extend_from_slice(&8_u32.to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(&member_offset.to_le_bytes());
+        body.extend_from_slice(&((symbol.len() + 1) as u32).to_le_bytes());
+        body.extend_from_slice(symbol.as_bytes());
+        body.push(0);
+        body
+    }
+
+    let malformed_member = synthetic_ar_member("bad.o/", &[0; 32]);
+    let placeholder_index = synthetic_ar_member("#1/9", &index_body(symbol, 0));
+    let member_offset = 8 + placeholder_index.len() as u32;
+    let index = synthetic_ar_member("#1/9", &index_body(symbol, member_offset));
+    assert_eq!(index.len(), placeholder_index.len());
+
+    let mut archive = b"!<arch>\n".to_vec();
+    archive.extend_from_slice(&index);
+    archive.extend_from_slice(&malformed_member);
+    archive
 }
 
 fn assemble_minimal_main(name: &str) -> Result<PathBuf, String> {
@@ -734,6 +824,7 @@ fn trace_flag_prints_loaded_inputs_and_archive_members() {
     let exe = env!("CARGO_BIN_EXE_afs-ld");
     let main_obj = scratch("trace-main.o");
     let helper_obj = scratch("trace-helper.o");
+    let tail_obj = scratch("trace-tail.o");
     let archive_path = scratch("libtracehelpers.a");
     let out_path = scratch("trace.out");
     let main_src = r#"
@@ -752,6 +843,13 @@ fn trace_flag_prints_loaded_inputs_and_archive_members() {
             ret
         .subsections_via_symbols
     "#;
+    let tail_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _tail
+        _tail:
+            ret
+        .subsections_via_symbols
+    "#;
     if let Err(e) = assemble(main_src, &main_obj) {
         eprintln!("skipping: assemble failed: {e}");
         return;
@@ -760,10 +858,17 @@ fn trace_flag_prints_loaded_inputs_and_archive_members() {
         eprintln!("skipping: assemble failed: {e}");
         return;
     }
+    if let Err(e) = assemble(tail_src, &tail_obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        let _ = fs::remove_file(main_obj);
+        let _ = fs::remove_file(helper_obj);
+        return;
+    }
     if let Err(e) = archive(&[&helper_obj], &archive_path) {
         eprintln!("skipping: archive failed: {e}");
         let _ = fs::remove_file(main_obj);
         let _ = fs::remove_file(helper_obj);
+        let _ = fs::remove_file(tail_obj);
         return;
     }
 
@@ -773,6 +878,7 @@ fn trace_flag_prints_loaded_inputs_and_archive_members() {
         .arg(&out_path)
         .arg(&main_obj)
         .arg(&archive_path)
+        .arg(&tail_obj)
         .output()
         .expect("afs-ld should run");
     assert!(
@@ -781,23 +887,192 @@ fn trace_flag_prints_loaded_inputs_and_archive_members() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains(&format!("afs-ld: loading {}", main_obj.display())),
-        "missing main object trace:\n{stderr}"
-    );
-    assert!(
-        stderr.contains(&format!("afs-ld: loading {}", archive_path.display())),
-        "missing archive trace:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("libtracehelpers.a("),
-        "missing fetched archive member trace:\n{stderr}"
-    );
+    let main_pos = stderr
+        .find(&format!("afs-ld: loading {}", main_obj.display()))
+        .unwrap_or_else(|| panic!("missing main object trace:\n{stderr}"));
+    let archive_pos = stderr
+        .find(&format!("afs-ld: loading {}", archive_path.display()))
+        .unwrap_or_else(|| panic!("missing archive trace:\n{stderr}"));
+    let member_pos = stderr
+        .find("libtracehelpers.a(")
+        .unwrap_or_else(|| panic!("missing fetched archive member trace:\n{stderr}"));
+    let tail_pos = stderr
+        .find(&format!("afs-ld: loading {}", tail_obj.display()))
+        .unwrap_or_else(|| panic!("missing tail object trace:\n{stderr}"));
+    assert!(main_pos < archive_pos && archive_pos < member_pos && member_pos < tail_pos);
 
     let _ = fs::remove_file(main_obj);
     let _ = fs::remove_file(helper_obj);
+    let _ = fs::remove_file(tail_obj);
     let _ = fs::remove_file(archive_path);
     let _ = fs::remove_file(out_path);
+}
+
+#[test]
+fn mixed_library_and_positional_inputs_follow_command_line_order() {
+    if !have_xcrun() {
+        eprintln!("skipping: xcrun as unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+
+    let root = scratch("mixed-input-order");
+    fs::create_dir_all(&root).unwrap();
+    let main_obj = root.join("main.o");
+    let a_obj = root.join("a.o");
+    let b_obj = root.join("b.o");
+    let lib_a = root.join("libA.a");
+    let lib_b = root.join("libB.a");
+    let out_path = root.join("linked.out");
+    let main_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _main
+        _main:
+            stp x29, x30, [sp, #-16]!
+            mov x29, sp
+            bl _choice
+            ldp x29, x30, [sp], #16
+            ret
+        .subsections_via_symbols
+    "#;
+    let a_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _choice
+        _choice:
+            mov w0, #11
+            ret
+        .subsections_via_symbols
+    "#;
+    let b_src = r#"
+        .section __TEXT,__text,regular,pure_instructions
+        .globl _choice
+        _choice:
+            mov w0, #22
+            ret
+        .subsections_via_symbols
+    "#;
+
+    for (src, object) in [(main_src, &main_obj), (a_src, &a_obj), (b_src, &b_obj)] {
+        if let Err(e) = assemble(src, object) {
+            eprintln!("skipping: assemble failed: {e}");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+    }
+    if let Err(e) = archive(&[&a_obj], &lib_a) {
+        eprintln!("skipping: archive failed: {e}");
+        let _ = fs::remove_dir_all(root);
+        return;
+    }
+    if let Err(e) = archive(&[&b_obj], &lib_b) {
+        eprintln!("skipping: archive failed: {e}");
+        let _ = fs::remove_dir_all(root);
+        return;
+    }
+
+    let link = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-arch")
+        .arg("arm64")
+        .arg("-syslibroot")
+        .arg(&sdk)
+        .arg("-L")
+        .arg(&root)
+        .arg(&main_obj)
+        .arg("-lA")
+        .arg(&lib_b)
+        .arg("-lSystem")
+        .arg("-o")
+        .arg(&out_path)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        link.status.success(),
+        "mixed-order link failed:\n{}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    assert_eq!(
+        Command::new(&out_path).status().unwrap().code(),
+        Some(11),
+        "the first archive on the command line must provide _choice"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn input_errors_follow_command_line_order() {
+    let malformed = scratch("ordered-error-input.o");
+    fs::write(&malformed, [0_u8; 32]).unwrap();
+    let missing_library = "afs_ld_ordering_fixture_that_does_not_exist";
+
+    let malformed_first = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg(&malformed)
+        .arg(format!("-l{missing_library}"))
+        .output()
+        .expect("afs-ld should run");
+    assert!(!malformed_first.status.success());
+    let stderr = String::from_utf8_lossy(&malformed_first.stderr);
+    assert!(
+        stderr.contains("not a Mach-O 64 file"),
+        "earlier malformed input should win:\n{stderr}"
+    );
+    assert!(!stderr.contains("unable to find library"));
+
+    let missing_first = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg(format!("-l{missing_library}"))
+        .arg(&malformed)
+        .output()
+        .expect("afs-ld should run");
+    assert!(!missing_first.status.success());
+    let stderr = String::from_utf8_lossy(&missing_first.stderr);
+    assert!(
+        stderr.contains(&format!("unable to find library `{missing_library}`")),
+        "earlier missing library should win:\n{stderr}"
+    );
+    assert!(!stderr.contains("not a Mach-O 64 file"));
+
+    let _ = fs::remove_file(malformed);
+}
+
+#[test]
+fn trace_precedes_archive_member_parse_error() {
+    let main = scratch("trace-error-main.o");
+    let archive = scratch("trace-error-lib.a");
+    fs::write(&main, synthetic_undefined_object("_bad")).unwrap();
+    fs::write(&archive, synthetic_malformed_archive("_bad")).unwrap();
+
+    for jobs in [1, 4] {
+        let output = scratch(&format!("trace-error-{jobs}.out"));
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-t")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&main)
+            .arg(&archive)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let main_trace = stderr
+            .find(&format!("afs-ld: loading {}", main.display()))
+            .unwrap_or_else(|| panic!("missing main trace with -j{jobs}:\n{stderr}"));
+        let archive_trace = stderr
+            .find(&format!("afs-ld: loading {}", archive.display()))
+            .unwrap_or_else(|| panic!("missing archive trace with -j{jobs}:\n{stderr}"));
+        let diagnostic = stderr
+            .find("not a Mach-O 64 file")
+            .unwrap_or_else(|| panic!("missing member parse error with -j{jobs}:\n{stderr}"));
+        assert!(main_trace < archive_trace && archive_trace < diagnostic);
+        let _ = fs::remove_file(output);
+    }
+
+    let _ = fs::remove_file(main);
+    let _ = fs::remove_file(archive);
 }
 
 #[test]

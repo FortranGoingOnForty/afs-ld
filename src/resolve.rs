@@ -186,6 +186,7 @@ pub struct DylibInput {
 pub(crate) enum OrderedInput {
     Object(InputId),
     Archive(ArchiveId),
+    ForceLoadArchive(ArchiveId),
     Dylib(DylibId),
 }
 
@@ -207,6 +208,13 @@ impl OrderedInputEntry {
         Self {
             load_order,
             input: OrderedInput::Archive(id),
+        }
+    }
+
+    pub(crate) fn force_load_archive(load_order: usize, id: ArchiveId) -> Self {
+        Self {
+            load_order,
+            input: OrderedInput::ForceLoadArchive(id),
         }
     }
 
@@ -1245,7 +1253,9 @@ pub(crate) fn resolve_inputs_in_order(
     for entry in ordered_inputs {
         let input_path = match entry.input {
             OrderedInput::Object(id) => inputs.objects[id.0 as usize].path.clone(),
-            OrderedInput::Archive(id) => inputs.archives[id.0 as usize].path.clone(),
+            OrderedInput::Archive(id) | OrderedInput::ForceLoadArchive(id) => {
+                inputs.archives[id.0 as usize].path.clone()
+            }
             OrderedInput::Dylib(id) => inputs.dylibs[id.0 as usize].path.clone(),
         };
         if traced_load_order != Some(entry.load_order) {
@@ -1287,6 +1297,15 @@ pub(crate) fn resolve_inputs_in_order(
                         ));
                     }
                 }
+            }
+            OrderedInput::ForceLoadArchive(id) => {
+                resolve_or_return!(force_load_archive(
+                    inputs,
+                    table,
+                    id,
+                    &mut report,
+                    parallel_jobs,
+                ));
             }
             OrderedInput::Dylib(id) => {
                 resolve_or_return!(seed_dylib(inputs, id, table, &mut step));
@@ -2589,6 +2608,57 @@ mod tests {
                     PathBuf::from("libA.a(choice.o)"),
                     PathBuf::from("libB.a"),
                     PathBuf::from("libB.a(choice.o)"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_force_load_exposes_references_to_later_archives() {
+        use crate::macho::constants::{N_ABS, N_EXT, N_UNDF};
+
+        for jobs in [1, 4] {
+            let forced_member = object_with_symbols(&[
+                ("_forced", N_ABS | N_EXT, 11),
+                ("_later", N_UNDF | N_EXT, 0),
+            ]);
+            let mut inputs = Inputs::new();
+            let forced = inputs
+                .add_archive(
+                    PathBuf::from("libForced.a"),
+                    archive_with_members(&[("_forced", 0)], &[("forced.o/", forced_member)]),
+                    0,
+                )
+                .unwrap();
+            let later = inputs
+                .add_archive(
+                    PathBuf::from("libLater.a"),
+                    archive_defining("_later", 22),
+                    1,
+                )
+                .unwrap();
+            let order = [
+                OrderedInputEntry::force_load_archive(0, forced),
+                OrderedInputEntry::archive(1, later),
+            ];
+
+            let mut table = SymbolTable::new();
+            let report =
+                resolve_inputs_in_order(&mut inputs, &order, &mut table, jobs, false).unwrap();
+            assert!(report.duplicates.is_empty());
+            assert_eq!(report.fetched_members, 2);
+            let later_symbol = table.lookup_str("_later").unwrap();
+            assert!(matches!(
+                table.get(later_symbol),
+                Symbol::Defined { value: 22, .. }
+            ));
+            assert_eq!(
+                report.loaded_paths,
+                vec![
+                    PathBuf::from("libForced.a"),
+                    PathBuf::from("libForced.a(forced.o)"),
+                    PathBuf::from("libLater.a"),
+                    PathBuf::from("libLater.a(choice.o)"),
                 ]
             );
         }

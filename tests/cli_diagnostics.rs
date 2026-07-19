@@ -3,12 +3,13 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use afs_ld::macho::constants::{
-    CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_UUID, MH_MAGIC_64, MH_OBJECT, N_EXT, N_UNDF,
+    CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_UUID, MH_MAGIC_64, MH_OBJECT, N_ABS, N_EXT, N_UNDF,
 };
 use afs_ld::macho::reader::{
     parse_commands, parse_header, write_header, LoadCommand, MachHeader64, SymtabCmd,
 };
 use afs_ld::symbol::{RawNlist, NLIST_SIZE};
+use afs_ld::{InputSpec, LinkError, LinkOptions, Linker};
 
 const EXPECTED_HELP: &str = include_str!("snapshots/help.txt");
 
@@ -72,11 +73,26 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn synthetic_undefined_object(name: &str) -> Vec<u8> {
+    synthetic_symbol_object(&[(name, N_UNDF | N_EXT, 0)])
+}
+
+fn synthetic_symbol_object(symbols: &[(&str, u8, u64)]) -> Vec<u8> {
     let mut strings = vec![0];
-    strings.extend_from_slice(name.as_bytes());
-    strings.push(0);
+    let mut raw_symbols = Vec::with_capacity(symbols.len());
+    for &(name, n_type, value) in symbols {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        raw_symbols.push(RawNlist {
+            strx,
+            n_type,
+            n_sect: 0,
+            n_desc: 0,
+            n_value: value,
+        });
+    }
     let symoff = afs_ld::macho::reader::HEADER_SIZE as u32 + SymtabCmd::WIRE_SIZE;
-    let stroff = symoff + NLIST_SIZE as u32;
+    let stroff = symoff + (raw_symbols.len() * NLIST_SIZE) as u32;
 
     let mut bytes = Vec::new();
     write_header(
@@ -94,19 +110,14 @@ fn synthetic_undefined_object(name: &str) -> Vec<u8> {
     );
     SymtabCmd {
         symoff,
-        nsyms: 1,
+        nsyms: raw_symbols.len() as u32,
         stroff,
         strsize: strings.len() as u32,
     }
     .write(&mut bytes);
-    RawNlist {
-        strx: 1,
-        n_type: N_UNDF | N_EXT,
-        n_sect: 0,
-        n_desc: 0,
-        n_value: 0,
+    for symbol in raw_symbols {
+        symbol.write(&mut bytes);
     }
-    .write(&mut bytes);
     bytes.extend_from_slice(&strings);
     bytes
 }
@@ -132,7 +143,7 @@ fn synthetic_ar_member(raw_name: &str, body: &[u8]) -> Vec<u8> {
     encoded
 }
 
-fn synthetic_malformed_archive(symbol: &str) -> Vec<u8> {
+fn synthetic_indexed_archive(symbol: &str, member_name: &str, member_body: &[u8]) -> Vec<u8> {
     fn index_body(symbol: &str, member_offset: u32) -> Vec<u8> {
         let mut body = b"__.SYMDEF".to_vec();
         body.extend_from_slice(&8_u32.to_le_bytes());
@@ -144,7 +155,7 @@ fn synthetic_malformed_archive(symbol: &str) -> Vec<u8> {
         body
     }
 
-    let malformed_member = synthetic_ar_member("bad.o/", &[0; 32]);
+    let encoded_member = synthetic_ar_member(member_name, member_body);
     let placeholder_index = synthetic_ar_member("#1/9", &index_body(symbol, 0));
     let member_offset = 8 + placeholder_index.len() as u32;
     let index = synthetic_ar_member("#1/9", &index_body(symbol, member_offset));
@@ -152,8 +163,12 @@ fn synthetic_malformed_archive(symbol: &str) -> Vec<u8> {
 
     let mut archive = b"!<arch>\n".to_vec();
     archive.extend_from_slice(&index);
-    archive.extend_from_slice(&malformed_member);
+    archive.extend_from_slice(&encoded_member);
     archive
+}
+
+fn synthetic_malformed_archive(symbol: &str) -> Vec<u8> {
+    synthetic_indexed_archive(symbol, "bad.o/", &[0; 32])
 }
 
 fn assemble_minimal_main(name: &str) -> Result<PathBuf, String> {
@@ -1072,6 +1087,153 @@ fn trace_precedes_archive_member_parse_error() {
     }
 
     let _ = fs::remove_file(main);
+    let _ = fs::remove_file(archive);
+}
+
+#[test]
+fn force_load_trace_precedes_member_parse_error() {
+    let archive = scratch("force-trace-error-lib");
+    fs::write(&archive, synthetic_malformed_archive("_bad")).unwrap();
+
+    for jobs in [1, 4] {
+        let output = scratch(&format!("force-trace-error-{jobs}.out"));
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-t")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg("-force_load")
+            .arg(&archive)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let archive_trace = stderr
+            .find(&format!("afs-ld: loading {}", archive.display()))
+            .unwrap_or_else(|| panic!("missing forced archive trace with -j{jobs}:\n{stderr}"));
+        let diagnostic = stderr
+            .find("not a Mach-O 64 file")
+            .unwrap_or_else(|| panic!("missing forced member error with -j{jobs}:\n{stderr}"));
+        assert!(archive_trace < diagnostic);
+        let _ = fs::remove_file(output);
+    }
+
+    let _ = fs::remove_file(archive);
+}
+
+#[test]
+fn force_load_resolves_references_from_later_archive() {
+    let forced_archive = scratch("force-order-first");
+    let later_archive = scratch("force-order-later.a");
+    let forced_member = synthetic_symbol_object(&[
+        ("_forced", N_ABS | N_EXT, 11),
+        ("_later", N_UNDF | N_EXT, 0),
+    ]);
+    let later_member = synthetic_symbol_object(&[("_later", N_ABS | N_EXT, 22)]);
+    fs::write(
+        &forced_archive,
+        synthetic_indexed_archive("_forced", "forced.o/", &forced_member),
+    )
+    .unwrap();
+    fs::write(
+        &later_archive,
+        synthetic_indexed_archive("_later", "later.o/", &later_member),
+    )
+    .unwrap();
+
+    for jobs in [1, 4] {
+        let output = scratch(&format!("force-order-{jobs}.out"));
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-t")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg("-force_load")
+            .arg(&forced_archive)
+            .arg(&later_archive)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            result.status.success(),
+            "later archive did not resolve the forced member with -j{jobs}:\n{stderr}"
+        );
+        assert!(!stderr.contains("undefined symbol: _later"));
+
+        let forced = stderr
+            .find(&format!("afs-ld: loading {}", forced_archive.display()))
+            .unwrap_or_else(|| panic!("missing forced archive trace with -j{jobs}:\n{stderr}"));
+        let forced_member = stderr
+            .find(&format!("{}(forced.o)", forced_archive.display()))
+            .unwrap_or_else(|| panic!("missing forced member trace with -j{jobs}:\n{stderr}"));
+        let later = stderr
+            .find(&format!("afs-ld: loading {}", later_archive.display()))
+            .unwrap_or_else(|| panic!("missing later archive trace with -j{jobs}:\n{stderr}"));
+        let later_member = stderr
+            .find(&format!("{}(later.o)", later_archive.display()))
+            .unwrap_or_else(|| panic!("missing later member trace with -j{jobs}:\n{stderr}"));
+        assert!(forced < forced_member && forced_member < later && later < later_member);
+        let _ = fs::remove_file(output);
+    }
+
+    let _ = fs::remove_file(forced_archive);
+    let _ = fs::remove_file(later_archive);
+}
+
+#[test]
+fn force_load_rejects_non_archive_input() {
+    let object = scratch("force-load-not-archive.o");
+    fs::write(&object, synthetic_undefined_object("_missing")).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-force_load")
+        .arg(&object)
+        .output()
+        .expect("afs-ld should run");
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("-force_load requires a static archive"),
+        "unexpected diagnostic:\n{stderr}"
+    );
+    assert!(!stderr.contains("no input files"));
+
+    let _ = fs::remove_file(object);
+}
+
+#[test]
+fn ordered_api_applies_configured_force_load_archives() {
+    let object = scratch("ordered-api-force-main.o");
+    let archive = scratch("ordered-api-force.a");
+    fs::write(
+        &object,
+        synthetic_symbol_object(&[("_duplicate", N_ABS | N_EXT, 1)]),
+    )
+    .unwrap();
+    fs::write(
+        &archive,
+        synthetic_indexed_archive(
+            "_duplicate",
+            "duplicate.o/",
+            &synthetic_symbol_object(&[("_duplicate", N_ABS | N_EXT, 2)]),
+        ),
+    )
+    .unwrap();
+
+    let opts = LinkOptions {
+        force_load_archives: vec![archive.clone()],
+        ..LinkOptions::default()
+    };
+    let specs = [
+        InputSpec::Path(object.clone()),
+        InputSpec::Path(archive.clone()),
+    ];
+    let error = Linker::run_ordered(&opts, &specs).unwrap_err();
+    assert!(matches!(error, LinkError::DuplicateSymbols(_)));
+
+    let _ = fs::remove_file(object);
     let _ = fs::remove_file(archive);
 }
 

@@ -341,7 +341,7 @@ impl std::fmt::Display for LinkError {
             LinkError::ForceLoadNotArchive(path) => {
                 write!(
                     f,
-                    "{}: -force_load requires a path that is also present as an archive input",
+                    "{}: -force_load requires a static archive",
                     path.display()
                 )
             }
@@ -448,23 +448,34 @@ impl Linker {
 
     pub fn run_profiled(opts: &LinkOptions) -> Result<LinkProfile, LinkError> {
         let input_specs = legacy_input_specs(opts);
-        Self::run_profiled_with_inputs(opts, &input_specs)
+        Self::run_profiled_with_inputs(opts, &input_specs, &[], true)
     }
 
     pub fn run_ordered(opts: &LinkOptions, input_specs: &[InputSpec]) -> Result<(), LinkError> {
-        Self::run_profiled_with_inputs(opts, input_specs).map(|_| ())
+        Self::run_profiled_with_inputs(opts, input_specs, &[], true).map(|_| ())
     }
 
     pub fn run_profiled_ordered(
         opts: &LinkOptions,
         input_specs: &[InputSpec],
     ) -> Result<LinkProfile, LinkError> {
-        Self::run_profiled_with_inputs(opts, input_specs)
+        Self::run_profiled_with_inputs(opts, input_specs, &[], true)
+    }
+
+    #[doc(hidden)]
+    pub fn run_ordered_with_force_loads(
+        opts: &LinkOptions,
+        input_specs: &[InputSpec],
+        force_load_positions: &[usize],
+    ) -> Result<(), LinkError> {
+        Self::run_profiled_with_inputs(opts, input_specs, force_load_positions, false).map(|_| ())
     }
 
     fn run_profiled_with_inputs(
         opts: &LinkOptions,
         input_specs: &[InputSpec],
+        force_load_positions: &[usize],
+        apply_legacy_force_loads: bool,
     ) -> Result<LinkProfile, LinkError> {
         let overall_started = Instant::now();
         let mut phases = LinkPhaseTimings::default();
@@ -515,7 +526,8 @@ impl Linker {
             );
         }
 
-        let (resolved_inputs, mut first_input_error) = resolve_input_specs(opts, input_specs);
+        let (resolved_inputs, mut first_input_error) =
+            resolve_input_specs(opts, input_specs, force_load_positions);
         let mut dylib_load_kinds: std::collections::HashMap<DylibId, DylibLoadKind> =
             std::collections::HashMap::new();
         let mut loaded_inputs = vec![false; resolved_inputs.len()];
@@ -526,20 +538,29 @@ impl Linker {
         let mut initial_loads = Vec::new();
         let phase_started = Instant::now();
         for (load_order, input) in resolved_inputs.iter().enumerate() {
-            if matches!(
-                input.path.extension().and_then(|ext| ext.to_str()),
-                Some("dylib" | "tbd")
-            ) {
+            if !input.force_load
+                && matches!(
+                    input.path.extension().and_then(|ext| ext.to_str()),
+                    Some("dylib" | "tbd")
+                )
+            {
                 deferred_dylibs.push((load_order, input.path.clone()));
                 continue;
             }
-            initial_loads.push((load_order, input.path.clone()));
+            initial_loads.push((load_order, input.path.clone(), input.force_load));
         }
         for result in load_initial_inputs(initial_loads, parallel_jobs) {
             match result {
                 Ok(loaded) => {
                     let load_order = loaded.load_order();
-                    let registered = register_loaded_initial_input(&mut inputs, loaded);
+                    let mut registered = register_loaded_initial_input(&mut inputs, loaded);
+                    if resolved_inputs[load_order].force_load {
+                        let OrderedInput::Archive(id) = registered.ordered[0].input else {
+                            unreachable!("force-loaded input must be registered as an archive");
+                        };
+                        registered.ordered[0] =
+                            OrderedInputEntry::force_load_archive(load_order, id);
+                    }
                     phases.add_input_load(registered.timings);
                     input_order.extend(registered.ordered);
                     loaded_inputs[load_order] = true;
@@ -617,17 +638,26 @@ impl Linker {
         }
 
         let mut force_report = DrainReport::default();
-        for archive_path in &opts.force_load_archives {
-            let Some(archive_id) = find_archive_by_path(&inputs, archive_path) else {
-                return Err(LinkError::ForceLoadNotArchive(archive_path.clone()));
-            };
-            force_load_archive(
-                &mut inputs,
-                &mut sym_table,
-                archive_id,
-                &mut force_report,
-                parallel_jobs,
-            )?;
+        if apply_legacy_force_loads {
+            for archive_path in &opts.force_load_archives {
+                let Some(archive_id) = find_archive_by_path(&inputs, archive_path) else {
+                    return Err(LinkError::ForceLoadNotArchive(archive_path.clone()));
+                };
+                if let Err(error) = force_load_archive(
+                    &mut inputs,
+                    &mut sym_table,
+                    archive_id,
+                    &mut force_report,
+                    parallel_jobs,
+                ) {
+                    if opts.trace_inputs {
+                        for path in &force_report.loaded_paths {
+                            eprintln!("afs-ld: loading {}", path.display());
+                        }
+                    }
+                    return Err(LinkError::Fetch(error));
+                }
+            }
         }
         if opts.trace_inputs {
             for path in &force_report.loaded_paths {
@@ -966,6 +996,7 @@ impl Linker {
 struct ResolvedInput {
     path: PathBuf,
     load_kind: DylibLoadKind,
+    force_load: bool,
 }
 
 fn legacy_input_specs(opts: &LinkOptions) -> Vec<InputSpec> {
@@ -991,9 +1022,10 @@ fn legacy_input_specs(opts: &LinkOptions) -> Vec<InputSpec> {
 fn resolve_input_specs(
     opts: &LinkOptions,
     input_specs: &[InputSpec],
+    force_load_positions: &[usize],
 ) -> (Vec<ResolvedInput>, Option<InitialLoadError>) {
     let mut resolved = Vec::with_capacity(input_specs.len());
-    for spec in input_specs {
+    for (position, spec) in input_specs.iter().enumerate() {
         let result = match spec {
             InputSpec::Path(path) => Ok((path.clone(), DylibLoadKind::Normal)),
             InputSpec::Library(name) => {
@@ -1019,7 +1051,11 @@ fn resolve_input_specs(
                 return (resolved, Some(InitialLoadError { load_order, error }));
             }
         };
-        resolved.push(ResolvedInput { path, load_kind });
+        resolved.push(ResolvedInput {
+            path,
+            load_kind,
+            force_load: force_load_positions.contains(&position),
+        });
     }
     (resolved, None)
 }
@@ -1148,14 +1184,14 @@ impl RegisteredInput {
 }
 
 fn load_initial_inputs(
-    loads: Vec<(usize, PathBuf)>,
+    loads: Vec<(usize, PathBuf, bool)>,
     parallel_jobs: usize,
 ) -> Vec<Result<LoadedInitialInput, InitialLoadError>> {
     let mut results = Vec::new();
     let mut object_jobs = Vec::new();
-    for (load_order, path) in loads {
-        if matches!(path.extension().and_then(|ext| ext.to_str()), Some("a")) {
-            results.push(load_archive_input(path, load_order));
+    for (load_order, path, force_archive) in loads {
+        if force_archive || matches!(path.extension().and_then(|ext| ext.to_str()), Some("a")) {
+            results.push(load_archive_input(path, load_order, force_archive));
         } else {
             object_jobs.push((load_order, path));
         }
@@ -1238,6 +1274,7 @@ fn load_object_input(
 fn load_archive_input(
     path: PathBuf,
     load_order: usize,
+    force_archive: bool,
 ) -> Result<LoadedInitialInput, InitialLoadError> {
     let mut timings = InputLoadTimings::default();
     let phase_started = Instant::now();
@@ -1250,7 +1287,11 @@ fn load_archive_input(
     let phase_started = Instant::now();
     Archive::open(&path, &bytes).map_err(|error| InitialLoadError {
         load_order,
-        error: LinkError::from(InputAddError::from(error)),
+        error: if force_archive {
+            LinkError::ForceLoadNotArchive(path.clone())
+        } else {
+            LinkError::from(InputAddError::from(error))
+        },
     })?;
     timings.archive_parse = phase_started.elapsed();
 

@@ -68,7 +68,7 @@ fn main() -> ExitCode {
         return code;
     }
 
-    let parsed = match args::parse_ordered(&argv[1..]) {
+    let (parsed, force_load_positions) = match args::parse_ordered_with_force_loads(&argv[1..]) {
         Ok(parsed) => parsed,
         Err(e) => {
             diag::error(&e.to_string());
@@ -127,7 +127,7 @@ fn main() -> ExitCode {
         };
     }
 
-    match Linker::run_ordered(&opts, &parsed.input_specs) {
+    match Linker::run_ordered_with_force_loads(&opts, &parsed.input_specs, &force_load_positions) {
         Ok(()) => ExitCode::SUCCESS,
         Err(LinkError::NoInputs) => {
             diag::error("no input files");

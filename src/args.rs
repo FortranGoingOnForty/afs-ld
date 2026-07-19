@@ -177,9 +177,17 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
 }
 
 pub fn parse_ordered(argv: &[String]) -> Result<ParsedArgs, ArgsError> {
+    parse_ordered_with_force_loads(argv).map(|(parsed, _)| parsed)
+}
+
+#[doc(hidden)]
+pub fn parse_ordered_with_force_loads(
+    argv: &[String],
+) -> Result<(ParsedArgs, Vec<usize>), ArgsError> {
     let normalized = normalize_wl(argv);
     let mut opts = LinkOptions::default();
     let mut input_specs = Vec::new();
+    let mut force_load_positions = Vec::new();
     let mut it = normalized.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -433,10 +441,13 @@ pub fn parse_ordered(argv: &[String]) -> Result<ParsedArgs, ArgsError> {
                 opts.all_load = true;
             }
             "-force_load" => {
-                opts.force_load_archives
-                    .push(PathBuf::from(it.next().ok_or_else(|| {
-                        ArgsError::MissingValue("-force_load".into())
-                    })?));
+                let path = PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("-force_load".into()))?,
+                );
+                opts.force_load_archives.push(path.clone());
+                force_load_positions.push(input_specs.len());
+                input_specs.push(InputSpec::Path(path));
             }
             "-j" => {
                 let value = it
@@ -478,10 +489,13 @@ pub fn parse_ordered(argv: &[String]) -> Result<ParsedArgs, ArgsError> {
             }
         }
     }
-    Ok(ParsedArgs {
-        options: opts,
-        input_specs,
-    })
+    Ok((
+        ParsedArgs {
+            options: opts,
+            input_specs,
+        },
+        force_load_positions,
+    ))
 }
 
 fn normalize_wl(argv: &[String]) -> Vec<String> {
@@ -877,6 +891,26 @@ mod tests {
             vec![PathBuf::from("liba.a"), PathBuf::from("libb.a")]
         );
         assert_eq!(opts.inputs, vec![PathBuf::from("main.o")]);
+    }
+
+    #[test]
+    fn force_load_stays_at_its_command_line_position() {
+        let (parsed, force_load_positions) = parse_ordered_with_force_loads(&argv(&[
+            "main.o",
+            "-force_load",
+            "libforced.a",
+            "liblater.a",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.input_specs,
+            vec![
+                InputSpec::Path(PathBuf::from("main.o")),
+                InputSpec::Path(PathBuf::from("libforced.a")),
+                InputSpec::Path(PathBuf::from("liblater.a")),
+            ]
+        );
+        assert_eq!(force_load_positions, vec![1]);
     }
 
     #[test]

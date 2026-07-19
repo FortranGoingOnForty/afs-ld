@@ -37,8 +37,9 @@ use atom::{atomize_object, backpatch_symbol_atoms, AtomTable};
 use icf::IcfError;
 use input::ObjectFile;
 use layout::{ExtraLayoutSections, Layout, LayoutInput};
+use macho::constants::MH_DYLIB;
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
-use macho::reader::ReadError;
+use macho::reader::{parse_header, ReadError};
 use macho::tbd::{
     parse_tbd_for_target, parse_tbd_metadata_for_target, parse_version, Arch, Platform, Target,
 };
@@ -544,13 +545,19 @@ impl Linker {
                     Some("dylib" | "tbd")
                 )
             {
-                deferred_dylibs.push((load_order, input.path.clone()));
+                deferred_dylibs.push(DeferredDylibInput::Path {
+                    load_order,
+                    path: input.path.clone(),
+                });
                 continue;
             }
             initial_loads.push((load_order, input.path.clone(), input.force_load));
         }
         for result in load_initial_inputs(initial_loads, parallel_jobs) {
             match result {
+                Ok(LoadedInitialInput::Dylib(input)) => {
+                    deferred_dylibs.push(DeferredDylibInput::Loaded(input));
+                }
                 Ok(loaded) => {
                     let load_order = loaded.load_order();
                     let mut registered = register_loaded_initial_input(&mut inputs, loaded);
@@ -568,25 +575,33 @@ impl Linker {
                 Err(error) => retain_earliest_input_error(&mut first_input_error, error),
             }
         }
+        deferred_dylibs.sort_by_key(DeferredDylibInput::load_order);
         let include_tbd_exports = inputs_may_need_dylib_exports(&inputs)?;
-        for (load_order, path) in &deferred_dylibs {
-            match register_input(&mut inputs, path, *load_order, include_tbd_exports) {
+        for deferred in deferred_dylibs {
+            let load_order = deferred.load_order();
+            let result = match deferred {
+                DeferredDylibInput::Path { path, .. } => {
+                    register_input(&mut inputs, &path, load_order, include_tbd_exports)
+                }
+                DeferredDylibInput::Loaded(input) => Ok(register_loaded_initial_input(
+                    &mut inputs,
+                    LoadedInitialInput::Dylib(input),
+                )),
+            };
+            match result {
                 Ok(registered) => {
                     for entry in &registered.ordered {
                         if let OrderedInput::Dylib(id) = entry.input {
-                            dylib_load_kinds.insert(id, resolved_inputs[*load_order].load_kind);
+                            dylib_load_kinds.insert(id, resolved_inputs[load_order].load_kind);
                         }
                     }
                     phases.add_input_load(registered.timings);
                     input_order.extend(registered.ordered);
-                    loaded_inputs[*load_order] = true;
+                    loaded_inputs[load_order] = true;
                 }
                 Err(error) => retain_earliest_input_error(
                     &mut first_input_error,
-                    InitialLoadError {
-                        load_order: *load_order,
-                        error,
-                    },
+                    InitialLoadError { load_order, error },
                 ),
             }
         }
@@ -1150,9 +1165,17 @@ struct LoadedArchiveInput {
     timings: InputLoadTimings,
 }
 
+struct LoadedDylibInput {
+    path: PathBuf,
+    load_order: usize,
+    parsed: DylibFile,
+    timings: InputLoadTimings,
+}
+
 enum LoadedInitialInput {
     Object(Box<LoadedObjectInput>),
     Archive(LoadedArchiveInput),
+    Dylib(Box<LoadedDylibInput>),
 }
 
 impl LoadedInitialInput {
@@ -1160,6 +1183,21 @@ impl LoadedInitialInput {
         match self {
             LoadedInitialInput::Object(input) => input.load_order,
             LoadedInitialInput::Archive(input) => input.load_order,
+            LoadedInitialInput::Dylib(input) => input.load_order,
+        }
+    }
+}
+
+enum DeferredDylibInput {
+    Path { load_order: usize, path: PathBuf },
+    Loaded(Box<LoadedDylibInput>),
+}
+
+impl DeferredDylibInput {
+    fn load_order(&self) -> usize {
+        match self {
+            DeferredDylibInput::Path { load_order, .. } => *load_order,
+            DeferredDylibInput::Loaded(input) => input.load_order,
         }
     }
 }
@@ -1188,15 +1226,15 @@ fn load_initial_inputs(
     parallel_jobs: usize,
 ) -> Vec<Result<LoadedInitialInput, InitialLoadError>> {
     let mut results = Vec::new();
-    let mut object_jobs = Vec::new();
+    let mut macho_jobs = Vec::new();
     for (load_order, path, force_archive) in loads {
         if force_archive || matches!(path.extension().and_then(|ext| ext.to_str()), Some("a")) {
             results.push(load_archive_input(path, load_order, force_archive));
         } else {
-            object_jobs.push((load_order, path));
+            macho_jobs.push((load_order, path));
         }
     }
-    results.extend(load_objects_parallel(object_jobs, parallel_jobs));
+    results.extend(load_macho_inputs_parallel(macho_jobs, parallel_jobs));
     results.sort_by_key(|result| match result {
         Ok(input) => input.load_order(),
         Err(error) => error.load_order,
@@ -1205,7 +1243,7 @@ fn load_initial_inputs(
     results
 }
 
-fn load_objects_parallel(
+fn load_macho_inputs_parallel(
     jobs: Vec<(usize, PathBuf)>,
     parallel_jobs: usize,
 ) -> Vec<Result<LoadedInitialInput, InitialLoadError>> {
@@ -1216,7 +1254,7 @@ fn load_objects_parallel(
     if job_count == 1 {
         return jobs
             .into_iter()
-            .map(|(load_order, path)| load_object_input(path, load_order))
+            .map(|(load_order, path)| load_macho_input(path, load_order))
             .collect();
     }
 
@@ -1234,7 +1272,7 @@ fn load_objects_parallel(
                 else {
                     break;
                 };
-                tx.send(load_object_input(path, load_order))
+                tx.send(load_macho_input(path, load_order))
                     .expect("input load receiver should stay live");
             });
         }
@@ -1243,7 +1281,7 @@ fn load_objects_parallel(
     })
 }
 
-fn load_object_input(
+fn load_macho_input(
     path: PathBuf,
     load_order: usize,
 ) -> Result<LoadedInitialInput, InitialLoadError> {
@@ -1256,19 +1294,36 @@ fn load_object_input(
     timings.read = phase_started.elapsed();
 
     let phase_started = Instant::now();
-    let parsed = ObjectFile::parse(&path, &bytes).map_err(|error| InitialLoadError {
+    let filetype = parse_header(&bytes).map_err(|error| InitialLoadError {
         load_order,
         error: LinkError::from(error),
     })?;
-    timings.object_parse = phase_started.elapsed();
-
-    Ok(LoadedInitialInput::Object(Box::new(LoadedObjectInput {
-        path,
-        load_order,
-        bytes,
-        parsed,
-        timings,
-    })))
+    if filetype.filetype == MH_DYLIB {
+        let parsed = DylibFile::parse(&path, &bytes).map_err(|error| InitialLoadError {
+            load_order,
+            error: LinkError::from(error),
+        })?;
+        timings.dylib_parse = phase_started.elapsed();
+        Ok(LoadedInitialInput::Dylib(Box::new(LoadedDylibInput {
+            path,
+            load_order,
+            parsed,
+            timings,
+        })))
+    } else {
+        let parsed = ObjectFile::parse(&path, &bytes).map_err(|error| InitialLoadError {
+            load_order,
+            error: LinkError::from(error),
+        })?;
+        timings.object_parse = phase_started.elapsed();
+        Ok(LoadedInitialInput::Object(Box::new(LoadedObjectInput {
+            path,
+            load_order,
+            bytes,
+            parsed,
+            timings,
+        })))
+    }
 }
 
 fn load_archive_input(
@@ -1321,6 +1376,13 @@ fn register_loaded_initial_input(
             RegisteredInput::one(
                 input.timings,
                 OrderedInputEntry::archive(input.load_order, id),
+            )
+        }
+        LoadedInitialInput::Dylib(input) => {
+            let id = inputs.add_dylib_from_file(input.path, input.parsed);
+            RegisteredInput::one(
+                input.timings,
+                OrderedInputEntry::dylib(input.load_order, id),
             )
         }
     }

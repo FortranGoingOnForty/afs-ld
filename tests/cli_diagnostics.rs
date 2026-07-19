@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use afs_ld::macho::constants::{
-    CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_UUID, MH_MAGIC_64, MH_OBJECT, N_ABS, N_EXT, N_UNDF,
+    CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_ID_DYLIB, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_UUID,
+    MH_DYLIB, MH_MAGIC_64, MH_OBJECT, N_ABS, N_EXT, N_UNDF,
 };
 use afs_ld::macho::reader::{
-    parse_commands, parse_header, write_header, LoadCommand, MachHeader64, SymtabCmd,
+    parse_commands, parse_header, write_header, DylibCmd, LoadCommand, MachHeader64, SymtabCmd,
 };
 use afs_ld::symbol::{RawNlist, NLIST_SIZE};
 use afs_ld::{InputSpec, LinkError, LinkOptions, Linker};
@@ -119,6 +120,32 @@ fn synthetic_symbol_object(symbols: &[(&str, u8, u64)]) -> Vec<u8> {
         symbol.write(&mut bytes);
     }
     bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_dylib(install_name: &str) -> Vec<u8> {
+    let id = DylibCmd {
+        cmd: LC_ID_DYLIB,
+        name: install_name.to_string(),
+        timestamp: 2,
+        current_version: 1 << 16,
+        compatibility_version: 1 << 16,
+    };
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_DYLIB,
+            ncmds: 1,
+            sizeofcmds: id.wire_size(),
+            flags: 0,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    id.write(&mut bytes);
     bytes
 }
 
@@ -1013,6 +1040,114 @@ fn mixed_library_and_positional_inputs_follow_command_line_order() {
         Some(11),
         "the first archive on the command line must provide _choice"
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn extensionless_dylib_is_dispatched_in_input_order() {
+    let named_dylib = scratch("named-dylib.dylib");
+    let extensionless_dylib = scratch("extensionless-dylib");
+    let named_install_name = "@rpath/libnamed.dylib";
+    let extensionless_install_name = "@rpath/libextensionless.dylib";
+    fs::write(&named_dylib, synthetic_dylib(named_install_name)).unwrap();
+    fs::write(
+        &extensionless_dylib,
+        synthetic_dylib(extensionless_install_name),
+    )
+    .unwrap();
+
+    for jobs in [1, 4] {
+        let output = scratch(&format!("extensionless-dylib-{jobs}.out"));
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-t")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&named_dylib)
+            .arg(&extensionless_dylib)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            result.status.success(),
+            "extensionless dylib link failed with -j{jobs}:\n{stderr}"
+        );
+        let named_trace = stderr
+            .find(&format!("afs-ld: loading {}", named_dylib.display()))
+            .unwrap_or_else(|| panic!("missing named dylib trace with -j{jobs}:\n{stderr}"));
+        let extensionless_trace = stderr
+            .find(&format!(
+                "afs-ld: loading {}",
+                extensionless_dylib.display()
+            ))
+            .unwrap_or_else(|| panic!("missing extensionless trace with -j{jobs}:\n{stderr}"));
+        assert!(named_trace < extensionless_trace);
+
+        let bytes = fs::read(&output).unwrap();
+        let header = parse_header(&bytes).unwrap();
+        let commands = parse_commands(&header, &bytes).unwrap();
+        let load_names: Vec<&str> = commands
+            .iter()
+            .filter_map(|command| match command {
+                LoadCommand::Dylib(dylib) if dylib.cmd == LC_LOAD_DYLIB => {
+                    Some(dylib.name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            load_names,
+            vec![named_install_name, extensionless_install_name]
+        );
+        let _ = fs::remove_file(output);
+    }
+
+    let _ = fs::remove_file(named_dylib);
+    let _ = fs::remove_file(extensionless_dylib);
+}
+
+#[test]
+fn extensionless_framework_preserves_weak_load_kind() {
+    let root = scratch("extensionless-framework-root");
+    let framework_dir = root.join("System/Library/Frameworks/Demo.framework");
+    let framework = framework_dir.join("Demo");
+    let install_name = "@rpath/Demo.framework/Demo";
+    fs::create_dir_all(&framework_dir).unwrap();
+    fs::write(&framework, synthetic_dylib(install_name)).unwrap();
+
+    for jobs in [1, 4] {
+        let output = scratch(&format!("extensionless-framework-{jobs}.out"));
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg("-syslibroot")
+            .arg(&root)
+            .arg("-weak_framework")
+            .arg("Demo")
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        assert!(
+            result.status.success(),
+            "extensionless framework link failed with -j{jobs}:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+
+        let bytes = fs::read(&output).unwrap();
+        let header = parse_header(&bytes).unwrap();
+        let commands = parse_commands(&header, &bytes).unwrap();
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                LoadCommand::Dylib(dylib)
+                    if dylib.cmd == LC_LOAD_WEAK_DYLIB && dylib.name == install_name
+            )
+        }));
+        let _ = fs::remove_file(output);
+    }
 
     let _ = fs::remove_dir_all(root);
 }

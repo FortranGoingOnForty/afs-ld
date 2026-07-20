@@ -401,7 +401,7 @@ fn init_array_priority_merge_and_brackets() {
         String::from_utf8_lossy(&r.stderr)
     );
     let img = std::fs::read(&out).unwrap();
-    let (section_type, _, _, size, align, entsize) =
+    let (_, section_type, _, _, size, align, entsize) =
         section_header_info(&img, ".init_array").expect("missing static .init_array");
     assert_eq!(section_type, 14);
     assert_eq!(size, 16);
@@ -457,7 +457,7 @@ fn dynamic_array_tags_drive_loader_initialization() {
         (".fini_array", 15u32, 26i64, 28i64, 8u64),
     ];
     for (name, expected_type, address_tag, size_tag, expected_size) in expected {
-        let (section_type, address, _, size, align, entsize) =
+        let (_, section_type, address, _, size, align, entsize) =
             section_header_info(&img, name).unwrap_or_else(|| panic!("missing {name}"));
         assert_eq!(section_type, expected_type, "{name} section type");
         assert_eq!(size, expected_size, "{name} size");
@@ -490,7 +490,7 @@ fn dynamic_array_tags_drive_loader_initialization() {
     let empty_out = dir.join("empty-array");
     assert!(link(&empty_obj, &empty_out).status.success());
     let empty_img = std::fs::read(&empty_out).unwrap();
-    let (section_type, address, _, size, _, entsize) =
+    let (_, section_type, address, _, size, _, entsize) =
         section_header_info(&empty_img, ".init_array").expect("missing empty .init_array");
     assert_eq!((section_type, size, entsize), (14, 0, 8));
     let empty_tags: std::collections::HashMap<i64, u64> =
@@ -2124,6 +2124,279 @@ fn dynamic_executable_calls_shared_ifunc_through_plt() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An IFUNC defined by the executable is resolved by the loader before
+/// `_start`: its IRELATIVE relocation fills an indirection slot with the
+/// implementation address, so calls never enter the resolver as a function.
+#[test]
+fn dynamic_executable_resolves_local_ifunc_before_entry() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_resolves_local_ifunc_before_entry count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let Some(ld) = system_ld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_resolves_local_ifunc_before_entry count=1 reason=\"no system ld to build the reference .so\"");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_resolves_local_ifunc_before_entry count=1 reason=\"no standard dynamic loader on this host\"");
+        return;
+    };
+    let dir =
+        std::env::temp_dir().join(format!("afs_ld_elf_local_ifunc_dyn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    let dep_obj = dir.join("dep.o");
+    assemble(
+        &gas,
+        ".text\n.globl dep\n.type dep,@function\ndep:\n    jmp pick@plt\n",
+        &dir.join("dep.s"),
+        &dep_obj,
+    );
+    let so = dir.join("libdep.so.1");
+    let r = Command::new(&ld)
+        .args(["-shared", "-soname", "libdep.so.1", "-o"])
+        .arg(&so)
+        .arg(&dep_obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "ld -shared: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n\
+             .globl _start\n\
+             _start:\n\
+                 cmpb $1, resolved(%rip)\n\
+                 jne 1f\n\
+                 leaq __rela_iplt_start(%rip), %r8\n\
+                 leaq __rela_iplt_end(%rip), %r9\n\
+                 subq %r8, %r9\n\
+                 cmpq $24, %r9\n\
+                 jne 1f\n\
+                 call dep@plt\n\
+                 movl %eax, %edi\n\
+                 jmp 2f\n\
+             1:  movl $7, %edi\n\
+             2:  movl ${exit_nr}, %eax\n\
+                 syscall\n\
+             .globl pick\n\
+             .type pick,@gnu_indirect_function\n\
+             pick:\n\
+                 movb $1, resolved(%rip)\n\
+                 leaq impl(%rip), %rax\n\
+                 ret\n\
+             impl:\n\
+                 movl $42, %eax\n\
+                 ret\n\
+             .data\n\
+             resolved: .byte 0\n"
+        ),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+
+    let link = |out: &std::path::Path| {
+        let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .args(["--dynamic-linker", interp, "-o"])
+            .arg(out)
+            .arg(&main_obj)
+            .arg(&so)
+            .output()
+            .unwrap();
+        assert!(
+            r.status.success(),
+            "afs-ld local IFUNC dynamic: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+    };
+    let out = dir.join("local_ifunc_dyn");
+    link(&out);
+
+    let image = std::fs::read(&out).unwrap();
+    let rela = section_bytes(&image, ".rela.plt").expect("mixed PLT needs relocations");
+    assert_eq!(
+        rela.len(),
+        48,
+        "one import and one local IFUNC need two entries"
+    );
+    let jump_slot = u64::from_le_bytes(rela[0..8].try_into().unwrap());
+    let jump_info = u64::from_le_bytes(rela[8..16].try_into().unwrap());
+    let slot = u64::from_le_bytes(rela[24..32].try_into().unwrap());
+    let info = u64::from_le_bytes(rela[32..40].try_into().unwrap());
+    let resolver = u64::from_le_bytes(rela[40..48].try_into().unwrap());
+    assert_eq!(jump_info as u32, afs_ld::elf::R_X86_64_JUMP_SLOT);
+    assert_ne!(
+        jump_info >> 32,
+        0,
+        "JUMP_SLOT must name its imported symbol"
+    );
+    assert_eq!(info as u32, afs_ld::elf::R_X86_64_IRELATIVE);
+    assert_eq!(info >> 32, 0, "IRELATIVE must not name a dynamic symbol");
+    let (got_addr, _, got_size) =
+        section_info(&image, ".got.plt").expect("local IFUNC needs writable indirection storage");
+    assert_eq!(
+        jump_slot,
+        got_addr + 24,
+        "the imported function uses slot 3"
+    );
+    assert_eq!(
+        slot,
+        got_addr + 32,
+        "the local IFUNC follows imported slots"
+    );
+    assert!(
+        slot >= got_addr && slot.checked_add(8).unwrap() <= got_addr + got_size,
+        "IRELATIVE target {slot:#x} must be in .got.plt"
+    );
+    assert_eq!((slot - got_addr) % 8, 0, "IFUNC slot must be aligned");
+    let (text_addr, _, text_size) = section_info(&image, ".text").unwrap();
+    assert!(
+        (text_addr..text_addr + text_size).contains(&resolver),
+        "IRELATIVE addend {resolver:#x} must name the resolver"
+    );
+    let (plt_index, _, plt_addr, _, plt_size, _, _) = section_header_info(&image, ".plt").unwrap();
+    let dynstr = section_bytes(&image, ".dynstr").unwrap();
+    let pick_export = section_bytes(&image, ".dynsym")
+        .unwrap()
+        .chunks_exact(24)
+        .find_map(|symbol| {
+            let name_offset = u32::from_le_bytes(symbol[0..4].try_into().unwrap()) as usize;
+            let name_len = dynstr[name_offset..].iter().position(|&byte| byte == 0)?;
+            (&dynstr[name_offset..name_offset + name_len] == b"pick").then(|| {
+                (
+                    symbol[4] & 0x0f,
+                    u16::from_le_bytes(symbol[6..8].try_into().unwrap()),
+                    u64::from_le_bytes(symbol[8..16].try_into().unwrap()),
+                    u64::from_le_bytes(symbol[16..24].try_into().unwrap()),
+                )
+            })
+        })
+        .expect("the DSO reference must export pick");
+    assert_eq!(pick_export.0, afs_ld::elf::STT_FUNC);
+    assert_eq!(pick_export.1, plt_index);
+    assert_eq!(pick_export.3, 0, "canonical PLT exports have no body size");
+    assert!(
+        (plt_addr..plt_addr + plt_size).contains(&pick_export.2),
+        "the DSO must bind to the canonical PLT address"
+    );
+    assert_ne!(pick_export.2, resolver, "the resolver is not callable");
+
+    let run = Command::new(&out)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "local IFUNC exe exit: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let out2 = dir.join("local_ifunc_dyn_2");
+    link(&out2);
+    assert_eq!(
+        image,
+        std::fs::read(&out2).unwrap(),
+        "local IFUNC output must be byte-deterministic"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dynamic_executable_resolves_local_ifunc_without_imports() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_resolves_local_ifunc_without_imports count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_executable_resolves_local_ifunc_without_imports count=1 reason=\"no standard dynamic loader on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "afs_ld_elf_local_only_ifunc_dyn_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n\
+             .globl _start\n\
+             _start:\n\
+                 cmpb $1, resolved(%rip)\n\
+                 jne 1f\n\
+                 call pick\n\
+                 cmpl $42, %eax\n\
+                 jne 1f\n\
+                 call *pick_addr(%rip)\n\
+                 movl %eax, %edi\n\
+                 jmp 2f\n\
+             1:  movl $7, %edi\n\
+             2:  movl ${exit_nr}, %eax\n\
+                 syscall\n\
+             .globl pick\n\
+             .type pick,@gnu_indirect_function\n\
+             pick:\n\
+                 movb $1, resolved(%rip)\n\
+                 leaq impl(%rip), %rax\n\
+                 ret\n\
+             impl:\n\
+                 movl $42, %eax\n\
+                 ret\n\
+             .data\n\
+             .p2align 3\n\
+             pick_addr: .quad pick\n\
+             resolved: .byte 0\n"
+        ),
+        &dir.join("main.s"),
+        &obj,
+    );
+
+    let out = dir.join("local_only_ifunc_dyn");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&out)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld local-only IFUNC dynamic: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let image = std::fs::read(&out).unwrap();
+    assert!(needed_libraries(&image).is_empty());
+    let rela = section_bytes(&image, ".rela.plt").expect("local IFUNC needs .rela.plt");
+    assert_eq!(rela.len(), 24, "one local IFUNC needs one relocation");
+    let info = u64::from_le_bytes(rela[8..16].try_into().unwrap());
+    assert_eq!(info >> 32, 0);
+    assert_eq!(info as u32, afs_ld::elf::R_X86_64_IRELATIVE);
+    let data = section_bytes(&image, ".data").unwrap();
+    let pick_addr = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let (plt_addr, _, plt_size) = section_info(&image, ".plt").unwrap();
+    assert!((plt_addr..plt_addr + plt_size).contains(&pick_addr));
+    assert!(section_bytes(&image, ".got.plt").is_some());
+
+    let run = Command::new(&out).output().unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "local-only IFUNC exe exit: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Dynamic mode consumes the glibc-style inputs the driver emits:
 /// `--gc-sections`, linker-script-expanded `.so` groups, positional
 /// archive members, `-l` archive fallback, and linker-defined
@@ -2286,11 +2559,11 @@ fn find_phdr(img: &[u8], p_type: u32) -> Option<(u64, u64, u64)> {
 
 /// `(sh_addr, sh_offset, sh_size)` of a named ELF64 section, or None.
 fn section_info(img: &[u8], name: &str) -> Option<(u64, u64, u64)> {
-    section_header_info(img, name).map(|(_, addr, offset, size, _, _)| (addr, offset, size))
+    section_header_info(img, name).map(|(_, _, addr, offset, size, _, _)| (addr, offset, size))
 }
 
-/// `(sh_type, sh_addr, sh_offset, sh_size, sh_addralign, sh_entsize)`.
-fn section_header_info(img: &[u8], name: &str) -> Option<(u32, u64, u64, u64, u64, u64)> {
+/// `(index, sh_type, sh_addr, sh_offset, sh_size, sh_addralign, sh_entsize)`.
+fn section_header_info(img: &[u8], name: &str) -> Option<(u16, u32, u64, u64, u64, u64, u64)> {
     let rd16 = |o: usize| u16::from_le_bytes(img[o..o + 2].try_into().unwrap());
     let rd32 = |o: usize| u32::from_le_bytes(img[o..o + 4].try_into().unwrap());
     let rd64 = |o: usize| u64::from_le_bytes(img[o..o + 8].try_into().unwrap());
@@ -2305,6 +2578,7 @@ fn section_header_info(img: &[u8], name: &str) -> Option<(u32, u64, u64, u64, u6
         let end = img[noff..].iter().position(|&b| b == 0).unwrap();
         if &img[noff..noff + end] == name.as_bytes() {
             return Some((
+                i as u16,
                 rd32(sh + 4),
                 rd64(sh + 16),
                 rd64(sh + 24),

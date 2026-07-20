@@ -2807,8 +2807,9 @@ pub fn link_dynamic_exec(
     }
     let n_imp = imports.len();
 
-    // Function imports drive the PLT; `func_slot[i]` is the k-th function
-    // import's dense PLT/`.got.plt` slot (data imports have None).
+    // Function imports and referenced executable-defined IFUNCs drive the
+    // PLT. Imported functions occupy the leading slots; local IFUNCs follow
+    // in first-reference order and use symbol-free IRELATIVE relocations.
     let mut func_slot: Vec<Option<usize>> = vec![None; n_imp];
     let mut n_func = 0usize;
     for i in 0..n_imp {
@@ -2817,10 +2818,34 @@ pub fn link_dynamic_exec(
             n_func += 1;
         }
     }
-    // No function imports ⇒ no PLT/.got.plt/.rela.plt at all (a data-only
-    // dynamic executable), matching what a reference linker emits.
-    let has_plt = n_func > 0;
-
+    let mut local_ifunc_slot: HashMap<(usize, usize), usize> = HashMap::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for sec in &obj.sections {
+            for r in &sec.relas {
+                let sym = obj.symbols.get(r.sym as usize).ok_or_else(|| {
+                    ElfError(format!(
+                        "relocation symbol index {} is out of range in {}",
+                        r.sym, obj.name
+                    ))
+                })?;
+                let def = if sym.shndx == SHN_UNDEF {
+                    globals.get(&sym.name).copied()
+                } else {
+                    Some(resolve_defined_identity(
+                        objects,
+                        &globals,
+                        oi,
+                        r.sym as usize,
+                    ))
+                };
+                let Some((doi, dsi)) = def else { continue };
+                if objects[doi].symbols[dsi].typ == STT_GNU_IFUNC {
+                    let next = local_ifunc_slot.len();
+                    local_ifunc_slot.entry((doi, dsi)).or_insert(next);
+                }
+            }
+        }
+    }
     // Canonical PLT (audit L6): when a non-PIE executable takes the address
     // of a function defined in a shared object, `&func` must have one
     // identity on both sides of the .so boundary. The psABI ("Function
@@ -2950,6 +2975,15 @@ pub fn link_dynamic_exec(
         }
     }
     let n_exp = export_names.len();
+    for &(doi, dsi) in &export_def {
+        if objects[doi].symbols[dsi].typ == STT_GNU_IFUNC {
+            let next = local_ifunc_slot.len();
+            local_ifunc_slot.entry((doi, dsi)).or_insert(next);
+        }
+    }
+    let n_local_ifunc = local_ifunc_slot.len();
+    let n_plt = n_func + n_local_ifunc;
+    let has_plt = n_plt > 0;
 
     // ---- Build .dynstr (soname + import name strings) and note offsets.
     let mut dynstr: Vec<u8> = vec![0];
@@ -2985,8 +3019,9 @@ pub fn link_dynamic_exec(
         .collect();
 
     // ---- .dynsym: null, then UND imports (FUNC/OBJECT), then DEFINED
-    // exports. Export st_value is patched once addresses are known;
-    // st_shndx=SHN_ABS (non-PIE — the value is already the final address).
+    // exports. Export st_value is patched once addresses are known. Ordinary
+    // exports are absolute in this non-PIE image; IFUNC exports are canonical
+    // functions whose section index is patched to .plt once it is known.
     let n_dynsym = 1 + n_imp + n_exp;
     let mut dynsym = vec![0u8; n_dynsym * 24];
     for (i, &noff) in import_name_off.iter().enumerate() {
@@ -2997,17 +3032,23 @@ pub fn link_dynamic_exec(
             STT_OBJECT
         };
         dynsym[e..e + 4].copy_from_slice(&noff.to_le_bytes());
-        dynsym[e + 4] = (STB_GLOBAL << 4) | styp; // st_info
-                                                  // st_other=0, st_shndx=0 (UND), value/size=0 already zeroed.
+        dynsym[e + 4] = (STB_GLOBAL << 4) | styp;
+        // st_other=0, st_shndx=0 (UND), value/size=0 already zeroed.
     }
     for (j, &(doi, dsi)) in export_def.iter().enumerate() {
         let e = (1 + n_imp + j) * 24;
         let sym = &objects[doi].symbols[dsi];
         dynsym[e..e + 4].copy_from_slice(&export_name_off[j].to_le_bytes());
-        dynsym[e + 4] = (STB_GLOBAL << 4) | sym.typ; // st_info
-        dynsym[e + 6..e + 8].copy_from_slice(&SHN_ABS.to_le_bytes()); // st_shndx
-        dynsym[e + 16..e + 24].copy_from_slice(&sym.size.to_le_bytes()); // st_size
-                                                                         // st_value (e+8..e+16) patched post-layout.
+        if sym.typ == STT_GNU_IFUNC {
+            dynsym[e + 4] = (STB_GLOBAL << 4) | STT_FUNC;
+            // st_shndx is patched to .plt after section headers are built;
+            // canonical PLT exports have st_size=0.
+        } else {
+            dynsym[e + 4] = (STB_GLOBAL << 4) | sym.typ;
+            dynsym[e + 6..e + 8].copy_from_slice(&SHN_ABS.to_le_bytes());
+            dynsym[e + 16..e + 24].copy_from_slice(&sym.size.to_le_bytes());
+        }
+        // st_value (e+8..e+16) is patched post-layout.
     }
 
     // The name for .dynsym index i (1-based, imports then exports).
@@ -3098,16 +3139,12 @@ pub fn link_dynamic_exec(
     let mut interp_bytes = interp.as_bytes().to_vec();
     interp_bytes.push(0);
     let plt_size = if has_plt {
-        ((n_func + 1) * 16) as u64
+        ((n_plt + 1) * 16) as u64
     } else {
         0
     }; // PLT0 + stub/func
-    let gotplt_size = if has_plt {
-        ((n_func + 3) * 8) as u64
-    } else {
-        0
-    }; // 3 reserved + func
-    let relaplt_size = (n_func * 24) as u64;
+    let gotplt_size = if has_plt { ((n_plt + 3) * 8) as u64 } else { 0 }; // 3 reserved + func
+    let relaplt_size = (n_plt * 24) as u64;
     let n_needed = needed_offsets.len();
     let has_preinit_array = outs.iter().any(|section| section.name == ".preinit_array");
     let has_init_array = outs.iter().any(|section| section.name == ".init_array");
@@ -3274,8 +3311,8 @@ pub fn link_dynamic_exec(
     let (pre_s, pre_e) = bounds(".preinit_array").unwrap_or((anchor, anchor));
     let (ini_s, ini_e) = bounds(".init_array").unwrap_or((anchor, anchor));
     let (fin_s, fin_e) = bounds(".fini_array").unwrap_or((anchor, anchor));
-    let (rip_s, rip_e) = if relaplt_size > 0 {
-        (relaplt_v, relaplt_v + relaplt_size)
+    let (rip_s, rip_e) = if n_local_ifunc > 0 {
+        (relaplt_v + (n_func * 24) as u64, relaplt_v + relaplt_size)
     } else {
         (anchor, anchor)
     };
@@ -3295,6 +3332,25 @@ pub fn link_dynamic_exec(
         rw_data_end_v,
         rw_mem_end_v,
     ];
+    let raw_addr = |doi: usize, dsi: usize| -> Result<u64, ElfError> {
+        let d = &objects[doi].symbols[dsi];
+        if d.shndx == SHN_ABS {
+            return Ok(d.value);
+        }
+        if d.shndx == SHN_COMMON {
+            let &(oidx, base) = common_place
+                .get(&(doi, dsi))
+                .ok_or_else(|| ElfError(format!("unplaced COMMON symbol '{}'", d.name)))?;
+            return Ok(out_vaddrs[oidx] + base);
+        }
+        let sec = d
+            .section
+            .ok_or_else(|| ElfError(format!("symbol '{}' has no section", d.name)))?;
+        let &(oidx, base) = place
+            .get(&(doi, sec))
+            .ok_or_else(|| ElfError(format!("unplaced section for '{}'", d.name)))?;
+        Ok(out_vaddrs[oidx] + base + d.value)
+    };
     let sym_vaddr = |oi: usize, si: usize| -> Result<u64, ElfError> {
         if oi == LINKER_MARK {
             return Ok(linker_addr[si]);
@@ -3325,23 +3381,16 @@ pub fn link_dynamic_exec(
         } else {
             resolve_defined_identity(objects, &globals, oi, si)
         };
-        let d = &objects[doi].symbols[dsi];
-        if d.shndx == SHN_ABS {
-            return Ok(d.value);
+        if objects[doi].symbols[dsi].typ == STT_GNU_IFUNC {
+            let &local_k = local_ifunc_slot.get(&(doi, dsi)).ok_or_else(|| {
+                ElfError(format!(
+                    "IFUNC symbol '{}' has no dynamic PLT slot",
+                    objects[doi].symbols[dsi].name
+                ))
+            })?;
+            return Ok(plt_stub(n_func + local_k));
         }
-        if d.shndx == SHN_COMMON {
-            let &(oidx, base) = common_place
-                .get(&(doi, dsi))
-                .ok_or_else(|| ElfError(format!("unplaced COMMON symbol '{}'", d.name)))?;
-            return Ok(out_vaddrs[oidx] + base);
-        }
-        let sec = d
-            .section
-            .ok_or_else(|| ElfError(format!("symbol '{}' has no section", d.name)))?;
-        let &(oidx, base) = place
-            .get(&(doi, sec))
-            .ok_or_else(|| ElfError(format!("unplaced section for '{}'", d.name)))?;
-        Ok(out_vaddrs[oidx] + base + d.value)
+        raw_addr(doi, dsi)
     };
 
     let mut suppressed: HashSet<(usize, usize, u64)> = HashSet::new();
@@ -3501,8 +3550,7 @@ pub fn link_dynamic_exec(
         plt[7] = 0x25;
         plt[8..12].copy_from_slice(&disp(plt_v + 12, gotplt_v + 16).to_le_bytes());
         plt[12..16].copy_from_slice(&[0x0f, 0x1f, 0x40, 0x00]);
-        for &fs in &func_slot {
-            let Some(k) = fs else { continue };
+        for k in 0..n_plt {
             let o = (k + 1) * 16;
             let stub = plt_v + o as u64;
             let slot = gotplt_slot(k);
@@ -3519,14 +3567,14 @@ pub fn link_dynamic_exec(
         }
         // .got.plt: [0]=&_DYNAMIC, [1]=[2]=0, [3+k]=stub push insn.
         gotplt[0..8].copy_from_slice(&dynamic_v.to_le_bytes());
-        for &fs in &func_slot {
-            let Some(k) = fs else { continue };
+        for k in 0..n_plt {
             let slot = (k + 3) * 8;
             gotplt[slot..slot + 8].copy_from_slice(&(plt_stub(k) + 6).to_le_bytes());
         }
     }
 
-    // ---- Build .rela.plt: one JUMP_SLOT per function import.
+    // ---- Build .rela.plt: imported JUMP_SLOT entries first, then local
+    // symbol-free IRELATIVE entries in matching PLT/GOT.PLT slot order.
     let mut relaplt = vec![0u8; relaplt_size as usize];
     for (i, &fs) in func_slot.iter().enumerate() {
         let Some(k) = fs else { continue };
@@ -3535,6 +3583,19 @@ pub fn link_dynamic_exec(
         let info = ((i as u64 + 1) << 32) | R_X86_64_JUMP_SLOT as u64; // dynsym index i+1
         relaplt[e + 8..e + 16].copy_from_slice(&info.to_le_bytes());
         // addend 0.
+    }
+    let mut local_ifuncs: Vec<((usize, usize), usize)> = local_ifunc_slot
+        .iter()
+        .map(|(&def, &slot)| (def, slot))
+        .collect();
+    local_ifuncs.sort_by_key(|&(_, slot)| slot);
+    for (def, local_k) in local_ifuncs {
+        let k = n_func + local_k;
+        let e = k * 24;
+        relaplt[e..e + 8].copy_from_slice(&gotplt_slot(k).to_le_bytes());
+        relaplt[e + 8..e + 16].copy_from_slice(&(R_X86_64_IRELATIVE as u64).to_le_bytes());
+        let resolver = raw_addr(def.0, def.1)?;
+        relaplt[e + 16..e + 24].copy_from_slice(&(resolver as i64).to_le_bytes());
     }
 
     // ---- Build .got and .rela.dyn. Data imports (and address-taken
@@ -3565,6 +3626,9 @@ pub fn link_dynamic_exec(
     // Patch exported symbols' st_value now that addresses are resolved.
     for (j, &(doi, dsi)) in export_def.iter().enumerate() {
         let e = (1 + n_imp + j) * 24;
+        // Executable IFUNC exports are canonical functions: DSOs bind to the
+        // same PLT address used by in-image references instead of asking the
+        // loader to invoke the resolver independently.
         let addr = sym_vaddr(doi, dsi)?;
         dynsym[e + 8..e + 16].copy_from_slice(&addr.to_le_bytes());
     }
@@ -3634,7 +3698,9 @@ pub fn link_dynamic_exec(
         let &(eoi, esi) = globals
             .get(entry)
             .ok_or_else(|| ElfError(format!("entry symbol '{}' not defined", entry)))?;
-        sym_vaddr(eoi, esi)?
+        // The entry is a raw code address, matching the reference linker's
+        // behavior even when explicitly pointed at an IFUNC resolver.
+        raw_addr(eoi, esi)?
     };
 
     // ---- Emit the image.
@@ -3727,7 +3793,6 @@ pub fn link_dynamic_exec(
         img[off as usize..off as usize + bytes.len()].copy_from_slice(bytes);
     };
     put(&mut image, interp_fo, &interp_bytes);
-    put(&mut image, dynsym_fo, &dynsym);
     put(&mut image, hash_fo, &hash);
     put(&mut image, dynstr_fo, &dynstr);
     if versioned {
@@ -3905,7 +3970,7 @@ pub fn link_dynamic_exec(
         );
     }
     // .rela.plt.info → .got.plt; patched once .got.plt's index is known.
-    // The whole PLT trio is present only with function imports.
+    // The PLT trio is present for imported functions or local IFUNCs.
     let relaplt_idx = if has_plt {
         Some(mk(
             &mut shstr,
@@ -3974,8 +4039,8 @@ pub fn link_dynamic_exec(
             output_section_entsize(o),
         );
     }
-    if has_plt {
-        mk(
+    let plt_idx = if has_plt {
+        Some(mk(
             &mut shstr,
             &mut shdrs,
             ".plt",
@@ -3988,8 +4053,21 @@ pub fn link_dynamic_exec(
             0,
             16,
             16,
-        );
+        ))
+    } else {
+        None
+    };
+    if let Some(plt_idx) = plt_idx {
+        let plt_shndx = u16::try_from(plt_idx)
+            .map_err(|_| ElfError("too many ELF sections for a symbol section index".into()))?;
+        for (j, &(doi, dsi)) in export_def.iter().enumerate() {
+            if objects[doi].symbols[dsi].typ == STT_GNU_IFUNC {
+                let e = (1 + n_imp + j) * 24;
+                dynsym[e + 6..e + 8].copy_from_slice(&plt_shndx.to_le_bytes());
+            }
+        }
     }
+    put(&mut image, dynsym_fo, &dynsym);
     for &i in &data_order {
         let o = &outs[i];
         mk(

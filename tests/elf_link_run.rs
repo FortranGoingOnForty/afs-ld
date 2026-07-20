@@ -400,7 +400,121 @@ fn init_array_priority_merge_and_brackets() {
         "afs-ld: {}",
         String::from_utf8_lossy(&r.stderr)
     );
+    let img = std::fs::read(&out).unwrap();
+    let (section_type, _, _, size, align, entsize) =
+        section_header_info(&img, ".init_array").expect("missing static .init_array");
+    assert_eq!(section_type, 14);
+    assert_eq!(size, 16);
+    assert!(align >= 8);
+    assert_eq!(entsize, 8);
     assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dynamic_array_tags_drive_loader_initialization() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_array_tags_drive_loader_initialization count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=dynamic_array_tags_drive_loader_initialization count=1 reason=\"no standard dynamic loader on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_array_tags_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let obj = dir.join("arrays.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n.type _start,@function\n_start:\n    movl code(%rip), %edi\n    movl ${exit_nr}, %eax\n    syscall\npreinit:\n    movl $2, code(%rip)\n    ret\ninit10:\n    addl $10, code(%rip)\n    ret\ninit30:\n    addl $30, code(%rip)\n    ret\nfini:\n    movl $99, code(%rip)\n    ret\n.section .preinit_array,\"aw\",@preinit_array\n    .quad preinit\n.section .init_array.00100,\"aw\",@init_array\n    .quad init10\n.section .init_array,\"aw\",@init_array\n    .quad init30\n.section .fini_array,\"aw\",@fini_array\n    .quad fini\n.data\ncode: .long 0\n"
+        ),
+        &dir.join("arrays.s"),
+        &obj,
+    );
+
+    let link = |input: &std::path::Path, out: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .args(["--dynamic-linker", interp, "-o"])
+            .arg(out)
+            .arg(input)
+            .output()
+            .unwrap()
+    };
+    let out = dir.join("arrays");
+    let r = link(&obj, &out);
+    assert!(
+        r.status.success(),
+        "afs-ld dynamic arrays: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let img = std::fs::read(&out).unwrap();
+    let tags: std::collections::HashMap<i64, u64> = dynamic_entries(&img).into_iter().collect();
+    let expected = [
+        (".preinit_array", 16u32, 32i64, 33i64, 8u64),
+        (".init_array", 14u32, 25i64, 27i64, 16u64),
+        (".fini_array", 15u32, 26i64, 28i64, 8u64),
+    ];
+    for (name, expected_type, address_tag, size_tag, expected_size) in expected {
+        let (section_type, address, _, size, align, entsize) =
+            section_header_info(&img, name).unwrap_or_else(|| panic!("missing {name}"));
+        assert_eq!(section_type, expected_type, "{name} section type");
+        assert_eq!(size, expected_size, "{name} size");
+        assert!(align >= 8, "{name} alignment");
+        assert_eq!(entsize, 8, "{name} entry size");
+        assert_eq!(tags.get(&address_tag), Some(&address), "{name} address tag");
+        assert_eq!(tags.get(&size_tag), Some(&size), "{name} size tag");
+    }
+    let dynamic = section_bytes(&img, ".dynamic").unwrap();
+    assert_eq!(&dynamic[dynamic.len() - 16..], &[0u8; 16]);
+    assert_eq!(
+        Command::new(&out).output().unwrap().status.code(),
+        Some(2),
+        "the loader must run the main executable's preinit array before _start"
+    );
+
+    let out2 = dir.join("arrays2");
+    assert!(link(&obj, &out2).status.success());
+    assert_eq!(img, std::fs::read(&out2).unwrap());
+
+    let empty_obj = dir.join("empty-array.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n    xorl %edi, %edi\n    movl ${exit_nr}, %eax\n    syscall\n.section .init_array,\"aw\",@init_array\n"
+        ),
+        &dir.join("empty-array.s"),
+        &empty_obj,
+    );
+    let empty_out = dir.join("empty-array");
+    assert!(link(&empty_obj, &empty_out).status.success());
+    let empty_img = std::fs::read(&empty_out).unwrap();
+    let (section_type, address, _, size, _, entsize) =
+        section_header_info(&empty_img, ".init_array").expect("missing empty .init_array");
+    assert_eq!((section_type, size, entsize), (14, 0, 8));
+    let empty_tags: std::collections::HashMap<i64, u64> =
+        dynamic_entries(&empty_img).into_iter().collect();
+    assert_eq!(empty_tags.get(&25), Some(&address));
+    assert_eq!(empty_tags.get(&27), Some(&0));
+
+    let absent_obj = dir.join("absent-array.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n    xorl %edi, %edi\n    movl ${exit_nr}, %eax\n    syscall\n"
+        ),
+        &dir.join("absent-array.s"),
+        &absent_obj,
+    );
+    let absent_out = dir.join("absent-array");
+    assert!(link(&absent_obj, &absent_out).status.success());
+    let absent_img = std::fs::read(&absent_out).unwrap();
+    let absent_tags: std::collections::HashMap<i64, u64> =
+        dynamic_entries(&absent_img).into_iter().collect();
+    for tag in [25, 26, 27, 28, 32, 33] {
+        assert!(!absent_tags.contains_key(&tag));
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2172,6 +2286,11 @@ fn find_phdr(img: &[u8], p_type: u32) -> Option<(u64, u64, u64)> {
 
 /// `(sh_addr, sh_offset, sh_size)` of a named ELF64 section, or None.
 fn section_info(img: &[u8], name: &str) -> Option<(u64, u64, u64)> {
+    section_header_info(img, name).map(|(_, addr, offset, size, _, _)| (addr, offset, size))
+}
+
+/// `(sh_type, sh_addr, sh_offset, sh_size, sh_addralign, sh_entsize)`.
+fn section_header_info(img: &[u8], name: &str) -> Option<(u32, u64, u64, u64, u64, u64)> {
     let rd16 = |o: usize| u16::from_le_bytes(img[o..o + 2].try_into().unwrap());
     let rd32 = |o: usize| u32::from_le_bytes(img[o..o + 4].try_into().unwrap());
     let rd64 = |o: usize| u64::from_le_bytes(img[o..o + 8].try_into().unwrap());
@@ -2185,7 +2304,14 @@ fn section_info(img: &[u8], name: &str) -> Option<(u64, u64, u64)> {
         let noff = shstr_off + rd32(sh) as usize;
         let end = img[noff..].iter().position(|&b| b == 0).unwrap();
         if &img[noff..noff + end] == name.as_bytes() {
-            return Some((rd64(sh + 16), rd64(sh + 24), rd64(sh + 32)));
+            return Some((
+                rd32(sh + 4),
+                rd64(sh + 16),
+                rd64(sh + 24),
+                rd64(sh + 32),
+                rd64(sh + 48),
+                rd64(sh + 56),
+            ));
         }
     }
     None
@@ -2205,18 +2331,13 @@ fn section_bytes<'a>(img: &'a [u8], name: &str) -> Option<&'a [u8]> {
 }
 
 fn needed_libraries(img: &[u8]) -> Vec<String> {
-    let dynamic = section_bytes(img, ".dynamic").expect("linked image must have .dynamic");
     let dynstr = section_bytes(img, ".dynstr").expect("linked image must have .dynstr");
     let mut needed = Vec::new();
-    for entry in dynamic.chunks_exact(16) {
-        let tag = i64::from_le_bytes(entry[0..8].try_into().unwrap());
-        let value = u64::from_le_bytes(entry[8..16].try_into().unwrap()) as usize;
-        if tag == 0 {
-            break;
-        }
+    for (tag, value) in dynamic_entries(img) {
         if tag != 1 {
             continue;
         }
+        let value = value as usize;
         let end = dynstr[value..]
             .iter()
             .position(|&byte| byte == 0)
@@ -2224,6 +2345,20 @@ fn needed_libraries(img: &[u8]) -> Vec<String> {
         needed.push(String::from_utf8(dynstr[value..value + end].to_vec()).unwrap());
     }
     needed
+}
+
+fn dynamic_entries(img: &[u8]) -> Vec<(i64, u64)> {
+    let dynamic = section_bytes(img, ".dynamic").expect("linked image must have .dynamic");
+    let mut entries = Vec::new();
+    for entry in dynamic.chunks_exact(16) {
+        let tag = i64::from_le_bytes(entry[0..8].try_into().unwrap());
+        let value = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+        if tag == 0 {
+            break;
+        }
+        entries.push((tag, value));
+    }
+    entries
 }
 
 /// Audit T1: `--eh-frame-hdr` must synthesize `.eh_frame_hdr` +

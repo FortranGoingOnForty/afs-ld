@@ -103,7 +103,13 @@ const DT_RELASZ: i64 = 8;
 const DT_RELAENT: i64 = 9;
 const DT_PLTREL: i64 = 20;
 const DT_JMPREL: i64 = 23;
+const DT_INIT_ARRAY: i64 = 25;
+const DT_FINI_ARRAY: i64 = 26;
+const DT_INIT_ARRAYSZ: i64 = 27;
+const DT_FINI_ARRAYSZ: i64 = 28;
 const DT_FLAGS: i64 = 30;
+const DT_PREINIT_ARRAY: i64 = 32;
+const DT_PREINIT_ARRAYSZ: i64 = 33;
 const DT_VERSYM: i64 = 0x6fff_fff0;
 const DT_VERNEED: i64 = 0x6fff_fffe;
 const DT_VERNEEDNUM: i64 = 0x6fff_ffff;
@@ -734,6 +740,25 @@ struct OutSec {
     vaddr: u64,
     file_off: u64,
     is_bss: bool,
+}
+
+fn output_section_type(section: &OutSec) -> u32 {
+    if section.is_bss {
+        return SHT_NOBITS;
+    }
+    match section.name.as_str() {
+        ".preinit_array" => SHT_PREINIT_ARRAY,
+        ".init_array" => SHT_INIT_ARRAY,
+        ".fini_array" => SHT_FINI_ARRAY,
+        _ => SHT_PROGBITS,
+    }
+}
+
+fn output_section_entsize(section: &OutSec) -> u64 {
+    match section.name.as_str() {
+        ".preinit_array" | ".init_array" | ".fini_array" => 8,
+        _ => 0,
+    }
 }
 
 /// (object index, section index) -> (output section, offset within it)
@@ -2335,7 +2360,7 @@ pub fn link_static_exec(
         let mut h = [0u8; 64];
         let n = name_off(&o.name, &mut shstr);
         h[0..4].copy_from_slice(&n.to_le_bytes());
-        h[4..8].copy_from_slice(&(if o.is_bss { SHT_NOBITS } else { SHT_PROGBITS }).to_le_bytes());
+        h[4..8].copy_from_slice(&output_section_type(o).to_le_bytes());
         h[8..16].copy_from_slice(&o.flags.to_le_bytes());
         h[16..24].copy_from_slice(&o.vaddr.to_le_bytes());
         h[24..32].copy_from_slice(&o.file_off.to_le_bytes());
@@ -2348,6 +2373,7 @@ pub fn link_static_exec(
             .to_le_bytes(),
         );
         h[48..56].copy_from_slice(&o.align.to_le_bytes());
+        h[56..64].copy_from_slice(&output_section_entsize(o).to_le_bytes());
         shdrs.push(h);
     }
     let shstr_name = name_off(".shstrtab", &mut shstr);
@@ -3083,15 +3109,23 @@ pub fn link_dynamic_exec(
     }; // 3 reserved + func
     let relaplt_size = (n_func * 24) as u64;
     let n_needed = needed_offsets.len();
+    let has_preinit_array = outs.iter().any(|section| section.name == ".preinit_array");
+    let has_init_array = outs.iter().any(|section| section.name == ".init_array");
+    let has_fini_array = outs.iter().any(|section| section.name == ".fini_array");
     // .dynamic entry count: NEEDED* + base tags (HASH/STRTAB/SYMTAB/STRSZ/
     // SYMENT/FLAGS) + PLT tags (PLTGOT/PLTRELSZ/PLTREL/JMPREL, only with a
     // PLT) + versioning tags (VERSYM/VERNEED/VERNEEDNUM) + .rela.dyn tags
-    // (RELA/RELASZ/RELAENT) + NULL.
+    // (RELA/RELASZ/RELAENT) + array address/size pairs + NULL.
     let n_base_dyn = 6;
     let n_plt_dyn = if has_plt { 4 } else { 0 };
     let n_ver_dyn = if versioned { 3 } else { 0 };
     let n_reladyn_dyn = if reladyn_size > 0 { 3 } else { 0 };
-    let dynamic_count = n_needed + n_base_dyn + n_plt_dyn + n_ver_dyn + n_reladyn_dyn + 1;
+    let n_array_dyn = 2 * [has_preinit_array, has_init_array, has_fini_array]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    let dynamic_count =
+        n_needed + n_base_dyn + n_plt_dyn + n_ver_dyn + n_reladyn_dyn + n_array_dyn + 1;
     let dynamic_size = (dynamic_count * 16) as u64;
 
     // ---- Layout. Fixed section order across three load segments.
@@ -3581,7 +3615,20 @@ pub fn link_dynamic_exec(
         dyn_push(DT_VERNEED, verneed_v, &mut dynamic);
         dyn_push(DT_VERNEEDNUM, verneed_count as u64, &mut dynamic);
     }
+    if has_preinit_array {
+        dyn_push(DT_PREINIT_ARRAY, pre_s, &mut dynamic);
+        dyn_push(DT_PREINIT_ARRAYSZ, pre_e - pre_s, &mut dynamic);
+    }
+    if has_init_array {
+        dyn_push(DT_INIT_ARRAY, ini_s, &mut dynamic);
+        dyn_push(DT_INIT_ARRAYSZ, ini_e - ini_s, &mut dynamic);
+    }
+    if has_fini_array {
+        dyn_push(DT_FINI_ARRAY, fin_s, &mut dynamic);
+        dyn_push(DT_FINI_ARRAYSZ, fin_e - fin_s, &mut dynamic);
+    }
     dyn_push(DT_NULL, 0, &mut dynamic);
+    debug_assert_eq!(dynamic.len(), dynamic_size as usize);
 
     let e_entry = {
         let &(eoi, esi) = globals
@@ -3899,7 +3946,7 @@ pub fn link_dynamic_exec(
             &mut shstr,
             &mut shdrs,
             &o.name,
-            SHT_PROGBITS,
+            output_section_type(o),
             o.flags,
             o.vaddr,
             o.file_off,
@@ -3907,7 +3954,7 @@ pub fn link_dynamic_exec(
             0,
             0,
             o.align,
-            0,
+            output_section_entsize(o),
         );
     }
     for &i in &text_order {
@@ -3916,7 +3963,7 @@ pub fn link_dynamic_exec(
             &mut shstr,
             &mut shdrs,
             &o.name,
-            SHT_PROGBITS,
+            output_section_type(o),
             o.flags,
             o.vaddr,
             o.file_off,
@@ -3924,7 +3971,7 @@ pub fn link_dynamic_exec(
             0,
             0,
             o.align,
-            0,
+            output_section_entsize(o),
         );
     }
     if has_plt {
@@ -3949,7 +3996,7 @@ pub fn link_dynamic_exec(
             &mut shstr,
             &mut shdrs,
             &o.name,
-            SHT_PROGBITS,
+            output_section_type(o),
             o.flags,
             o.vaddr,
             o.file_off,
@@ -3957,7 +4004,7 @@ pub fn link_dynamic_exec(
             0,
             0,
             o.align,
-            0,
+            output_section_entsize(o),
         );
     }
     if got_size > 0 {

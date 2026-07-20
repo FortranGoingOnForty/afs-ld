@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use afs_ld::macho::constants::{
-    CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_ID_DYLIB, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_UUID,
-    MH_DYLIB, MH_MAGIC_64, MH_OBJECT, N_ABS, N_EXT, N_NO_DEAD_STRIP, N_PEXT, N_SECT, N_UNDF,
-    SECTION_TYPE_MASK, S_REGULAR, S_ZEROFILL,
+    CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_ID_DYLIB, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_MAIN,
+    LC_UUID, MH_DYLIB, MH_EXECUTE, MH_MAGIC_64, MH_OBJECT, N_ABS, N_EXT, N_NO_DEAD_STRIP, N_PEXT,
+    N_SECT, N_UNDF, SECTION_TYPE_MASK, S_REGULAR, S_ZEROFILL,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::reader::{
@@ -131,6 +131,78 @@ fn synthetic_symbol_object_with_desc(symbols: &[(&str, u8, u16, u64)]) -> Vec<u8
     for symbol in raw_symbols {
         symbol.write(&mut bytes);
     }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_text_object(symbol_name: &str) -> Vec<u8> {
+    let text = [0xc0, 0x03, 0x5f, 0xd6]; // ret
+    let mut strings = vec![0];
+    let strx = strings.len() as u32;
+    strings.extend_from_slice(symbol_name.as_bytes());
+    strings.push(0);
+    let symbol = RawNlist {
+        strx,
+        n_type: N_SECT | N_EXT,
+        n_sect: 1,
+        n_desc: 0,
+        n_value: 0,
+    };
+    let mut segment = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: 0,
+        vmsize: text.len() as u64,
+        fileoff: 0,
+        filesize: text.len() as u64,
+        maxprot: 5,
+        initprot: 5,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: 0,
+            size: text.len() as u64,
+            offset: 0,
+            align: 2,
+            reloff: 0,
+            nreloc: 0,
+            flags: S_REGULAR,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = afs_ld::macho::reader::HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    let symoff = data_offset + text.len() as u32;
+    let stroff = symoff + NLIST_SIZE as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: 0,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: 1,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    symbol.write(&mut bytes);
     bytes.extend_from_slice(&strings);
     bytes
 }
@@ -648,6 +720,104 @@ fn explicit_absolute_entry_symbol_is_rejected() {
     assert!(!output.exists());
 
     let _ = fs::remove_file(object);
+}
+
+#[test]
+fn executable_without_default_entry_is_rejected() {
+    let object = scratch("missing-default-entry.o");
+    let output = scratch("missing-default-entry.out");
+    let _ = fs::remove_file(&output);
+    fs::write(&object, synthetic_text_object("_foo")).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-dead_strip")
+        .arg("-o")
+        .arg(&output)
+        .arg(&object)
+        .output()
+        .expect("afs-ld should run");
+
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(
+            "executable has no entry symbol; define `_main` or `_start`, or use `-e <symbol>`"
+        ),
+        "unexpected diagnostic:\n{stderr}"
+    );
+    assert!(!output.exists());
+
+    let _ = fs::remove_file(object);
+}
+
+#[test]
+fn executable_accepts_default_and_explicit_entries() {
+    for (symbol, entry) in [("_main", None), ("_start", None), ("_foo", Some("_foo"))] {
+        let stem = symbol.trim_start_matches('_');
+        let object = scratch(&format!("valid-{stem}-entry.o"));
+        let output = scratch(&format!("valid-{stem}-entry.out"));
+        let _ = fs::remove_file(&output);
+        fs::write(&object, synthetic_text_object(symbol)).unwrap();
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_afs-ld"));
+        if let Some(entry) = entry {
+            command.arg("-e").arg(entry);
+        }
+        let result = command
+            .arg("-o")
+            .arg(&output)
+            .arg(&object)
+            .output()
+            .expect("afs-ld should run");
+        assert!(
+            result.status.success(),
+            "valid entry {symbol} failed:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+
+        let bytes = fs::read(&output).unwrap();
+        let header = parse_header(&bytes).unwrap();
+        assert_eq!(header.filetype, MH_EXECUTE);
+        assert!(parse_commands(&header, &bytes)
+            .unwrap()
+            .iter()
+            .any(|command| matches!(command, LoadCommand::Raw { cmd, .. } if *cmd == LC_MAIN)));
+
+        let _ = fs::remove_file(object);
+        let _ = fs::remove_file(output);
+    }
+}
+
+#[test]
+fn dylib_does_not_require_an_executable_entry() {
+    let object = scratch("dylib-without-entry.o");
+    let output = scratch("dylib-without-entry.dylib");
+    let _ = fs::remove_file(&output);
+    fs::write(&object, synthetic_text_object("_foo")).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-dylib")
+        .arg("-o")
+        .arg(&output)
+        .arg(&object)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        result.status.success(),
+        "dylib link failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let bytes = fs::read(&output).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    assert_eq!(header.filetype, MH_DYLIB);
+    assert!(!parse_commands(&header, &bytes)
+        .unwrap()
+        .iter()
+        .any(|command| matches!(command, LoadCommand::Raw { cmd, .. } if *cmd == LC_MAIN)));
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(output);
 }
 
 #[test]
@@ -1278,6 +1448,7 @@ fn extensionless_dylib_is_dispatched_in_input_order() {
     for jobs in [1, 4] {
         let output = scratch(&format!("extensionless-dylib-{jobs}.out"));
         let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
             .arg("-t")
             .arg("-j")
             .arg(jobs.to_string())
@@ -1338,6 +1509,7 @@ fn extensionless_framework_preserves_weak_load_kind() {
     for jobs in [1, 4] {
         let output = scratch(&format!("extensionless-framework-{jobs}.out"));
         let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
             .arg("-j")
             .arg(jobs.to_string())
             .arg("-syslibroot")
@@ -1555,6 +1727,7 @@ fn force_load_resolves_references_from_later_archive() {
     for jobs in [1, 4] {
         let output = scratch(&format!("force-order-{jobs}.out"));
         let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
             .arg("-t")
             .arg("-j")
             .arg(jobs.to_string())
@@ -1663,6 +1836,7 @@ fn thin_archive_loads_external_macho_members() {
     for jobs in [1, 4] {
         let output = root.join(format!("thin-lazy-{jobs}.out"));
         let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
             .arg("-t")
             .arg("-j")
             .arg(jobs.to_string())
@@ -1690,6 +1864,7 @@ fn thin_archive_loads_external_macho_members() {
 
         let force_output = root.join(format!("thin-force-{jobs}.out"));
         let forced = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
             .arg("-t")
             .arg("-j")
             .arg(jobs.to_string())
@@ -1718,6 +1893,7 @@ fn thin_archive_loads_external_macho_members() {
 
         let nested_output = root.join(format!("thin-nested-lazy-{jobs}.out"));
         let nested = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
             .arg("-t")
             .arg("-j")
             .arg(jobs.to_string())
@@ -1742,6 +1918,7 @@ fn thin_archive_loads_external_macho_members() {
 
         let nested_force_output = root.join(format!("thin-nested-force-{jobs}.out"));
         let nested_forced = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
             .arg("-t")
             .arg("-j")
             .arg(jobs.to_string())
@@ -1766,6 +1943,7 @@ fn thin_archive_loads_external_macho_members() {
 
         let recursive_output = root.join(format!("thin-recursive-lazy-{jobs}.out"));
         let recursive = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
             .arg("-t")
             .arg("-j")
             .arg(jobs.to_string())
@@ -1787,6 +1965,7 @@ fn thin_archive_loads_external_macho_members() {
 
         let recursive_force_output = root.join(format!("thin-recursive-force-{jobs}.out"));
         let recursive_forced = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
             .arg("-t")
             .arg("-j")
             .arg(jobs.to_string())
@@ -1810,6 +1989,7 @@ fn thin_archive_loads_external_macho_members() {
     fs::remove_file(&member).unwrap();
     for jobs in [1, 4] {
         let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
             .arg("-j")
             .arg(jobs.to_string())
             .arg(&main)

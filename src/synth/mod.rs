@@ -162,11 +162,22 @@ impl SyntheticPlan {
                             continue;
                         };
                         if direct_import_bind_supported(reloc) {
+                            let atom_offset = reloc
+                                .offset
+                                .checked_sub(atom.input_offset)
+                                .ok_or_else(|| SynthError {
+                                    input: obj.path.clone(),
+                                    atom: atom_id,
+                                    reloc_offset: reloc.offset,
+                                    kind: reloc.kind,
+                                    detail: "direct-import relocation lands before atom start"
+                                        .to_string(),
+                                })?;
                             direct_binds.push(DirectBind {
                                 atom: atom_id,
-                                atom_offset: reloc.offset.saturating_sub(atom.input_offset),
+                                atom_offset,
                                 symbol: symbol_id,
-                                addend: reloc.addend,
+                                addend: direct_import_bind_addend(atom, obj, atom_offset, reloc)?,
                             });
                         }
                     }
@@ -597,6 +608,31 @@ fn got_page_symbol_needs_slot(
 
 fn direct_import_bind_supported(reloc: Reloc) -> bool {
     matches!(reloc.length, RelocLength::Quad) && !reloc.pcrel && reloc.subtrahend.is_none()
+}
+
+fn direct_import_bind_addend(
+    atom: &Atom,
+    obj: &ObjectFile,
+    atom_offset: u32,
+    reloc: Reloc,
+) -> Result<i64, SynthError> {
+    let start = atom_offset as usize;
+    let end = start.checked_add(8).ok_or_else(|| SynthError {
+        input: obj.path.clone(),
+        atom: atom.id,
+        reloc_offset: atom_offset,
+        kind: reloc.kind,
+        detail: "direct-import pointer offset overflows the host address space".to_string(),
+    })?;
+    let bytes = atom.data.get(start..end).ok_or_else(|| SynthError {
+        input: obj.path.clone(),
+        atom: atom.id,
+        reloc_offset: atom_offset,
+        kind: reloc.kind,
+        detail: "64-bit direct-import pointer slot extends past atom contents".to_string(),
+    })?;
+    let implicit_addend = i64::from_le_bytes(bytes.try_into().expect("checked 8-byte slice"));
+    Ok(reloc.addend.wrapping_add(implicit_addend))
 }
 
 fn inputs_have_tlv_descriptors(inputs: &[LayoutInput<'_>]) -> bool {
@@ -1098,7 +1134,8 @@ mod tests {
             addend: 0,
             subtrahend: None,
         }];
-        let object = synth_object("_ext_data", encode_raw_relocs(&relocs));
+        let mut object = synth_object("_ext_data", encode_raw_relocs(&relocs));
+        object.sections[0].data[..8].copy_from_slice(&4_i64.to_le_bytes());
 
         let mut atoms = AtomTable::new();
         let atom_id = atoms.push(Atom {
@@ -1111,7 +1148,7 @@ mod tests {
             align_pow2: 3,
             owner: None,
             alt_entries: Vec::new(),
-            data: vec![0; 8],
+            data: 4_i64.to_le_bytes().to_vec(),
             flags: AtomFlags::default(),
             parent_of: None,
         });
@@ -1134,6 +1171,7 @@ mod tests {
         assert_eq!(plan.direct_binds[0].atom, atom_id);
         assert_eq!(plan.direct_binds[0].atom_offset, 0);
         assert_eq!(plan.direct_binds[0].symbol, import);
+        assert_eq!(plan.direct_binds[0].addend, 4);
     }
 
     #[test]

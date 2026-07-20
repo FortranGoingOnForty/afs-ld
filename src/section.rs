@@ -49,6 +49,10 @@ pub enum SectionKind {
     NonLazySymbolPointers,
     /// Lazy symbol pointers — typically `__DATA,__la_symbol_ptr`.
     LazySymbolPointers,
+    /// Process initializer function pointers (`S_MOD_INIT_FUNC_POINTERS`).
+    InitializerPointers,
+    /// Process terminator function pointers (`S_MOD_TERM_FUNC_POINTERS`).
+    TerminatorPointers,
     /// Symbol stubs — typically `__TEXT,__stubs`.
     SymbolStubs,
     /// Any other regular section not otherwise classified.
@@ -69,6 +73,8 @@ pub fn classify_section(segname: &str, sectname: &str, flags: u32) -> SectionKin
         S_16BYTE_LITERALS => SectionKind::Literal16,
         S_NON_LAZY_SYMBOL_POINTERS => SectionKind::NonLazySymbolPointers,
         S_LAZY_SYMBOL_POINTERS => SectionKind::LazySymbolPointers,
+        S_MOD_INIT_FUNC_POINTERS => SectionKind::InitializerPointers,
+        S_MOD_TERM_FUNC_POINTERS => SectionKind::TerminatorPointers,
         S_SYMBOL_STUBS => SectionKind::SymbolStubs,
         S_COALESCED => {
             if sectname == "__eh_frame" {
@@ -376,6 +382,18 @@ mod tests {
             classify_section("__DATA", "__thread_ptrs", S_THREAD_LOCAL_VARIABLE_POINTERS),
             SectionKind::ThreadLocalVariablePointers
         );
+    }
+
+    #[test]
+    fn classify_initializer_and_terminator_pointers() {
+        assert!(!matches!(
+            classify_section("__DATA", "__mod_init_func", S_MOD_INIT_FUNC_POINTERS),
+            SectionKind::Unknown(_)
+        ));
+        assert!(!matches!(
+            classify_section("__DATA", "__mod_term_func", S_MOD_TERM_FUNC_POINTERS),
+            SectionKind::Unknown(_)
+        ));
     }
 
     #[test]

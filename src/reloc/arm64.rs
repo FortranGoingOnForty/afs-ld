@@ -437,8 +437,15 @@ fn input_section_address_map(layout: &Layout, atoms: &AtomTable) -> HashMap<(Inp
     for section in &layout.sections {
         for placed in &section.atoms {
             let atom = atoms.get(placed.atom);
+            let Some(input_section_addr) = section
+                .addr
+                .checked_add(placed.offset)
+                .and_then(|addr| addr.checked_sub(atom.input_offset as u64))
+            else {
+                continue;
+            };
             out.entry((atom.origin, atom.input_section))
-                .or_insert(section.addr);
+                .or_insert(input_section_addr);
         }
     }
     out
@@ -471,61 +478,54 @@ fn synthetic_address_maps(
     };
 
     let mut stub_addrs = HashMap::new();
-    if let Some(section) = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__TEXT" && section.name == "__stubs")
-    {
+    if let Some(section) = layout.synthetic_section("__TEXT", "__stubs") {
         for (idx, entry) in plan.stubs.entries.iter().enumerate() {
-            stub_addrs.insert(entry.symbol, section.addr + (idx as u64) * STUB_SIZE as u64);
+            stub_addrs.insert(
+                entry.symbol,
+                section.addr + section.synthetic_offset + (idx as u64) * STUB_SIZE as u64,
+            );
         }
     }
 
     let mut got_addrs = HashMap::new();
-    if let Some(section) = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
-    {
+    if let Some(section) = layout.synthetic_section("__DATA_CONST", "__got") {
         for (idx, entry) in plan.got.entries.iter().enumerate() {
-            got_addrs.insert(entry.symbol, section.addr + (idx as u64) * 8);
+            got_addrs.insert(
+                entry.symbol,
+                section.addr + section.synthetic_offset + (idx as u64) * 8,
+            );
         }
     }
 
     let mut thread_pointer_addrs = HashMap::new();
-    if let Some(section) = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__DATA" && section.name == "__thread_ptrs")
-    {
+    if let Some(section) = layout.synthetic_section("__DATA", "__thread_ptrs") {
         for (idx, entry) in plan.thread_pointers.entries.iter().enumerate() {
-            thread_pointer_addrs.insert(entry.symbol, section.addr + (idx as u64) * 8);
+            thread_pointer_addrs.insert(
+                entry.symbol,
+                section.addr + section.synthetic_offset + (idx as u64) * 8,
+            );
         }
     }
 
     let mut lazy_pointer_addrs = HashMap::new();
-    if let Some(section) = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
-    {
+    if let Some(section) = layout.synthetic_section("__DATA", "__la_symbol_ptr") {
         for (idx, entry) in plan.lazy_pointers.entries.iter().enumerate() {
-            lazy_pointer_addrs.insert(entry.symbol, section.addr + (idx as u64) * 8);
+            lazy_pointer_addrs.insert(
+                entry.symbol,
+                section.addr + section.synthetic_offset + (idx as u64) * 8,
+            );
         }
     }
 
     let mut stub_helper_entry_addrs = HashMap::new();
     let mut stub_helper_header_addr = None;
-    if let Some(section) = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__TEXT" && section.name == "__stub_helper")
-    {
-        stub_helper_header_addr = Some(section.addr);
+    if let Some(section) = layout.synthetic_section("__TEXT", "__stub_helper") {
+        let start = section.addr + section.synthetic_offset;
+        stub_helper_header_addr = Some(start);
         for (idx, entry) in plan.lazy_pointers.entries.iter().enumerate() {
             stub_helper_entry_addrs.insert(
                 entry.symbol,
-                section.addr
+                start
                     + STUB_HELPER_HEADER_SIZE as u64
                     + (idx as u64) * STUB_HELPER_ENTRY_SIZE as u64,
             );
@@ -533,12 +533,9 @@ fn synthetic_address_maps(
     }
 
     let dyld_private_addr = layout
-        .sections
-        .iter()
-        .find(|section| {
-            section.segment == "__DATA"
-                && section.name == "__data"
-                && section.synthetic_data.len() >= crate::synth::stubs::DYLD_PRIVATE_SIZE as usize
+        .synthetic_section("__DATA", "__data")
+        .filter(|section| {
+            section.synthetic_data.len() >= crate::synth::stubs::DYLD_PRIVATE_SIZE as usize
         })
         .map(|section| section.addr + section.synthetic_offset);
 
@@ -823,12 +820,13 @@ fn apply_one(
                 patch_pageoff12(bytes, atom, obj, local_offset, reloc, target)
             }
         }
-        RelocKind::PointerToGot => patch_unsigned(
+        RelocKind::PointerToGot => patch_pointer_to_got(
             bytes,
             atom,
             obj,
             local_offset,
             reloc,
+            place,
             resolve_got_target(obj, atom, reloc, resolve)?,
         ),
         RelocKind::TlvpLoadPage21 => patch_page21(
@@ -1578,6 +1576,66 @@ fn patch_unsigned(
     }
 }
 
+fn patch_pointer_to_got(
+    bytes: &mut [u8],
+    atom: &Atom,
+    obj: &ObjectFile,
+    local_offset: u32,
+    reloc: Reloc,
+    place: u64,
+    target: u64,
+) -> Result<(), RelocError> {
+    if !reloc.pcrel {
+        return patch_unsigned(bytes, atom, obj, local_offset, reloc, target);
+    }
+
+    let implicit_addend = read_implicit_addend(
+        bytes,
+        local_offset,
+        reloc.length,
+        atom,
+        obj,
+        reloc.kind,
+        reloc.referent,
+    )?;
+    let delta = i128::from(target) + i128::from(reloc.addend) + i128::from(implicit_addend)
+        - i128::from(place);
+    let referent = describe_referent(obj, reloc.referent);
+    match reloc.length {
+        RelocLength::Word => {
+            let value = i32::try_from(delta).map_err(|_| {
+                reloc_error(
+                    atom,
+                    &obj.path,
+                    local_offset,
+                    reloc.kind,
+                    &referent,
+                    format!(
+                        "PC-relative POINTER_TO_GOT delta is out of signed 32-bit range ({delta:#x})"
+                    ),
+                )
+            })?;
+            write_u32(
+                bytes,
+                local_offset,
+                value as u32,
+                atom,
+                obj,
+                reloc.kind,
+                &referent,
+            )
+        }
+        other => Err(reloc_error(
+            atom,
+            &obj.path,
+            local_offset,
+            reloc.kind,
+            &referent,
+            format!("PC-relative POINTER_TO_GOT must use Word width, got {other:?}"),
+        )),
+    }
+}
+
 fn direct_import_bind_supported(reloc: Reloc) -> bool {
     matches!(reloc.length, RelocLength::Quad) && !reloc.pcrel && reloc.subtrahend.is_none()
 }
@@ -2191,11 +2249,7 @@ fn synthesize_got_section(
     plan: &SyntheticPlan,
     resolve: &ResolveView<'_>,
 ) -> Result<(), RelocError> {
-    let Some(section) = layout
-        .sections
-        .iter_mut()
-        .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
-    else {
+    let Some(section) = layout.synthetic_section_mut("__DATA_CONST", "__got") else {
         return Ok(());
     };
 
@@ -2249,18 +2303,14 @@ fn synthesize_stub_section(
     plan: &SyntheticPlan,
     resolve: &ResolveView<'_>,
 ) -> Result<(), RelocError> {
-    let Some(section) = layout
-        .sections
-        .iter_mut()
-        .find(|section| section.segment == "__TEXT" && section.name == "__stubs")
-    else {
+    let Some(section) = layout.synthetic_section_mut("__TEXT", "__stubs") else {
         return Ok(());
     };
 
     for (idx, entry) in plan.stubs.entries.iter().enumerate() {
         let start = idx * STUB_SIZE as usize;
         let end = start + STUB_SIZE as usize;
-        let stub_addr = section.addr + (idx as u64) * STUB_SIZE as u64;
+        let stub_addr = section.addr + section.synthetic_offset + (idx as u64) * STUB_SIZE as u64;
         let lazy_addr = resolve
             .lazy_pointer_addrs
             .get(&entry.symbol)
@@ -2285,11 +2335,7 @@ fn synthesize_lazy_pointer_section(
     plan: &SyntheticPlan,
     resolve: &ResolveView<'_>,
 ) -> Result<(), RelocError> {
-    let Some(section) = layout
-        .sections
-        .iter_mut()
-        .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
-    else {
+    let Some(section) = layout.synthetic_section_mut("__DATA", "__la_symbol_ptr") else {
         return Ok(());
     };
 
@@ -2323,11 +2369,7 @@ fn synthesize_stub_helper_section(
     let Some(binder_symbol) = plan.binder_symbol else {
         return Ok(());
     };
-    let Some(section) = layout
-        .sections
-        .iter_mut()
-        .find(|section| section.segment == "__TEXT" && section.name == "__stub_helper")
-    else {
+    let Some(section) = layout.synthetic_section_mut("__TEXT", "__stub_helper") else {
         return Ok(());
     };
 
@@ -2703,6 +2745,84 @@ mod tests {
     use crate::symbol::{InputSymbol, RawNlist};
     use crate::OutputKind;
 
+    fn apply_pointer_to_got_fixture(
+        place: u64,
+        got: u64,
+        length: RelocLength,
+        pcrel: bool,
+        explicit_addend: i64,
+        implicit_addend: i64,
+    ) -> Result<Vec<u8>, RelocError> {
+        let width = match length {
+            RelocLength::Word => 4,
+            RelocLength::Quad => 8,
+            other => panic!("unsupported fixture width {other:?}"),
+        };
+        let object = thunk_test_object(Vec::new(), 0, width);
+        let mut atoms = AtomTable::new();
+        let atom_id = atoms.push(test_atom(0, width as u32));
+        let mut symbols = SymbolTable::new();
+        let target_name = symbols.intern("_target");
+        symbols
+            .insert(Symbol::Defined {
+                name: target_name,
+                origin: InputId(0),
+                atom: atom_id,
+                value: 0,
+                weak: false,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap();
+        let target = symbols.lookup(target_name).unwrap();
+        let symbol_name_index = build_symbol_name_index(&symbols);
+        let atom_addrs = HashMap::from([(atom_id, place)]);
+        let atoms_by_input_section = atoms.by_input_section();
+        let section_addrs = HashMap::new();
+        let got_addrs = HashMap::from([(target, got)]);
+        let empty_symbol_addrs = HashMap::new();
+        let resolve = ResolveView {
+            sym_table: &symbols,
+            symbol_name_index: &symbol_name_index,
+            atom_table: &atoms,
+            atom_addrs: &atom_addrs,
+            atoms_by_input_section: &atoms_by_input_section,
+            section_addrs: &section_addrs,
+            stub_addrs: &empty_symbol_addrs,
+            got_addrs: &got_addrs,
+            thread_pointer_addrs: &empty_symbol_addrs,
+            lazy_pointer_addrs: &empty_symbol_addrs,
+            stub_helper_entry_addrs: &empty_symbol_addrs,
+            stub_helper_header_addr: None,
+            dyld_private_addr: None,
+            icf_redirects: None,
+        };
+        let mut bytes = match length {
+            RelocLength::Word => (implicit_addend as i32).to_le_bytes().to_vec(),
+            RelocLength::Quad => implicit_addend.to_le_bytes().to_vec(),
+            _ => unreachable!(),
+        };
+
+        apply_one(
+            &mut bytes,
+            atoms.get(atom_id),
+            &object,
+            Reloc {
+                offset: 0,
+                kind: RelocKind::PointerToGot,
+                length,
+                pcrel,
+                referent: Referent::Symbol(0),
+                addend: explicit_addend,
+                subtrahend: None,
+            },
+            &resolve,
+            None,
+            None,
+        )?;
+        Ok(bytes)
+    }
+
     #[test]
     fn branch26_patches_low_bits() {
         let insn = 0x9400_0000u32;
@@ -2766,6 +2886,70 @@ mod tests {
     }
 
     #[test]
+    fn pointer_to_got_word_uses_place_and_addends() {
+        let place = 0x1_0000_5000;
+        let got = 0x1_0000_1000;
+
+        let bytes =
+            apply_pointer_to_got_fixture(place, got, RelocLength::Word, true, 12, -4).unwrap();
+
+        assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), -0x3ff8);
+    }
+
+    #[test]
+    fn pointer_to_got_word_accepts_signed_range_endpoints() {
+        let place = 0x1_0000_0000;
+
+        for (got, expected) in [
+            (place + i32::MAX as u64, i32::MAX),
+            (place - (1_u64 << 31), i32::MIN),
+        ] {
+            let bytes =
+                apply_pointer_to_got_fixture(place, got, RelocLength::Word, true, 0, 0).unwrap();
+
+            assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn pointer_to_got_word_rejects_out_of_range_delta() {
+        let place = 0x1_0000_0000;
+
+        for got in [place + (1_u64 << 31), place - (1_u64 << 31) - 1] {
+            let error = apply_pointer_to_got_fixture(place, got, RelocLength::Word, true, 0, 0)
+                .unwrap_err();
+
+            assert!(error.detail.contains("signed 32-bit"), "{error}");
+        }
+    }
+
+    #[test]
+    fn pcrel_pointer_to_got_rejects_quad_width() {
+        let error = apply_pointer_to_got_fixture(
+            0x1_0000_0000,
+            0x1_0000_1000,
+            RelocLength::Quad,
+            true,
+            0,
+            0,
+        )
+        .unwrap_err();
+
+        assert!(error.detail.contains("must use Word width"), "{error}");
+    }
+
+    #[test]
+    fn absolute_pointer_to_got_quad_preserves_pointer_value() {
+        let got = 0x1234_5678_9abc_def0;
+
+        let bytes =
+            apply_pointer_to_got_fixture(0x1_0000_0000, got, RelocLength::Quad, false, -8, 4)
+                .unwrap();
+
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), got - 4);
+    }
+
+    #[test]
     fn branch26_span_fast_path_rejects_only_large_non_linkedit_images() {
         let small = Layout {
             kind: OutputKind::Executable,
@@ -2792,6 +2976,58 @@ mod tests {
             ],
         };
         assert!(!layout_fits_branch26_span(&large));
+    }
+
+    #[test]
+    fn input_section_addresses_track_each_object_contribution() {
+        let mut atoms = AtomTable::new();
+        let first = atoms.push(Atom {
+            origin: InputId(0),
+            input_section: 2,
+            ..test_atom(0, 8)
+        });
+        let second = atoms.push(Atom {
+            origin: InputId(1),
+            input_section: 2,
+            ..test_atom(0, 8)
+        });
+        let layout = Layout {
+            kind: OutputKind::Executable,
+            segments: Vec::new(),
+            sections: vec![OutputSection {
+                segment: "__DATA".into(),
+                name: "__data".into(),
+                kind: SectionKind::Data,
+                align_pow2: 3,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                atoms: vec![
+                    crate::section::OutputAtom {
+                        atom: first,
+                        offset: 0,
+                        size: 8,
+                        data: vec![1; 8],
+                    },
+                    crate::section::OutputAtom {
+                        atom: second,
+                        offset: 8,
+                        size: 8,
+                        data: vec![2; 8],
+                    },
+                ],
+                synthetic_offset: 16,
+                synthetic_data: Vec::new(),
+                addr: 0x1_0000_4000,
+                size: 16,
+                file_off: 0x4000,
+            }],
+        };
+
+        let addrs = input_section_address_map(&layout, &atoms);
+        assert_eq!(addrs[&(InputId(0), 2)], 0x1_0000_4000);
+        assert_eq!(addrs[&(InputId(1), 2)], 0x1_0000_4008);
     }
 
     #[test]

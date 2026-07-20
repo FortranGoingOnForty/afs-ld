@@ -557,26 +557,47 @@ fn parse_direct_string_list(
 }
 
 fn collect_direct_flow(lines: &[&str], i: usize, rest: &str) -> Result<(String, usize), TbdError> {
+    let (flow, next) = consume_direct_flow(lines, i, rest, true)?;
+    Ok((
+        flow.expect("collecting a direct flow must produce text"),
+        next,
+    ))
+}
+
+fn skip_direct_flow(lines: &[&str], i: usize, rest: &str) -> Result<usize, TbdError> {
+    consume_direct_flow(lines, i, rest, false).map(|(_, next)| next)
+}
+
+fn consume_direct_flow(
+    lines: &[&str],
+    i: usize,
+    rest: &str,
+    collect: bool,
+) -> Result<(Option<String>, usize), TbdError> {
     let start_line = i + 1;
-    let mut flow = rest.trim().to_string();
-    if !flow.starts_with('[') {
+    let rest = rest.trim();
+    if !rest.starts_with('[') {
         return Err(schema("expected a flow sequence"));
     }
+    let mut flow = collect.then(|| rest.to_string());
+    let mut balance = DirectFlowBalance::default();
+    balance.scan(rest);
+    let mut ends_with_close = rest.ends_with(']');
     let mut next_i = if direct_trimmed(lines.get(i).copied().unwrap_or_default())
-        .map(|line| line.contains(rest.trim()))
+        .map(|line| line.contains(rest))
         .unwrap_or(false)
     {
         i + 1
     } else {
         i
     };
-    while direct_flow_unbalanced(&flow) {
+    while balance.is_unbalanced() {
         let Some(next) = lines.get(next_i).and_then(|line| direct_trimmed(line)) else {
             return Err(schema(&format!(
                 "unterminated flow sequence from line {} near line {}: {:?}",
                 start_line,
                 next_i + 1,
-                flow
+                flow.as_deref().unwrap_or(rest)
             )));
         };
         if next.starts_with("---") || next.starts_with("...") {
@@ -584,21 +605,53 @@ fn collect_direct_flow(lines: &[&str], i: usize, rest: &str) -> Result<(String, 
                 "unterminated flow sequence from line {} before line {}: {:?}",
                 start_line,
                 next_i + 1,
-                flow
+                flow.as_deref().unwrap_or(rest)
             )));
         }
-        flow.push(' ');
-        flow.push_str(next);
+        balance.scan(" ");
+        balance.scan(next);
+        if let Some(flow) = &mut flow {
+            flow.push(' ');
+            flow.push_str(next);
+        }
+        ends_with_close = next.ends_with(']');
         next_i += 1;
     }
-    if !flow.ends_with(']') {
+    if !ends_with_close {
         return Err(schema("flow sequence must end with ']'"));
     }
     Ok((flow, next_i))
 }
 
-fn skip_direct_flow(lines: &[&str], i: usize, rest: &str) -> Result<usize, TbdError> {
-    collect_direct_flow(lines, i, rest).map(|(_, next)| next)
+#[derive(Default)]
+struct DirectFlowBalance {
+    depth: i32,
+    in_single: bool,
+    in_double: bool,
+    escape_next: bool,
+}
+
+impl DirectFlowBalance {
+    fn scan(&mut self, fragment: &str) {
+        for byte in fragment.bytes() {
+            if self.escape_next {
+                self.escape_next = false;
+                continue;
+            }
+            match byte {
+                b'\\' if self.in_double => self.escape_next = true,
+                b'\'' if !self.in_double => self.in_single = !self.in_single,
+                b'"' if !self.in_single => self.in_double = !self.in_double,
+                b'[' | b'{' if !self.in_single && !self.in_double => self.depth += 1,
+                b']' | b'}' if !self.in_single && !self.in_double => self.depth -= 1,
+                _ => {}
+            }
+        }
+    }
+
+    fn is_unbalanced(&self) -> bool {
+        self.depth != 0
+    }
 }
 
 fn skip_direct_inline_value(lines: &[&str], i: usize, rest: &str) -> Result<usize, TbdError> {
@@ -719,30 +772,6 @@ fn direct_trimmed(line: &str) -> Option<&str> {
 
 fn direct_indent(line: &str) -> usize {
     line.bytes().take_while(|b| *b == b' ').count()
-}
-
-fn direct_flow_unbalanced(s: &str) -> bool {
-    let mut depth = 0i32;
-    let mut in_single = false;
-    let mut in_double = false;
-    let bytes = s.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        match b {
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'\\' if in_double && i + 1 < bytes.len() => {
-                i += 2;
-                continue;
-            }
-            b'[' | b'{' if !in_single && !in_double => depth += 1,
-            b']' | b'}' if !in_single && !in_double => depth -= 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    depth != 0
 }
 
 fn targets_match(targets: &[Target], target: &Target) -> bool {
@@ -1102,6 +1131,49 @@ mod tests {
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].exports.len(), 1);
         assert_eq!(docs[0].exports[0].value.symbols, ["_arm_one", "_arm_two"]);
+    }
+
+    #[test]
+    fn target_fast_path_scans_large_multiline_exports_once() {
+        let mut src = String::from(
+            "--- !tapi-tbd\n\
+             tbd-version: 4\n\
+             targets: [ arm64-macos ]\n\
+             install-name: '/usr/lib/liblarge.dylib'\n\
+             exports:\n\
+             \x20 - targets: [ x86_64-macos ]\n\
+             \x20   symbols: [\n",
+        );
+        for symbol in 0..4096 {
+            src.push_str(&format!("    '_x86_symbol_{symbol}[quoted]',\n"));
+        }
+        src.push_str(
+            "    _x86_last_symbol ]\n\
+             \x20 - targets: [ arm64-macos ]\n\
+             \x20   symbols: [\n",
+        );
+        for symbol in 0..4096 {
+            src.push_str(&format!("    '_symbol_{symbol}[quoted]',\n"));
+        }
+        src.push_str("    _last_symbol ]\n");
+
+        let docs = parse_tbd_for_target_direct(&src, &arm64_macos(), true).unwrap();
+        assert_eq!(docs.len(), 1);
+        let symbols = &docs[0].exports[0].value.symbols;
+        assert_eq!(symbols.len(), 4097);
+        assert_eq!(symbols[0], "_symbol_0[quoted]");
+        assert_eq!(symbols[4095], "_symbol_4095[quoted]");
+        assert_eq!(symbols[4096], "_last_symbol");
+    }
+
+    #[test]
+    fn direct_flow_balance_carries_escapes_between_fragments() {
+        let mut balance = DirectFlowBalance::default();
+        balance.scan("[ \"_quoted");
+        balance.scan("\\");
+        balance.scan(" ");
+        balance.scan("_continued\", _tail ]");
+        assert!(!balance.is_unbalanced());
     }
 
     #[test]

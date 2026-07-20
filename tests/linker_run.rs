@@ -8,11 +8,12 @@ use std::process::Command;
 
 mod common;
 
-use afs_ld::leb::read_uleb;
+use afs_ld::input::ObjectFile;
+use afs_ld::leb::{read_sleb, read_uleb};
 use afs_ld::macho::constants::{
     BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DONE, BIND_OPCODE_DO_BIND,
     BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED, BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB,
-    BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_MASK,
+    BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_MASK, BIND_OPCODE_SET_ADDEND_SLEB,
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
@@ -26,7 +27,8 @@ use afs_ld::macho::constants::{
     REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB, REBASE_OPCODE_MASK,
     REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM, REBASE_TYPE_POINTER,
-    SG_READ_ONLY, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_REGULAR,
+    SECTION_TYPE_MASK, SG_READ_ONLY, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_REGULAR,
+    S_ZEROFILL,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::{ExportKind, Exports};
@@ -34,7 +36,10 @@ use afs_ld::macho::reader::{
     parse_commands, parse_header, u32_le, write_header, LoadCommand, MachHeader64, Section64Header,
     Segment64, SymtabCmd, HEADER_SIZE,
 };
-use afs_ld::reloc::{write_raw_relocs, write_relocs, Referent, Reloc, RelocKind, RelocLength};
+use afs_ld::reloc::{
+    parse_raw_relocs, parse_relocs, write_raw_relocs, write_relocs, Referent, Reloc, RelocKind,
+    RelocLength,
+};
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, RawNlist, SymKind, NLIST_SIZE};
 use afs_ld::synth::unwind::decode_unwind_info;
@@ -318,16 +323,36 @@ fn synthetic_got_reference_object(entry: &str, target: &str, weak_ref: bool) -> 
 }
 
 fn synthetic_absolute_reference_object(entry: &str, target: &str) -> Vec<u8> {
-    let text = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // .quad target
+    synthetic_data_reference_object(entry, target, RelocKind::Unsigned, RelocLength::Quad, false)
+}
+
+fn synthetic_pointer_to_got_reference_object(
+    entry: &str,
+    target: &str,
+    length: RelocLength,
+    pcrel: bool,
+) -> Vec<u8> {
+    synthetic_data_reference_object(entry, target, RelocKind::PointerToGot, length, pcrel)
+}
+
+fn synthetic_data_reference_object(
+    entry: &str,
+    target: &str,
+    kind: RelocKind,
+    length: RelocLength,
+    pcrel: bool,
+) -> Vec<u8> {
+    let field_size = length.byte_width();
+    let mut text = vec![0; field_size];
+    text.extend_from_slice(&[
         0x00, 0x00, 0x80, 0x52, // mov w0, #0
         0xc0, 0x03, 0x5f, 0xd6, // ret
-    ];
+    ]);
     let relocs = [Reloc {
         offset: 0,
-        kind: RelocKind::Unsigned,
-        length: RelocLength::Quad,
-        pcrel: false,
+        kind,
+        length,
+        pcrel,
         referent: Referent::Symbol(1),
         addend: 0,
         subtrahend: None,
@@ -349,7 +374,7 @@ fn synthetic_absolute_reference_object(entry: &str, target: &str) -> Vec<u8> {
             n_type: N_SECT | N_EXT,
             n_sect: 1,
             n_desc: 0,
-            n_value: 8,
+            n_value: field_size as u64,
         },
         RawNlist {
             strx: target_strx,
@@ -375,7 +400,7 @@ fn synthetic_absolute_reference_object(entry: &str, target: &str) -> Vec<u8> {
             addr: 0,
             size: text.len() as u64,
             offset: 0,
-            align: 3,
+            align: field_size.trailing_zeros(),
             reloff: 0,
             nreloc: raw_relocs.len() as u32,
             flags: S_REGULAR,
@@ -423,12 +448,290 @@ fn synthetic_absolute_reference_object(entry: &str, target: &str) -> Vec<u8> {
     bytes
 }
 
+fn synthetic_custom_segment_rebase_object(pointer_section: &str) -> Vec<u8> {
+    let text = [
+        0x00, 0x00, 0x80, 0x52, // mov w0, #0
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+    let pointer = [0; 8];
+    let target = 7u64.to_le_bytes();
+    let relocs = [Reloc {
+        offset: 0,
+        kind: RelocKind::Unsigned,
+        length: RelocLength::Quad,
+        pcrel: false,
+        referent: Referent::Section(3),
+        addend: 0,
+        subtrahend: None,
+    }];
+    let raw_relocs = write_relocs(&relocs).unwrap();
+    let mut reloc_bytes = Vec::new();
+    write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+
+    let mut strings = vec![0];
+    let mut add_string = |name: &str| {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        strx
+    };
+    let symbols = [
+        RawNlist {
+            strx: add_string("_main"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: add_string("_p"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 2,
+            n_desc: 0,
+            n_value: 8,
+        },
+        RawNlist {
+            strx: add_string("_target"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 3,
+            n_desc: 0,
+            n_value: 16,
+        },
+    ];
+
+    let mut segment = Segment64 {
+        segname: [0; 16],
+        vmaddr: 0,
+        vmsize: 24,
+        fileoff: 0,
+        filesize: 24,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections: vec![
+            Section64Header {
+                sectname: name16("__text"),
+                segname: name16("__TEXT"),
+                addr: 0,
+                size: text.len() as u64,
+                offset: 0,
+                align: 2,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+            Section64Header {
+                sectname: name16(pointer_section),
+                segname: name16("__CUSTOM"),
+                addr: 8,
+                size: pointer.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: raw_relocs.len() as u32,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+            Section64Header {
+                sectname: name16("__data"),
+                segname: name16("__DATA"),
+                addr: 16,
+                size: target.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+        ],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    for (index, section) in segment.sections.iter_mut().enumerate() {
+        section.offset = data_offset + (index as u32) * 8;
+    }
+    segment.sections[1].reloff = data_offset + 24;
+    let symoff = segment.sections[1].reloff + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&pointer);
+    bytes.extend_from_slice(&target);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_icf_section_reference_object(symbol: &str, data_value: u64) -> Vec<u8> {
+    let text = [
+        0x00, 0x00, 0x00, 0x90, // adrp x0, __data@PAGE
+        0x00, 0x00, 0x00, 0x91, // add x0, x0, __data@PAGEOFF
+        0x00, 0x00, 0x40, 0xb9, // ldr w0, [x0]
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+    let data = data_value.to_le_bytes();
+    let relocs = [
+        Reloc {
+            offset: 0,
+            kind: RelocKind::Page21,
+            length: RelocLength::Word,
+            pcrel: true,
+            referent: Referent::Section(2),
+            addend: 0,
+            subtrahend: None,
+        },
+        Reloc {
+            offset: 4,
+            kind: RelocKind::PageOff12,
+            length: RelocLength::Word,
+            pcrel: false,
+            referent: Referent::Section(2),
+            addend: 0,
+            subtrahend: None,
+        },
+    ];
+    let raw_relocs = write_relocs(&relocs).unwrap();
+    let mut reloc_bytes = Vec::new();
+    write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+
+    let mut strings = vec![0];
+    let symbol_strx = strings.len() as u32;
+    strings.extend_from_slice(symbol.as_bytes());
+    strings.push(0);
+    let symbols = [RawNlist {
+        strx: symbol_strx,
+        n_type: N_SECT | N_EXT | N_PEXT,
+        n_sect: 1,
+        n_desc: 0,
+        n_value: 0,
+    }];
+
+    let mut segment = Segment64 {
+        segname: [0; 16],
+        vmaddr: 0,
+        vmsize: (text.len() + data.len()) as u64,
+        fileoff: 0,
+        filesize: (text.len() + data.len()) as u64,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections: vec![
+            Section64Header {
+                sectname: name16("__text"),
+                segname: name16("__TEXT"),
+                addr: 0,
+                size: text.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: raw_relocs.len() as u32,
+                flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+            Section64Header {
+                sectname: name16("__data"),
+                segname: name16("__DATA"),
+                addr: text.len() as u64,
+                size: data.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+        ],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    segment.sections[1].offset = data_offset + text.len() as u32;
+    segment.sections[0].reloff = data_offset + text.len() as u32 + data.len() as u32;
+    let symoff = segment.sections[0].reloff + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&data);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
 #[derive(Clone, Copy)]
 enum SyntheticAliasEncoding {
     Indirect,
     ExplicitAlternateEntry,
     OverlappingSection,
 }
+
+const SAME_ADDRESS_ENTRY_CODE: [u8; 8] = [
+    0x40, 0x05, 0x80, 0x52, // mov w0, #42
+    0xc0, 0x03, 0x5f, 0xd6, // ret
+];
 
 fn synthetic_defined_alias_object(
     private_alias: bool,
@@ -580,6 +883,106 @@ fn synthetic_defined_alias_object(
     .write(&mut bytes);
     bytes.extend_from_slice(&text);
     bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_same_address_entry_alias_object() -> Vec<u8> {
+    let text = [
+        SAME_ADDRESS_ENTRY_CODE.as_slice(),
+        &[
+            0xe0, 0x00, 0x80, 0x52, // _unused: mov w0, #7
+            0xc0, 0x03, 0x5f, 0xd6, // ret
+        ],
+    ]
+    .concat();
+    let mut strings = vec![0];
+    let mut add_string = |name: &str| {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        strx
+    };
+    let symbols = [
+        RawNlist {
+            strx: add_string("_main"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: add_string("_zalias"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: add_string("_unused"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: SAME_ADDRESS_ENTRY_CODE.len() as u64,
+        },
+    ];
+    let mut segment = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: 0,
+        vmsize: text.len() as u64,
+        fileoff: 0,
+        filesize: text.len() as u64,
+        maxprot: 5,
+        initprot: 5,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: 0,
+            size: text.len() as u64,
+            offset: 0,
+            align: 2,
+            reloff: 0,
+            nreloc: 0,
+            flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = u64::from(data_offset);
+    segment.sections[0].offset = data_offset;
+    let symoff = data_offset + text.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
     for symbol in symbols {
         symbol.write(&mut bytes);
     }
@@ -745,6 +1148,17 @@ fn segment_flags(bytes: &[u8], segname: &str) -> Option<u32> {
     None
 }
 
+fn segment_protections(bytes: &[u8], segname: &str) -> Option<(u32, u32)> {
+    let header = parse_header(bytes).ok()?;
+    let commands = parse_commands(&header, bytes).ok()?;
+    commands.into_iter().find_map(|cmd| match cmd {
+        LoadCommand::Segment64(seg) if seg.segname_str() == segname => {
+            Some((seg.maxprot, seg.initprot))
+        }
+        _ => None,
+    })
+}
+
 fn segment_vmaddr(bytes: &[u8], segname: &str) -> Option<u64> {
     let header = parse_header(bytes).ok()?;
     let commands = parse_commands(&header, bytes).ok()?;
@@ -874,6 +1288,36 @@ fn canonical_symbol_record_map(bytes: &[u8]) -> HashMap<String, CanonicalSymbolR
         .into_iter()
         .map(|record| (record.name.clone(), record))
         .collect()
+}
+
+fn assert_same_address_entry_alias_output(bytes: &[u8]) {
+    let records = canonical_symbol_record_map(bytes);
+    let main = records.get("_main").unwrap();
+    let alias = records.get("_zalias").unwrap();
+    assert_eq!(main.n_sect, alias.n_sect);
+    assert_eq!(main.value, 0);
+    assert_eq!(alias.value, 0);
+    assert_eq!(main.n_desc & N_ALT_ENTRY, N_ALT_ENTRY);
+    assert_eq!(alias.n_desc & N_ALT_ENTRY, 0);
+    assert!(!records.contains_key("_unused"));
+
+    let text = output_section_header(bytes, "__TEXT", "__text").unwrap();
+    assert_eq!(
+        output_section(bytes, "__TEXT", "__text").unwrap().1,
+        SAME_ADDRESS_ENTRY_CODE
+    );
+    let header = parse_header(bytes).unwrap();
+    let entryoff = parse_commands(&header, bytes)
+        .unwrap()
+        .into_iter()
+        .find_map(|command| match command {
+            LoadCommand::Raw { cmd, data, .. } if cmd == afs_ld::macho::constants::LC_MAIN => {
+                Some(u64::from_le_bytes(data[0..8].try_into().unwrap()))
+            }
+            _ => None,
+        })
+        .expect("LC_MAIN");
+    assert_eq!(entryoff, u64::from(text.offset));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1440,6 +1884,7 @@ struct BindRecord {
     ordinal: u16,
     symbol: String,
     weak_import: bool,
+    addend: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1691,6 +2136,7 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
     let mut ordinal = 0u16;
     let mut symbol = String::new();
     let mut weak_import = false;
+    let mut addend = 0i64;
     while cursor < stream.len() {
         let byte = stream[cursor];
         cursor += 1;
@@ -1701,6 +2147,7 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
                 if lazy {
                     symbol.clear();
                     weak_import = false;
+                    addend = 0;
                 } else {
                     break;
                 }
@@ -1721,6 +2168,12 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
                 symbol = read_cstr(stream, &mut cursor)?;
             }
             BIND_OPCODE_SET_TYPE_IMM => {}
+            BIND_OPCODE_SET_ADDEND_SLEB => {
+                let (value, len) =
+                    read_sleb(&stream[cursor..]).map_err(|e| format!("bind SLEB: {e}"))?;
+                cursor += len;
+                addend = value;
+            }
             BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
                 segment_index = imm;
                 let (offset, len) =
@@ -1744,6 +2197,7 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
                     ordinal,
                     symbol: symbol.clone(),
                     weak_import,
+                    addend,
                 });
                 segment_offset += 8;
             }
@@ -1757,6 +2211,7 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
                     ordinal,
                     symbol: symbol.clone(),
                     weak_import,
+                    addend,
                 });
                 segment_offset += 8;
                 let (delta, len) =
@@ -1774,6 +2229,7 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
                     ordinal,
                     symbol: symbol.clone(),
                     weak_import,
+                    addend,
                 });
                 segment_offset += 8 + (imm as u64) * 8;
             }
@@ -1794,6 +2250,7 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
                         ordinal,
                         symbol: symbol.clone(),
                         weak_import,
+                        addend,
                     });
                     segment_offset += 8 + skip;
                 }
@@ -2256,6 +2713,31 @@ fn assert_direct_bind_case_matches_apple_ld(
             "{}: lazy-bind stream diverged from Apple ld",
             case.name
         ));
+    }
+
+    for (label, output) in [("afs-ld", &our_out), ("Apple ld", &apple_out)] {
+        let verify = Command::new("codesign")
+            .arg("-v")
+            .arg(output)
+            .output()
+            .map_err(|e| format!("spawn codesign for {label}: {e}"))?;
+        if !verify.status.success() {
+            return Err(format!(
+                "{}: {label} codesign verification failed: {}",
+                case.name,
+                String::from_utf8_lossy(&verify.stderr)
+            ));
+        }
+        let status = Command::new(output)
+            .status()
+            .map_err(|e| format!("run {label} output for {}: {e}", case.name))?;
+        if status.code() != Some(0) {
+            return Err(format!(
+                "{}: {label} output exited with {:?}",
+                case.name,
+                status.code()
+            ));
+        }
     }
 
     let _ = fs::remove_file(dylib);
@@ -3703,6 +4185,82 @@ fn linker_run_routes_far_absolute_got_loads_through_unrebased_slot() {
 }
 
 #[test]
+fn linker_run_writes_pcrel_pointer_to_got_as_delta_from_place() {
+    const ABSOLUTE_VALUE: u64 = 0x1234_5678_9abc_def0;
+
+    let reference = scratch("pcrel-pointer-to-got-reference.o");
+    let definition = scratch("pcrel-pointer-to-got-definition.o");
+    let out = scratch("pcrel-pointer-to-got.out");
+    fs::write(
+        &reference,
+        synthetic_pointer_to_got_reference_object("_main", "_absolute", RelocLength::Word, true),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        synthetic_absolute_object("_absolute", ABSOLUTE_VALUE),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![reference.clone(), definition.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let (got_addr, got) = output_section(&bytes, "__DATA_CONST", "__got").unwrap();
+    let actual = i32::from_le_bytes(text[0..4].try_into().unwrap());
+    let expected = i32::try_from(i128::from(got_addr) - i128::from(text_addr)).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(got, ABSOLUTE_VALUE.to_le_bytes());
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_preserves_absolute_pointer_to_got() {
+    const ABSOLUTE_VALUE: u64 = 0x1234_5678_9abc_def0;
+
+    let reference = scratch("absolute-pointer-to-got-reference.o");
+    let definition = scratch("absolute-pointer-to-got-definition.o");
+    let out = scratch("absolute-pointer-to-got.out");
+    fs::write(
+        &reference,
+        synthetic_pointer_to_got_reference_object("_main", "_absolute", RelocLength::Quad, false),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        synthetic_absolute_object("_absolute", ABSOLUTE_VALUE),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![reference.clone(), definition.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (_, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let (got_addr, got) = output_section(&bytes, "__DATA_CONST", "__got").unwrap();
+    assert_eq!(u64::from_le_bytes(text[0..8].try_into().unwrap()), got_addr);
+    assert_eq!(got, ABSOLUTE_VALUE.to_le_bytes());
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_resolves_external_absolute_symbols_without_atoms() {
     const ABSOLUTE_VALUE: u64 = 0x1234_5678_9abc_def0;
 
@@ -4830,6 +5388,12 @@ fn linker_run_handles_non_standard_segment_without_panicking() {
         .globl _custom
         _custom:
             .quad 1
+
+        .text
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
         .subsections_via_symbols
     "#;
     if let Err(e) = assemble(src, &obj) {
@@ -4855,6 +5419,170 @@ fn linker_run_handles_non_standard_segment_without_panicking() {
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_rebases_local_pointers_in_custom_segments() {
+    for pointer_section in ["__ptrs", "__thread_vars"] {
+        let obj = scratch(&format!("custom-segment-{pointer_section}-synthetic.o"));
+        let out = scratch(&format!("custom-segment-{pointer_section}-synthetic.out"));
+        fs::write(
+            &obj,
+            synthetic_custom_segment_rebase_object(pointer_section),
+        )
+        .unwrap();
+
+        let opts = LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            entry: Some("_main".into()),
+            kind: OutputKind::Executable,
+            ..LinkOptions::default()
+        };
+        Linker::run(&opts).unwrap();
+
+        let bytes = fs::read(&out).unwrap();
+        assert_eq!(segment_protections(&bytes, "__CUSTOM"), Some((3, 3)));
+        let (target_addr, _) = output_section(&bytes, "__DATA", "__data").unwrap();
+        let (_, pointer) = output_section(&bytes, "__CUSTOM", pointer_section).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(pointer.try_into().unwrap()),
+            target_addr,
+            "custom-segment pointer should contain the target preferred address"
+        );
+        assert_eq!(
+            decode_rebase_records(&bytes).unwrap(),
+            vec![RebaseRecord {
+                segment: "__CUSTOM".into(),
+                section: pointer_section.into(),
+                section_offset: 0,
+                rebase_type: REBASE_TYPE_POINTER,
+            }]
+        );
+
+        let _ = fs::remove_file(obj);
+        let _ = fs::remove_file(out);
+    }
+}
+
+#[test]
+fn linker_run_rebases_custom_segment_pointers_like_apple_ld() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("custom-segment-rebase.o");
+    let our_out = scratch("custom-segment-rebase-ours.out");
+    let apple_out = scratch("custom-segment-rebase-apple.out");
+    let src = r#"
+        .section __CUSTOM,__ptrs,regular
+        .p2align 3
+        .globl _p
+        _p: .quad _target
+
+        .data
+        .p2align 3
+        .globl _target
+        _target: .quad 7
+
+        .text
+        .globl _main
+        _main:
+            adrp x8, _p@PAGE
+            add x8, x8, _p@PAGEOFF
+            ldr x9, [x8]
+            adrp x10, _target@PAGE
+            add x10, x10, _target@PAGEOFF
+            cmp x9, x10
+            cset w0, ne
+            ret
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        entry: Some("_main".into()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    let apple = Command::new("xcrun")
+        .args([
+            "ld",
+            "-arch",
+            "arm64",
+            "-platform_version",
+            "macos",
+            &sdk_ver,
+            &sdk_ver,
+            "-syslibroot",
+            &sdk,
+            "-no_fixup_chains",
+            "-e",
+            "_main",
+            "-o",
+        ])
+        .arg(&apple_out)
+        .arg(&obj)
+        .arg("-lSystem")
+        .output()
+        .unwrap();
+    assert!(
+        apple.status.success(),
+        "xcrun ld failed: {}",
+        String::from_utf8_lossy(&apple.stderr)
+    );
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let our_rebases = decode_rebase_records(&our_bytes).unwrap();
+    assert!(
+        our_rebases.iter().any(|record| {
+            record.segment == "__CUSTOM"
+                && record.section == "__ptrs"
+                && record.section_offset == 0
+                && record.rebase_type == REBASE_TYPE_POINTER
+        }),
+        "missing custom-segment rebase: {our_rebases:#?}"
+    );
+    assert_eq!(our_rebases, decode_rebase_records(&apple_bytes).unwrap());
+
+    for output in [&our_out, &apple_out] {
+        let verify = Command::new("codesign")
+            .arg("-v")
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "codesign verify failed for {}: {}",
+            output.display(),
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        assert_eq!(Command::new(output).status().unwrap().code(), Some(0));
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
 }
 
 #[test]
@@ -4923,6 +5651,101 @@ fn linker_run_uses_requested_entry_symbol() {
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_dead_strip_keeps_same_address_entry_alias_bytes() {
+    let obj = scratch("same-address-entry-alias-synthetic.o");
+    let out = scratch("same-address-entry-alias-synthetic.out");
+    fs::write(&obj, synthetic_same_address_entry_alias_object()).unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        dead_strip: true,
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    assert_same_address_entry_alias_output(&fs::read(&out).unwrap());
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_dead_strip_keeps_same_address_entry_alias() {
+    if !have_xcrun_tool("ld") || !have_tool("codesign") {
+        eprintln!("skipping: xcrun ld or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("same-address-entry-alias.o");
+    let our_out = scratch("same-address-entry-alias-ours.out");
+    let apple_out = scratch("same-address-entry-alias-apple.out");
+    fs::write(&obj, synthetic_same_address_entry_alias_object()).unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        dead_strip: true,
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+    apple_link_with_args(
+        &obj,
+        &apple_out,
+        "_main",
+        &sdk,
+        &sdk_ver,
+        &["-dead_strip", "-no_fixup_chains"],
+    )
+    .unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    for bytes in [&our_bytes, &apple_bytes] {
+        assert_same_address_entry_alias_output(bytes);
+    }
+    let our_records = canonical_symbol_record_map(&our_bytes);
+    let apple_records = canonical_symbol_record_map(&apple_bytes);
+    for name in ["_main", "_zalias"] {
+        assert_eq!(our_records.get(name), apple_records.get(name));
+    }
+
+    for output in [&our_out, &apple_out] {
+        let verify = Command::new("codesign")
+            .arg("-v")
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "codesign verify failed for {}: {}",
+            output.display(),
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        assert_eq!(Command::new(output).status().unwrap().code(), Some(42));
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
 }
 
 #[test]
@@ -5739,10 +6562,12 @@ fn linker_run_replans_thunks_until_layout_converges() {
             bl _borderline
             mov w0, #0
             ret
+            .space 0x3fe8
 
-        .zerofill __TEXT,__apad,_gap,0x7ffffec,2
+        .zerofill __DATA,__bss,_gap,0x7ff8000,2
 
-        .section __TEXT,__late,regular,pure_instructions
+        .section __FAR,__text,regular,pure_instructions
+            .space 0x3ffc
         .globl _borderline
         _borderline:
             ret
@@ -5789,7 +6614,7 @@ fn linker_run_replans_thunks_until_layout_converges() {
 }
 
 #[test]
-fn linker_run_uses_multiple_thunk_islands_within_text_segment() {
+fn linker_run_emits_multiple_thunk_islands_within_text_segment() {
     if !have_xcrun() || !have_tool("codesign") {
         eprintln!("skipping: xcrun or codesign unavailable");
         return;
@@ -5805,8 +6630,6 @@ fn linker_run_uses_multiple_thunk_islands_within_text_segment() {
             mov w0, #0
             ret
 
-        .zerofill __TEXT,__apad1,_gap1,0x9000000,2
-
         .section __TEXT,__bmid,regular,pure_instructions
         .globl _midcaller
         _midcaller:
@@ -5815,8 +6638,6 @@ fn linker_run_uses_multiple_thunk_islands_within_text_segment() {
             bl _helper
             ldp x29, x30, [sp], #16
             ret
-
-        .zerofill __TEXT,__cpad2,_gap2,0x9000000,2
 
         .section __TEXT,__dlate,regular,pure_instructions
         .globl _helper
@@ -5833,6 +6654,7 @@ fn linker_run_uses_multiple_thunk_islands_within_text_segment() {
         inputs: vec![obj.clone()],
         output: Some(out.clone()),
         kind: OutputKind::Executable,
+        thunks: afs_ld::ThunkMode::All,
         ..LinkOptions::default()
     };
     Linker::run(&opts).unwrap();
@@ -5842,7 +6664,7 @@ fn linker_run_uses_multiple_thunk_islands_within_text_segment() {
     assert_eq!(
         thunk_sections.len(),
         2,
-        "expected one thunk island after __text and one after __mid"
+        "expected one thunk island after each caller"
     );
     assert!(
         thunk_sections.iter().all(|(_, bytes)| bytes.len() == 12),
@@ -6044,6 +6866,104 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
 
     let _ = fs::remove_file(out);
     let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn linker_run_applies_pcrel_pointer_to_got_like_apple_ld() {
+    if !have_xcrun() || !have_xcrun_tool("ld") || !have_tool("codesign") {
+        eprintln!("skipping: xcrun as/ld or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("pcrel-pointer-to-got.o");
+    let our_out = scratch("pcrel-pointer-to-got-ours.out");
+    let apple_out = scratch("pcrel-pointer-to-got-apple.out");
+    let src = r#"
+        .data
+        .globl _delta
+        _delta:
+            .long _puts@GOT - .
+
+        .text
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    assemble(src, &obj).unwrap();
+
+    let object_bytes = fs::read(&obj).unwrap();
+    let object = ObjectFile::parse(&obj, &object_bytes).unwrap();
+    let relocs: Vec<_> = object
+        .sections
+        .iter()
+        .flat_map(|section| {
+            let raw = parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).unwrap();
+            parse_relocs(&raw).unwrap()
+        })
+        .collect();
+    assert!(relocs.iter().any(|reloc| {
+        reloc.kind == RelocKind::PointerToGot && reloc.length == RelocLength::Word && reloc.pcrel
+    }));
+
+    Linker::run(&LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+    apple_link_with_args(
+        &obj,
+        &apple_out,
+        "_main",
+        &sdk,
+        &sdk_ver,
+        &["-no_fixup_chains"],
+    )
+    .unwrap();
+
+    for output in [&our_out, &apple_out] {
+        let bytes = fs::read(output).unwrap();
+        let (data_addr, data) = output_section(&bytes, "__DATA", "__data").unwrap();
+        let (got_addr, _) = output_section(&bytes, "__DATA_CONST", "__got").unwrap();
+        let delta_addr = symbol_values(&bytes)["_delta"];
+        let delta_offset = usize::try_from(delta_addr - data_addr).unwrap();
+        let actual = i32::from_le_bytes(data[delta_offset..delta_offset + 4].try_into().unwrap());
+        let expected = i32::try_from(i128::from(got_addr) - i128::from(delta_addr)).unwrap();
+        assert_eq!(actual, expected);
+
+        let verify = Command::new("codesign")
+            .arg("-v")
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "codesign verify failed for {}: {}",
+            output.display(),
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        assert_eq!(Command::new(output).status().unwrap().code(), Some(0));
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
 }
 
 #[test]
@@ -6409,6 +7329,17 @@ fn direct_bind_surfaces_match_apple_ld_across_fixture_matrix() {
                 int main(void) { return (*p == 5 && *q == 5) ? 0 : 1; }
             "#,
         },
+        DirectBindParityCase {
+            name: "direct-addend",
+            dylib_src: r#"
+                char ext_data[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+            "#,
+            main_src: r#"
+                extern char ext_data[];
+                char *p = ext_data + 4;
+                int main(void) { return p == &ext_data[4] ? 0 : 1; }
+            "#,
+        },
     ];
 
     let mut failures = Vec::new();
@@ -6682,6 +7613,211 @@ fn linker_run_dead_strip_prunes_synthetic_import_sections() {
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_dead_strip_keeps_and_runs_initializers() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("dead-strip-initializers.o");
+    let our_out = scratch("dead-strip-initializers-ours.out");
+    let apple_out = scratch("dead-strip-initializers-apple.out");
+    let src = r#"
+        .data
+        .p2align 2
+        Lstate:
+            .long 0
+
+        .text
+        .private_extern _ctor
+        _ctor:
+            adrp x8, Lstate@PAGE
+            add x8, x8, Lstate@PAGEOFF
+            mov w9, #1
+            str w9, [x8]
+            ret
+
+        .globl _main
+        _main:
+            adrp x8, Lstate@PAGE
+            add x8, x8, Lstate@PAGEOFF
+            ldr w0, [x8]
+            ret
+
+        .section __DATA,__mod_init_func,mod_init_funcs
+        .p2align 3
+            .quad _ctor
+        .subsections_via_symbols
+    "#;
+    assemble(src, &obj).unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        dead_strip: true,
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_with_args(
+        &obj,
+        &apple_out,
+        "_main",
+        &sdk,
+        &sdk_ver,
+        &["-dead_strip", "-no_fixup_chains"],
+    )
+    .unwrap();
+
+    for output in [&our_out, &apple_out] {
+        let bytes = fs::read(output).unwrap();
+        assert!([
+            ("__DATA", "__mod_init_func"),
+            ("__DATA_CONST", "__mod_init_func"),
+        ]
+        .into_iter()
+        .any(|(segment, section)| output_section(&bytes, segment, section).is_some()));
+        let verify = Command::new("codesign")
+            .arg("-v")
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "codesign verify failed for {}: {}",
+            output.display(),
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        assert_eq!(Command::new(output).status().unwrap().code(), Some(1));
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_preserves_initialized_same_name_section_data() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let zerofill_obj = scratch("same-name-zerofill.o");
+    let regular_obj = scratch("same-name-regular.o");
+    let main_obj = scratch("same-name-main.o");
+    let output = scratch("same-name-sections.out");
+    assemble(
+        r#"
+        .globl _z
+        .zerofill __DATA,__foo,_z,8,3
+        "#,
+        &zerofill_obj,
+    )
+    .unwrap();
+    assemble(
+        r#"
+        .section __DATA,__foo,regular
+        .p2align 3
+        .globl _x
+        _x:
+            .quad 42
+        "#,
+        &regular_obj,
+    )
+    .unwrap();
+    assemble(
+        r#"
+        .text
+        .globl _main
+        _main:
+            adrp x8, _x@PAGE
+            ldr x0, [x8, _x@PAGEOFF]
+            ret
+        .subsections_via_symbols
+        "#,
+        &main_obj,
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![
+            zerofill_obj.clone(),
+            regular_obj.clone(),
+            main_obj.clone(),
+            tbd,
+        ],
+        output: Some(output.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
+    let mut matching = Vec::new();
+    for command in &commands {
+        let LoadCommand::Segment64(segment) = command else {
+            continue;
+        };
+        matching.extend(segment.sections.iter().filter(|section| {
+            section.segname_str() == "__DATA" && section.sectname_str() == "__foo"
+        }));
+    }
+    assert_eq!(matching.len(), 2);
+    assert!(matching
+        .iter()
+        .any(|section| section.flags & SECTION_TYPE_MASK == S_ZEROFILL));
+    let regular = matching
+        .iter()
+        .find(|section| section.flags & SECTION_TYPE_MASK == S_REGULAR)
+        .unwrap();
+    let regular_start = usize::try_from(regular.offset).unwrap();
+    let regular_end = regular_start + usize::try_from(regular.size).unwrap();
+    assert_eq!(&bytes[regular_start..regular_end], &42u64.to_le_bytes());
+
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    assert_eq!(Command::new(&output).status().unwrap().code(), Some(42));
+
+    let _ = fs::remove_file(zerofill_obj);
+    let _ = fs::remove_file(regular_obj);
+    let _ = fs::remove_file(main_obj);
+    let _ = fs::remove_file(output);
 }
 
 #[test]
@@ -8724,6 +9860,182 @@ fn linker_run_rebases_runtime_init_metadata_like_apple_ld() {
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn synthetic_icf_fixture_uses_section_relocation() {
+    let bytes = synthetic_icf_section_reference_object("_f", 1);
+    let object = ObjectFile::parse("icf-section.o", &bytes).unwrap();
+    let text = &object.sections[0];
+    let raw = parse_raw_relocs(&text.raw_relocs, 0, text.nreloc).unwrap();
+    let relocs = parse_relocs(&raw).unwrap();
+
+    assert_eq!(relocs.len(), 2);
+    assert!(relocs.iter().any(|reloc| {
+        reloc.offset == 0
+            && reloc.kind == RelocKind::Page21
+            && reloc.referent == Referent::Section(2)
+    }));
+    assert!(relocs.iter().any(|reloc| {
+        reloc.offset == 4
+            && reloc.kind == RelocKind::PageOff12
+            && reloc.referent == Referent::Section(2)
+    }));
+}
+
+#[test]
+fn linker_run_icf_safe_keeps_cross_object_section_targets_distinct() {
+    if !have_xcrun() || !have_xcrun_tool("ld") || !have_tool("codesign") {
+        eprintln!("skipping: xcrun as/ld or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let first = scratch("icf-section-first.o");
+    let second = scratch("icf-section-second.o");
+    let apple_first = scratch("icf-section-first-apple.o");
+    let apple_second = scratch("icf-section-second-apple.o");
+    let main = scratch("icf-section-main.o");
+    let our_out = scratch("icf-section-ours.out");
+    let apple_out = scratch("icf-section-apple.out");
+    let map = scratch("icf-section.map");
+    fs::write(&first, synthetic_icf_section_reference_object("_fa", 1)).unwrap();
+    fs::write(&second, synthetic_icf_section_reference_object("_fb", 2)).unwrap();
+    assemble(
+        r#"
+            .data
+            .p2align 3
+        Lvalue:
+            .quad 1
+
+            .text
+            .private_extern _fa
+        _fa:
+            adrp x0, Lvalue@PAGE
+            add x0, x0, Lvalue@PAGEOFF
+            ldr w0, [x0]
+            ret
+            .subsections_via_symbols
+        "#,
+        &apple_first,
+    )
+    .unwrap();
+    assemble(
+        r#"
+            .data
+            .p2align 3
+        Lvalue:
+            .quad 2
+
+            .text
+            .private_extern _fb
+        _fb:
+            adrp x0, Lvalue@PAGE
+            add x0, x0, Lvalue@PAGEOFF
+            ldr w0, [x0]
+            ret
+            .subsections_via_symbols
+        "#,
+        &apple_second,
+    )
+    .unwrap();
+    assemble(
+        r#"
+            .text
+            .globl _main
+            _main:
+              sub sp, sp, #32
+              stp x29, x30, [sp, #16]
+              bl _fa
+              str w0, [sp, #12]
+              bl _fb
+              ldr w1, [sp, #12]
+              add w0, w0, w1
+              ldp x29, x30, [sp, #16]
+              add sp, sp, #32
+              ret
+            .subsections_via_symbols
+        "#,
+        &main,
+    )
+    .unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![first.clone(), second.clone(), main.clone(), tbd],
+        output: Some(our_out.clone()),
+        map: Some(map.clone()),
+        icf_mode: afs_ld::IcfMode::Safe,
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    let apple = Command::new("xcrun")
+        .args([
+            "ld",
+            "-arch",
+            "arm64",
+            "-platform_version",
+            "macos",
+            &sdk_ver,
+            &sdk_ver,
+            "-syslibroot",
+            &sdk,
+            "-no_fixup_chains",
+        ])
+        .arg(&apple_first)
+        .arg(&apple_second)
+        .arg(&main)
+        .args(["-lSystem", "-e", "_main", "-o"])
+        .arg(&apple_out)
+        .output()
+        .unwrap();
+    assert!(
+        apple.status.success(),
+        "xcrun ld failed: {}",
+        String::from_utf8_lossy(&apple.stderr)
+    );
+
+    let our_symbols = symbol_values(&fs::read(&our_out).unwrap());
+    assert_ne!(our_symbols.get("_fa"), our_symbols.get("_fb"));
+    let map_text = fs::read_to_string(&map).unwrap();
+    assert!(!map_text.contains("_fa folded to _fb"));
+    assert!(!map_text.contains("_fb folded to _fa"));
+
+    for output in [&our_out, &apple_out] {
+        let verify = Command::new("codesign")
+            .arg("-v")
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "codesign verify failed for {}: {}",
+            output.display(),
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        assert_eq!(Command::new(output).status().unwrap().code(), Some(3));
+    }
+
+    let _ = fs::remove_file(first);
+    let _ = fs::remove_file(second);
+    let _ = fs::remove_file(apple_first);
+    let _ = fs::remove_file(apple_second);
+    let _ = fs::remove_file(main);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+    let _ = fs::remove_file(map);
 }
 
 #[test]

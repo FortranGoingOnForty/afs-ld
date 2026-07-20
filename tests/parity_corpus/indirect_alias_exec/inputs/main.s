@@ -2,8 +2,7 @@
 .p2align 2
 .globl _main
 _main:
-    bl _alias_chain
-    ret
+    b _alias_chain
 
 .globl _target
 _target:

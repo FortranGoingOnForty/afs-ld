@@ -218,7 +218,7 @@ enum FoldReferent {
     Atom(AtomId),
     Absolute(u64),
     Symbol(SymbolId),
-    Section(u8),
+    Section { input: InputId, section: u8 },
 }
 
 fn fold_order_key(
@@ -410,6 +410,7 @@ fn reloc_signature_for_atom(
                 length: reloc.length,
                 pcrel: reloc.pcrel,
                 referent: normalize_referent(
+                    atom.origin,
                     object,
                     reloc.referent,
                     sym_table,
@@ -419,6 +420,7 @@ fn reloc_signature_for_atom(
                 addend: reloc.addend,
                 subtrahend: match reloc.subtrahend {
                     Some(referent) => Some(normalize_referent(
+                        atom.origin,
                         object,
                         referent,
                         sym_table,
@@ -433,6 +435,7 @@ fn reloc_signature_for_atom(
 }
 
 fn normalize_referent(
+    input: InputId,
     object: &crate::input::ObjectFile,
     referent: Referent,
     sym_table: &SymbolTable,
@@ -452,7 +455,7 @@ fn normalize_referent(
                 _ => Some(FoldReferent::Symbol(symbol_id)),
             }
         }
-        Referent::Section(section) => Some(FoldReferent::Section(section)),
+        Referent::Section(section) => Some(FoldReferent::Section { input, section }),
     }
 }
 
@@ -508,5 +511,169 @@ fn target_atoms_for_reloc(
             }
         }
         Referent::Section(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::input::ObjectFile;
+    use crate::macho::constants::{
+        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, S_ATTR_PURE_INSTRUCTIONS,
+        S_ATTR_SOME_INSTRUCTIONS, S_REGULAR,
+    };
+    use crate::macho::reader::MachHeader64;
+    use crate::reloc::{write_raw_relocs, write_relocs};
+    use crate::section::{InputSection, SectionKind};
+    use crate::string_table::StringTable;
+
+    fn section_reloc_object(
+        path: &str,
+        text_size: u64,
+        relocs: &[Reloc],
+        data_value: u64,
+    ) -> ObjectFile {
+        let raw_relocs = write_relocs(relocs).unwrap();
+        let mut reloc_bytes = Vec::new();
+        write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+        ObjectFile {
+            path: PathBuf::from(path),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections: vec![
+                InputSection {
+                    segname: "__TEXT".into(),
+                    sectname: "__text".into(),
+                    kind: SectionKind::Text,
+                    addr: 0,
+                    size: text_size,
+                    align_pow2: 3,
+                    flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                    offset: 0,
+                    reloff: 0,
+                    nreloc: raw_relocs.len() as u32,
+                    reserved1: 0,
+                    reserved2: 0,
+                    reserved3: 0,
+                    data: vec![0; text_size as usize],
+                    raw_relocs: reloc_bytes,
+                },
+                InputSection {
+                    segname: "__DATA".into(),
+                    sectname: "__data".into(),
+                    kind: SectionKind::Data,
+                    addr: text_size,
+                    size: 8,
+                    align_pow2: 3,
+                    flags: S_REGULAR,
+                    offset: 0,
+                    reloff: 0,
+                    nreloc: 0,
+                    reserved1: 0,
+                    reserved2: 0,
+                    reserved3: 0,
+                    data: data_value.to_le_bytes().to_vec(),
+                    raw_relocs: Vec::new(),
+                },
+            ],
+            symbols: Vec::new(),
+            strings: StringTable::from_bytes(vec![0]),
+            symtab: None,
+            dysymtab: None,
+            loh: Vec::new(),
+            data_in_code: Vec::new(),
+        }
+    }
+
+    fn foldable_atom(origin: InputId, input_offset: u32) -> Atom {
+        Atom {
+            id: AtomId(0),
+            origin,
+            input_section: 1,
+            section: AtomSection::Text,
+            input_offset,
+            size: 8,
+            align_pow2: 3,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 8],
+            flags: AtomFlags::default().with(AtomFlags::PURE_INSTRUCTIONS),
+            parent_of: None,
+        }
+    }
+
+    fn section_reloc(offset: u32) -> Reloc {
+        Reloc {
+            offset,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Section(2),
+            addend: 0,
+            subtrahend: None,
+        }
+    }
+
+    #[test]
+    fn section_referents_from_different_objects_do_not_fold() {
+        let objects = [
+            section_reloc_object("a.o", 8, &[section_reloc(0)], 1),
+            section_reloc_object("b.o", 8, &[section_reloc(0)], 2),
+        ];
+        let inputs = [
+            LayoutInput {
+                id: InputId(0),
+                object: &objects[0],
+                load_order: 0,
+                archive_member_offset: None,
+            },
+            LayoutInput {
+                id: InputId(1),
+                object: &objects[1],
+                load_order: 1,
+                archive_member_offset: None,
+            },
+        ];
+        let mut atoms = AtomTable::new();
+        let first = atoms.push(foldable_atom(InputId(0), 0));
+        let second = atoms.push(foldable_atom(InputId(1), 0));
+        let mut symbols = SymbolTable::new();
+
+        let plan = fold_safe(&inputs, &mut atoms, &mut symbols, None).unwrap();
+
+        assert!(plan.kept_atoms().contains(&first));
+        assert!(plan.kept_atoms().contains(&second));
+        assert!(plan.redirects().is_empty());
+    }
+
+    #[test]
+    fn matching_section_referents_in_one_object_still_fold() {
+        let object = section_reloc_object("same.o", 16, &[section_reloc(0), section_reloc(8)], 1);
+        let inputs = [LayoutInput {
+            id: InputId(0),
+            object: &object,
+            load_order: 0,
+            archive_member_offset: None,
+        }];
+        let mut atoms = AtomTable::new();
+        atoms.push(foldable_atom(InputId(0), 0));
+        atoms.push(foldable_atom(InputId(0), 8));
+        let mut symbols = SymbolTable::new();
+
+        let plan = fold_safe(&inputs, &mut atoms, &mut symbols, None).unwrap();
+
+        assert_eq!(plan.redirects().len(), 1);
+        assert_eq!(plan.kept_atoms().len(), 1);
     }
 }

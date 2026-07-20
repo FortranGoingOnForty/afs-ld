@@ -9905,12 +9905,52 @@ fn linker_run_icf_safe_keeps_cross_object_section_targets_distinct() {
 
     let first = scratch("icf-section-first.o");
     let second = scratch("icf-section-second.o");
+    let apple_first = scratch("icf-section-first-apple.o");
+    let apple_second = scratch("icf-section-second-apple.o");
     let main = scratch("icf-section-main.o");
     let our_out = scratch("icf-section-ours.out");
     let apple_out = scratch("icf-section-apple.out");
     let map = scratch("icf-section.map");
     fs::write(&first, synthetic_icf_section_reference_object("_fa", 1)).unwrap();
     fs::write(&second, synthetic_icf_section_reference_object("_fb", 2)).unwrap();
+    assemble(
+        r#"
+            .data
+            .p2align 3
+        Lvalue:
+            .quad 1
+
+            .text
+            .private_extern _fa
+        _fa:
+            adrp x0, Lvalue@PAGE
+            add x0, x0, Lvalue@PAGEOFF
+            ldr w0, [x0]
+            ret
+            .subsections_via_symbols
+        "#,
+        &apple_first,
+    )
+    .unwrap();
+    assemble(
+        r#"
+            .data
+            .p2align 3
+        Lvalue:
+            .quad 2
+
+            .text
+            .private_extern _fb
+        _fb:
+            adrp x0, Lvalue@PAGE
+            add x0, x0, Lvalue@PAGEOFF
+            ldr w0, [x0]
+            ret
+            .subsections_via_symbols
+        "#,
+        &apple_second,
+    )
+    .unwrap();
     assemble(
         r#"
             .text
@@ -9954,8 +9994,8 @@ fn linker_run_icf_safe_keeps_cross_object_section_targets_distinct() {
             &sdk,
             "-no_fixup_chains",
         ])
-        .arg(&first)
-        .arg(&second)
+        .arg(&apple_first)
+        .arg(&apple_second)
         .arg(&main)
         .args(["-lSystem", "-e", "_main", "-o"])
         .arg(&apple_out)
@@ -9990,6 +10030,8 @@ fn linker_run_icf_safe_keeps_cross_object_section_targets_distinct() {
 
     let _ = fs::remove_file(first);
     let _ = fs::remove_file(second);
+    let _ = fs::remove_file(apple_first);
+    let _ = fs::remove_file(apple_second);
     let _ = fs::remove_file(main);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(apple_out);

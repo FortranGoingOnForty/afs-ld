@@ -159,6 +159,7 @@ impl DeadStripAnalysis {
     fn is_live_symbol(&self, sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
         match sym_table.get(symbol_id) {
             Symbol::Defined { atom, .. } if atom.0 != 0 => self.live_atoms.contains(atom),
+            Symbol::Absolute { .. } => true,
             _ => false,
         }
     }
@@ -171,6 +172,9 @@ impl DeadStripAnalysis {
         let requested_name = self.symbol_name(sym_table, requested_symbol);
         if !self.is_live_symbol(sym_table, requested_symbol) {
             return format!("{requested_name} is not live (dead-stripped)\n");
+        }
+        if matches!(sym_table.get(requested_symbol), Symbol::Absolute { .. }) {
+            return format!("{requested_name} is absolute and is not subject to dead stripping\n");
         }
 
         let Symbol::Defined { atom, .. } = sym_table.get(requested_symbol) else {
@@ -402,13 +406,10 @@ fn resolved_symbol_map(sym_table: &SymbolTable) -> HashMap<String, SymbolId> {
     let mut out = HashMap::new();
     for (symbol_id, symbol) in sym_table.iter() {
         let name = sym_table.interner.resolve(symbol.name()).to_string();
-        let resolved = match symbol {
-            Symbol::Alias { name, .. } => sym_table
-                .resolve_chain(*name)
-                .map(|(resolved_id, _)| resolved_id)
-                .unwrap_or(symbol_id),
-            _ => symbol_id,
-        };
+        let resolved = sym_table
+            .resolve_chain(symbol.name())
+            .map(|(resolved_id, _)| resolved_id)
+            .unwrap_or(symbol_id);
         out.insert(name, resolved);
     }
     out
@@ -431,6 +432,10 @@ fn root_symbols(
             Symbol::Defined {
                 no_dead_strip: true,
                 ..
+            }
+            | Symbol::Absolute {
+                no_dead_strip: true,
+                ..
             } => {
                 roots.entry(symbol_id).or_insert(RootReason::NoDeadStrip);
             }
@@ -439,6 +444,23 @@ fn root_symbols(
                 ..
             } if opts.kind == OutputKind::Dylib => {
                 roots.entry(symbol_id).or_insert(RootReason::ExportedDylib);
+            }
+            Symbol::Absolute {
+                private_extern: false,
+                ..
+            } if opts.kind == OutputKind::Dylib => {
+                roots.entry(symbol_id).or_insert(RootReason::ExportedDylib);
+            }
+            Symbol::Alias {
+                name,
+                private_extern: false,
+                ..
+            } if opts.kind == OutputKind::Dylib => {
+                if let Ok((target_id, target)) = sym_table.resolve_chain(*name) {
+                    if matches!(target, Symbol::Defined { .. } | Symbol::Absolute { .. }) {
+                        roots.entry(target_id).or_insert(RootReason::ExportedDylib);
+                    }
+                }
             }
             _ => {}
         }
@@ -485,6 +507,17 @@ fn root_atoms(
                 ..
             } if opts.kind == OutputKind::Dylib && atom.0 != 0 => {
                 roots.entry(*atom).or_insert(RootReason::ExportedDylib);
+            }
+            Symbol::Alias {
+                name,
+                private_extern: false,
+                ..
+            } if opts.kind == OutputKind::Dylib => {
+                if let Ok((_, Symbol::Defined { atom, .. })) = sym_table.resolve_chain(*name) {
+                    if atom.0 != 0 {
+                        roots.entry(*atom).or_insert(RootReason::ExportedDylib);
+                    }
+                }
             }
             _ => {}
         }
@@ -835,4 +868,66 @@ fn symbol_name(sym_table: &SymbolTable, symbol_id: SymbolId) -> String {
         .interner
         .resolve(sym_table.get(symbol_id).name())
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::atom::AtomFlags;
+
+    fn alias_roots_private_target(private_alias: bool) -> (bool, bool) {
+        let mut atoms = AtomTable::new();
+        let target_atom = atoms.push(Atom {
+            id: AtomId(0),
+            origin: InputId(0),
+            input_section: 1,
+            section: AtomSection::Text,
+            input_offset: 0,
+            size: 4,
+            align_pow2: 2,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0xc0, 0x03, 0x5f, 0xd6],
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        });
+        let mut symbols = SymbolTable::new();
+        let target_name = symbols.intern("_target");
+        symbols
+            .insert(Symbol::Defined {
+                name: target_name,
+                origin: InputId(0),
+                atom: target_atom,
+                value: 0,
+                weak: false,
+                private_extern: true,
+                no_dead_strip: false,
+            })
+            .unwrap();
+        let target_symbol = symbols.lookup(target_name).unwrap();
+        let alias_name = symbols.intern("_alias");
+        symbols
+            .insert(Symbol::Alias {
+                name: alias_name,
+                aliased: target_name,
+                origin: InputId(0),
+                private_extern: private_alias,
+            })
+            .unwrap();
+        let opts = LinkOptions {
+            kind: OutputKind::Dylib,
+            ..LinkOptions::default()
+        };
+
+        (
+            root_symbols(&opts, &symbols, None).contains_key(&target_symbol),
+            root_atoms(&opts, &atoms, &symbols, None).contains_key(&target_atom),
+        )
+    }
+
+    #[test]
+    fn dylib_alias_roots_follow_alias_visibility() {
+        assert_eq!(alias_roots_private_target(false), (true, true));
+        assert_eq!(alias_roots_private_target(true), (false, false));
+    }
 }

@@ -6,7 +6,7 @@
 //! |-----------|--------------|------------------------------------------------|
 //! | `Bsd`     | `!<arch>\n`  | `#1/<N>` — next N bytes of the body are the name |
 //! | `Sysv`    | `!<arch>\n`  | `foo.o/` (short) or `/NNN` into `//` (long)    |
-//! | `GnuThin` | `!<thin>\n`  | name field holds an external path (body empty) |
+//! | `GnuThin` | `!<thin>\n`  | SysV names; ordinary bodies live in external files |
 //!
 //! Both BSD and SysV archives use the same magic; distinguishing them
 //! requires peeking at the first member. Apple's `ar` emits BSD; GNU's `ar`
@@ -14,10 +14,15 @@
 //!
 //! Sprint 4 parses headers and member names, builds a symbol index, and
 //! exposes `fetch_by_name` for lazy member retrieval driven by the Sprint 8
-//! resolution pass. Member body bytes are returned as borrowed slices into
-//! the archive buffer (or a secondary mmap for GNU-thin).
+//! resolution pass. Regular bodies borrow from the archive buffer; GNU-thin
+//! object files are read from their external paths on demand.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::str;
 
@@ -32,6 +37,26 @@ pub const AR_MAGIC_THIN: &[u8; 8] = b"!<thin>\n";
 pub const AR_FMAG: &[u8; 2] = b"`\n";
 /// Size of `ar_hdr` on the wire.
 pub const AR_HDR_SIZE: usize = 60;
+
+#[cfg(test)]
+thread_local! {
+    static ARCHIVE_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_archive_parse_count() {
+    ARCHIVE_PARSE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn archive_parse_count() -> usize {
+    ARCHIVE_PARSE_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_archive_parse() {
+    ARCHIVE_PARSE_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+}
 
 /// Every parser error the archive reader can produce.
 #[derive(Debug)]
@@ -54,7 +79,7 @@ pub enum ArchiveError {
     /// A member's claimed size would overrun the archive.
     MemberOverrun { at_offset: usize, size: u64 },
     /// A `/NNN` long-name offset didn't land inside the `//` table.
-    LongNameOob { at_offset: usize, strx: u32 },
+    LongNameOob { at_offset: usize, strx: u64 },
     /// Required special member (e.g. `__.SYMDEF`) malformed.
     BadSymbolIndex { reason: &'static str },
     /// Name field could not be interpreted as UTF-8.
@@ -110,8 +135,8 @@ pub enum Flavor {
     /// `!<arch>\n` with SysV short names (`foo.o/`) and a `//` long-name
     /// string table for anything that doesn't fit in 16 bytes.
     Sysv,
-    /// `!<thin>\n` — member bodies are zero bytes; the name field carries an
-    /// external path, resolved lazily against the archive's parent directory.
+    /// `!<thin>\n` — symbol and name tables stay inline, while ordinary
+    /// member bodies live at paths resolved against the archive's parent.
     GnuThin,
 }
 
@@ -156,8 +181,21 @@ impl ArHeader {
         })
     }
 
-    pub fn raw_name_str(&self) -> &str {
-        trim_ascii(&self.name)
+    pub fn raw_name_bytes(&self) -> &[u8] {
+        let trimmed = trim_ascii_bytes(&self.name);
+        let Some(without_terminal_slash) = trimmed.strip_suffix(b"/") else {
+            return trimmed;
+        };
+        let candidate = trim_ascii_bytes(without_terminal_slash);
+        if is_sysv_name_reference(candidate) {
+            candidate
+        } else {
+            trimmed
+        }
+    }
+
+    pub fn raw_name_str(&self) -> Result<&str, str::Utf8Error> {
+        str::from_utf8(self.raw_name_bytes())
     }
 }
 
@@ -169,6 +207,8 @@ pub enum SpecialMember {
     BsdSymIndex,
     /// SysV `/` — the symbol index.
     SysvSymIndex,
+    /// GNU `/SYM64/` — the symbol index with 64-bit counts and offsets.
+    SysvSymIndex64,
     /// SysV `//` — long-name string table.
     SysvLongNames,
 }
@@ -176,8 +216,12 @@ pub enum SpecialMember {
 /// A single parsed archive member.
 #[derive(Debug, Clone)]
 pub struct Member<'a> {
-    /// Real filename, post-flavor-specific decoding.
-    pub name: String,
+    /// Decoded member path. For flattened thin members this names the
+    /// external archive; `nested_member_offset` selects the object inside it.
+    pub name: PathBuf,
+    /// For a member flattened from another archive, the `ar_hdr` offset in
+    /// that external archive. Direct external object files use `None`.
+    pub nested_member_offset: Option<u64>,
     /// Byte offset of the member's `ar_hdr` within the archive.
     pub header_offset: usize,
     /// Byte offset of the member's visible body (after any BSD extended-name
@@ -196,23 +240,199 @@ pub struct Archive<'a> {
     pub flavor: Flavor,
     data: &'a [u8],
     members: Vec<Member<'a>>,
+    member_by_offset: HashMap<u64, usize>,
     symbol_index: Option<SymbolIndex>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ArchiveMemberMetadata {
+    name: PathBuf,
+    nested_member_offset: Option<u64>,
+    header_offset: u64,
+    body_offset: usize,
+    body_len: usize,
+    special: SpecialMember,
+}
+
+#[derive(Debug)]
+pub(crate) struct ArchiveMetadata {
+    flavor: Flavor,
+    members: Vec<ArchiveMemberMetadata>,
+    member_by_offset: HashMap<u64, usize>,
+    symbol_index: Option<SymbolIndex>,
+}
+
+pub(crate) struct LoadedMember<'a> {
+    pub logical_path: PathBuf,
+    pub bytes: Cow<'a, [u8]>,
+}
+
+#[derive(Debug)]
+pub enum MemberLoadError {
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    NestedArchive {
+        path: PathBuf,
+        source: ArchiveError,
+    },
+    MissingNestedMember {
+        path: PathBuf,
+        member_header_offset: u64,
+    },
+    NestingTooDeep {
+        path: PathBuf,
+    },
+    CachedMemberOutOfBounds {
+        path: PathBuf,
+        member_header_offset: u64,
+    },
+}
+
+impl fmt::Display for MemberLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MemberLoadError::Io { path, source } => {
+                write!(f, "{}: thin archive member I/O: {source}", path.display())
+            }
+            MemberLoadError::NestedArchive { path, source } => {
+                write!(f, "{}: nested archive is malformed: {source}", path.display())
+            }
+            MemberLoadError::MissingNestedMember {
+                path,
+                member_header_offset,
+            } => write!(
+                f,
+                "{}: nested archive has no object member at ar_hdr offset {member_header_offset:#x}",
+                path.display()
+            ),
+            MemberLoadError::NestingTooDeep { path } => write!(
+                f,
+                "{}: nested thin archive depth exceeds the supported limit",
+                path.display()
+            ),
+            MemberLoadError::CachedMemberOutOfBounds {
+                path,
+                member_header_offset,
+            } => write!(
+                f,
+                "{}: cached archive member at ar_hdr offset {member_header_offset:#x} is out of bounds",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MemberLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            MemberLoadError::Io { source, .. } => Some(source),
+            MemberLoadError::NestedArchive { source, .. } => Some(source),
+            MemberLoadError::MissingNestedMember { .. }
+            | MemberLoadError::NestingTooDeep { .. }
+            | MemberLoadError::CachedMemberOutOfBounds { .. } => None,
+        }
+    }
+}
+
+const MAX_THIN_ARCHIVE_NESTING: usize = 32;
+
+impl ArchiveMetadata {
+    pub(crate) fn parse(path: &Path, data: &[u8]) -> Result<Self, ArchiveError> {
+        Ok(Archive::open(path, data)?.into_metadata())
+    }
+
+    pub(crate) fn symbol_index(&self) -> Option<&SymbolIndex> {
+        self.symbol_index.as_ref()
+    }
+
+    pub(crate) fn member_at_offset(&self, header_offset: u64) -> Option<&ArchiveMemberMetadata> {
+        let index = *self.member_by_offset.get(&header_offset)?;
+        self.members.get(index)
+    }
+
+    pub(crate) fn object_member_offsets(&self) -> impl Iterator<Item = u64> + '_ {
+        self.members
+            .iter()
+            .filter(|member| member.special == SpecialMember::None)
+            .map(|member| member.header_offset)
+    }
+
+    pub(crate) fn load_member<'a>(
+        &self,
+        archive_path: &Path,
+        archive_data: &'a [u8],
+        member: &ArchiveMemberMetadata,
+    ) -> Result<LoadedMember<'a>, MemberLoadError> {
+        if self.flavor == Flavor::GnuThin {
+            return load_thin_member(archive_path, &member.name, member.nested_member_offset, 0);
+        }
+
+        let end = member
+            .body_offset
+            .checked_add(member.body_len)
+            .ok_or_else(|| MemberLoadError::CachedMemberOutOfBounds {
+                path: archive_path.to_path_buf(),
+                member_header_offset: member.header_offset,
+            })?;
+        let body = archive_data.get(member.body_offset..end).ok_or_else(|| {
+            MemberLoadError::CachedMemberOutOfBounds {
+                path: archive_path.to_path_buf(),
+                member_header_offset: member.header_offset,
+            }
+        })?;
+        Ok(LoadedMember {
+            logical_path: inline_member_logical_path(archive_path, &member.name),
+            bytes: Cow::Borrowed(body),
+        })
+    }
 }
 
 impl<'a> Archive<'a> {
     /// Open an archive given its raw bytes and the source path (for
     /// diagnostics and GNU-thin external-file resolution).
     pub fn open(path: impl Into<PathBuf>, data: &'a [u8]) -> Result<Self, ArchiveError> {
+        #[cfg(test)]
+        record_archive_parse();
+
         let flavor = detect_flavor(data)?;
         let (members, flavor) = parse_members(data, flavor)?;
         let symbol_index = build_symbol_index(&members)?;
+        let member_by_offset = members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| (member.header_offset as u64, index))
+            .collect();
         Ok(Archive {
             path: path.into(),
             flavor,
             data,
             members,
+            member_by_offset,
             symbol_index,
         })
+    }
+
+    pub(crate) fn into_metadata(self) -> ArchiveMetadata {
+        let members = self
+            .members
+            .into_iter()
+            .map(|member| ArchiveMemberMetadata {
+                name: member.name,
+                nested_member_offset: member.nested_member_offset,
+                header_offset: member.header_offset as u64,
+                body_offset: member.body_offset,
+                body_len: member.body.len(),
+                special: member.special,
+            })
+            .collect();
+        ArchiveMetadata {
+            flavor: self.flavor,
+            members,
+            member_by_offset: self.member_by_offset,
+            symbol_index: self.symbol_index,
+        }
     }
 
     pub fn symbol_index(&self) -> Option<&SymbolIndex> {
@@ -243,10 +463,9 @@ impl<'a> Archive<'a> {
 
     /// Find the first member whose `ar_hdr` begins at `header_offset`. The
     /// symbol-index's `member_header_offset` fields feed into this lookup.
-    pub fn member_at_offset(&self, header_offset: u32) -> Option<&Member<'a>> {
-        self.members
-            .iter()
-            .find(|m| m.header_offset == header_offset as usize)
+    pub fn member_at_offset(&self, header_offset: u64) -> Option<&Member<'a>> {
+        let index = *self.member_by_offset.get(&header_offset)?;
+        self.members.get(index)
     }
 
     /// First member that defines `name` according to the archive's symbol
@@ -261,15 +480,8 @@ impl<'a> Archive<'a> {
     /// the in-buffer slice; GNU-thin members read their external file on
     /// demand.
     pub fn parse_member_object(&self, member: &Member<'a>) -> Result<ObjectFile, FetchError> {
-        let logical_path = self.member_logical_path(member);
-        match self.flavor {
-            Flavor::GnuThin => {
-                let file_path = self.member_external_path(member);
-                let bytes = std::fs::read(&file_path).map_err(FetchError::Io)?;
-                ObjectFile::parse(logical_path, &bytes).map_err(FetchError::Read)
-            }
-            _ => ObjectFile::parse(logical_path, member.body).map_err(FetchError::Read),
-        }
+        let loaded = self.load_member(member).map_err(FetchError::Load)?;
+        ObjectFile::parse(loaded.logical_path, loaded.bytes.as_ref()).map_err(FetchError::Read)
     }
 
     /// Resolve `name` to its defining member, then parse that member as an
@@ -280,43 +492,103 @@ impl<'a> Archive<'a> {
         Some(self.parse_member_object(member))
     }
 
-    /// Produce the display path a member should surface as when parsed:
-    /// `/abs/path/libfoo.a(foo.o)`. For thin archives the path is the
-    /// external source file — that path is useful on its own.
-    fn member_logical_path(&self, member: &Member<'a>) -> PathBuf {
-        if self.flavor == Flavor::GnuThin {
-            return self.member_external_path(member);
-        }
-        let mut s = self.path.as_os_str().to_owned();
-        s.push("(");
-        s.push(member.name.as_str());
-        s.push(")");
-        PathBuf::from(s)
+    pub(crate) fn load_member<'m>(
+        &'m self,
+        member: &'m Member<'a>,
+    ) -> Result<LoadedMember<'m>, MemberLoadError> {
+        self.load_member_at_depth(member, 0)
     }
 
-    fn member_external_path(&self, member: &Member<'a>) -> PathBuf {
-        let base = self.path.parent().unwrap_or_else(|| Path::new("."));
-        base.join(&member.name)
+    fn load_member_at_depth<'m>(
+        &'m self,
+        member: &'m Member<'a>,
+        depth: usize,
+    ) -> Result<LoadedMember<'m>, MemberLoadError> {
+        if self.flavor != Flavor::GnuThin {
+            return Ok(LoadedMember {
+                logical_path: inline_member_logical_path(&self.path, &member.name),
+                bytes: Cow::Borrowed(member.body),
+            });
+        }
+        load_thin_member(&self.path, &member.name, member.nested_member_offset, depth)
     }
+}
+
+fn inline_member_logical_path(archive_path: &Path, member_name: &Path) -> PathBuf {
+    let mut path = archive_path.as_os_str().to_owned();
+    path.push("(");
+    path.push(member_name.as_os_str());
+    path.push(")");
+    PathBuf::from(path)
+}
+
+fn load_thin_member<'a>(
+    archive_path: &Path,
+    member_name: &Path,
+    nested_member_offset: Option<u64>,
+    depth: usize,
+) -> Result<LoadedMember<'a>, MemberLoadError> {
+    let base = archive_path.parent().unwrap_or_else(|| Path::new("."));
+    let external_path = base.join(member_name);
+    let bytes = std::fs::read(&external_path).map_err(|source| MemberLoadError::Io {
+        path: external_path.clone(),
+        source,
+    })?;
+    let Some(member_header_offset) = nested_member_offset else {
+        return Ok(LoadedMember {
+            logical_path: external_path,
+            bytes: Cow::Owned(bytes),
+        });
+    };
+
+    if depth >= MAX_THIN_ARCHIVE_NESTING {
+        return Err(MemberLoadError::NestingTooDeep {
+            path: external_path,
+        });
+    }
+    let nested =
+        Archive::open(&external_path, &bytes).map_err(|source| MemberLoadError::NestedArchive {
+            path: external_path.clone(),
+            source,
+        })?;
+    let nested_member = nested
+        .member_at_offset(member_header_offset)
+        .filter(|member| member.special == SpecialMember::None)
+        .ok_or_else(|| MemberLoadError::MissingNestedMember {
+            path: external_path.clone(),
+            member_header_offset,
+        })?;
+    let loaded = nested.load_member_at_depth(nested_member, depth + 1)?;
+    Ok(LoadedMember {
+        logical_path: loaded.logical_path,
+        bytes: Cow::Owned(loaded.bytes.into_owned()),
+    })
 }
 
 /// Unified error for member fetching — I/O (GNU-thin only) or Mach-O parse.
 #[derive(Debug)]
 pub enum FetchError {
-    Io(std::io::Error),
+    Load(MemberLoadError),
     Read(ReadError),
 }
 
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FetchError::Io(e) => write!(f, "thin-member I/O: {e}"),
+            FetchError::Load(e) => write!(f, "{e}"),
             FetchError::Read(e) => write!(f, "{e}"),
         }
     }
 }
 
-impl std::error::Error for FetchError {}
+impl std::error::Error for FetchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FetchError::Load(error) => Some(error),
+            FetchError::Read(error) => Some(error),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Member walking & name decoding.
@@ -340,48 +612,71 @@ fn parse_members<'a>(
             });
         }
         let hdr = ArHeader::parse(&data[cursor..cursor + AR_HDR_SIZE], cursor)?;
+        let raw_name = hdr.raw_name_bytes();
         let size = hdr.size as usize;
+        let stored_size = if flavor == Flavor::GnuThin && !thin_member_has_body(raw_name) {
+            0
+        } else {
+            size
+        };
         let body_start = cursor + AR_HDR_SIZE;
         let body_end = body_start
-            .checked_add(size)
+            .checked_add(stored_size)
             .ok_or(ArchiveError::MemberOverrun {
                 at_offset: cursor,
                 size: hdr.size,
             })?;
-        if flavor != Flavor::GnuThin && body_end > data.len() {
+        if body_end > data.len() {
             return Err(ArchiveError::MemberOverrun {
                 at_offset: cursor,
                 size: hdr.size,
             });
         }
-        let raw_name = hdr.raw_name_str();
-        let (real_name, body_offset, body, special) =
-            decode_member(raw_name, data, body_start, size, flavor, long_names, cursor)?;
+        let DecodedMember {
+            name,
+            nested_member_offset,
+            body_offset,
+            body,
+            special,
+        } = decode_member(
+            raw_name,
+            data,
+            body_start,
+            stored_size,
+            flavor,
+            long_names,
+            cursor,
+        )?;
 
         // Opportunistic flavor refinement. The sole unambiguous signal for
         // Sysv is the presence of `/` or `//` members — BSD never emits
         // either.
-        match special {
-            SpecialMember::SysvSymIndex | SpecialMember::SysvLongNames => {
-                flavor = Flavor::Sysv;
-            }
-            _ => {}
+        if flavor == Flavor::Bsd
+            && matches!(
+                special,
+                SpecialMember::SysvSymIndex
+                    | SpecialMember::SysvSymIndex64
+                    | SpecialMember::SysvLongNames
+            )
+        {
+            flavor = Flavor::Sysv;
         }
         if matches!(special, SpecialMember::SysvLongNames) {
             long_names = Some(body);
         }
 
         out.push(Member {
-            name: real_name,
+            name,
+            nested_member_offset,
             header_offset: cursor,
             body_offset,
             body,
             special,
         });
 
-        // Advance past body + 1-byte alignment pad for odd sizes (GNU-thin
-        // members have zero-byte bodies so this collapses to a no-op).
-        let advance = AR_HDR_SIZE + size + (size & 1);
+        // Thin structural members keep inline bodies; ordinary thin members
+        // advertise the external file size but store no bytes here.
+        let advance = AR_HDR_SIZE + stored_size + (stored_size & 1);
         cursor = cursor
             .checked_add(advance)
             .ok_or(ArchiveError::MemberOverrun {
@@ -393,30 +688,31 @@ fn parse_members<'a>(
     Ok((out, flavor))
 }
 
+fn thin_member_has_body(raw_name: &[u8]) -> bool {
+    matches!(raw_name, b"/" | b"/SYM64/" | b"//")
+}
+
+struct DecodedMember<'a> {
+    name: PathBuf,
+    nested_member_offset: Option<u64>,
+    body_offset: usize,
+    body: &'a [u8],
+    special: SpecialMember,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_member<'a>(
-    raw_name: &str,
+    raw_name: &[u8],
     data: &'a [u8],
     body_start: usize,
     size: usize,
     flavor: Flavor,
     long_names: Option<&'a [u8]>,
     header_offset: usize,
-) -> Result<(String, usize, &'a [u8], SpecialMember), ArchiveError> {
-    // GNU-thin: body is zero bytes; name field is the external path.
-    if flavor == Flavor::GnuThin {
-        let name = raw_name.trim_end_matches('/').to_string();
-        return Ok((
-            name,
-            body_start,
-            &data[body_start..body_start],
-            SpecialMember::None,
-        ));
-    }
-
+) -> Result<DecodedMember<'a>, ArchiveError> {
     // BSD extended: "#1/<N>" — first N bytes of the body are the real name.
-    if let Some(rest) = raw_name.strip_prefix("#1/") {
-        let nlen: usize = rest.parse().map_err(|_| ArchiveError::BadAsciiField {
+    if let Some(rest) = raw_name.strip_prefix(b"#1/") {
+        let nlen = parse_ascii_usize(rest).map_err(|_| ArchiveError::BadAsciiField {
             at_offset: header_offset,
             field: "#1/<N>",
         })?;
@@ -427,42 +723,66 @@ fn decode_member<'a>(
             });
         }
         let name_bytes = &data[body_start..body_start + nlen];
-        let name = str::from_utf8(name_bytes).map_err(|_| ArchiveError::BadName {
-            at_offset: header_offset,
-        })?;
         // Trim trailing nulls (some writers pad the name to 4/8 bytes).
-        let name = name.trim_end_matches('\0').to_string();
+        let name_end = name_bytes
+            .iter()
+            .rposition(|&byte| byte != 0)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let name_bytes = &name_bytes[..name_end];
+        let name = archive_name_path(name_bytes, header_offset)?;
         let body = &data[body_start + nlen..body_start + size];
-        let special = if name == "__.SYMDEF" || name == "__.SYMDEF SORTED" {
+        let special = if name_bytes == b"__.SYMDEF" || name_bytes == b"__.SYMDEF SORTED" {
             SpecialMember::BsdSymIndex
         } else {
             SpecialMember::None
         };
-        return Ok((name, body_start + nlen, body, special));
+        return Ok(DecodedMember {
+            name,
+            nested_member_offset: None,
+            body_offset: body_start + nlen,
+            body,
+            special,
+        });
     }
 
     // SysV structural members.
-    if raw_name == "/" {
-        return Ok((
-            "/".to_string(),
-            body_start,
-            &data[body_start..body_start + size],
-            SpecialMember::SysvSymIndex,
-        ));
+    if raw_name == b"/" {
+        return Ok(DecodedMember {
+            name: PathBuf::from("/"),
+            nested_member_offset: None,
+            body_offset: body_start,
+            body: &data[body_start..body_start + size],
+            special: SpecialMember::SysvSymIndex,
+        });
     }
-    if raw_name == "//" {
-        return Ok((
-            "//".to_string(),
-            body_start,
-            &data[body_start..body_start + size],
-            SpecialMember::SysvLongNames,
-        ));
+    if raw_name == b"/SYM64/" {
+        return Ok(DecodedMember {
+            name: PathBuf::from("/SYM64/"),
+            nested_member_offset: None,
+            body_offset: body_start,
+            body: &data[body_start..body_start + size],
+            special: SpecialMember::SysvSymIndex64,
+        });
+    }
+    if raw_name == b"//" {
+        return Ok(DecodedMember {
+            name: PathBuf::from("//"),
+            nested_member_offset: None,
+            body_offset: body_start,
+            body: &data[body_start..body_start + size],
+            special: SpecialMember::SysvLongNames,
+        });
     }
 
     // SysV long-name reference: "/NNN".
-    if let Some(rest) = raw_name.strip_prefix('/') {
-        if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
-            let strx: u32 = rest.parse().map_err(|_| ArchiveError::BadAsciiField {
+    if let Some(rest) = raw_name.strip_prefix(b"/") {
+        let (strx_bytes, nested_offset_bytes) = match rest.iter().position(|&byte| byte == b':') {
+            Some(colon) if flavor == Flavor::GnuThin => (&rest[..colon], Some(&rest[colon + 1..])),
+            _ => (rest, None),
+        };
+        if !strx_bytes.is_empty() && strx_bytes.iter().all(u8::is_ascii_digit) {
+            let strx = parse_ascii_u64(strx_bytes).map_err(|_| ArchiveError::BadAsciiField {
                 at_offset: header_offset,
                 field: "/NNN",
             })?;
@@ -471,32 +791,63 @@ fn decode_member<'a>(
                 strx,
             })?;
             let name = decode_long_name(table, strx, header_offset)?;
-            return Ok((
+            let nested_member_offset = nested_offset_bytes
+                .map(|bytes| {
+                    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+                        return Err(ArchiveError::BadAsciiField {
+                            at_offset: header_offset,
+                            field: "/NNN:MMM",
+                        });
+                    }
+                    parse_ascii_u64(bytes).map_err(|_| ArchiveError::BadAsciiField {
+                        at_offset: header_offset,
+                        field: "/NNN:MMM",
+                    })
+                })
+                .transpose()?;
+            return Ok(DecodedMember {
                 name,
-                body_start,
-                &data[body_start..body_start + size],
-                SpecialMember::None,
-            ));
+                nested_member_offset,
+                body_offset: body_start,
+                body: &data[body_start..body_start + size],
+                special: SpecialMember::None,
+            });
         }
     }
 
+    // GNU-thin ordinary members have no inline body. Their names use the
+    // same short-name or /NNN encoding as regular GNU archives.
+    if flavor == Flavor::GnuThin {
+        let name_bytes = raw_name.strip_suffix(b"/").unwrap_or(raw_name);
+        let name = archive_name_path(name_bytes, header_offset)?;
+        return Ok(DecodedMember {
+            name,
+            nested_member_offset: None,
+            body_offset: body_start,
+            body: &data[body_start..body_start],
+            special: SpecialMember::None,
+        });
+    }
+
     // SysV short name — slash-terminated.
-    if let Some(stripped) = raw_name.strip_suffix('/') {
-        return Ok((
-            stripped.to_string(),
-            body_start,
-            &data[body_start..body_start + size],
-            SpecialMember::None,
-        ));
+    if let Some(stripped) = raw_name.strip_suffix(b"/") {
+        return Ok(DecodedMember {
+            name: archive_name_path(stripped, header_offset)?,
+            nested_member_offset: None,
+            body_offset: body_start,
+            body: &data[body_start..body_start + size],
+            special: SpecialMember::None,
+        });
     }
 
     // BSD short name (no trailing slash, no #1/ prefix).
-    Ok((
-        raw_name.to_string(),
-        body_start,
-        &data[body_start..body_start + size],
-        SpecialMember::None,
-    ))
+    Ok(DecodedMember {
+        name: archive_name_path(raw_name, header_offset)?,
+        nested_member_offset: None,
+        body_offset: body_start,
+        body: &data[body_start..body_start + size],
+        special: SpecialMember::None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -508,7 +859,7 @@ fn decode_member<'a>(
 pub struct SymbolIndexEntry {
     pub name: String,
     /// Byte offset of the defining member's `ar_hdr` within the archive.
-    pub member_header_offset: u32,
+    pub member_header_offset: u64,
 }
 
 /// The table of `(symbol → defining member offset)` the archive writer
@@ -531,7 +882,7 @@ impl SymbolIndex {
     /// Return the `ar_hdr` offset of the first member that defines `name`,
     /// or `None` if the index has no such entry. The "first" rule matches
     /// ld's classic ordering — a later duplicate doesn't shadow an earlier.
-    pub fn first_defining_offset(&self, name: &str) -> Option<u32> {
+    pub fn first_defining_offset(&self, name: &str) -> Option<u64> {
         self.entries
             .iter()
             .find(|e| e.name == name)
@@ -540,7 +891,7 @@ impl SymbolIndex {
 
     /// All `ar_hdr` offsets where `name` appears. Exists for `-all_load` /
     /// `-force_load` semantics and for tests that want to verify duplicates.
-    pub fn offsets_for<'n>(&'n self, name: &'n str) -> impl Iterator<Item = u32> + 'n {
+    pub fn offsets_for<'n>(&'n self, name: &'n str) -> impl Iterator<Item = u64> + 'n {
         self.entries
             .iter()
             .filter(move |e| e.name == name)
@@ -556,6 +907,9 @@ fn build_symbol_index(members: &[Member<'_>]) -> Result<Option<SymbolIndex>, Arc
             }
             SpecialMember::SysvSymIndex => {
                 return Ok(Some(parse_sysv_symbol_index(m.body)?));
+            }
+            SpecialMember::SysvSymIndex64 => {
+                return Ok(Some(parse_sysv_symbol_index64(m.body)?));
             }
             _ => {}
         }
@@ -632,7 +986,7 @@ fn parse_bsd_symbol_index(body: &[u8]) -> Result<SymbolIndex, ArchiveError> {
             .to_string();
         entries.push(SymbolIndexEntry {
             name,
-            member_header_offset: mh_off,
+            member_header_offset: mh_off as u64,
         });
         off += 8;
     }
@@ -688,15 +1042,73 @@ fn parse_sysv_symbol_index(body: &[u8]) -> Result<SymbolIndex, ArchiveError> {
             .to_string();
         entries.push(SymbolIndexEntry {
             name,
-            member_header_offset: mh_off,
+            member_header_offset: mh_off as u64,
         });
         cursor = end + 1;
     }
     Ok(SymbolIndex { entries })
 }
 
-fn decode_long_name(table: &[u8], strx: u32, at_offset: usize) -> Result<String, ArchiveError> {
-    let start = strx as usize;
+/// GNU `/SYM64/` symbol index, big-endian. It matches the SysV `/` layout
+/// but widens the symbol count and every member-header offset to 64 bits.
+fn parse_sysv_symbol_index64(body: &[u8]) -> Result<SymbolIndex, ArchiveError> {
+    if body.len() < 8 {
+        return Err(ArchiveError::BadSymbolIndex {
+            reason: "GNU 64-bit symbol index shorter than 8-byte header",
+        });
+    }
+    let nsyms =
+        usize::try_from(u64::from_be_bytes(body[0..8].try_into().unwrap())).map_err(|_| {
+            ArchiveError::BadSymbolIndex {
+                reason: "GNU 64-bit symbol count does not fit in memory",
+            }
+        })?;
+    let offsets_end = nsyms
+        .checked_mul(8)
+        .and_then(|size| 8usize.checked_add(size))
+        .ok_or(ArchiveError::BadSymbolIndex {
+            reason: "GNU 64-bit symbol-index offsets region overflows",
+        })?;
+    if offsets_end > body.len() {
+        return Err(ArchiveError::BadSymbolIndex {
+            reason: "GNU 64-bit symbol-index offsets region overruns member",
+        });
+    }
+    let strings = &body[offsets_end..];
+
+    let mut entries = Vec::with_capacity(nsyms);
+    let mut cursor = 0usize;
+    for i in 0..nsyms {
+        let off = 8 + i * 8;
+        let member_header_offset = u64::from_be_bytes(body[off..off + 8].try_into().unwrap());
+        if cursor >= strings.len() {
+            return Err(ArchiveError::BadSymbolIndex {
+                reason: "GNU 64-bit symbol-index names exhausted before nsyms satisfied",
+            });
+        }
+        let end = strings[cursor..]
+            .iter()
+            .position(|&byte| byte == 0)
+            .map(|length| cursor + length)
+            .ok_or(ArchiveError::BadSymbolIndex {
+                reason: "GNU 64-bit symbol-index name not null-terminated",
+            })?;
+        let name = str::from_utf8(&strings[cursor..end])
+            .map_err(|_| ArchiveError::BadSymbolIndex {
+                reason: "GNU 64-bit symbol-index name not UTF-8",
+            })?
+            .to_string();
+        entries.push(SymbolIndexEntry {
+            name,
+            member_header_offset,
+        });
+        cursor = end + 1;
+    }
+    Ok(SymbolIndex { entries })
+}
+
+fn decode_long_name(table: &[u8], strx: u64, at_offset: usize) -> Result<PathBuf, ArchiveError> {
+    let start = usize::try_from(strx).map_err(|_| ArchiveError::LongNameOob { at_offset, strx })?;
     if start >= table.len() {
         return Err(ArchiveError::LongNameOob { at_offset, strx });
     }
@@ -713,9 +1125,7 @@ fn decode_long_name(table: &[u8], strx: u32, at_offset: usize) -> Result<String,
     } else {
         end
     };
-    str::from_utf8(&table[start..trimmed_end])
-        .map(|s| s.to_string())
-        .map_err(|_| ArchiveError::BadName { at_offset })
+    archive_name_path(&table[start..trimmed_end], at_offset)
 }
 
 pub fn detect_flavor(data: &[u8]) -> Result<Flavor, ArchiveError> {
@@ -738,27 +1148,68 @@ pub fn detect_flavor(data: &[u8]) -> Result<Flavor, ArchiveError> {
 // Small helpers.
 // ---------------------------------------------------------------------------
 
-/// Trim trailing spaces and null bytes from a fixed-width ASCII field.
-pub(crate) fn trim_ascii(bytes: &[u8]) -> &str {
+/// Trim trailing spaces and null bytes from a fixed-width archive field.
+pub(crate) fn trim_ascii_bytes(bytes: &[u8]) -> &[u8] {
     let end = bytes
         .iter()
         .rposition(|&b| b != b' ' && b != 0)
         .map(|i| i + 1)
         .unwrap_or(0);
-    // Safe: `ar_hdr` fields are ASCII in practice; non-ASCII surfaces via
-    // the caller-level `BadName` diagnostic.
-    str::from_utf8(&bytes[..end]).unwrap_or("")
+    &bytes[..end]
 }
 
 /// Parse a right-trimmed ASCII-decimal field into `u64`. Empty (all-space)
 /// fields return 0 — this matches what Apple's `ar` writes for `date/uid/gid/mode`
 /// on anonymized archives.
 pub(crate) fn ascii_decimal(bytes: &[u8]) -> Result<u64, ()> {
-    let s = trim_ascii(bytes);
+    let s = str::from_utf8(trim_ascii_bytes(bytes)).map_err(|_| ())?;
     if s.is_empty() {
         return Ok(0);
     }
     s.parse::<u64>().map_err(|_| ())
+}
+
+fn parse_ascii_u64(bytes: &[u8]) -> Result<u64, ()> {
+    str::from_utf8(bytes)
+        .map_err(|_| ())?
+        .parse::<u64>()
+        .map_err(|_| ())
+}
+
+fn parse_ascii_usize(bytes: &[u8]) -> Result<usize, ()> {
+    usize::try_from(parse_ascii_u64(bytes)?).map_err(|_| ())
+}
+
+fn is_sysv_name_reference(bytes: &[u8]) -> bool {
+    let Some(rest) = bytes.strip_prefix(b"/") else {
+        return false;
+    };
+    let mut parts = rest.split(|&byte| byte == b':');
+    let Some(strx) = parts.next() else {
+        return false;
+    };
+    if strx.is_empty() || !strx.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    match (parts.next(), parts.next()) {
+        (None, _) => true,
+        (Some(offset), None) => !offset.is_empty() && offset.iter().all(u8::is_ascii_digit),
+        (Some(_), Some(_)) => false,
+    }
+}
+
+#[cfg(unix)]
+fn archive_name_path(bytes: &[u8], _at_offset: usize) -> Result<PathBuf, ArchiveError> {
+    use std::os::unix::ffi::OsStringExt;
+
+    Ok(PathBuf::from(OsString::from_vec(bytes.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn archive_name_path(bytes: &[u8], at_offset: usize) -> Result<PathBuf, ArchiveError> {
+    String::from_utf8(bytes.to_vec())
+        .map(PathBuf::from)
+        .map_err(|_| ArchiveError::BadName { at_offset })
 }
 
 #[cfg(test)]
@@ -822,7 +1273,15 @@ mod tests {
         let hdr = make_ar_hdr("foo.o/", 128);
         let parsed = ArHeader::parse(&hdr, 0).unwrap();
         assert_eq!(parsed.size, 128);
-        assert_eq!(parsed.raw_name_str(), "foo.o/");
+        assert_eq!(parsed.raw_name_str().unwrap(), "foo.o/");
+    }
+
+    #[test]
+    fn ar_header_normalizes_padded_sysv_name_reference() {
+        let mut hdr = make_ar_hdr("/0", 128);
+        hdr[15] = b'/';
+        let parsed = ArHeader::parse(&hdr, 0).unwrap();
+        assert_eq!(parsed.raw_name_bytes(), b"/0");
     }
 
     #[test]
@@ -905,7 +1364,7 @@ mod tests {
         buf.extend_from_slice(&encode_member("foo.o", b"XXXX"));
         let ar = Archive::open("/tmp/bsd.a", &buf).unwrap();
         assert_eq!(ar.members().len(), 1);
-        assert_eq!(ar.members()[0].name, "foo.o");
+        assert_eq!(ar.members()[0].name, Path::new("foo.o"));
         assert_eq!(ar.members()[0].body, b"XXXX");
         assert_eq!(ar.members()[0].special, SpecialMember::None);
     }
@@ -919,7 +1378,10 @@ mod tests {
             b"CONT",
         ));
         let ar = Archive::open("/tmp/bsd_ext.a", &buf).unwrap();
-        assert_eq!(ar.members()[0].name, "long_filename_with_many_chars.o");
+        assert_eq!(
+            ar.members()[0].name,
+            Path::new("long_filename_with_many_chars.o")
+        );
         assert_eq!(ar.members()[0].body, b"CONT");
     }
 
@@ -940,7 +1402,7 @@ mod tests {
         // Sysv short names are right-padded with spaces and terminated by '/'.
         buf.extend_from_slice(&encode_member("foo.o/", b"aa"));
         let ar = Archive::open("/tmp/sysv.a", &buf).unwrap();
-        assert_eq!(ar.members()[0].name, "foo.o");
+        assert_eq!(ar.members()[0].name, Path::new("foo.o"));
     }
 
     #[test]
@@ -957,9 +1419,9 @@ mod tests {
         assert_eq!(ar.flavor, Flavor::Sysv);
         assert_eq!(ar.members().len(), 3);
         assert_eq!(ar.members()[0].special, SpecialMember::SysvLongNames);
-        assert_eq!(ar.members()[1].name, "really_long_name.o");
+        assert_eq!(ar.members()[1].name, Path::new("really_long_name.o"));
         assert_eq!(ar.members()[1].body, b"BODY1");
-        assert_eq!(ar.members()[2].name, "foo");
+        assert_eq!(ar.members()[2].name, Path::new("foo"));
     }
 
     #[test]
@@ -981,8 +1443,8 @@ mod tests {
         buf.extend_from_slice(&encode_member("b.o", b"AA")); // 2 bytes → no pad
         let ar = Archive::open("/tmp/pad.a", &buf).unwrap();
         assert_eq!(ar.members().len(), 2);
-        assert_eq!(ar.members()[0].name, "a.o");
-        assert_eq!(ar.members()[1].name, "b.o");
+        assert_eq!(ar.members()[0].name, Path::new("a.o"));
+        assert_eq!(ar.members()[1].name, Path::new("b.o"));
     }
 
     #[test]
@@ -995,7 +1457,7 @@ mod tests {
         let ar = Archive::open("/tmp/mixed.a", &buf).unwrap();
         assert_eq!(ar.members().len(), 2);
         let reals: Vec<_> = ar.object_members().map(|m| m.name.clone()).collect();
-        assert_eq!(reals, vec!["real.o"]);
+        assert_eq!(reals, vec![PathBuf::from("real.o")]);
     }
 
     #[test]
@@ -1008,8 +1470,109 @@ mod tests {
         let ar = Archive::open("/tmp/thin.a", &buf).unwrap();
         assert_eq!(ar.flavor, Flavor::GnuThin);
         assert_eq!(ar.members().len(), 2);
-        assert_eq!(ar.members()[0].name, "../foo.o");
-        assert_eq!(ar.members()[1].name, "bar.o");
+        assert_eq!(ar.members()[0].name, Path::new("../foo.o"));
+        assert_eq!(ar.members()[1].name, Path::new("bar.o"));
+    }
+
+    #[test]
+    fn gnu_thin_decodes_structural_members_and_long_paths() {
+        let first_name = "objects/very_long_thin_member_name.o";
+        let second_name = "objects/second_thin_member_name.o";
+        let long_names = format!("{first_name}/\n{second_name}/\n");
+        let placeholder_index =
+            encode_member("/", &encode_sysv_symbol_index(&[("_thin_symbol", 0)]));
+        let long_name_member = encode_member("//", long_names.as_bytes());
+        let object_offset =
+            (AR_MAGIC_THIN.len() + placeholder_index.len() + long_name_member.len()) as u32;
+        let second_object_offset = object_offset + AR_HDR_SIZE as u32;
+        let symbol_index = encode_member(
+            "/",
+            &encode_sysv_symbol_index(&[("_thin_symbol", object_offset)]),
+        );
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(AR_MAGIC_THIN);
+        buf.extend_from_slice(&symbol_index);
+        buf.extend_from_slice(&long_name_member);
+        buf.extend_from_slice(&make_ar_hdr("/0", 4097));
+        buf.extend_from_slice(&make_ar_hdr(
+            &format!("/{}:8192", first_name.len() + 2),
+            2048,
+        ));
+
+        let ar = Archive::open("/tmp/libthin.a", &buf).unwrap();
+        assert_eq!(ar.flavor, Flavor::GnuThin);
+        assert_eq!(ar.members().len(), 4);
+        assert_eq!(ar.members()[0].special, SpecialMember::SysvSymIndex);
+        assert_eq!(ar.members()[1].special, SpecialMember::SysvLongNames);
+        assert_eq!(ar.members()[2].name, Path::new(first_name));
+        assert!(ar.members()[2].body.is_empty());
+        assert_eq!(ar.members()[2].nested_member_offset, None);
+        assert_eq!(ar.members()[2].header_offset as u32, object_offset);
+        assert_eq!(ar.members()[3].name, Path::new(second_name));
+        assert_eq!(ar.members()[3].nested_member_offset, Some(8192));
+        assert_eq!(ar.members()[3].header_offset as u32, second_object_offset);
+        assert_eq!(
+            ar.first_member_defining("_thin_symbol")
+                .map(|member| member.header_offset as u32),
+            Some(object_offset)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gnu_thin_preserves_non_utf8_long_name_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let long_name = b"member-\xff.o/\n";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(AR_MAGIC_THIN);
+        buf.extend_from_slice(&encode_member("//", long_name));
+        buf.extend_from_slice(&make_ar_hdr("/0", 1));
+
+        let archive = Archive::open("/tmp/non-utf8-thin.a", &buf).unwrap();
+        let member = archive.object_members().next().unwrap();
+        assert_eq!(member.name.as_os_str().as_bytes(), b"member-\xff.o");
+    }
+
+    #[test]
+    fn gnu_thin_decodes_sym64_index() {
+        const WIDE_OFFSET: u64 = u32::MAX as u64 + 0x100;
+        let placeholder = encode_member(
+            "/SYM64/",
+            &encode_sysv_symbol_index64(&[("_wide_symbol", 0), ("_beyond_u32", WIDE_OFFSET)]),
+        );
+        let object_offset = (AR_MAGIC_THIN.len() + placeholder.len()) as u32;
+        let index = encode_member(
+            "/SYM64/",
+            &encode_sysv_symbol_index64(&[
+                ("_wide_symbol", object_offset as u64),
+                ("_beyond_u32", WIDE_OFFSET),
+            ]),
+        );
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(AR_MAGIC_THIN);
+        buf.extend_from_slice(&index);
+        buf.extend_from_slice(&make_ar_hdr("member.o/", 4097));
+
+        let ar = Archive::open("/tmp/libthin64.a", &buf).unwrap();
+        assert_eq!(ar.flavor, Flavor::GnuThin);
+        assert_eq!(ar.members().len(), 2);
+        assert_eq!(ar.members()[0].special, SpecialMember::SysvSymIndex64);
+        assert_eq!(ar.members()[1].name, Path::new("member.o"));
+        assert_eq!(
+            ar.first_member_defining("_wide_symbol")
+                .map(|member| member.header_offset as u32),
+            Some(object_offset)
+        );
+        assert_eq!(
+            ar.symbol_index()
+                .unwrap()
+                .first_defining_offset("_beyond_u32"),
+            Some(WIDE_OFFSET)
+        );
+        assert!(ar.member_at_offset(WIDE_OFFSET).is_none());
     }
 
     // ----- symbol-index tests -----
@@ -1044,6 +1607,19 @@ mod tests {
         body.extend_from_slice(&nsyms.to_be_bytes());
         for (_, mh_off) in entries {
             body.extend_from_slice(&mh_off.to_be_bytes());
+        }
+        for (name, _) in entries {
+            body.extend_from_slice(name.as_bytes());
+            body.push(0);
+        }
+        body
+    }
+
+    fn encode_sysv_symbol_index64(entries: &[(&str, u64)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(entries.len() as u64).to_be_bytes());
+        for (_, member_offset) in entries {
+            body.extend_from_slice(&member_offset.to_be_bytes());
         }
         for (name, _) in entries {
             body.extend_from_slice(name.as_bytes());
@@ -1097,7 +1673,7 @@ mod tests {
         let ar = Archive::open("/tmp/dup.a", &buf).unwrap();
         let idx = ar.symbol_index().unwrap();
         assert_eq!(idx.first_defining_offset("_sym"), Some(0x100));
-        let all: Vec<u32> = idx.offsets_for("_sym").collect();
+        let all: Vec<u64> = idx.offsets_for("_sym").collect();
         assert_eq!(all, vec![0x100, 0x200]);
     }
 
@@ -1148,7 +1724,7 @@ mod tests {
 
         let ar = Archive::open("/tmp/sym_fetch.a", &buf).unwrap();
         let m = ar.first_member_defining("_foo").expect("symbol found");
-        assert_eq!(m.name, "real.o");
+        assert_eq!(m.name, Path::new("real.o"));
         assert_eq!(m.body, b"CONTENT");
     }
 

@@ -16,20 +16,27 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
-    BIND_SYMBOL_FLAGS_WEAK_IMPORT, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION,
-    LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS,
-    LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, N_PEXT, REBASE_IMMEDIATE_MASK,
-    REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE,
-    REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
-    REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
-    REBASE_OPCODE_MASK, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
-    REBASE_TYPE_POINTER, SG_READ_ONLY,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64,
+    EXPORT_SYMBOL_FLAGS_REEXPORT, EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, INDIRECT_SYMBOL_ABS,
+    INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
+    LC_FUNCTION_STARTS, LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, MH_MAGIC_64,
+    MH_OBJECT, MH_SUBSECTIONS_VIA_SYMBOLS, N_ABS, N_ALT_ENTRY, N_EXT, N_INDR, N_PEXT, N_SECT,
+    N_UNDF, N_WEAK_REF, REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED,
+    REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB,
+    REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
+    REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB, REBASE_OPCODE_MASK,
+    REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM, REBASE_TYPE_POINTER,
+    SG_READ_ONLY, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_REGULAR,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::{ExportKind, Exports};
-use afs_ld::macho::reader::{parse_commands, parse_header, u32_le, LoadCommand, Section64Header};
+use afs_ld::macho::reader::{
+    parse_commands, parse_header, u32_le, write_header, LoadCommand, MachHeader64, Section64Header,
+    Segment64, SymtabCmd, HEADER_SIZE,
+};
+use afs_ld::reloc::{write_raw_relocs, write_relocs, Referent, Reloc, RelocKind, RelocLength};
 use afs_ld::string_table::StringTable;
-use afs_ld::symbol::{parse_nlist_table, SymKind};
+use afs_ld::symbol::{parse_nlist_table, RawNlist, SymKind, NLIST_SIZE};
 use afs_ld::synth::unwind::decode_unwind_info;
 use afs_ld::{FrameworkSpec, LinkError, LinkOptions, Linker, OutputKind};
 use common::artifacts::workspace_artifact;
@@ -183,6 +190,479 @@ fn compile_dylib_c(src: &str, out: &PathBuf) -> Result<(), String> {
 
 fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-linker-run-{}-{name}", std::process::id()))
+}
+
+fn name16(name: &str) -> [u8; 16] {
+    assert!(name.len() <= 16);
+    let mut out = [0; 16];
+    out[..name.len()].copy_from_slice(name.as_bytes());
+    out
+}
+
+fn synthetic_got_reference_object(entry: &str, target: &str, weak_ref: bool) -> Vec<u8> {
+    let text = [
+        0x00, 0x00, 0x00, 0x90, // adrp x0, target@GOTPAGE
+        0x00, 0x00, 0x40, 0xf9, // ldr x0, [x0, target@GOTPAGEOFF]
+        0x00, 0x00, 0x80, 0x52, // mov w0, #0
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+    let relocs = [
+        Reloc {
+            offset: 0,
+            kind: RelocKind::GotLoadPage21,
+            length: RelocLength::Word,
+            pcrel: true,
+            referent: Referent::Symbol(1),
+            addend: 0,
+            subtrahend: None,
+        },
+        Reloc {
+            offset: 4,
+            kind: RelocKind::GotLoadPageOff12,
+            length: RelocLength::Word,
+            pcrel: false,
+            referent: Referent::Symbol(1),
+            addend: 0,
+            subtrahend: None,
+        },
+    ];
+    let raw_relocs = write_relocs(&relocs).unwrap();
+    let mut reloc_bytes = Vec::new();
+    write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+
+    let mut strings = vec![0];
+    let entry_strx = strings.len() as u32;
+    strings.extend_from_slice(entry.as_bytes());
+    strings.push(0);
+    let target_strx = strings.len() as u32;
+    strings.extend_from_slice(target.as_bytes());
+    strings.push(0);
+    let symbols = [
+        RawNlist {
+            strx: entry_strx,
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: target_strx,
+            n_type: N_UNDF | N_EXT,
+            n_sect: 0,
+            n_desc: if weak_ref { N_WEAK_REF } else { 0 },
+            n_value: 0,
+        },
+    ];
+
+    let mut segment = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: 0,
+        vmsize: text.len() as u64,
+        fileoff: 0,
+        filesize: text.len() as u64,
+        maxprot: 5,
+        initprot: 5,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: 0,
+            size: text.len() as u64,
+            offset: 0,
+            align: 2,
+            reloff: 0,
+            nreloc: raw_relocs.len() as u32,
+            flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    segment.sections[0].reloff = data_offset + text.len() as u32;
+    let symoff = segment.sections[0].reloff + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: 0,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_absolute_reference_object(entry: &str, target: &str) -> Vec<u8> {
+    let text = [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // .quad target
+        0x00, 0x00, 0x80, 0x52, // mov w0, #0
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+    let relocs = [Reloc {
+        offset: 0,
+        kind: RelocKind::Unsigned,
+        length: RelocLength::Quad,
+        pcrel: false,
+        referent: Referent::Symbol(1),
+        addend: 0,
+        subtrahend: None,
+    }];
+    let raw_relocs = write_relocs(&relocs).unwrap();
+    let mut reloc_bytes = Vec::new();
+    write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+
+    let mut strings = vec![0];
+    let entry_strx = strings.len() as u32;
+    strings.extend_from_slice(entry.as_bytes());
+    strings.push(0);
+    let target_strx = strings.len() as u32;
+    strings.extend_from_slice(target.as_bytes());
+    strings.push(0);
+    let symbols = [
+        RawNlist {
+            strx: entry_strx,
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 8,
+        },
+        RawNlist {
+            strx: target_strx,
+            n_type: N_UNDF | N_EXT,
+            n_sect: 0,
+            n_desc: 0,
+            n_value: 0,
+        },
+    ];
+
+    let mut segment = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: 0,
+        vmsize: text.len() as u64,
+        fileoff: 0,
+        filesize: text.len() as u64,
+        maxprot: 5,
+        initprot: 5,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: 0,
+            size: text.len() as u64,
+            offset: 0,
+            align: 3,
+            reloff: 0,
+            nreloc: raw_relocs.len() as u32,
+            flags: S_REGULAR,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    segment.sections[0].reloff = data_offset + text.len() as u32;
+    let symoff = segment.sections[0].reloff + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+#[derive(Clone, Copy)]
+enum SyntheticAliasEncoding {
+    Indirect,
+    ExplicitAlternateEntry,
+    OverlappingSection,
+}
+
+fn synthetic_defined_alias_object(
+    private_alias: bool,
+    private_main: bool,
+    private_target: bool,
+    reference_alias: bool,
+    encoding: SyntheticAliasEncoding,
+) -> Vec<u8> {
+    let first_instruction = if reference_alias {
+        [0x00, 0x00, 0x00, 0x94] // bl _alias
+    } else {
+        [0x00, 0x00, 0x80, 0x52] // mov w0, #0
+    };
+    let text = [
+        first_instruction,
+        [0xc0, 0x03, 0x5f, 0xd6], // ret
+        [0x1f, 0x20, 0x03, 0xd5], // nop
+        [0xc0, 0x03, 0x5f, 0xd6], // _target: ret
+    ]
+    .concat();
+    let relocs = if reference_alias {
+        vec![Reloc {
+            offset: 0,
+            kind: RelocKind::Branch26,
+            length: RelocLength::Word,
+            pcrel: true,
+            referent: Referent::Symbol(match encoding {
+                SyntheticAliasEncoding::Indirect => 1,
+                SyntheticAliasEncoding::ExplicitAlternateEntry => 2,
+                SyntheticAliasEncoding::OverlappingSection => 1,
+            }),
+            addend: 0,
+            subtrahend: None,
+        }]
+    } else {
+        Vec::new()
+    };
+    let raw_relocs = write_relocs(&relocs).unwrap();
+    let mut reloc_bytes = Vec::new();
+    write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+
+    let mut strings = vec![0];
+    let mut add_string = |name: &str| {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        strx
+    };
+    let main_strx = add_string("_main");
+    let alias_strx = add_string("_alias");
+    let target_strx = add_string("_target");
+    let main = RawNlist {
+        strx: main_strx,
+        n_type: N_SECT | N_EXT | if private_main { N_PEXT } else { 0 },
+        n_sect: 1,
+        n_desc: 0,
+        n_value: 0,
+    };
+    let target = RawNlist {
+        strx: target_strx,
+        n_type: N_SECT | N_EXT | if private_target { N_PEXT } else { 0 },
+        n_sect: 1,
+        n_desc: 0,
+        n_value: 12,
+    };
+    let alias = match encoding {
+        SyntheticAliasEncoding::Indirect => RawNlist {
+            strx: alias_strx,
+            n_type: N_INDR | N_EXT | if private_alias { N_PEXT } else { 0 },
+            n_sect: 0,
+            n_desc: 0,
+            n_value: target_strx as u64,
+        },
+        SyntheticAliasEncoding::ExplicitAlternateEntry => RawNlist {
+            strx: alias_strx,
+            n_type: N_SECT | N_EXT | if private_alias { N_PEXT } else { 0 },
+            n_sect: 1,
+            n_desc: N_ALT_ENTRY,
+            n_value: 12,
+        },
+        SyntheticAliasEncoding::OverlappingSection => RawNlist {
+            strx: alias_strx,
+            n_type: N_SECT | N_EXT | if private_alias { N_PEXT } else { 0 },
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 12,
+        },
+    };
+    let symbols = match encoding {
+        SyntheticAliasEncoding::Indirect | SyntheticAliasEncoding::OverlappingSection => {
+            [main, alias, target]
+        }
+        SyntheticAliasEncoding::ExplicitAlternateEntry => [main, target, alias],
+    };
+
+    let mut segment = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: 0,
+        vmsize: text.len() as u64,
+        fileoff: 0,
+        filesize: text.len() as u64,
+        maxprot: 5,
+        initprot: 5,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: 0,
+            size: text.len() as u64,
+            offset: 0,
+            align: 2,
+            reloff: 0,
+            nreloc: raw_relocs.len() as u32,
+            flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    segment.sections[0].reloff = data_offset + text.len() as u32;
+    let symoff = segment.sections[0].reloff + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_alias_object(alias: &str, target: &str, private_alias: bool) -> Vec<u8> {
+    let mut strings = vec![0];
+    let alias_strx = strings.len() as u32;
+    strings.extend_from_slice(alias.as_bytes());
+    strings.push(0);
+    let target_strx = strings.len() as u32;
+    strings.extend_from_slice(target.as_bytes());
+    strings.push(0);
+    let symbol = RawNlist {
+        strx: alias_strx,
+        n_type: N_INDR | N_EXT | if private_alias { N_PEXT } else { 0 },
+        n_sect: 0,
+        n_desc: 0,
+        n_value: target_strx as u64,
+    };
+    synthetic_atomless_object(strings, &[symbol])
+}
+
+fn synthetic_absolute_object(name: &str, value: u64) -> Vec<u8> {
+    let mut strings = vec![0];
+    let strx = strings.len() as u32;
+    strings.extend_from_slice(name.as_bytes());
+    strings.push(0);
+    let symbol = RawNlist {
+        strx,
+        n_type: N_ABS | N_EXT,
+        n_sect: 0,
+        n_desc: 0,
+        n_value: value,
+    };
+    synthetic_atomless_object(strings, &[symbol])
+}
+
+fn synthetic_atomless_object(strings: Vec<u8>, symbols: &[RawNlist]) -> Vec<u8> {
+    let segment = Segment64 {
+        segname: [0; 16],
+        vmaddr: 0,
+        vmsize: 0,
+        fileoff: 0,
+        filesize: 0,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections: Vec::new(),
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let symoff = HEADER_SIZE as u32 + sizeofcmds;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: 0,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
 }
 
 fn output_section(bytes: &[u8], segname: &str, sectname: &str) -> Option<(u64, Vec<u8>)> {
@@ -2916,6 +3396,609 @@ fn linker_run_promotes_unresolved_symbol_to_dynamic_lookup() {
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
+}
+
+fn assert_flat_got_import(bytes: &[u8], symbol: &str, weak_import: bool) {
+    let bind_records = decode_bind_records(bytes, false).unwrap();
+    assert!(
+        bind_records.iter().any(|record| {
+            record.symbol == symbol
+                && record.ordinal == 0xFFFE
+                && record.weak_import == weak_import
+                && record.segment == "__DATA_CONST"
+                && record.section == "__got"
+        }),
+        "expected flat GOT bind for {symbol} with weak_import={weak_import}, got {bind_records:?}"
+    );
+    let got = output_section_header(bytes, "__DATA_CONST", "__got").unwrap();
+    let got_start = got.offset as usize;
+    let got_bytes = &bytes[got_start..got_start + got.size as usize];
+    assert_eq!(got_bytes, &[0; 8]);
+
+    let symbols = canonical_symbol_record_map(bytes);
+    let imported = symbols.get(symbol).unwrap();
+    assert_eq!(imported.n_type, N_UNDF | N_EXT);
+    assert_eq!(imported.n_sect, 0);
+    assert_eq!(imported.value, 0);
+    assert_eq!(imported.n_desc & N_WEAK_REF != 0, weak_import);
+}
+
+#[test]
+fn linker_run_reports_unresolved_weak_symbol_under_error_policy() {
+    let obj = scratch("missing-weak.o");
+    let out = scratch("missing-weak.out");
+    fs::write(
+        &obj,
+        synthetic_got_reference_object("_main", "_optional", true),
+    )
+    .unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    let err = Linker::run(&opts).unwrap_err();
+    match err {
+        LinkError::UndefinedSymbols(msg) => {
+            assert!(msg.contains("undefined symbol: _optional"), "{msg}");
+        }
+        other => panic!("expected UndefinedSymbols, got {other:?}"),
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_emits_flat_weak_bind_for_permitted_unresolved_reference() {
+    let obj = scratch("missing-weak-dynamic.o");
+    let out = scratch("missing-weak-dynamic.out");
+    fs::write(
+        &obj,
+        synthetic_got_reference_object("_main", "_optional", true),
+    )
+    .unwrap();
+
+    let mut outputs = Vec::new();
+    for jobs in [1, 4] {
+        let opts = LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Executable,
+            undefined_treatment: afs_ld::resolve::UndefinedTreatment::DynamicLookup,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        };
+        Linker::run(&opts).unwrap();
+        outputs.push(fs::read(&out).unwrap());
+    }
+    assert_eq!(outputs[0], outputs[1], "-j1 and -j4 output differs");
+
+    let bytes = &outputs[0];
+    assert_flat_got_import(bytes, "_optional", true);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_emits_required_flat_bind_for_strong_unresolved_reference() {
+    let obj = scratch("missing-strong-dynamic.o");
+    let out = scratch("missing-strong-dynamic.out");
+    let target = "_afs_ld_required_missing_symbol";
+    fs::write(&obj, synthetic_got_reference_object("_main", target, false)).unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        undefined_treatment: afs_ld::resolve::UndefinedTreatment::DynamicLookup,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    assert_flat_got_import(&bytes, target, false);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_mixed_undefined_references_are_required_in_both_orders() {
+    let target = "_afs_ld_mixed_missing_symbol";
+    for weak_first in [false, true] {
+        let order = if weak_first {
+            "weak-first"
+        } else {
+            "strong-first"
+        };
+        let first = scratch(&format!("mixed-{order}-first.o"));
+        let second = scratch(&format!("mixed-{order}-second.o"));
+        let out = scratch(&format!("mixed-{order}.out"));
+        fs::write(
+            &first,
+            synthetic_got_reference_object("_main", target, weak_first),
+        )
+        .unwrap();
+        fs::write(
+            &second,
+            synthetic_got_reference_object("_helper", target, !weak_first),
+        )
+        .unwrap();
+
+        let opts = LinkOptions {
+            inputs: vec![first.clone(), second.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Executable,
+            undefined_treatment: afs_ld::resolve::UndefinedTreatment::DynamicLookup,
+            ..LinkOptions::default()
+        };
+        Linker::run(&opts).unwrap();
+
+        let bytes = fs::read(&out).unwrap();
+        assert_flat_got_import(&bytes, target, false);
+
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
+        let _ = fs::remove_file(out);
+    }
+}
+
+#[test]
+fn linker_run_resolves_indirect_aliases_and_preserves_visibility() {
+    for private_alias in [false, true] {
+        let visibility = if private_alias { "private" } else { "public" };
+        let obj = scratch(&format!("indirect-alias-{visibility}.o"));
+        let out = scratch(&format!("indirect-alias-{visibility}.out"));
+        let map = scratch(&format!("indirect-alias-{visibility}.map"));
+        fs::write(
+            &obj,
+            synthetic_defined_alias_object(
+                private_alias,
+                false,
+                false,
+                true,
+                SyntheticAliasEncoding::Indirect,
+            ),
+        )
+        .unwrap();
+
+        let opts = LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            map: Some(map.clone()),
+            kind: OutputKind::Executable,
+            ..LinkOptions::default()
+        };
+        Linker::run(&opts).unwrap();
+
+        let bytes = fs::read(&out).unwrap();
+        let records = canonical_symbol_record_map(&bytes);
+        let main = records.get("_main").unwrap();
+        let alias = records.get("_alias").unwrap();
+        let target = records.get("_target").unwrap();
+        assert_eq!(
+            alias.n_type,
+            N_SECT | if private_alias { N_PEXT } else { N_EXT }
+        );
+        assert_eq!(alias.n_sect, target.n_sect);
+        assert_eq!(alias.n_desc, N_ALT_ENTRY);
+        assert_eq!(alias.value, target.value);
+
+        let (_, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+        let start = main.value as usize;
+        let instruction = u32::from_le_bytes(text[start..start + 4].try_into().unwrap());
+        let immediate = ((instruction & 0x03ff_ffff) as i32) << 6 >> 6;
+        assert_eq!(
+            main.value as i64 + (i64::from(immediate) << 2),
+            target.value as i64
+        );
+
+        let (locals, external_defineds, _) = symbol_partition_names(&bytes);
+        assert_eq!(locals.contains(&"_alias".to_string()), private_alias);
+        assert_eq!(
+            external_defineds.contains(&"_alias".to_string()),
+            !private_alias
+        );
+        let map_text = fs::read_to_string(&map).unwrap();
+        let alias_line = map_text
+            .lines()
+            .find(|line| line.ends_with(" _alias"))
+            .unwrap();
+        assert_eq!(alias_line.split_whitespace().nth(1), Some("0x00000000"));
+
+        let _ = fs::remove_file(obj);
+        let _ = fs::remove_file(out);
+        let _ = fs::remove_file(map);
+    }
+}
+
+#[test]
+fn linker_run_marks_section_alias_descriptors() {
+    for (encoding_name, encoding) in [
+        ("explicit", SyntheticAliasEncoding::ExplicitAlternateEntry),
+        ("overlapping", SyntheticAliasEncoding::OverlappingSection),
+    ] {
+        for private_alias in [false, true] {
+            let visibility = if private_alias { "private" } else { "public" };
+            let obj = scratch(&format!("section-alias-{encoding_name}-{visibility}.o"));
+            let out = scratch(&format!("section-alias-{encoding_name}-{visibility}.out"));
+            fs::write(
+                &obj,
+                synthetic_defined_alias_object(private_alias, false, false, true, encoding),
+            )
+            .unwrap();
+
+            let opts = LinkOptions {
+                inputs: vec![obj.clone()],
+                output: Some(out.clone()),
+                kind: OutputKind::Executable,
+                ..LinkOptions::default()
+            };
+            Linker::run(&opts).unwrap();
+
+            let bytes = fs::read(&out).unwrap();
+            let records = canonical_symbol_record_map(&bytes);
+            let alias = records.get("_alias").unwrap();
+            let target = records.get("_target").unwrap();
+            assert_eq!(
+                alias.n_type,
+                N_SECT | if private_alias { N_PEXT } else { N_EXT }
+            );
+            assert_eq!(alias.n_sect, target.n_sect);
+            assert_eq!(alias.n_desc, N_ALT_ENTRY);
+            assert_eq!(alias.value, target.value);
+            assert_eq!(target.n_desc & N_ALT_ENTRY, 0);
+
+            let _ = fs::remove_file(obj);
+            let _ = fs::remove_file(out);
+        }
+    }
+}
+
+#[test]
+fn linker_run_routes_far_absolute_got_loads_through_unrebased_slot() {
+    const ABSOLUTE_VALUE: u64 = 0x1234_5678_9abc_def0;
+
+    let reference = scratch("absolute-got-reference.o");
+    let definition = scratch("absolute-got-definition.o");
+    let out = scratch("absolute-got-reference.out");
+    fs::write(
+        &reference,
+        synthetic_got_reference_object("_main", "_absolute", false),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        synthetic_absolute_object("_absolute", ABSOLUTE_VALUE),
+    )
+    .unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![reference.clone(), definition.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (_, got) = output_section(&bytes, "__DATA_CONST", "__got").unwrap();
+    assert_eq!(got, ABSOLUTE_VALUE.to_le_bytes());
+    assert!(decode_rebase_records(&bytes).unwrap().is_empty());
+
+    let absolute = canonical_symbol_record_map(&bytes)
+        .remove("_absolute")
+        .unwrap();
+    assert_eq!(absolute.n_type, N_ABS | N_EXT);
+    assert_eq!(absolute.n_sect, 0);
+    assert_eq!(absolute.value, ABSOLUTE_VALUE);
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_resolves_external_absolute_symbols_without_atoms() {
+    const ABSOLUTE_VALUE: u64 = 0x1234_5678_9abc_def0;
+
+    let reference = scratch("absolute-reference.o");
+    let definition = scratch("absolute-definition.o");
+    let out = scratch("absolute-reference.out");
+    let map = scratch("absolute-reference.map");
+    fs::write(
+        &reference,
+        synthetic_absolute_reference_object("_main", "_absolute"),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        synthetic_absolute_object("_absolute", ABSOLUTE_VALUE),
+    )
+    .unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![reference.clone(), definition.clone()],
+        output: Some(out.clone()),
+        map: Some(map.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (_, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    assert_eq!(
+        u64::from_le_bytes(text[..8].try_into().unwrap()),
+        ABSOLUTE_VALUE
+    );
+    let absolute = canonical_symbol_record_map(&bytes)
+        .remove("_absolute")
+        .unwrap();
+    assert_eq!(absolute.n_type, N_ABS | N_EXT);
+    assert_eq!(absolute.n_sect, 0);
+    assert_eq!(absolute.value, ABSOLUTE_VALUE);
+
+    let map_text = fs::read_to_string(&map).unwrap();
+    let absolute_line = map_text
+        .lines()
+        .find(|line| line.ends_with(" _absolute"))
+        .unwrap();
+    assert!(absolute_line.starts_with("0x123456789abcdef0 "));
+    assert_eq!(absolute_line.split_whitespace().nth(1), Some("0x00000000"));
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+    let _ = fs::remove_file(map);
+}
+
+#[test]
+fn linker_run_emits_aliases_to_absolute_symbols() {
+    const ABSOLUTE_VALUE: u64 = 0x1234_5678;
+
+    let alias = scratch("absolute-alias.o");
+    let definition = scratch("absolute-alias-definition.o");
+    let out = scratch("absolute-alias.dylib");
+    fs::write(
+        &alias,
+        synthetic_alias_object("_absolute_alias", "_absolute", false),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        synthetic_absolute_object("_absolute", ABSOLUTE_VALUE),
+    )
+    .unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![alias.clone(), definition.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Dylib,
+        dead_strip: true,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let records = canonical_symbol_record_map(&bytes);
+    for name in ["_absolute", "_absolute_alias"] {
+        let record = records.get(name).unwrap();
+        assert_eq!(record.n_type, N_ABS | N_EXT);
+        assert_eq!(record.n_sect, 0);
+        assert_eq!(record.n_desc, 0);
+        assert_eq!(record.value, ABSOLUTE_VALUE);
+    }
+    let exports = canonical_export_records(&bytes);
+    for name in ["_absolute", "_absolute_alias"] {
+        let export = exports.iter().find(|entry| entry.name == name).unwrap();
+        assert!(matches!(
+            export.kind,
+            CanonicalExportKind::Absolute(ABSOLUTE_VALUE)
+        ));
+    }
+
+    let _ = fs::remove_file(alias);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_keeps_public_alias_targets_live_in_dead_stripped_dylibs() {
+    let obj = scratch("indirect-alias-dead-strip.o");
+    let out = scratch("indirect-alias-dead-strip.dylib");
+    fs::write(
+        &obj,
+        synthetic_defined_alias_object(false, false, true, false, SyntheticAliasEncoding::Indirect),
+    )
+    .unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Dylib,
+        dead_strip: true,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let records = canonical_symbol_record_map(&bytes);
+    let alias = records.get("_alias").unwrap();
+    assert_eq!(alias.n_type, N_SECT | N_EXT);
+    assert!(
+        output_section(&bytes, "__TEXT", "__text").is_some_and(|(_, text)| !text.is_empty()),
+        "public alias target was dead stripped"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_binds_import_aliases_through_their_reexported_target() {
+    for private_alias in [false, true] {
+        let visibility = if private_alias { "private" } else { "public" };
+        let use_obj = scratch(&format!("indirect-import-{visibility}-use.o"));
+        let alias_obj = scratch(&format!("indirect-import-{visibility}-alias.o"));
+        let tbd = scratch(&format!("indirect-import-{visibility}.tbd"));
+        let out = scratch(&format!("indirect-import-{visibility}.dylib"));
+        fs::write(
+            &use_obj,
+            synthetic_got_reference_object("_probe", "_alias", false),
+        )
+        .unwrap();
+        fs::write(
+            &alias_obj,
+            synthetic_alias_object("_alias", "_target", private_alias),
+        )
+        .unwrap();
+        fs::write(
+            &tbd,
+            r#"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libtarget.dylib'
+exports:
+  - targets: [ arm64-macos ]
+    weak-symbols: [ _target ]
+...
+"#,
+        )
+        .unwrap();
+
+        let opts = LinkOptions {
+            inputs: vec![use_obj.clone(), alias_obj.clone(), tbd.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Dylib,
+            ..LinkOptions::default()
+        };
+        Linker::run(&opts).unwrap();
+
+        let bytes = fs::read(&out).unwrap();
+        Linker::run(&opts).unwrap();
+        assert_eq!(bytes, fs::read(&out).unwrap());
+        let binds = decode_bind_records(&bytes, false).unwrap();
+        assert!(
+            binds.iter().any(|record| {
+                record.symbol == "_target" && record.ordinal == 1 && record.weak_import
+            }),
+            "expected target bind, got {binds:?}"
+        );
+        assert!(!binds.iter().any(|record| record.symbol == "_alias"));
+
+        let records = canonical_symbol_record_map(&bytes);
+        let (locals, external_defineds, _) = symbol_partition_names(&bytes);
+        let exports = canonical_export_records(&bytes);
+        let alias_export = exports.iter().find(|entry| entry.name == "_alias");
+        if private_alias {
+            assert!(!records.contains_key("_alias"));
+            assert!(!locals.contains(&"_alias".to_string()));
+            assert!(!external_defineds.contains(&"_alias".to_string()));
+            assert!(alias_export.is_none());
+        } else {
+            let alias = records.get("_alias").unwrap();
+            assert_eq!(alias.n_type, N_INDR | N_EXT);
+            assert_eq!(alias.n_desc, 0);
+            let (symtab, _) = symtab_and_dysymtab(&bytes);
+            let strings = StringTable::from_file(&bytes, symtab.stroff, symtab.strsize).unwrap();
+            assert_eq!(strings.get(alias.value as u32).unwrap(), "_target");
+            assert!(external_defineds.contains(&"_alias".to_string()));
+            let alias_export = alias_export.unwrap();
+            assert_eq!(
+                alias_export.kind,
+                CanonicalExportKind::Reexport {
+                    ordinal: 1,
+                    imported_name: "_target".to_string(),
+                }
+            );
+            assert_eq!(
+                alias_export.flags,
+                EXPORT_SYMBOL_FLAGS_REEXPORT | EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION
+            );
+        }
+
+        let _ = fs::remove_file(use_obj);
+        let _ = fs::remove_file(alias_obj);
+        let _ = fs::remove_file(tbd);
+        let _ = fs::remove_file(out);
+    }
+}
+
+#[test]
+fn linker_run_reports_alias_cycles_from_object_inputs() {
+    let first = scratch("indirect-cycle-a.o");
+    let second = scratch("indirect-cycle-b.o");
+    let out = scratch("indirect-cycle.out");
+    let _ = fs::remove_file(&out);
+    fs::write(&first, synthetic_alias_object("_a", "_b", false)).unwrap();
+    fs::write(&second, synthetic_alias_object("_b", "_a", false)).unwrap();
+
+    let error = Linker::run(&LinkOptions {
+        inputs: vec![first.clone(), second.clone()],
+        output: Some(out.clone()),
+        ..LinkOptions::default()
+    })
+    .unwrap_err();
+
+    match error {
+        LinkError::DuplicateSymbols(message) => {
+            assert_eq!(message, "afs-ld: error: alias cycle involving _b\n");
+        }
+        other => panic!("expected DuplicateSymbols, got {other:?}"),
+    }
+    assert!(!out.exists());
+
+    let _ = fs::remove_file(first);
+    let _ = fs::remove_file(second);
+}
+
+#[test]
+fn linker_run_reports_alias_definition_provenance_in_input_order() {
+    let alias = scratch("indirect-duplicate-alias.o");
+    let definition = scratch("indirect-duplicate-definition.o");
+    fs::write(&alias, synthetic_alias_object("_dup", "_target", false)).unwrap();
+    fs::write(
+        &definition,
+        synthetic_got_reference_object("_dup", "_unused", false),
+    )
+    .unwrap();
+
+    for alias_first in [false, true] {
+        let out = scratch(&format!("indirect-duplicate-{alias_first}.out"));
+        let _ = fs::remove_file(&out);
+        let (first, second) = if alias_first {
+            (&alias, &definition)
+        } else {
+            (&definition, &alias)
+        };
+        let error = Linker::run(&LinkOptions {
+            inputs: vec![first.clone(), second.clone()],
+            output: Some(out.clone()),
+            ..LinkOptions::default()
+        })
+        .unwrap_err();
+
+        match error {
+            LinkError::DuplicateSymbols(message) => assert_eq!(
+                message,
+                format!(
+                    "afs-ld: error: duplicate symbol _dup\n  defined in {}\n  also in {}\n",
+                    first.display(),
+                    second.display()
+                )
+            ),
+            other => panic!("expected DuplicateSymbols, got {other:?}"),
+        }
+        assert!(!out.exists());
+    }
+
+    let _ = fs::remove_file(alias);
+    let _ = fs::remove_file(definition);
 }
 
 #[test]
@@ -7410,7 +8493,6 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
             &sdk_ver,
             "-syslibroot",
             &sdk,
-            "-lSystem",
             "-e",
             "_main",
             "-no_fixup_chains",
@@ -7419,6 +8501,7 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
         .arg(&apple_out)
         .arg(&obj)
         .arg(&runtime)
+        .arg("-lSystem")
         .output()
         .unwrap();
     assert!(
@@ -7589,7 +8672,6 @@ fn linker_run_rebases_runtime_init_metadata_like_apple_ld() {
             &sdk_ver,
             "-syslibroot",
             &sdk,
-            "-lSystem",
             "-e",
             "_main",
             "-no_fixup_chains",
@@ -7598,6 +8680,7 @@ fn linker_run_rebases_runtime_init_metadata_like_apple_ld() {
         .arg(&apple_out)
         .arg(&obj)
         .arg(&runtime)
+        .arg("-lSystem")
         .output()
         .unwrap();
     assert!(

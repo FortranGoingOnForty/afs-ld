@@ -7,7 +7,9 @@
 use std::path::PathBuf;
 
 use crate::resolve::{levenshtein, UndefinedTreatment};
-use crate::{FrameworkSpec, IcfMode, LinkOptions, OutputKind, PlatformVersion, ThunkMode};
+use crate::{
+    FrameworkSpec, IcfMode, InputSpec, LinkOptions, OutputKind, PlatformVersion, ThunkMode,
+};
 
 const KNOWN_FLAGS: &[&str] = &[
     "-o",
@@ -77,6 +79,12 @@ pub enum ArgsError {
         flag: String,
         suggestion: Option<String>,
     },
+}
+
+#[derive(Debug)]
+pub struct ParsedArgs {
+    pub options: LinkOptions,
+    pub input_specs: Vec<InputSpec>,
 }
 
 impl std::fmt::Display for ArgsError {
@@ -160,9 +168,26 @@ fn parse_jobs(value: &str) -> Result<usize, ArgsError> {
     Ok(jobs)
 }
 
+#[deprecated(
+    since = "0.1.0",
+    note = "grouped LinkOptions cannot preserve mixed input order; use parse_ordered"
+)]
 pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
+    parse_ordered(argv).map(|parsed| parsed.options)
+}
+
+pub fn parse_ordered(argv: &[String]) -> Result<ParsedArgs, ArgsError> {
+    parse_ordered_with_force_loads(argv).map(|(parsed, _)| parsed)
+}
+
+#[doc(hidden)]
+pub fn parse_ordered_with_force_loads(
+    argv: &[String],
+) -> Result<(ParsedArgs, Vec<usize>), ArgsError> {
     let normalized = normalize_wl(argv);
     let mut opts = LinkOptions::default();
+    let mut input_specs = Vec::new();
+    let mut force_load_positions = Vec::new();
     let mut it = normalized.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -187,14 +212,17 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                 );
             }
             "-l" => {
-                opts.library_names.push(
-                    it.next()
-                        .ok_or_else(|| ArgsError::MissingValue("-l".into()))?
-                        .clone(),
-                );
+                let name = it
+                    .next()
+                    .ok_or_else(|| ArgsError::MissingValue("-l".into()))?
+                    .clone();
+                opts.library_names.push(name.clone());
+                input_specs.push(InputSpec::Library(name));
             }
             s if s.starts_with("-l") && s.len() > 2 => {
-                opts.library_names.push(s[2..].to_string());
+                let name = s[2..].to_string();
+                opts.library_names.push(name.clone());
+                input_specs.push(InputSpec::Library(name));
             }
             "-L" => {
                 opts.search_paths.push(PathBuf::from(
@@ -203,22 +231,26 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                 ));
             }
             "-framework" => {
-                opts.frameworks.push(FrameworkSpec {
+                let framework = FrameworkSpec {
                     name: it
                         .next()
                         .ok_or_else(|| ArgsError::MissingValue("-framework".into()))?
                         .clone(),
                     weak: false,
-                });
+                };
+                opts.frameworks.push(framework.clone());
+                input_specs.push(InputSpec::Framework(framework));
             }
             "-weak_framework" => {
-                opts.frameworks.push(FrameworkSpec {
+                let framework = FrameworkSpec {
                     name: it
                         .next()
                         .ok_or_else(|| ArgsError::MissingValue("-weak_framework".into()))?
                         .clone(),
                     weak: true,
-                });
+                };
+                opts.frameworks.push(framework.clone());
+                input_specs.push(InputSpec::Framework(framework));
             }
             "-ObjC" => {
                 opts.objc_force_load = true;
@@ -409,10 +441,13 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                 opts.all_load = true;
             }
             "-force_load" => {
-                opts.force_load_archives
-                    .push(PathBuf::from(it.next().ok_or_else(|| {
-                        ArgsError::MissingValue("-force_load".into())
-                    })?));
+                let path = PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| ArgsError::MissingValue("-force_load".into()))?,
+                );
+                opts.force_load_archives.push(path.clone());
+                force_load_positions.push(input_specs.len());
+                input_specs.push(InputSpec::Path(path));
             }
             "-j" => {
                 let value = it
@@ -448,11 +483,19 @@ pub fn parse(argv: &[String]) -> Result<LinkOptions, ArgsError> {
                 return Err(unknown_flag(s));
             }
             _ => {
-                opts.inputs.push(PathBuf::from(arg));
+                let path = PathBuf::from(arg);
+                opts.inputs.push(path.clone());
+                input_specs.push(InputSpec::Path(path));
             }
         }
     }
-    Ok(opts)
+    Ok((
+        ParsedArgs {
+            options: opts,
+            input_specs,
+        },
+        force_load_positions,
+    ))
 }
 
 fn normalize_wl(argv: &[String]) -> Vec<String> {
@@ -472,6 +515,7 @@ fn normalize_wl(argv: &[String]) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -484,7 +528,10 @@ mod tests {
         let opts = parse(&argv(&["-o", "out", "-e", "_start", "a.o", "b.o"])).unwrap();
         assert_eq!(opts.output.as_deref(), Some(std::path::Path::new("out")));
         assert_eq!(opts.entry.as_deref(), Some("_start"));
-        assert_eq!(opts.inputs.len(), 2);
+        assert_eq!(
+            opts.inputs,
+            vec![PathBuf::from("a.o"), PathBuf::from("b.o")]
+        );
     }
 
     #[test]
@@ -610,10 +657,46 @@ mod tests {
                 FrameworkSpec {
                     name: "Metal".into(),
                     weak: true,
-                }
+                },
             ]
         );
         assert_eq!(opts.inputs, vec![PathBuf::from("main.o")]);
+    }
+
+    #[test]
+    fn mixed_inputs_share_one_command_line_order() {
+        let parsed = parse_ordered(&argv(&[
+            "main.o",
+            "-lA",
+            "libB.a",
+            "-weak_framework",
+            "Metal",
+            "tail.o",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.input_specs,
+            vec![
+                InputSpec::Path(PathBuf::from("main.o")),
+                InputSpec::Library("A".into()),
+                InputSpec::Path(PathBuf::from("libB.a")),
+                InputSpec::Framework(FrameworkSpec {
+                    name: "Metal".into(),
+                    weak: true,
+                }),
+                InputSpec::Path(PathBuf::from("tail.o")),
+            ]
+        );
+        assert_eq!(
+            parsed.options.inputs,
+            vec![
+                PathBuf::from("main.o"),
+                PathBuf::from("libB.a"),
+                PathBuf::from("tail.o")
+            ]
+        );
+        assert_eq!(parsed.options.library_names, vec!["A"]);
+        assert_eq!(parsed.options.frameworks[0].name, "Metal");
     }
 
     #[test]
@@ -811,6 +894,26 @@ mod tests {
     }
 
     #[test]
+    fn force_load_stays_at_its_command_line_position() {
+        let (parsed, force_load_positions) = parse_ordered_with_force_loads(&argv(&[
+            "main.o",
+            "-force_load",
+            "libforced.a",
+            "liblater.a",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.input_specs,
+            vec![
+                InputSpec::Path(PathBuf::from("main.o")),
+                InputSpec::Path(PathBuf::from("libforced.a")),
+                InputSpec::Path(PathBuf::from("liblater.a")),
+            ]
+        );
+        assert_eq!(force_load_positions, vec![1]);
+    }
+
+    #[test]
     fn jobs_flag_records_positive_worker_limit() {
         let opts = parse(&argv(&["-j", "1", "main.o"])).unwrap();
         assert_eq!(opts.jobs, Some(1));
@@ -891,6 +994,8 @@ mod tests {
     fn empty_argv_is_ok_with_no_inputs() {
         let opts = parse(&[]).unwrap();
         assert!(opts.inputs.is_empty());
+        assert!(opts.library_names.is_empty());
+        assert!(opts.frameworks.is_empty());
     }
 
     #[test]

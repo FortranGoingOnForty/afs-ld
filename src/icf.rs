@@ -110,7 +110,7 @@ pub fn fold_safe(
     });
     let mut redirects = HashMap::new();
 
-    let order_by_input: HashMap<InputId, (usize, Option<u32>)> = layout_inputs
+    let order_by_input: HashMap<InputId, (usize, Option<u64>)> = layout_inputs
         .iter()
         .map(|input| (input.id, (input.load_order, input.archive_member_offset)))
         .collect();
@@ -216,15 +216,16 @@ struct FoldReloc {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum FoldReferent {
     Atom(AtomId),
+    Absolute(u64),
     Symbol(SymbolId),
     Section(u8),
 }
 
 fn fold_order_key(
     atom: &Atom,
-    order_by_input: &HashMap<InputId, (usize, Option<u32>)>,
+    order_by_input: &HashMap<InputId, (usize, Option<u64>)>,
     atom_id: AtomId,
-) -> (usize, u32, u32, u32) {
+) -> (usize, u64, u32, u32) {
     let (load_order, archive_member_offset) = order_by_input
         .get(&atom.origin)
         .copied()
@@ -298,9 +299,13 @@ fn rebind_symbols_to_canonical_winners(
 fn resolved_symbol_map(sym_table: &SymbolTable) -> HashMap<String, SymbolId> {
     let mut out = HashMap::new();
     for (symbol_id, symbol) in sym_table.iter() {
+        let resolved_id = sym_table
+            .resolve_chain(symbol.name())
+            .map(|(resolved_id, _)| resolved_id)
+            .unwrap_or(symbol_id);
         out.insert(
             sym_table.interner.resolve(symbol.name()).to_string(),
-            symbol_id,
+            resolved_id,
         );
     }
     out
@@ -443,6 +448,7 @@ fn normalize_referent(
                 Symbol::Defined { atom, .. } if atom.0 != 0 => {
                     Some(FoldReferent::Atom(canonical_atom(*atom, redirects)))
                 }
+                Symbol::Absolute { value, .. } => Some(FoldReferent::Absolute(*value)),
                 _ => Some(FoldReferent::Symbol(symbol_id)),
             }
         }

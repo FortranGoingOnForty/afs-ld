@@ -501,6 +501,7 @@ fn resolve_reference_address(
                     };
                     Ok(base_addr + *value)
                 }
+                Symbol::Absolute { value, .. } => Ok(*value),
                 Symbol::DylibImport { .. } if allow_import_got => {
                     personality_got_addr(layout, synthetic_plan, symbol_id, atom_id, obj, label)
                 }

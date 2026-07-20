@@ -483,7 +483,7 @@ fn build_input_symbol_index(
                     .object
                     .symbol_name(input_sym)
                     .ok()
-                    .and_then(|name| sym_table.lookup_str(name));
+                    .and_then(|name| sym_table.lookup_resolved_str(name));
             }
         }
         index.insert(input.id, symbols);
@@ -583,7 +583,7 @@ fn got_page_symbol_needs_slot(
     symbol_id: SymbolId,
 ) -> bool {
     match sym_table.get(symbol_id) {
-        Symbol::DylibImport { .. } => true,
+        Symbol::DylibImport { .. } | Symbol::Absolute { .. } => true,
         Symbol::Defined {
             atom,
             private_extern,

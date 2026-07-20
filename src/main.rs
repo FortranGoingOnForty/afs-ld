@@ -68,13 +68,14 @@ fn main() -> ExitCode {
         return code;
     }
 
-    let opts = match args::parse(&argv[1..]) {
-        Ok(opts) => opts,
+    let (parsed, force_load_positions) = match args::parse_ordered_with_force_loads(&argv[1..]) {
+        Ok(parsed) => parsed,
         Err(e) => {
             diag::error(&e.to_string());
             return ExitCode::from(2);
         }
     };
+    let opts = parsed.options;
 
     if opts.show_help {
         print!("{}", usage());
@@ -126,7 +127,7 @@ fn main() -> ExitCode {
         };
     }
 
-    match Linker::run(&opts) {
+    match Linker::run_ordered_with_force_loads(&opts, &parsed.input_specs, &force_load_positions) {
         Ok(()) => ExitCode::SUCCESS,
         Err(LinkError::NoInputs) => {
             diag::error("no input files");
@@ -490,6 +491,7 @@ fn link_static(
         if bytes.starts_with(archive::AR_MAGIC) || bytes.starts_with(archive::AR_MAGIC_THIN) {
             inputs.push(elf::LinkInput::Archive(elf::Library {
                 name: p.display().to_string(),
+                path: p,
                 bytes,
             }));
         } else {
@@ -564,6 +566,7 @@ fn push_dynamic_path(
     if bytes.starts_with(archive::AR_MAGIC) || bytes.starts_with(archive::AR_MAGIC_THIN) {
         inputs.push(elf::DynamicLinkInput::Archive(elf::Library {
             name: p.display().to_string(),
+            path: p.to_path_buf(),
             bytes,
         }));
         return Ok(());

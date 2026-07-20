@@ -45,13 +45,14 @@ pub fn dump_archive_file(path: &Path) -> io::Result<()> {
             SpecialMember::None => "obj",
             SpecialMember::BsdSymIndex => "bsd-symindex",
             SpecialMember::SysvSymIndex => "sysv-symindex",
+            SpecialMember::SysvSymIndex64 => "sysv-symindex64",
             SpecialMember::SysvLongNames => "sysv-longnames",
         };
         writeln!(
             h,
             "  [{i}] @0x{:x} {kind:<16} {} ({} bytes)",
             m.header_offset,
-            m.name,
+            m.name.display(),
             m.body.len()
         )?;
     }

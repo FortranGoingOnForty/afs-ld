@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
-use crate::archive::{Archive, ArchiveError};
+use crate::archive::{Archive, ArchiveError, ArchiveMetadata, MemberLoadError};
 use crate::input::ObjectFile;
 use crate::macho::dylib::DylibFile;
 use crate::macho::reader::ReadError;
@@ -118,10 +118,15 @@ opaque_id!(
     /// in a per-linker instance): one slot per `.a` on the link line.
     ArchiveId
 );
-opaque_id!(
-    /// Per-archive handle identifying a member by its `ar_hdr` offset.
-    MemberId
-);
+/// Per-archive handle identifying a member by its 64-bit `ar_hdr` offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MemberId(pub u64);
+
+impl MemberId {
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
 opaque_id!(
     /// Index into `SymbolTable::symbols`. Stable across the whole link.
     SymbolId
@@ -140,7 +145,7 @@ opaque_id!(
 pub struct ObjectInput {
     pub path: PathBuf,
     pub load_order: usize,
-    pub archive_member_offset: Option<u32>,
+    pub archive_member_offset: Option<u64>,
     /// Raw bytes retained for diagnostics and future low-level readers.
     pub bytes: Vec<u8>,
     /// Parsed object view. It owns section/relocation/string-table buffers,
@@ -152,12 +157,20 @@ pub struct ObjectInput {
 pub struct ArchiveInput {
     pub path: PathBuf,
     pub load_order: usize,
-    pub bytes: Vec<u8>,
+    /// Immutable after metadata parsing so cached body ranges stay valid.
+    bytes: Vec<u8>,
+    metadata: ArchiveMetadata,
     /// Members we've already fetched (keyed by `ar_hdr` offset). Prevents
     /// the fixed-point loop from re-ingesting the same object twice —
     /// important both for correctness (no duplicate-strong errors from
     /// our own symbols) and for keeping transitions deterministic.
-    pub fetched: HashSet<u32>,
+    pub fetched: HashSet<u64>,
+}
+
+impl ArchiveInput {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 #[derive(Debug)]
@@ -180,6 +193,50 @@ pub struct DylibInput {
     /// bind opcodes. Matches the output's `LC_LOAD_DYLIB` ordering, so several
     /// parsed TBD documents from one umbrella input may legitimately share it.
     pub ordinal: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrderedInput {
+    Object(InputId),
+    Archive(ArchiveId),
+    ForceLoadArchive(ArchiveId),
+    Dylib(DylibId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OrderedInputEntry {
+    pub(crate) load_order: usize,
+    pub(crate) input: OrderedInput,
+}
+
+impl OrderedInputEntry {
+    pub(crate) fn object(load_order: usize, id: InputId) -> Self {
+        Self {
+            load_order,
+            input: OrderedInput::Object(id),
+        }
+    }
+
+    pub(crate) fn archive(load_order: usize, id: ArchiveId) -> Self {
+        Self {
+            load_order,
+            input: OrderedInput::Archive(id),
+        }
+    }
+
+    pub(crate) fn force_load_archive(load_order: usize, id: ArchiveId) -> Self {
+        Self {
+            load_order,
+            input: OrderedInput::ForceLoadArchive(id),
+        }
+    }
+
+    pub(crate) fn dylib(load_order: usize, id: DylibId) -> Self {
+        Self {
+            load_order,
+            input: OrderedInput::Dylib(id),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -270,8 +327,26 @@ impl Inputs {
         bytes: Vec<u8>,
         load_order: usize,
     ) -> Result<ArchiveId, InputAddError> {
-        Archive::open(&path, &bytes)?; // validate
-        Ok(self.add_validated_archive(path, bytes, load_order))
+        let metadata = ArchiveMetadata::parse(&path, &bytes)?;
+        Ok(self.add_parsed_archive(path, bytes, metadata, load_order))
+    }
+
+    pub(crate) fn add_parsed_archive(
+        &mut self,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        metadata: ArchiveMetadata,
+        load_order: usize,
+    ) -> ArchiveId {
+        let id = ArchiveId(self.archives.len() as u32);
+        self.archives.push(ArchiveInput {
+            path,
+            load_order,
+            bytes,
+            metadata,
+            fetched: std::collections::HashSet::new(),
+        });
+        id
     }
 
     pub fn add_validated_archive(
@@ -280,14 +355,13 @@ impl Inputs {
         bytes: Vec<u8>,
         load_order: usize,
     ) -> ArchiveId {
-        let id = ArchiveId(self.archives.len() as u32);
-        self.archives.push(ArchiveInput {
-            path,
-            load_order,
-            bytes,
-            fetched: std::collections::HashSet::new(),
+        let metadata = ArchiveMetadata::parse(&path, &bytes).unwrap_or_else(|error| {
+            panic!(
+                "validated archive {} failed metadata parsing: {error}",
+                path.display()
+            )
         });
-        id
+        self.add_parsed_archive(path, bytes, metadata, load_order)
     }
 
     /// Register a `.dylib`. TBD-backed dylibs go through
@@ -372,11 +446,11 @@ impl Inputs {
         Ok(&o.parsed)
     }
 
-    /// Open an `Archive` view, borrowing from the registry's bytes for the
-    /// returned lifetime.
+    /// Construct a standalone archive view for callers that need the public
+    /// archive reader. Link resolution uses the retained metadata instead.
     pub fn archive_view(&self, id: ArchiveId) -> Result<Archive<'_>, ArchiveError> {
-        let a = &self.archives[id.0 as usize];
-        Archive::open(&a.path, &a.bytes)
+        let archive = &self.archives[id.0 as usize];
+        Archive::open(&archive.path, &archive.bytes)
     }
 }
 
@@ -386,6 +460,7 @@ impl Inputs {
 // Every state a name can be in during resolution:
 //   * Undefined — referenced but not yet satisfied
 //   * Defined — an object file provides a concrete body at `atom + value`
+//   * Absolute — an object file provides a fixed value without storage
 //   * Common — tentative definition (`N_UNDF + N_EXT + n_value>0`); picks
 //     a winner by size/alignment, then morphs into Defined during atomization
 //   * DylibImport — resolved from a dylib's export trie / TBD
@@ -411,11 +486,21 @@ pub enum Symbol {
         private_extern: bool,
         no_dead_strip: bool,
     },
+    Absolute {
+        name: Istr,
+        origin: InputId,
+        value: u64,
+        weak: bool,
+        private_extern: bool,
+        no_dead_strip: bool,
+    },
     Common {
         name: Istr,
         origin: InputId,
         size: u64,
         align_pow2: u8,
+        private_extern: bool,
+        no_dead_strip: bool,
     },
     DylibImport {
         name: Istr,
@@ -435,6 +520,8 @@ pub enum Symbol {
     Alias {
         name: Istr,
         aliased: Istr,
+        origin: InputId,
+        private_extern: bool,
     },
 }
 
@@ -443,6 +530,7 @@ impl Symbol {
         match self {
             Symbol::Undefined { name, .. }
             | Symbol::Defined { name, .. }
+            | Symbol::Absolute { name, .. }
             | Symbol::Common { name, .. }
             | Symbol::DylibImport { name, .. }
             | Symbol::LazyArchive { name, .. }
@@ -454,7 +542,7 @@ impl Symbol {
     pub fn kind(&self) -> SymbolKindTag {
         match self {
             Symbol::Undefined { .. } => SymbolKindTag::Undefined,
-            Symbol::Defined { .. } => SymbolKindTag::Defined,
+            Symbol::Defined { .. } | Symbol::Absolute { .. } => SymbolKindTag::Defined,
             Symbol::Common { .. } => SymbolKindTag::Common,
             Symbol::DylibImport { .. } => SymbolKindTag::DylibImport,
             Symbol::LazyArchive { .. } => SymbolKindTag::LazyArchive,
@@ -463,14 +551,24 @@ impl Symbol {
         }
     }
 
-    /// True for `Defined` without the weak flag — ld's "strong" category,
-    /// the only one where duplicates are an error.
+    /// True for a concrete definition without the weak flag — ld's "strong"
+    /// category, the only one where duplicates are an error.
     pub fn is_strong_defined(&self) -> bool {
-        matches!(self, Symbol::Defined { weak: false, .. })
+        matches!(
+            self,
+            Symbol::Defined { weak: false, .. } | Symbol::Absolute { weak: false, .. }
+        )
     }
 
     pub fn is_weak_defined(&self) -> bool {
-        matches!(self, Symbol::Defined { weak: true, .. })
+        matches!(
+            self,
+            Symbol::Defined { weak: true, .. } | Symbol::Absolute { weak: true, .. }
+        )
+    }
+
+    pub fn is_strong_definition(&self) -> bool {
+        self.is_strong_defined() || matches!(self, Symbol::Alias { .. })
     }
 }
 
@@ -500,10 +598,11 @@ pub enum InsertOutcome {
         from: SymbolKindTag,
         to: SymbolKindTag,
     },
-    /// Existing entry wins; the new one was dropped on the floor.
+    /// Existing entry keeps its identity. Duplicate Undefined entries may
+    /// conservatively merge reference attributes into that slot.
     Kept(SymbolId),
-    /// Two Common symbols with the same name were coalesced: size grew to
-    /// the max and alignment grew to the stricter of the two.
+    /// Two Common symbols with the same name were coalesced by selecting the
+    /// larger tentative definition and the later declaration on a tie.
     CommonCoalesced { id: SymbolId },
     /// Inserting an Undefined whose slot currently holds a LazyArchive.
     /// The caller (Sprint 8 resolver) must fetch the named archive member
@@ -583,6 +682,11 @@ impl SymbolTable {
         self.interner.get(name).and_then(|name| self.lookup(name))
     }
 
+    pub fn lookup_resolved_str(&self, name: &str) -> Option<SymbolId> {
+        let name = self.interner.get(name)?;
+        self.resolve_chain(name).ok().map(|(id, _)| id)
+    }
+
     pub fn get(&self, id: SymbolId) -> &Symbol {
         &self.symbols[id.0 as usize]
     }
@@ -622,6 +726,30 @@ impl SymbolTable {
         }
     }
 
+    /// Replace a resolved tentative definition with its allocated atom.
+    pub(crate) fn materialize_common(&mut self, id: SymbolId, atom: AtomId) {
+        let slot = &mut self.symbols[id.0 as usize];
+        let (name, origin, private_extern, no_dead_strip) = match slot {
+            Symbol::Common {
+                name,
+                origin,
+                private_extern,
+                no_dead_strip,
+                ..
+            } => (*name, *origin, *private_extern, *no_dead_strip),
+            _ => unreachable!("materialize_common requires a Common symbol"),
+        };
+        *slot = Symbol::Defined {
+            name,
+            origin,
+            atom,
+            value: 0,
+            weak: false,
+            private_extern,
+            no_dead_strip,
+        };
+    }
+
     /// Insert a symbol, running the resolution matrix. See Sprint 7's
     /// `.docs/sprints/sprint07.md` for the full matrix.
     pub fn insert(&mut self, sym: Symbol) -> Result<InsertOutcome, InsertError> {
@@ -629,6 +757,11 @@ impl SymbolTable {
 
         // Vacant slot: just store it.
         let Some(&existing_id) = self.by_name.get(&name) else {
+            if let Symbol::Alias { aliased, .. } = &sym {
+                if self.alias_would_cycle(name, *aliased) {
+                    return Err(InsertError::AliasCycle { name });
+                }
+            }
             let id = self.push_new(sym.clone());
             self.transitions.push(Transition {
                 id,
@@ -642,19 +775,40 @@ impl SymbolTable {
         let existing_kind = self.symbols[existing_id.0 as usize].kind();
         let new_kind = sym.kind();
 
-        // Alias insertions have their own rules (cycle detection).
+        // An alias is a strong, non-coalescing definition. It replaces weak
+        // definitions and unresolved states, but collides with another strong
+        // definition regardless of input order.
         if new_kind == SymbolKindTag::Alias {
-            return self.insert_alias_over(existing_id, sym);
+            let existing = &self.symbols[existing_id.0 as usize];
+            if existing.is_strong_definition() {
+                return Err(InsertError::DuplicateStrong {
+                    name,
+                    first: existing_id,
+                    second: Box::new(sym),
+                });
+            }
+            let Symbol::Alias { aliased, .. } = &sym else {
+                unreachable!();
+            };
+            if self.alias_would_cycle(name, *aliased) {
+                return Err(InsertError::AliasCycle { name });
+            }
+            return Ok(self.apply_action(
+                existing_id,
+                sym,
+                existing_kind,
+                new_kind,
+                Action::Replace,
+            ));
         }
 
         // Resolve the existing × new pair via the matrix.
         use SymbolKindTag::*;
         let action = match (existing_kind, new_kind) {
             // --- existing Undefined ---
-            (Undefined, Undefined) => Action::Keep,
-            (Undefined, Defined | Common | DylibImport | LazyArchive | LazyObject) => {
-                Action::Replace
-            }
+            (Undefined, Undefined) => Action::CoalesceUndefined,
+            (Undefined, Defined | Common | DylibImport | LazyObject) => Action::Replace,
+            (Undefined, LazyArchive) => Action::ReplaceAndPendingArchiveFetch,
 
             // --- existing Defined (strong vs weak resolved inline) ---
             (Defined, Undefined)
@@ -694,8 +848,16 @@ impl SymbolTable {
             | (LazyObject, LazyArchive) => Action::Replace,
             (LazyObject, LazyObject) => Action::Keep,
 
-            // --- existing Alias: a direct form replaces it ---
-            (Alias, _) => Action::Replace,
+            // --- existing Alias: keep against unresolved/weak forms and
+            // reject another strong definition ---
+            (Alias, Defined) if sym.is_strong_defined() => {
+                return Err(InsertError::DuplicateStrong {
+                    name,
+                    first: existing_id,
+                    second: Box::new(sym),
+                });
+            }
+            (Alias, _) => Action::Keep,
 
             // Shouldn't hit — Alias insertions diverged above.
             (_, Alias) => unreachable!(),
@@ -732,6 +894,12 @@ impl SymbolTable {
     ) -> InsertOutcome {
         match action {
             Action::Keep => InsertOutcome::Kept(id),
+            Action::CoalesceUndefined => {
+                self.coalesce_undefined(id, sym);
+                // The slot's identity and origin remain unchanged; only the
+                // aggregate weak-reference attribute may become stricter.
+                InsertOutcome::Kept(id)
+            }
             Action::Replace => {
                 self.symbols[id.0 as usize] = sym;
                 self.transitions.push(Transition {
@@ -741,6 +909,26 @@ impl SymbolTable {
                     cause: TransitionCause::Replaced,
                 });
                 InsertOutcome::Replaced { id, from, to }
+            }
+            Action::ReplaceAndPendingArchiveFetch => {
+                let (archive, member) = match &sym {
+                    Symbol::LazyArchive {
+                        archive, member, ..
+                    } => (*archive, *member),
+                    _ => unreachable!("archive fetch replacement requires LazyArchive"),
+                };
+                self.symbols[id.0 as usize] = sym;
+                self.transitions.push(Transition {
+                    id,
+                    from,
+                    to,
+                    cause: TransitionCause::Replaced,
+                });
+                InsertOutcome::PendingArchiveFetch {
+                    id,
+                    archive,
+                    member,
+                }
             }
             Action::CoalesceCommon => {
                 self.coalesce_common(id, sym);
@@ -774,29 +962,42 @@ impl SymbolTable {
         }
     }
 
+    fn coalesce_undefined(&mut self, id: SymbolId, incoming: Symbol) {
+        let slot = &mut self.symbols[id.0 as usize];
+        let Symbol::Undefined {
+            weak_ref: existing_weak_ref,
+            ..
+        } = slot
+        else {
+            unreachable!("coalesce_undefined requires an Undefined slot");
+        };
+        let Symbol::Undefined {
+            weak_ref: incoming_weak_ref,
+            ..
+        } = incoming
+        else {
+            unreachable!("coalesce_undefined requires an Undefined input");
+        };
+        *existing_weak_ref &= incoming_weak_ref;
+    }
+
     fn coalesce_common(&mut self, id: SymbolId, incoming: Symbol) {
         let slot = &mut self.symbols[id.0 as usize];
-        let (
-            Symbol::Common {
-                size: a_size,
-                align_pow2: a_align,
-                ..
-            },
-            Symbol::Common {
-                size: b_size,
-                align_pow2: b_align,
-                ..
-            },
-        ) = (slot.clone(), incoming)
-        else {
-            unreachable!("coalesce_common requires two Common entries");
+        let replace = match (&*slot, &incoming) {
+            (
+                Symbol::Common {
+                    size: existing_size,
+                    ..
+                },
+                Symbol::Common {
+                    size: incoming_size,
+                    ..
+                },
+            ) => incoming_size >= existing_size,
+            _ => unreachable!("coalesce_common requires two Common entries"),
         };
-        if let Symbol::Common {
-            size, align_pow2, ..
-        } = slot
-        {
-            *size = a_size.max(b_size);
-            *align_pow2 = a_align.max(b_align);
+        if replace {
+            *slot = incoming;
         }
     }
 
@@ -806,32 +1007,6 @@ impl SymbolTable {
         self.symbols.push(sym);
         self.by_name.insert(name, id);
         id
-    }
-
-    fn insert_alias_over(
-        &mut self,
-        existing_id: SymbolId,
-        sym: Symbol,
-    ) -> Result<InsertOutcome, InsertError> {
-        let Symbol::Alias { name, aliased } = &sym else {
-            unreachable!("insert_alias_over called with non-Alias symbol");
-        };
-        if self.alias_would_cycle(*name, *aliased) {
-            return Err(InsertError::AliasCycle { name: *name });
-        }
-        let from = self.symbols[existing_id.0 as usize].kind();
-        self.symbols[existing_id.0 as usize] = sym;
-        self.transitions.push(Transition {
-            id: existing_id,
-            from,
-            to: SymbolKindTag::Alias,
-            cause: TransitionCause::Replaced,
-        });
-        Ok(InsertOutcome::Replaced {
-            id: existing_id,
-            from,
-            to: SymbolKindTag::Alias,
-        })
     }
 
     /// Walk alias chains to a concrete (non-Alias) symbol. Used by Sprint 8
@@ -883,7 +1058,9 @@ impl SymbolTable {
 /// performing the operation.
 enum Action {
     Keep,
+    CoalesceUndefined,
     Replace,
+    ReplaceAndPendingArchiveFetch,
     CoalesceCommon,
     PendingArchiveFetch,
     PendingObjectLoad,
@@ -1010,25 +1187,70 @@ pub fn seed_archives(
     table: &mut SymbolTable,
     report: &mut SeedReport,
 ) -> Result<(), SeedError> {
-    for (ai_idx, ai) in inputs.archives.iter().enumerate() {
-        let archive = Archive::open(&ai.path, &ai.bytes)?;
-        let archive_id = ArchiveId(ai_idx as u32);
-        let Some(idx) = archive.symbol_index() else {
-            // Archives without a symbol index are legal (clang produces
-            // them occasionally). They require -all_load to pull anything.
+    for ai_idx in 0..inputs.archives.len() {
+        seed_archive(inputs, ArchiveId(ai_idx as u32), table, report)?;
+    }
+    Ok(())
+}
+
+/// Seed the lazy definitions contributed by one archive at its position in
+/// the top-level input stream.
+fn seed_archive(
+    inputs: &Inputs,
+    archive_id: ArchiveId,
+    table: &mut SymbolTable,
+    report: &mut SeedReport,
+) -> Result<(), SeedError> {
+    let ai = inputs.archive(archive_id);
+    let Some(idx) = ai.metadata.symbol_index() else {
+        // Archives without a symbol index are legal. They require -all_load
+        // or -force_load to pull members.
+        return Ok(());
+    };
+    for entry in &idx.entries {
+        let name = table.intern(&entry.name);
+        let sym = Symbol::LazyArchive {
+            name,
+            archive: archive_id,
+            member: MemberId(entry.member_header_offset),
+        };
+        match table.insert(sym) {
+            Ok(outcome) => report.record_outcome(outcome),
+            Err(e) => report.record_error(e),
+        }
+    }
+    Ok(())
+}
+
+fn seed_archive_for_unresolved(
+    inputs: &Inputs,
+    archive_id: ArchiveId,
+    table: &mut SymbolTable,
+    report: &mut SeedReport,
+) -> Result<(), SeedError> {
+    let ai = inputs.archive(archive_id);
+    let Some(index) = ai.metadata.symbol_index() else {
+        return Ok(());
+    };
+
+    for entry in &index.entries {
+        let Some(name) = table.interner.get(&entry.name) else {
             continue;
         };
-        for entry in &idx.entries {
-            let name = table.intern(&entry.name);
-            let sym = Symbol::LazyArchive {
-                name,
-                archive: archive_id,
-                member: MemberId(entry.member_header_offset),
-            };
-            match table.insert(sym) {
-                Ok(outcome) => report.record_outcome(outcome),
-                Err(e) => report.record_error(e),
-            }
+        let Some(id) = table.lookup(name) else {
+            continue;
+        };
+        if !matches!(table.get(id), Symbol::Undefined { .. }) {
+            continue;
+        }
+        let symbol = Symbol::LazyArchive {
+            name,
+            archive: archive_id,
+            member: MemberId(entry.member_header_offset),
+        };
+        match table.insert(symbol) {
+            Ok(outcome) => report.record_outcome(outcome),
+            Err(error) => report.record_error(error),
         }
     }
     Ok(())
@@ -1057,11 +1279,40 @@ pub fn seed_object(
         };
         let name = table.intern(name_str);
         report.referrers.add(name, input_id);
-        let Some(sym) = symbolize_input(name, input_sym, input_id) else {
-            continue;
+        let alias_target = if input_sym.kind() == crate::symbol::SymKind::Indirect {
+            let target_name = obj
+                .indirect_target_name(input_sym)
+                .expect("indirect symbol should have a target name")?;
+            Some(table.intern(target_name))
+        } else {
+            None
+        };
+        let sym = if let Some(aliased) = alias_target {
+            Symbol::Alias {
+                name,
+                aliased,
+                origin: input_id,
+                private_extern: input_sym.is_private_ext(),
+            }
+        } else {
+            symbolize_input(name, input_sym, input_id)
         };
         match table.insert(sym) {
-            Ok(outcome) => report.record_outcome(outcome),
+            Ok(outcome) => {
+                report.record_outcome(outcome);
+                if let Some(target) = alias_target {
+                    report.referrers.add(target, input_id);
+                    let target_ref = Symbol::Undefined {
+                        name: target,
+                        origin: input_id,
+                        weak_ref: false,
+                    };
+                    match table.insert(target_ref) {
+                        Ok(outcome) => report.record_outcome(outcome),
+                        Err(error) => report.record_error(error),
+                    }
+                }
+            }
             Err(e) => report.record_error(e),
         }
     }
@@ -1110,6 +1361,116 @@ pub fn seed_all(inputs: &Inputs, table: &mut SymbolTable) -> Result<SeedReport, 
     Ok(report)
 }
 
+/// Resolve top-level inputs in command-line order. Each archive sees only the
+/// unresolved references that exist when it is encountered, and its members
+/// are fetched to a fixed point before the next top-level input is considered.
+pub(crate) fn resolve_inputs_in_order(
+    inputs: &mut Inputs,
+    ordered_inputs: &[OrderedInputEntry],
+    table: &mut SymbolTable,
+    parallel_jobs: usize,
+    force_all_archives: bool,
+) -> Result<DrainReport, Box<OrderedResolveError>> {
+    let mut report = DrainReport::default();
+    let mut traced_load_order = None;
+    let mut ordered_inputs = ordered_inputs.to_vec();
+    ordered_inputs.sort_by_key(|entry| entry.load_order);
+
+    macro_rules! resolve_or_return {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(Box::new(OrderedResolveError {
+                        error: error.into(),
+                        report,
+                    }));
+                }
+            }
+        };
+    }
+
+    for entry in ordered_inputs {
+        let input_path = match entry.input {
+            OrderedInput::Object(id) => inputs.objects[id.0 as usize].path.clone(),
+            OrderedInput::Archive(id) | OrderedInput::ForceLoadArchive(id) => {
+                inputs.archives[id.0 as usize].path.clone()
+            }
+            OrderedInput::Dylib(id) => inputs.dylibs[id.0 as usize].path.clone(),
+        };
+        if traced_load_order != Some(entry.load_order) {
+            report.loaded_paths.push(input_path);
+            traced_load_order = Some(entry.load_order);
+        }
+
+        let mut step = SeedReport::default();
+        match entry.input {
+            OrderedInput::Object(id) => {
+                resolve_or_return!(seed_object(inputs, id, table, &mut step));
+            }
+            OrderedInput::Archive(id) => {
+                if force_all_archives {
+                    resolve_or_return!(force_load_archive(
+                        inputs,
+                        table,
+                        id,
+                        &mut report,
+                        parallel_jobs,
+                    ));
+                } else {
+                    loop {
+                        resolve_or_return!(seed_archive_for_unresolved(
+                            inputs, id, table, &mut step,
+                        ));
+                        let pending = std::mem::take(&mut step.pending_fetches);
+                        report.duplicates.append(&mut step.duplicates);
+                        report.referrers.extend_from(&step.referrers);
+                        if pending.is_empty() {
+                            break;
+                        }
+                        resolve_or_return!(drain_fetches_into(
+                            inputs,
+                            table,
+                            pending,
+                            parallel_jobs,
+                            &mut report,
+                        ));
+                    }
+                }
+            }
+            OrderedInput::ForceLoadArchive(id) => {
+                resolve_or_return!(force_load_archive(
+                    inputs,
+                    table,
+                    id,
+                    &mut report,
+                    parallel_jobs,
+                ));
+            }
+            OrderedInput::Dylib(id) => {
+                resolve_or_return!(seed_dylib(inputs, id, table, &mut step));
+            }
+        }
+
+        let pending = std::mem::take(&mut step.pending_fetches);
+        report.duplicates.append(&mut step.duplicates);
+        report.referrers.extend_from(&step.referrers);
+
+        if pending.is_empty() {
+            continue;
+        }
+        resolve_or_return!(drain_fetches_into(
+            inputs,
+            table,
+            pending,
+            parallel_jobs,
+            &mut report,
+        ));
+    }
+
+    Ok(report)
+}
+
 // ---------------------------------------------------------------------------
 // Fixed-point fetch loop.
 // ---------------------------------------------------------------------------
@@ -1118,6 +1479,7 @@ pub fn seed_all(inputs: &Inputs, table: &mut SymbolTable) -> Result<SeedReport, 
 pub enum FetchError {
     Read(ReadError),
     Archive(ArchiveError),
+    MemberLoad(MemberLoadError),
     MemberNotFound {
         archive: ArchiveId,
         member: MemberId,
@@ -1129,6 +1491,7 @@ impl std::fmt::Display for FetchError {
         match self {
             FetchError::Read(e) => write!(f, "{e}"),
             FetchError::Archive(e) => write!(f, "{e}"),
+            FetchError::MemberLoad(e) => write!(f, "{e}"),
             FetchError::MemberNotFound { archive, member } => write!(
                 f,
                 "archive #{} has no member at ar_hdr offset 0x{:x}",
@@ -1138,7 +1501,16 @@ impl std::fmt::Display for FetchError {
     }
 }
 
-impl std::error::Error for FetchError {}
+impl std::error::Error for FetchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FetchError::Read(error) => Some(error),
+            FetchError::Archive(error) => Some(error),
+            FetchError::MemberLoad(error) => Some(error),
+            FetchError::MemberNotFound { .. } => None,
+        }
+    }
+}
 
 impl From<ReadError> for FetchError {
     fn from(e: ReadError) -> Self {
@@ -1149,6 +1521,12 @@ impl From<ReadError> for FetchError {
 impl From<ArchiveError> for FetchError {
     fn from(e: ArchiveError) -> Self {
         FetchError::Archive(e)
+    }
+}
+
+impl From<MemberLoadError> for FetchError {
+    fn from(error: MemberLoadError) -> Self {
+        FetchError::MemberLoad(error)
     }
 }
 
@@ -1169,6 +1547,12 @@ pub struct DrainReport {
     pub referrers: ReferrerLog,
 }
 
+#[derive(Debug)]
+pub(crate) struct OrderedResolveError {
+    pub(crate) error: FetchError,
+    pub(crate) report: DrainReport,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ArchiveMemberKey {
     archive: ArchiveId,
@@ -1181,6 +1565,7 @@ struct ArchiveMemberLoadJob<'a> {
     key: ArchiveMemberKey,
     archive_path: &'a Path,
     archive_bytes: &'a [u8],
+    archive_metadata: &'a ArchiveMetadata,
     archive_load_order: usize,
 }
 
@@ -1205,6 +1590,7 @@ fn make_archive_member_jobs<'a>(
                 key,
                 archive_path: &archive.path,
                 archive_bytes: &archive.bytes,
+                archive_metadata: &archive.metadata,
                 archive_load_order: archive.load_order,
             }
         })
@@ -1265,17 +1651,18 @@ fn load_archive_member_job(
     Result<LoadedArchiveMember, FetchError>,
 ) {
     let result = (|| {
-        let archive = Archive::open(job.archive_path, job.archive_bytes)?;
-        let member =
-            archive
-                .member_at_offset(job.key.member.0)
-                .ok_or(FetchError::MemberNotFound {
-                    archive: job.key.archive,
-                    member: job.key.member,
-                })?;
-        let logical_path =
-            PathBuf::from(format!("{}({})", job.archive_path.display(), member.name));
-        let bytes = member.body.to_vec();
+        let member = job
+            .archive_metadata
+            .member_at_offset(job.key.member.0)
+            .ok_or(FetchError::MemberNotFound {
+                archive: job.key.archive,
+                member: job.key.member,
+            })?;
+        let loaded =
+            job.archive_metadata
+                .load_member(job.archive_path, job.archive_bytes, member)?;
+        let logical_path = loaded.logical_path;
+        let bytes = loaded.bytes.into_owned();
         let parsed = ObjectFile::parse(&logical_path, &bytes)?;
         Ok(LoadedArchiveMember {
             key: job.key,
@@ -1388,13 +1775,9 @@ pub fn force_load_archive(
     report: &mut DrainReport,
     parallel_jobs: usize,
 ) -> Result<(), FetchError> {
-    let member_offsets: Vec<u32> = {
+    let member_offsets: Vec<u64> = {
         let ai = &inputs.archives[archive_id.0 as usize];
-        let archive = Archive::open(&ai.path, &ai.bytes)?;
-        archive
-            .object_members()
-            .map(|m| m.header_offset as u32)
-            .collect()
+        ai.metadata.object_member_offsets().collect()
     };
     let keys = member_offsets
         .into_iter()
@@ -1451,9 +1834,9 @@ pub enum UndefinedTreatment {
     /// Undefineds are errors. The default, matching Apple `ld`.
     #[default]
     Error,
-    /// Undefineds produce warnings; left in the table as Undefined.
+    /// Undefineds produce warnings and become flat-lookup imports.
     Warning,
-    /// Undefineds are silently accepted; left in the table as Undefined.
+    /// Undefineds are silently accepted as flat-lookup imports.
     Suppress,
     /// Undefineds are promoted to flat-lookup DylibImport entries — dyld
     /// searches every loaded dylib at runtime.
@@ -1474,17 +1857,17 @@ impl DylibId {
 
 #[derive(Debug, Default)]
 pub struct ClassificationReport {
-    /// Strong undefineds that triggered errors under `Error` treatment.
+    /// Undefineds that triggered errors under `Error` treatment.
     pub errors: Vec<Unresolved>,
-    /// Strong undefineds that produced warnings under `Warning` treatment and
+    /// Undefineds that produced warnings under `Warning` treatment and
     /// were promoted to flat-lookup imports for final emission.
     pub warnings: Vec<Unresolved>,
-    /// Strong undefineds that were silently accepted under `Suppress` and
+    /// Undefineds that were silently accepted under `Suppress` and
     /// were promoted to flat-lookup imports for final emission.
     pub suppressed: Vec<Unresolved>,
     /// Undefineds promoted to flat-lookup DylibImport entries.
     pub promoted_to_dynamic: Vec<SymbolId>,
-    /// Weak references that remain unresolved — always accepted.
+    /// References marked weak that had no link-time provider.
     pub weak: Vec<Unresolved>,
 }
 
@@ -1603,31 +1986,41 @@ pub fn format_undefined_warning_diagnostic(
     format_undefined_diagnostic_with_level(table, inputs, referrers, unresolved, "warning")
 }
 
-/// Format a `DuplicateStrong` insertion error for user consumption. Needs
-/// the incumbent symbol (from the table) plus the losing second symbol
-/// carried in the error itself.
+/// Format a symbol insertion error for user consumption.
 pub fn format_duplicate_diagnostic(
     table: &SymbolTable,
     inputs: &Inputs,
     err: &InsertError,
 ) -> String {
+    if let InsertError::AliasCycle { name } = err {
+        return format!(
+            "afs-ld: error: alias cycle involving {}\n",
+            table.interner.resolve(*name)
+        );
+    }
     let InsertError::DuplicateStrong {
         name,
         first,
         second,
     } = err
     else {
-        return String::new();
+        unreachable!("all symbol insertion errors should be formatted");
     };
     let name_str = table.interner.resolve(*name);
     let mut out = String::new();
     out.push_str(&format!("afs-ld: error: duplicate symbol {name_str}\n"));
-    if let Symbol::Defined { origin, .. } = table.get(*first) {
+    if let Symbol::Defined { origin, .. }
+    | Symbol::Absolute { origin, .. }
+    | Symbol::Alias { origin, .. } = table.get(*first)
+    {
         if let Some(oi) = inputs.objects.get(origin.0 as usize) {
             out.push_str(&format!("  defined in {}\n", oi.path.display()));
         }
     }
-    if let Symbol::Defined { origin, .. } = second.as_ref() {
+    if let Symbol::Defined { origin, .. }
+    | Symbol::Absolute { origin, .. }
+    | Symbol::Alias { origin, .. } = second.as_ref()
+    {
         if let Some(oi) = inputs.objects.get(origin.0 as usize) {
             out.push_str(&format!("  also in {}\n", oi.path.display()));
         }
@@ -1636,19 +2029,25 @@ pub fn format_duplicate_diagnostic(
 }
 
 /// After the fixed-point loop, walk the table and classify every remaining
-/// `Undefined`. Weak references always pass through cleanly.
+/// `Undefined`. Weak references follow the selected unresolved-symbol policy;
+/// permissive policies preserve their weak-import semantics at runtime.
 pub fn classify_unresolved(
     table: &mut SymbolTable,
     treatment: UndefinedTreatment,
 ) -> ClassificationReport {
     let mut report = ClassificationReport::default();
 
-    fn promote_to_flat_lookup(table: &mut SymbolTable, id: SymbolId, name: Istr) {
+    fn promote_to_flat_lookup(
+        table: &mut SymbolTable,
+        id: SymbolId,
+        name: Istr,
+        weak_import: bool,
+    ) {
         table.symbols[id.0 as usize] = Symbol::DylibImport {
             name,
             dylib: DylibId::INVALID,
             ordinal: FLAT_LOOKUP_ORDINAL,
-            weak_import: true,
+            weak_import,
         };
         table.transitions.push(Transition {
             id,
@@ -1670,7 +2069,6 @@ pub fn classify_unresolved(
     for (id, name, weak_ref) in undefs {
         if weak_ref {
             report.weak.push(Unresolved { name, id });
-            continue;
         }
         match treatment {
             UndefinedTreatment::Error => {
@@ -1678,16 +2076,16 @@ pub fn classify_unresolved(
             }
             UndefinedTreatment::Warning => {
                 report.warnings.push(Unresolved { name, id });
-                promote_to_flat_lookup(table, id, name);
+                promote_to_flat_lookup(table, id, name, weak_ref);
                 report.promoted_to_dynamic.push(id);
             }
             UndefinedTreatment::Suppress => {
                 report.suppressed.push(Unresolved { name, id });
-                promote_to_flat_lookup(table, id, name);
+                promote_to_flat_lookup(table, id, name, weak_ref);
                 report.promoted_to_dynamic.push(id);
             }
             UndefinedTreatment::DynamicLookup => {
-                promote_to_flat_lookup(table, id, name);
+                promote_to_flat_lookup(table, id, name, weak_ref);
                 report.promoted_to_dynamic.push(id);
             }
         }
@@ -1705,9 +2103,20 @@ pub fn drain_fetches(
     initial: Vec<PendingFetch>,
     parallel_jobs: usize,
 ) -> Result<DrainReport, FetchError> {
+    let mut report = DrainReport::default();
+    drain_fetches_into(inputs, table, initial, parallel_jobs, &mut report)?;
+    Ok(report)
+}
+
+fn drain_fetches_into(
+    inputs: &mut Inputs,
+    table: &mut SymbolTable,
+    initial: Vec<PendingFetch>,
+    parallel_jobs: usize,
+    report: &mut DrainReport,
+) -> Result<(), FetchError> {
     let mut queue = initial;
     let mut prepared = HashMap::new();
-    let mut report = DrainReport::default();
     while let Some(p) = queue.pop() {
         let key = archive_member_key(p);
         let slot_is_still_lazy = matches!(table.get(p.id), Symbol::LazyArchive { .. });
@@ -1728,10 +2137,10 @@ pub fn drain_fetches(
         if !slot_is_still_lazy || archive_member_is_fetched(inputs, key) {
             continue;
         }
-        let new_pending = ingest_loaded_member(inputs, table, loaded, &mut report)?;
+        let new_pending = ingest_loaded_member(inputs, table, loaded, report)?;
         queue.extend(new_pending);
     }
-    Ok(report)
+    Ok(())
 }
 
 fn preparse_pending_fetches(
@@ -1760,56 +2169,95 @@ fn preparse_pending_fetches(
     }
 }
 
-/// Turn a wire-form `InputSymbol` into a resolver-side `Symbol`. Returns
-/// `None` for kinds the resolver does not track (currently: aliases with
-/// unresolved target strx — Sprint 8's resolver defers those for now).
-fn symbolize_input(
-    name: Istr,
-    input_sym: &crate::symbol::InputSymbol,
-    origin: InputId,
-) -> Option<Symbol> {
+/// Turn a non-indirect wire-form `InputSymbol` into a resolver-side `Symbol`.
+fn symbolize_input(name: Istr, input_sym: &crate::symbol::InputSymbol, origin: InputId) -> Symbol {
     use crate::symbol::SymKind;
     match input_sym.kind() {
         SymKind::Undef => {
             if let Some(size) = input_sym.common_size() {
                 let align_pow2 = input_sym.common_align_pow2().unwrap_or(0);
-                Some(Symbol::Common {
+                Symbol::Common {
                     name,
                     origin,
                     size,
                     align_pow2,
-                })
+                    private_extern: input_sym.is_private_ext(),
+                    no_dead_strip: input_sym.no_dead_strip(),
+                }
             } else {
-                Some(Symbol::Undefined {
+                Symbol::Undefined {
                     name,
                     origin,
                     weak_ref: input_sym.weak_ref(),
-                })
+                }
             }
         }
-        SymKind::Abs | SymKind::Sect => Some(Symbol::Defined {
+        SymKind::Abs => Symbol::Absolute {
             name,
             origin,
-            // AtomId(0) is a placeholder; Sprint 9's atomization pass
-            // replaces these with real atom handles in-place.
+            value: input_sym.value(),
+            weak: input_sym.weak_def(),
+            private_extern: input_sym.is_private_ext(),
+            no_dead_strip: input_sym.no_dead_strip(),
+        },
+        SymKind::Sect => Symbol::Defined {
+            name,
+            origin,
+            // AtomId(0) is a placeholder; atomization replaces section
+            // definitions with real atom handles in-place.
             atom: AtomId(0),
             value: input_sym.value(),
             weak: input_sym.weak_def(),
             private_extern: input_sym.is_private_ext(),
             no_dead_strip: input_sym.no_dead_strip(),
-        }),
-        SymKind::Indirect => {
-            // Sprint 8 does not wire indirect-strx lookups yet — Sprint 9's
-            // atomization pass (which has the string table at hand) will
-            // rewrite these. For now, skip.
-            None
-        }
+        },
+        SymKind::Indirect => unreachable!("indirect symbols are handled by seed_object"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_absolute_symbols_are_atomless_definitions() {
+        use crate::macho::constants::{N_ABS, N_EXT, N_SECT};
+        use crate::symbol::{InputSymbol, RawNlist};
+
+        let name = Istr(1);
+        let absolute = InputSymbol::from_raw(RawNlist {
+            strx: 0,
+            n_type: N_ABS | N_EXT,
+            n_sect: 0,
+            n_desc: 0,
+            n_value: 0x1234,
+        });
+        assert!(matches!(
+            symbolize_input(name, &absolute, InputId(7)),
+            Symbol::Absolute {
+                name: Istr(1),
+                origin: InputId(7),
+                value: 0x1234,
+                ..
+            }
+        ));
+
+        let section = InputSymbol::from_raw(RawNlist {
+            strx: 0,
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0x20,
+        });
+        assert!(matches!(
+            symbolize_input(name, &section, InputId(7)),
+            Symbol::Defined {
+                atom: AtomId(0),
+                value: 0x20,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn interner_dedups_same_string() {
@@ -1869,6 +2317,600 @@ mod tests {
         Istr(i)
     }
 
+    fn object_with_symbol(name: &str, n_type: u8, value: u64) -> Vec<u8> {
+        object_with_symbols(&[(name, n_type, value)])
+    }
+
+    fn object_with_symbols(symbols: &[(&str, u8, u64)]) -> Vec<u8> {
+        use crate::macho::constants::{
+            CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT,
+        };
+        use crate::macho::reader::{write_header, MachHeader64, SymtabCmd};
+        use crate::symbol::RawNlist;
+
+        let mut strings = vec![0];
+        let mut raw_symbols = Vec::with_capacity(symbols.len());
+        for &(name, n_type, value) in symbols {
+            let strx = strings.len() as u32;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            raw_symbols.push(RawNlist {
+                strx,
+                n_type,
+                n_sect: 0,
+                n_desc: 0,
+                n_value: value,
+            });
+        }
+        let symoff = (crate::macho::reader::HEADER_SIZE as u32) + SymtabCmd::WIRE_SIZE;
+        let stroff = symoff + (raw_symbols.len() * crate::symbol::NLIST_SIZE) as u32;
+
+        let mut bytes = Vec::new();
+        write_header(
+            &MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 1,
+                sizeofcmds: SymtabCmd::WIRE_SIZE,
+                flags: 0,
+                reserved: 0,
+            },
+            &mut bytes,
+        );
+        SymtabCmd {
+            symoff,
+            nsyms: raw_symbols.len() as u32,
+            stroff,
+            strsize: strings.len() as u32,
+        }
+        .write(&mut bytes);
+        for symbol in raw_symbols {
+            symbol.write(&mut bytes);
+        }
+        bytes.extend_from_slice(&strings);
+        bytes
+    }
+
+    fn ar_member(raw_name: &str, body: &[u8]) -> Vec<u8> {
+        fn field(out: &mut Vec<u8>, value: &str, width: usize) {
+            assert!(value.len() <= width);
+            out.extend_from_slice(value.as_bytes());
+            out.resize(out.len() + width - value.len(), b' ');
+        }
+
+        let mut out = Vec::new();
+        field(&mut out, raw_name, 16);
+        field(&mut out, "0", 12);
+        field(&mut out, "0", 6);
+        field(&mut out, "0", 6);
+        field(&mut out, "100644", 8);
+        field(&mut out, &body.len().to_string(), 10);
+        out.extend_from_slice(b"`\n");
+        assert_eq!(out.len(), 60);
+        out.extend_from_slice(body);
+        if body.len() & 1 != 0 {
+            out.push(b'\n');
+        }
+        out
+    }
+
+    fn bsd_symbol_index(entries: &[(&str, u32)]) -> Vec<u8> {
+        let mut strings = Vec::new();
+        let mut ranlib = Vec::with_capacity(entries.len());
+        for &(name, member_offset) in entries {
+            let strx = strings.len() as u32;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            ranlib.push((strx, member_offset));
+        }
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&((ranlib.len() * 8) as u32).to_le_bytes());
+        for (strx, member_offset) in ranlib {
+            body.extend_from_slice(&strx.to_le_bytes());
+            body.extend_from_slice(&member_offset.to_le_bytes());
+        }
+        body.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        body.extend_from_slice(&strings);
+        body
+    }
+
+    fn archive_with_members(index: &[(&str, usize)], members: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let encoded_members: Vec<_> = members
+            .iter()
+            .map(|(name, body)| ar_member(name, body))
+            .collect();
+        let placeholder_entries: Vec<_> = index.iter().map(|(name, _)| (*name, 0)).collect();
+        let mut index_body = b"__.SYMDEF".to_vec();
+        index_body.extend_from_slice(&bsd_symbol_index(&placeholder_entries));
+        let placeholder_member = ar_member("#1/9", &index_body);
+
+        let mut member_offsets = Vec::with_capacity(encoded_members.len());
+        let mut offset = crate::archive::AR_MAGIC.len() + placeholder_member.len();
+        for member in &encoded_members {
+            member_offsets.push(offset as u32);
+            offset += member.len();
+        }
+        let resolved_entries: Vec<_> = index
+            .iter()
+            .map(|(name, member)| (*name, member_offsets[*member]))
+            .collect();
+        index_body.truncate(9);
+        index_body.extend_from_slice(&bsd_symbol_index(&resolved_entries));
+        let index_member = ar_member("#1/9", &index_body);
+        assert_eq!(index_member.len(), placeholder_member.len());
+
+        let mut archive = crate::archive::AR_MAGIC.to_vec();
+        archive.extend_from_slice(&index_member);
+        for member in encoded_members {
+            archive.extend_from_slice(&member);
+        }
+        archive
+    }
+
+    fn archive_defining(name: &str, value: u64) -> Vec<u8> {
+        use crate::macho::constants::{N_ABS, N_EXT};
+
+        let object = object_with_symbol(name, N_ABS | N_EXT, value);
+        archive_with_members(&[(name, 0)], &[("choice.o/", object)])
+    }
+
+    fn dylib_exporting(name: &str) -> DylibFile {
+        use crate::macho::tbd::{Arch, Platform, Scoped, SymbolLists, Target, Tbd};
+
+        let target = Target {
+            arch: Arch::Arm64,
+            platform: Platform::MacOs,
+        };
+        let document = Tbd {
+            version: 4,
+            targets: vec![target.clone()],
+            install_name: "/usr/lib/libChoice.dylib".into(),
+            current_version: None,
+            compatibility_version: None,
+            parent_umbrella: Vec::new(),
+            allowable_clients: Vec::new(),
+            reexported_libraries: Vec::new(),
+            exports: vec![Scoped {
+                targets: vec![target.clone()],
+                value: SymbolLists {
+                    symbols: vec![name.into()],
+                    ..SymbolLists::default()
+                },
+            }],
+            reexports: Vec::new(),
+        };
+        DylibFile::from_tbd("libChoice.tbd", &document, &target)
+    }
+
+    fn resolve_first_archive_value(first: u64, second: u64) -> u64 {
+        use crate::macho::constants::{N_EXT, N_UNDF};
+
+        let mut inputs = Inputs::new();
+        let main = inputs
+            .add_object(
+                PathBuf::from("main.o"),
+                object_with_symbol("_choice", N_UNDF | N_EXT, 0),
+                0,
+            )
+            .unwrap();
+        let first_archive = inputs
+            .add_archive(
+                PathBuf::from("libFirst.a"),
+                archive_defining("_choice", first),
+                1,
+            )
+            .unwrap();
+        let second_archive = inputs
+            .add_archive(
+                PathBuf::from("libSecond.a"),
+                archive_defining("_choice", second),
+                2,
+            )
+            .unwrap();
+        let order = [
+            OrderedInputEntry::object(0, main),
+            OrderedInputEntry::archive(1, first_archive),
+            OrderedInputEntry::archive(2, second_archive),
+        ];
+
+        let mut table = SymbolTable::new();
+        let report = resolve_inputs_in_order(&mut inputs, &order, &mut table, 1, false).unwrap();
+        assert!(report.duplicates.is_empty());
+        assert_eq!(report.fetched_members, 1);
+        let symbol = table.lookup_str("_choice").unwrap();
+        match table.get(symbol) {
+            Symbol::Absolute { value, .. } => *value,
+            other => panic!("expected fetched definition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordered_resolution_uses_first_archive_provider() {
+        assert_eq!(resolve_first_archive_value(11, 22), 11);
+        assert_eq!(resolve_first_archive_value(22, 11), 22);
+    }
+
+    #[test]
+    fn archive_does_not_resolve_reference_from_later_object() {
+        use crate::macho::constants::{N_EXT, N_UNDF};
+
+        let mut inputs = Inputs::new();
+        let archive = inputs
+            .add_archive(
+                PathBuf::from("libEarly.a"),
+                archive_defining("_choice", 11),
+                0,
+            )
+            .unwrap();
+        let object = inputs
+            .add_object(
+                PathBuf::from("late.o"),
+                object_with_symbol("_choice", N_UNDF | N_EXT, 0),
+                1,
+            )
+            .unwrap();
+        let order = [
+            OrderedInputEntry::archive(0, archive),
+            OrderedInputEntry::object(1, object),
+        ];
+
+        let mut table = SymbolTable::new();
+        let report = resolve_inputs_in_order(&mut inputs, &order, &mut table, 4, false).unwrap();
+        assert!(report.duplicates.is_empty());
+        assert_eq!(report.fetched_members, 0);
+        let symbol = table.lookup_str("_choice").unwrap();
+        assert!(matches!(table.get(symbol), Symbol::Undefined { .. }));
+    }
+
+    #[test]
+    fn ordered_resolution_honors_archive_and_dylib_order() {
+        use crate::macho::constants::{N_EXT, N_UNDF};
+
+        for archive_first in [true, false] {
+            let mut inputs = Inputs::new();
+            let main = inputs
+                .add_object(
+                    PathBuf::from("main.o"),
+                    object_with_symbol("_choice", N_UNDF | N_EXT, 0),
+                    0,
+                )
+                .unwrap();
+            let (archive_order, dylib_order) = if archive_first { (1, 2) } else { (2, 1) };
+            let archive = inputs
+                .add_archive(
+                    PathBuf::from("libChoice.a"),
+                    archive_defining("_choice", 11),
+                    archive_order,
+                )
+                .unwrap();
+            let dylib = inputs.add_dylib_from_file_with_meta(
+                PathBuf::from("libChoice.tbd"),
+                dylib_exporting("_choice"),
+                DylibLoadMeta {
+                    install_name: "/usr/lib/libChoice.dylib".into(),
+                    current_version: 0,
+                    compatibility_version: 0,
+                    ordinal: 1,
+                },
+            );
+            let order = [
+                OrderedInputEntry::object(0, main),
+                OrderedInputEntry::archive(archive_order, archive),
+                OrderedInputEntry::dylib(dylib_order, dylib),
+            ];
+
+            let mut table = SymbolTable::new();
+            let report =
+                resolve_inputs_in_order(&mut inputs, &order, &mut table, 4, false).unwrap();
+            assert!(report.duplicates.is_empty());
+            let symbol = table.lookup_str("_choice").unwrap();
+            if archive_first {
+                assert_eq!(report.fetched_members, 1);
+                assert!(matches!(table.get(symbol), Symbol::Absolute { .. }));
+            } else {
+                assert_eq!(report.fetched_members, 0);
+                assert!(matches!(table.get(symbol), Symbol::DylibImport { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_resolution_reaches_same_archive_fixed_point() {
+        use crate::macho::constants::{N_ABS, N_EXT, N_UNDF};
+
+        for jobs in [1, 4] {
+            let first = object_with_symbols(&[
+                ("_first", N_ABS | N_EXT, 11),
+                ("_second", N_UNDF | N_EXT, 0),
+            ]);
+            let second = object_with_symbol("_second", N_ABS | N_EXT, 22);
+            let archive = archive_with_members(
+                &[("_first", 0), ("_second", 1)],
+                &[("first.o/", first), ("second.o/", second)],
+            );
+            let mut inputs = Inputs::new();
+            let main = inputs
+                .add_object(
+                    PathBuf::from("main.o"),
+                    object_with_symbol("_first", N_UNDF | N_EXT, 0),
+                    0,
+                )
+                .unwrap();
+            let archive = inputs
+                .add_archive(PathBuf::from("libChain.a"), archive, 1)
+                .unwrap();
+            let order = [
+                OrderedInputEntry::object(0, main),
+                OrderedInputEntry::archive(1, archive),
+            ];
+
+            let mut table = SymbolTable::new();
+            let report =
+                resolve_inputs_in_order(&mut inputs, &order, &mut table, jobs, false).unwrap();
+            assert!(report.duplicates.is_empty());
+            assert_eq!(report.fetched_members, 2);
+            for (name, expected) in [("_first", 11), ("_second", 22)] {
+                let symbol = table.lookup_str(name).unwrap();
+                assert!(matches!(
+                    table.get(symbol),
+                    Symbol::Absolute { value, .. } if *value == expected
+                ));
+            }
+            assert_eq!(
+                report.loaded_paths,
+                vec![
+                    PathBuf::from("main.o"),
+                    PathBuf::from("libChain.a"),
+                    PathBuf::from("libChain.a(first.o)"),
+                    PathBuf::from("libChain.a(second.o)"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_resolution_errors_retain_prior_trace_paths() {
+        use crate::macho::constants::{N_EXT, N_UNDF};
+
+        for jobs in [1, 4] {
+            let mut inputs = Inputs::new();
+            let main = inputs
+                .add_object(
+                    PathBuf::from("main.o"),
+                    object_with_symbol("_bad", N_UNDF | N_EXT, 0),
+                    0,
+                )
+                .unwrap();
+            let archive = inputs
+                .add_archive(
+                    PathBuf::from("libMalformed.a"),
+                    archive_with_members(&[("_bad", 0)], &[("bad.o/", vec![0; 32])]),
+                    1,
+                )
+                .unwrap();
+            let order = [
+                OrderedInputEntry::object(0, main),
+                OrderedInputEntry::archive(1, archive),
+            ];
+
+            let mut table = SymbolTable::new();
+            let error =
+                resolve_inputs_in_order(&mut inputs, &order, &mut table, jobs, false).unwrap_err();
+            assert!(matches!(error.error, FetchError::Read(_)));
+            assert_eq!(
+                error.report.loaded_paths,
+                vec![PathBuf::from("main.o"), PathBuf::from("libMalformed.a")]
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_resolution_accumulates_duplicate_events_in_order() {
+        use crate::macho::constants::{N_ABS, N_EXT, N_UNDF};
+
+        for jobs in [1, 4] {
+            let mut inputs = Inputs::new();
+            let main = inputs
+                .add_object(
+                    PathBuf::from("main.o"),
+                    object_with_symbols(&[
+                        ("_dup_a", N_ABS | N_EXT, 1),
+                        ("_dup_b", N_ABS | N_EXT, 2),
+                        ("_need", N_UNDF | N_EXT, 0),
+                    ]),
+                    0,
+                )
+                .unwrap();
+            let archive = inputs
+                .add_archive(
+                    PathBuf::from("libDuplicate.a"),
+                    archive_with_members(
+                        &[("_need", 0), ("_dup_a", 0)],
+                        &[(
+                            "member.o/",
+                            object_with_symbols(&[
+                                ("_need", N_ABS | N_EXT, 3),
+                                ("_dup_a", N_ABS | N_EXT, 4),
+                            ]),
+                        )],
+                    ),
+                    1,
+                )
+                .unwrap();
+            let tail = inputs
+                .add_object(
+                    PathBuf::from("tail.o"),
+                    object_with_symbol("_dup_b", N_ABS | N_EXT, 5),
+                    2,
+                )
+                .unwrap();
+            let order = [
+                OrderedInputEntry::object(0, main),
+                OrderedInputEntry::archive(1, archive),
+                OrderedInputEntry::object(2, tail),
+            ];
+
+            let mut table = SymbolTable::new();
+            let report =
+                resolve_inputs_in_order(&mut inputs, &order, &mut table, jobs, false).unwrap();
+            let names: Vec<_> = report
+                .duplicates
+                .iter()
+                .map(|error| match error {
+                    InsertError::DuplicateStrong { name, .. } => table.interner.resolve(*name),
+                    other => panic!("expected duplicate symbol error, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(names, vec!["_dup_a", "_dup_b"]);
+        }
+    }
+
+    #[test]
+    fn ordered_resolution_force_loads_unreferenced_members() {
+        let mut inputs = Inputs::new();
+        let archive = inputs
+            .add_archive(
+                PathBuf::from("libUnused.a"),
+                archive_defining("_unused", 17),
+                0,
+            )
+            .unwrap();
+        let order = [OrderedInputEntry::archive(0, archive)];
+
+        let mut table = SymbolTable::new();
+        let report = resolve_inputs_in_order(&mut inputs, &order, &mut table, 4, true).unwrap();
+        assert!(report.duplicates.is_empty());
+        assert_eq!(report.fetched_members, 1);
+        let symbol = table.lookup_str("_unused").unwrap();
+        assert!(matches!(
+            table.get(symbol),
+            Symbol::Absolute { value: 17, .. }
+        ));
+    }
+
+    #[test]
+    fn force_load_reuses_registered_archive_metadata() {
+        use crate::macho::constants::{N_ABS, N_EXT};
+
+        let first = object_with_symbol("_first", N_ABS | N_EXT, 11);
+        let second = object_with_symbol("_second", N_ABS | N_EXT, 22);
+        let mut inputs = Inputs::new();
+        crate::archive::reset_archive_parse_count();
+        let archive = inputs
+            .add_archive(
+                PathBuf::from("libCached.a"),
+                archive_with_members(
+                    &[("_first", 0), ("_second", 1)],
+                    &[("first.o/", first), ("second.o/", second)],
+                ),
+                0,
+            )
+            .unwrap();
+
+        let mut table = SymbolTable::new();
+        let mut report = DrainReport::default();
+        force_load_archive(&mut inputs, &mut table, archive, &mut report, 1).unwrap();
+
+        assert_eq!(crate::archive::archive_parse_count(), 1);
+        assert_eq!(report.fetched_members, 2);
+        for (name, value) in [("_first", 11), ("_second", 22)] {
+            let symbol = table.lookup_str(name).unwrap();
+            assert!(matches!(
+                table.get(symbol),
+                Symbol::Absolute {
+                    value: actual,
+                    ..
+                } if *actual == value
+            ));
+        }
+    }
+
+    #[test]
+    fn ordered_resolution_force_loads_multiple_archives_in_order() {
+        for jobs in [1, 4] {
+            let mut inputs = Inputs::new();
+            let first = inputs
+                .add_archive(PathBuf::from("libA.a"), archive_defining("_a", 11), 0)
+                .unwrap();
+            let second = inputs
+                .add_archive(PathBuf::from("libB.a"), archive_defining("_b", 22), 1)
+                .unwrap();
+            let order = [
+                OrderedInputEntry::archive(0, first),
+                OrderedInputEntry::archive(1, second),
+            ];
+
+            let mut table = SymbolTable::new();
+            let report =
+                resolve_inputs_in_order(&mut inputs, &order, &mut table, jobs, true).unwrap();
+            assert!(report.duplicates.is_empty());
+            assert_eq!(report.fetched_members, 2);
+            assert_eq!(
+                report.loaded_paths,
+                vec![
+                    PathBuf::from("libA.a"),
+                    PathBuf::from("libA.a(choice.o)"),
+                    PathBuf::from("libB.a"),
+                    PathBuf::from("libB.a(choice.o)"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_force_load_exposes_references_to_later_archives() {
+        use crate::macho::constants::{N_ABS, N_EXT, N_UNDF};
+
+        for jobs in [1, 4] {
+            let forced_member = object_with_symbols(&[
+                ("_forced", N_ABS | N_EXT, 11),
+                ("_later", N_UNDF | N_EXT, 0),
+            ]);
+            let mut inputs = Inputs::new();
+            let forced = inputs
+                .add_archive(
+                    PathBuf::from("libForced.a"),
+                    archive_with_members(&[("_forced", 0)], &[("forced.o/", forced_member)]),
+                    0,
+                )
+                .unwrap();
+            let later = inputs
+                .add_archive(
+                    PathBuf::from("libLater.a"),
+                    archive_defining("_later", 22),
+                    1,
+                )
+                .unwrap();
+            let order = [
+                OrderedInputEntry::force_load_archive(0, forced),
+                OrderedInputEntry::archive(1, later),
+            ];
+
+            let mut table = SymbolTable::new();
+            let report =
+                resolve_inputs_in_order(&mut inputs, &order, &mut table, jobs, false).unwrap();
+            assert!(report.duplicates.is_empty());
+            assert_eq!(report.fetched_members, 2);
+            let later_symbol = table.lookup_str("_later").unwrap();
+            assert!(matches!(
+                table.get(later_symbol),
+                Symbol::Absolute { value: 22, .. }
+            ));
+            assert_eq!(
+                report.loaded_paths,
+                vec![
+                    PathBuf::from("libForced.a"),
+                    PathBuf::from("libForced.a(forced.o)"),
+                    PathBuf::from("libLater.a"),
+                    PathBuf::from("libLater.a(choice.o)"),
+                ]
+            );
+        }
+    }
+
     #[test]
     fn symbol_kind_tags_match_variants() {
         let undef = Symbol::Undefined {
@@ -1891,6 +2933,18 @@ mod tests {
         assert!(defined.is_strong_defined());
         assert!(!defined.is_weak_defined());
 
+        let absolute = Symbol::Absolute {
+            name: n(8),
+            origin: InputId(0),
+            value: 0x1234,
+            weak: false,
+            private_extern: false,
+            no_dead_strip: false,
+        };
+        assert_eq!(absolute.kind(), SymbolKindTag::Defined);
+        assert!(absolute.is_strong_defined());
+        assert!(!absolute.is_weak_defined());
+
         let weak = Symbol::Defined {
             name: n(2),
             origin: InputId(0),
@@ -1908,7 +2962,9 @@ mod tests {
                 name: n(3),
                 origin: InputId(0),
                 size: 8,
-                align_pow2: 3
+                align_pow2: 3,
+                private_extern: false,
+                no_dead_strip: false,
             }
             .kind(),
             SymbolKindTag::Common
@@ -1943,7 +2999,9 @@ mod tests {
         assert_eq!(
             Symbol::Alias {
                 name: n(7),
-                aliased: n(0)
+                aliased: n(0),
+                origin: InputId(0),
+                private_extern: false,
             }
             .kind(),
             SymbolKindTag::Alias
@@ -1957,6 +3015,8 @@ mod tests {
             origin: InputId(0),
             size: 16,
             align_pow2: 4,
+            private_extern: false,
+            no_dead_strip: false,
         };
         assert_eq!(sym.name(), n(42));
     }
@@ -1968,6 +3028,14 @@ mod tests {
             name: t.intern(name),
             origin: InputId(0),
             weak_ref: false,
+        }
+    }
+
+    fn weak_undef(t: &mut SymbolTable, name: &str) -> Symbol {
+        Symbol::Undefined {
+            name: t.intern(name),
+            origin: InputId(0),
+            weak_ref: true,
         }
     }
 
@@ -2001,6 +3069,8 @@ mod tests {
             origin: InputId(0),
             size,
             align_pow2: align,
+            private_extern: false,
+            no_dead_strip: false,
         }
     }
 
@@ -2034,7 +3104,106 @@ mod tests {
         Symbol::Alias {
             name: name_i,
             aliased: target_i,
+            origin: InputId(0),
+            private_extern: false,
         }
+    }
+
+    #[test]
+    fn unresolved_weak_references_follow_the_requested_policy() {
+        for treatment in [
+            UndefinedTreatment::Error,
+            UndefinedTreatment::Warning,
+            UndefinedTreatment::Suppress,
+            UndefinedTreatment::DynamicLookup,
+        ] {
+            let mut table = SymbolTable::new();
+            let symbol = weak_undef(&mut table, "_optional");
+            let id = match table.insert(symbol).unwrap() {
+                InsertOutcome::Inserted(id) => id,
+                other => panic!("unexpected insert outcome: {other:?}"),
+            };
+
+            let report = classify_unresolved(&mut table, treatment);
+            assert_eq!(
+                report.weak,
+                vec![Unresolved {
+                    name: table.intern("_optional"),
+                    id
+                }]
+            );
+
+            match treatment {
+                UndefinedTreatment::Error => {
+                    assert_eq!(report.errors.len(), 1);
+                    assert!(report.promoted_to_dynamic.is_empty());
+                    assert!(matches!(
+                        table.get(id),
+                        Symbol::Undefined { weak_ref: true, .. }
+                    ));
+                }
+                UndefinedTreatment::Warning => {
+                    assert_eq!(report.warnings.len(), 1);
+                    assert_eq!(report.promoted_to_dynamic, vec![id]);
+                    assert!(matches!(
+                        table.get(id),
+                        Symbol::DylibImport {
+                            dylib: DylibId::INVALID,
+                            ordinal: FLAT_LOOKUP_ORDINAL,
+                            weak_import: true,
+                            ..
+                        }
+                    ));
+                }
+                UndefinedTreatment::Suppress => {
+                    assert_eq!(report.suppressed.len(), 1);
+                    assert_eq!(report.promoted_to_dynamic, vec![id]);
+                    assert!(matches!(
+                        table.get(id),
+                        Symbol::DylibImport {
+                            dylib: DylibId::INVALID,
+                            ordinal: FLAT_LOOKUP_ORDINAL,
+                            weak_import: true,
+                            ..
+                        }
+                    ));
+                }
+                UndefinedTreatment::DynamicLookup => {
+                    assert_eq!(report.promoted_to_dynamic, vec![id]);
+                    assert!(matches!(
+                        table.get(id),
+                        Symbol::DylibImport {
+                            dylib: DylibId::INVALID,
+                            ordinal: FLAT_LOOKUP_ORDINAL,
+                            weak_import: true,
+                            ..
+                        }
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_lookup_keeps_strong_references_required_at_runtime() {
+        let mut table = SymbolTable::new();
+        let symbol = undef(&mut table, "_required");
+        let id = match table.insert(symbol).unwrap() {
+            InsertOutcome::Inserted(id) => id,
+            other => panic!("unexpected insert outcome: {other:?}"),
+        };
+
+        let report = classify_unresolved(&mut table, UndefinedTreatment::DynamicLookup);
+        assert_eq!(report.promoted_to_dynamic, vec![id]);
+        assert!(matches!(
+            table.get(id),
+            Symbol::DylibImport {
+                dylib: DylibId::INVALID,
+                ordinal: FLAT_LOOKUP_ORDINAL,
+                weak_import: false,
+                ..
+            }
+        ));
     }
 
     // ---- vacant-slot insertions ----
@@ -2064,6 +3233,44 @@ mod tests {
         t.insert(a).unwrap();
         let out = t.insert(b).unwrap();
         assert!(matches!(out, InsertOutcome::Kept(_)));
+    }
+
+    #[test]
+    fn mixed_undefined_references_are_strong_in_both_orders() {
+        for weak_first in [false, true] {
+            let mut table = SymbolTable::new();
+            let first = if weak_first {
+                weak_undef(&mut table, "_required")
+            } else {
+                undef(&mut table, "_required")
+            };
+            let second = if weak_first {
+                undef(&mut table, "_required")
+            } else {
+                weak_undef(&mut table, "_required")
+            };
+            let id = match table.insert(first).unwrap() {
+                InsertOutcome::Inserted(id) => id,
+                other => panic!("unexpected insert outcome: {other:?}"),
+            };
+            assert!(matches!(table.insert(second), Ok(InsertOutcome::Kept(_))));
+            assert!(matches!(
+                table.get(id),
+                Symbol::Undefined {
+                    weak_ref: false,
+                    ..
+                }
+            ));
+
+            classify_unresolved(&mut table, UndefinedTreatment::DynamicLookup);
+            assert!(matches!(
+                table.get(id),
+                Symbol::DylibImport {
+                    weak_import: false,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
@@ -2097,13 +3304,21 @@ mod tests {
     }
 
     #[test]
-    fn undefined_replaced_by_lazy_archive() {
+    fn undefined_followed_by_archive_queues_member_fetch() {
         let mut t = SymbolTable::new();
         let first = undef(&mut t, "_x");
         t.insert(first).unwrap();
         let la = lazy_archive(&mut t, "_x");
         let out = t.insert(la).unwrap();
-        assert!(matches!(out, InsertOutcome::Replaced { .. }));
+        assert!(matches!(
+            out,
+            InsertOutcome::PendingArchiveFetch {
+                archive: ArchiveId(7),
+                member: MemberId(42),
+                ..
+            }
+        ));
+        assert!(matches!(t.get(SymbolId(0)), Symbol::LazyArchive { .. }));
     }
 
     #[test]
@@ -2221,20 +3436,116 @@ mod tests {
     }
 
     #[test]
-    fn common_coalesces_to_larger_size_and_stricter_alignment() {
+    fn common_coalescing_selects_the_larger_declaration_as_a_unit() {
         let mut t = SymbolTable::new();
-        let a = common(&mut t, "_x", 8, 2);
-        t.insert(a).unwrap();
-        let b = common(&mut t, "_x", 16, 5);
-        let out = t.insert(b).unwrap();
+        let name = t.intern("_x");
+        t.insert(Symbol::Common {
+            name,
+            origin: InputId(0),
+            size: 8,
+            align_pow2: 5,
+            private_extern: true,
+            no_dead_strip: false,
+        })
+        .unwrap();
+        let out = t
+            .insert(Symbol::Common {
+                name,
+                origin: InputId(1),
+                size: 16,
+                align_pow2: 3,
+                private_extern: false,
+                no_dead_strip: true,
+            })
+            .unwrap();
         assert!(matches!(out, InsertOutcome::CommonCoalesced { .. }));
         if let Symbol::Common {
-            size, align_pow2, ..
+            origin,
+            size,
+            align_pow2,
+            private_extern,
+            no_dead_strip,
+            ..
         } = t.get(SymbolId(0))
         {
+            assert_eq!(*origin, InputId(1));
             assert_eq!(*size, 16);
-            assert_eq!(*align_pow2, 5);
+            assert_eq!(*align_pow2, 3);
+            assert!(!private_extern);
+            assert!(*no_dead_strip);
         }
+    }
+
+    #[test]
+    fn common_coalescing_selects_the_later_equal_size_declaration() {
+        let mut t = SymbolTable::new();
+        let name = t.intern("_x");
+        t.insert(Symbol::Common {
+            name,
+            origin: InputId(0),
+            size: 16,
+            align_pow2: 2,
+            private_extern: true,
+            no_dead_strip: false,
+        })
+        .unwrap();
+        t.insert(Symbol::Common {
+            name,
+            origin: InputId(1),
+            size: 16,
+            align_pow2: 5,
+            private_extern: false,
+            no_dead_strip: true,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            t.get(SymbolId(0)),
+            Symbol::Common {
+                origin: InputId(1),
+                size: 16,
+                align_pow2: 5,
+                private_extern: false,
+                no_dead_strip: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn common_coalescing_keeps_every_attribute_from_the_larger_declaration() {
+        let mut t = SymbolTable::new();
+        let name = t.intern("_x");
+        t.insert(Symbol::Common {
+            name,
+            origin: InputId(0),
+            size: 16,
+            align_pow2: 3,
+            private_extern: true,
+            no_dead_strip: false,
+        })
+        .unwrap();
+        t.insert(Symbol::Common {
+            name,
+            origin: InputId(1),
+            size: 8,
+            align_pow2: 5,
+            private_extern: false,
+            no_dead_strip: true,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            t.get(SymbolId(0)),
+            Symbol::Common {
+                origin: InputId(0),
+                size: 16,
+                align_pow2: 3,
+                private_extern: true,
+                no_dead_strip: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2340,27 +3651,58 @@ mod tests {
     }
 
     #[test]
-    fn direct_definition_replaces_alias() {
+    fn strong_definition_and_alias_are_duplicates_in_both_orders() {
+        for alias_first in [false, true] {
+            let mut t = SymbolTable::new();
+            let alias = alias_sym(&mut t, "_alias", "_target");
+            let defined = defined_strong(&mut t, "_alias");
+            let error = if alias_first {
+                t.insert(alias).unwrap();
+                t.insert(defined).unwrap_err()
+            } else {
+                t.insert(defined).unwrap();
+                t.insert(alias).unwrap_err()
+            };
+            assert!(matches!(error, InsertError::DuplicateStrong { .. }));
+        }
+    }
+
+    #[test]
+    fn self_target_alias_collides_with_an_existing_strong_definition() {
         let mut t = SymbolTable::new();
-        let al = alias_sym(&mut t, "_alias", "_target");
-        t.insert(al).unwrap();
-        let def = defined_strong(&mut t, "_alias");
-        let out = t.insert(def).unwrap();
+        let defined = defined_strong(&mut t, "_same");
+        t.insert(defined).unwrap();
+        let alias = alias_sym(&mut t, "_same", "_same");
+
         assert!(matches!(
-            out,
-            InsertOutcome::Replaced {
-                from: SymbolKindTag::Alias,
-                to: SymbolKindTag::Defined,
-                ..
-            }
+            t.insert(alias).unwrap_err(),
+            InsertError::DuplicateStrong { .. }
         ));
     }
 
     #[test]
-    fn self_loop_alias_rejected() {
+    fn alias_wins_against_weak_definition_in_both_orders() {
+        for alias_first in [false, true] {
+            let mut t = SymbolTable::new();
+            let alias = alias_sym(&mut t, "_alias", "_target");
+            let weak = defined_weak(&mut t, "_alias");
+            if alias_first {
+                t.insert(alias).unwrap();
+                assert!(matches!(t.insert(weak).unwrap(), InsertOutcome::Kept(_)));
+            } else {
+                t.insert(weak).unwrap();
+                assert!(matches!(
+                    t.insert(alias).unwrap(),
+                    InsertOutcome::Replaced { .. }
+                ));
+            }
+            assert!(matches!(t.get(SymbolId(0)), Symbol::Alias { .. }));
+        }
+    }
+
+    #[test]
+    fn self_loop_alias_rejected_in_vacant_slot() {
         let mut t = SymbolTable::new();
-        let u = undef(&mut t, "_foo");
-        t.insert(u).unwrap();
         let looped = alias_sym(&mut t, "_foo", "_foo");
         let err = t.insert(looped).unwrap_err();
         assert!(matches!(err, InsertError::AliasCycle { .. }));
@@ -2388,6 +3730,29 @@ mod tests {
         let name = t.intern("_alias");
         let (_, sym) = t.resolve_chain(name).unwrap();
         assert!(matches!(sym, Symbol::Defined { .. }));
+        assert_eq!(t.lookup_resolved_str("_alias"), t.lookup_str("_target"));
+    }
+
+    #[test]
+    fn resolve_chain_walks_through_multiple_aliases() {
+        let mut t = SymbolTable::new();
+        let defined = defined_strong(&mut t, "_target");
+        t.insert(defined).unwrap();
+        let middle = alias_sym(&mut t, "_middle", "_target");
+        t.insert(middle).unwrap();
+        let outer = alias_sym(&mut t, "_outer", "_middle");
+        t.insert(outer).unwrap();
+
+        assert_eq!(t.lookup_resolved_str("_outer"), t.lookup_str("_target"));
+    }
+
+    #[test]
+    fn alias_cycle_diagnostic_names_the_symbol() {
+        let mut t = SymbolTable::new();
+        let looped = alias_sym(&mut t, "_loop", "_loop");
+        let error = t.insert(looped).unwrap_err();
+        let diagnostic = format_duplicate_diagnostic(&t, &Inputs::new(), &error);
+        assert_eq!(diagnostic, "afs-ld: error: alias cycle involving _loop\n");
     }
 
     #[test]

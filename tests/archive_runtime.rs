@@ -57,14 +57,18 @@ fn libarmfortas_rt_archive_walks_cleanly() {
     let Some(mem) = ar.first_member_defining(target) else {
         panic_with_index("runtime archive missing _afs_program_init", idx);
     };
-    assert!(!mem.name.is_empty());
+    assert!(!mem.name.as_os_str().is_empty());
 
     // Fetch and parse that member. The member must expose the symbol as a
     // defined, external, section symbol.
     let obj = match ar.fetch_object_defining(target) {
         Some(Ok(o)) => o,
-        Some(Err(FetchError::Read(e))) => panic!("parse error on {}: {e}", mem.name),
-        Some(Err(FetchError::Io(e))) => panic!("i/o error on {}: {e}", mem.name),
+        Some(Err(FetchError::Read(e))) => {
+            panic!("parse error on {}: {e}", mem.name.display())
+        }
+        Some(Err(FetchError::Load(e))) => {
+            panic!("member load error on {}: {e}", mem.name.display())
+        }
         None => panic!("fetch returned None for {}", target),
     };
 

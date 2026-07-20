@@ -30,7 +30,7 @@ use crate::string_table::StringTableBuilder;
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind, NLIST_SIZE};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::{
-    code_sig::{CodeSignatureError, CodeSignaturePlan},
+    code_sig::{sha256, CodeSignatureError, CodeSignaturePlan},
     dyld_info::{
         build_export_trie, emit_bind_records, emit_lazy_bind_record, emit_rebase_run,
         BindRecordSpec, OpcodeStream,
@@ -328,6 +328,7 @@ pub fn write_finalized_with_linkedit(
         .cloned()
         .ok_or(WriteError::MissingSegment("__LINKEDIT"))?;
     let commands = build_commands(layout, kind, opts, entry_point, dylibs, linkedit_plan)?;
+    let uuid_offset = uuid_payload_offset(&commands);
 
     let sizeofcmds: u32 = commands.iter().map(LoadCommand::cmdsize).sum();
     let header = MachHeader64 {
@@ -422,6 +423,15 @@ pub fn write_finalized_with_linkedit(
     }
     let end = stroff + linkedit_plan.strtab_bytes.len();
     out[stroff..end].copy_from_slice(&linkedit_plan.strtab_bytes);
+    if let Some(uuid_offset) = uuid_offset {
+        // Normalize the self-referential fields, then patch the UUID before signing.
+        let content_end = linkedit_plan
+            .code_signature
+            .as_ref()
+            .map_or(out.len(), |signature| signature.dataoff as usize);
+        let uuid = content_uuid(out, uuid_offset, content_end);
+        out[uuid_offset..uuid_offset + uuid.len()].copy_from_slice(&uuid);
+    }
     if let Some(code_signature) = &linkedit_plan.code_signature {
         let start = code_signature.dataoff as usize;
         let bytes = code_signature.build_with_jobs(&out[..start], opts.parallel_jobs());
@@ -455,7 +465,7 @@ fn build_commands(
             commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
             commands.push(raw_dylinker_command("/usr/lib/dyld"));
             if opts.emit_uuid {
-                commands.push(raw_uuid_command(stable_uuid(layout, kind)));
+                commands.push(raw_uuid_command([0; 16]));
             }
             commands.push(LoadCommand::BuildVersion(build_version_command(opts)));
             commands.push(raw_source_version_command(0));
@@ -473,7 +483,7 @@ fn build_commands(
             commands.push(LoadCommand::Symtab(linkedit.symtab));
             commands.push(LoadCommand::Dysymtab(linkedit.dysymtab));
             if opts.emit_uuid {
-                commands.push(raw_uuid_command(stable_uuid(layout, kind)));
+                commands.push(raw_uuid_command([0; 16]));
             }
             commands.push(LoadCommand::BuildVersion(build_version_command(opts)));
             commands.push(raw_source_version_command(0));
@@ -666,6 +676,41 @@ fn raw_uuid_command(uuid: [u8; 16]) -> LoadCommand {
     }
 }
 
+fn uuid_payload_offset(commands: &[LoadCommand]) -> Option<usize> {
+    let mut offset = HEADER_SIZE;
+    for command in commands {
+        if command.cmd() == LC_UUID {
+            return Some(offset + 8);
+        }
+        offset += command.cmdsize() as usize;
+    }
+    None
+}
+
+fn content_uuid(bytes: &mut [u8], uuid_offset: usize, content_end: usize) -> [u8; 16] {
+    let uuid_end = uuid_offset + 16;
+    debug_assert!(uuid_end <= content_end);
+    debug_assert!(content_end <= bytes.len());
+
+    let saved_uuid: [u8; 16] = bytes[uuid_offset..uuid_end].try_into().unwrap();
+    let saved_signature = bytes[content_end..]
+        .iter()
+        .any(|byte| *byte != 0)
+        .then(|| bytes[content_end..].to_vec());
+    bytes[uuid_offset..uuid_end].fill(0);
+    bytes[content_end..].fill(0);
+    let digest = sha256(bytes);
+    bytes[uuid_offset..uuid_end].copy_from_slice(&saved_uuid);
+    if let Some(signature) = saved_signature {
+        bytes[content_end..].copy_from_slice(&signature);
+    }
+
+    let mut uuid: [u8; 16] = digest[..16].try_into().unwrap();
+    uuid[6] = (uuid[6] & 0x0f) | 0x30;
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;
+    uuid
+}
+
 fn raw_source_version_command(version: u64) -> LoadCommand {
     LoadCommand::Raw {
         cmd: LC_SOURCE_VERSION,
@@ -699,47 +744,6 @@ fn build_version_command(opts: &LinkOptions) -> BuildVersionCmd {
             version: pack_version(0, 1, 0),
         }],
     }
-}
-
-fn stable_uuid(layout: &Layout, kind: OutputKind) -> [u8; 16] {
-    fn mix(state: &mut u64, bytes: &[u8]) {
-        for byte in bytes {
-            *state ^= u64::from(*byte);
-            *state = state.wrapping_mul(0x100000001b3);
-        }
-    }
-
-    let mut lo = 0xcbf29ce484222325u64;
-    let mut hi = 0x84222325cbf29ce4u64;
-    mix(
-        &mut lo,
-        &[match kind {
-            OutputKind::Executable => 1,
-            OutputKind::Dylib => 2,
-        }],
-    );
-    for segment in &layout.segments {
-        mix(&mut lo, segment.name.as_bytes());
-        mix(&mut lo, &segment.vm_addr.to_le_bytes());
-        mix(&mut lo, &segment.vm_size.to_le_bytes());
-        mix(&mut hi, &segment.file_off.to_le_bytes());
-        mix(&mut hi, &segment.file_size.to_le_bytes());
-        mix(&mut hi, &segment.flags.to_le_bytes());
-    }
-    for section in &layout.sections {
-        mix(&mut lo, section.segment.as_bytes());
-        mix(&mut lo, section.name.as_bytes());
-        mix(&mut lo, &section.addr.to_le_bytes());
-        mix(&mut hi, &section.size.to_le_bytes());
-        mix(&mut hi, &section.file_off.to_le_bytes());
-        mix(&mut hi, &section.flags.to_le_bytes());
-    }
-    let mut uuid = [0u8; 16];
-    uuid[..8].copy_from_slice(&lo.to_be_bytes());
-    uuid[8..].copy_from_slice(&hi.to_be_bytes());
-    uuid[6] = (uuid[6] & 0x0f) | 0x40;
-    uuid[8] = (uuid[8] & 0x3f) | 0x80;
-    uuid
 }
 
 fn header_flags(layout: &Layout, kind: OutputKind) -> u32 {
@@ -2789,6 +2793,68 @@ mod tests {
         out
     }
 
+    fn layout_with_text_bytes(kind: OutputKind, data: Vec<u8>) -> Layout {
+        let size = data.len() as u64;
+        let mut layout = Layout::empty(kind, 0);
+        layout.sections.push(OutputSection {
+            segment: "__TEXT".into(),
+            name: "__text".into(),
+            kind: SectionKind::Text,
+            align_pow2: 2,
+            flags: 0,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            atoms: vec![OutputAtom {
+                atom: AtomId(1),
+                offset: 0,
+                size,
+                data,
+            }],
+            synthetic_offset: 0,
+            synthetic_data: Vec::new(),
+            addr: 0,
+            size,
+            file_off: 0,
+        });
+        layout.relayout(0);
+        layout
+    }
+
+    fn output_uuid(bytes: &[u8]) -> [u8; 16] {
+        let header = crate::macho::reader::parse_header(bytes).unwrap();
+        crate::macho::reader::parse_commands(&header, bytes)
+            .unwrap()
+            .into_iter()
+            .find_map(|command| match command {
+                LoadCommand::Raw { cmd, data, .. } if cmd == LC_UUID => {
+                    Some(data.try_into().unwrap())
+                }
+                _ => None,
+            })
+            .expect("LC_UUID")
+    }
+
+    fn read_be_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn uuid_hash_context(bytes: &[u8]) -> (usize, usize) {
+        let header = crate::macho::reader::parse_header(bytes).unwrap();
+        let commands = crate::macho::reader::parse_commands(&header, bytes).unwrap();
+        let uuid_offset = uuid_payload_offset(&commands).expect("LC_UUID");
+        let content_end = commands
+            .iter()
+            .find_map(|command| match command {
+                LoadCommand::Raw { cmd, data, .. } if *cmd == LC_CODE_SIGNATURE => {
+                    Some(u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize)
+                }
+                _ => None,
+            })
+            .unwrap_or(bytes.len());
+        (uuid_offset, content_end)
+    }
+
     #[test]
     fn minimal_executable_writes_parseable_header() {
         let layout = Layout::empty(OutputKind::Executable, 0);
@@ -2832,6 +2898,68 @@ mod tests {
                 .any(|cmd| matches!(cmd, LoadCommand::Dylib(d) if d.cmd == LC_ID_DYLIB)),
             "expected LC_ID_DYLIB in {commands:?}"
         );
+    }
+
+    #[test]
+    fn uuid_changes_with_linked_content() {
+        let opts = LinkOptions {
+            output: Some("libcontent.dylib".into()),
+            kind: OutputKind::Dylib,
+            ..LinkOptions::default()
+        };
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        write(
+            &layout_with_text_bytes(OutputKind::Dylib, vec![0x20, 0x00, 0x80, 0xd2]),
+            OutputKind::Dylib,
+            &opts,
+            &mut first,
+        )
+        .unwrap();
+        write(
+            &layout_with_text_bytes(OutputKind::Dylib, vec![0x40, 0x00, 0x80, 0xd2]),
+            OutputKind::Dylib,
+            &opts,
+            &mut second,
+        )
+        .unwrap();
+
+        assert_ne!(output_uuid(&first), output_uuid(&second));
+    }
+
+    #[test]
+    fn content_uuid_is_stable_and_normalizes_its_own_field() {
+        let layout = layout_with_text_bytes(
+            OutputKind::Dylib,
+            vec![0x20, 0x00, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6],
+        );
+        let opts = LinkOptions {
+            output: Some("libstable.dylib".into()),
+            kind: OutputKind::Dylib,
+            ..LinkOptions::default()
+        };
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        write(&layout, OutputKind::Dylib, &opts, &mut first).unwrap();
+        write(&layout, OutputKind::Dylib, &opts, &mut second).unwrap();
+
+        assert_eq!(first, second);
+        let expected = output_uuid(&first);
+        assert_eq!(expected[6] >> 4, 3);
+        assert_eq!(expected[8] >> 6, 2);
+
+        let (uuid_offset, content_end) = uuid_hash_context(&first);
+        let signature = &second[content_end..];
+        let code_directory = read_be_u32(signature, 16) as usize;
+        let hash_offset = read_be_u32(signature, code_directory + 16) as usize;
+        assert_eq!(
+            &signature[code_directory + hash_offset..code_directory + hash_offset + 32],
+            &sha256(&second[..0x1000])
+        );
+        assert_eq!(content_uuid(&mut first, uuid_offset, content_end), expected);
+        first[uuid_offset..uuid_offset + 16].fill(0xa5);
+        assert_eq!(content_uuid(&mut first, uuid_offset, content_end), expected);
+        assert_eq!(&first[uuid_offset..uuid_offset + 16], &[0xa5; 16]);
     }
 
     #[test]

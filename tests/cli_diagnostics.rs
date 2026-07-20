@@ -235,6 +235,24 @@ fn synthetic_dylib(install_name: &str) -> Vec<u8> {
     bytes
 }
 
+fn synthetic_macho_with_truncated_commands(filetype: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype,
+            ncmds: 1,
+            sizeofcmds: 8,
+            flags: 0,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    bytes
+}
+
 fn synthetic_ar_header(raw_name: &str, size: usize) -> Vec<u8> {
     fn field(out: &mut Vec<u8>, value: &str, width: usize) {
         assert!(value.len() <= width);
@@ -1350,6 +1368,63 @@ fn extensionless_framework_preserves_weak_load_kind() {
     }
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn macho_parse_diagnostics_include_input_paths() {
+    let valid = scratch("path-diagnostic-valid.o");
+    fs::write(
+        &valid,
+        synthetic_symbol_object(&[("_main", N_ABS | N_EXT, 0)]),
+    )
+    .unwrap();
+
+    for (name, bytes, context) in [
+        (
+            "path-diagnostic-header.o",
+            vec![0xcf, 0xfa],
+            "mach_header_64",
+        ),
+        (
+            "path-diagnostic-object.o",
+            synthetic_macho_with_truncated_commands(MH_OBJECT),
+            "load-command region",
+        ),
+        (
+            "path-diagnostic-dylib",
+            synthetic_macho_with_truncated_commands(MH_DYLIB),
+            "load-command region",
+        ),
+    ] {
+        let malformed = scratch(name);
+        fs::write(&malformed, bytes).unwrap();
+        for jobs in [1, 4] {
+            let output = scratch(&format!("{name}-{jobs}.out"));
+            let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+                .arg("-j")
+                .arg(jobs.to_string())
+                .arg(&valid)
+                .arg(&malformed)
+                .arg("-o")
+                .arg(&output)
+                .output()
+                .expect("afs-ld should run");
+            assert!(!result.status.success());
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                stderr.contains(&malformed.display().to_string()),
+                "missing malformed input path with -j{jobs}:\n{stderr}"
+            );
+            assert!(
+                stderr.contains(&format!("truncated input while reading {context}")),
+                "missing parse context with -j{jobs}:\n{stderr}"
+            );
+            let _ = fs::remove_file(output);
+        }
+        let _ = fs::remove_file(malformed);
+    }
+
+    let _ = fs::remove_file(valid);
 }
 
 #[test]

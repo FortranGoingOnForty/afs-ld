@@ -218,6 +218,10 @@ pub enum LinkError {
     /// No input files were provided on the command line.
     NoInputs,
     Io(io::Error),
+    MachOParse {
+        path: PathBuf,
+        source: ReadError,
+    },
     Input(InputAddError),
     Seed(resolve::SeedError),
     Fetch(resolve::FetchError),
@@ -301,6 +305,15 @@ impl LinkPhaseTimings {
     }
 }
 
+impl LinkError {
+    fn macho_parse(path: &std::path::Path, source: ReadError) -> Self {
+        Self::MachOParse {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct InputLoadTimings {
     read: Duration,
@@ -323,6 +336,9 @@ impl std::fmt::Display for LinkError {
         match self {
             LinkError::NoInputs => write!(f, "no input files"),
             LinkError::Io(e) => write!(f, "{e}"),
+            LinkError::MachOParse { path, source } => {
+                write!(f, "{}: {source}", path.display())
+            }
             LinkError::Input(e) => write!(f, "{e}"),
             LinkError::Seed(e) => write!(f, "{e}"),
             LinkError::Fetch(e) => write!(f, "{e}"),
@@ -1343,12 +1359,12 @@ fn load_macho_input(
     let phase_started = Instant::now();
     let filetype = parse_header(&bytes).map_err(|error| InitialLoadError {
         load_order,
-        error: LinkError::from(error),
+        error: LinkError::macho_parse(&path, error),
     })?;
     if filetype.filetype == MH_DYLIB {
         let parsed = DylibFile::parse(&path, &bytes).map_err(|error| InitialLoadError {
             load_order,
-            error: LinkError::from(error),
+            error: LinkError::macho_parse(&path, error),
         })?;
         timings.dylib_parse = phase_started.elapsed();
         Ok(LoadedInitialInput::Dylib(Box::new(LoadedDylibInput {
@@ -1360,7 +1376,7 @@ fn load_macho_input(
     } else {
         let parsed = ObjectFile::parse(&path, &bytes).map_err(|error| InitialLoadError {
             load_order,
-            error: LinkError::from(error),
+            error: LinkError::macho_parse(&path, error),
         })?;
         timings.object_parse = phase_started.elapsed();
         Ok(LoadedInitialInput::Object(Box::new(LoadedObjectInput {

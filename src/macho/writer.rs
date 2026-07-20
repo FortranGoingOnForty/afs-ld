@@ -30,7 +30,7 @@ use crate::string_table::StringTableBuilder;
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind, NLIST_SIZE};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::{
-    code_sig::CodeSignaturePlan,
+    code_sig::{CodeSignatureError, CodeSignaturePlan},
     dyld_info::{
         build_export_trie, emit_bind_records, emit_lazy_bind_record, emit_rebase_run,
         BindRecordSpec, OpcodeStream,
@@ -1088,8 +1088,12 @@ fn build_code_signature(
     regular_end: u64,
 ) -> Result<CodeSignaturePlan, WriteError> {
     let code_limit = align_up(regular_end, 16);
-    CodeSignaturePlan::new(layout, opts, code_limit, kind == OutputKind::Executable)
-        .map_err(WriteError::OffsetTooLarge)
+    CodeSignaturePlan::new(layout, opts, code_limit, kind == OutputKind::Executable).map_err(
+        |error| match error {
+            CodeSignatureError::MissingTextSegment => WriteError::MissingSegment("__TEXT"),
+            CodeSignatureError::OffsetTooLarge(what) => WriteError::OffsetTooLarge(what),
+        },
+    )
 }
 
 fn pad_dyld_info_stream(mut bytes: Vec<u8>) -> Vec<u8> {

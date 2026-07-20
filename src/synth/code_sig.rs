@@ -1,7 +1,6 @@
 use std::thread;
 
 use crate::layout::Layout;
-use crate::section::is_executable;
 use crate::LinkOptions;
 
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade0cc0;
@@ -17,6 +16,12 @@ const PAGE_SIZE_LOG2: u8 = 12;
 const PAGE_SIZE: usize = 1 << PAGE_SIZE_LOG2;
 const SUPERBLOB_HEADER_SIZE: usize = 20;
 const CODEDIRECTORY_HEADER_SIZE: usize = 88;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeSignatureError {
+    MissingTextSegment,
+    OffsetTooLarge(&'static str),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeSignaturePlan {
@@ -35,21 +40,27 @@ impl CodeSignaturePlan {
         opts: &LinkOptions,
         code_limit: u64,
         executable: bool,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, CodeSignatureError> {
+        let text = layout
+            .segment("__TEXT")
+            .ok_or(CodeSignatureError::MissingTextSegment)?;
         let code_limit = u32::try_from(code_limit)
-            .map_err(|_| "code-signature offset exceeds 32-bit Mach-O field width")?;
+            .map_err(|_| CodeSignatureError::OffsetTooLarge("code-signature offset"))?;
         let identifier = output_identifier(opts);
-        let (exec_seg_base, exec_seg_limit, exec_seg_flags) = exec_segment_info(layout, executable);
         let blob_len = blob_len(code_limit as usize, &identifier);
         Ok(Self {
             dataoff: code_limit,
             datasize: u32::try_from(blob_len)
-                .map_err(|_| "code-signature blob exceeds 32-bit Mach-O field width")?,
+                .map_err(|_| CodeSignatureError::OffsetTooLarge("code-signature blob"))?,
             code_limit,
             identifier,
-            exec_seg_base,
-            exec_seg_limit,
-            exec_seg_flags,
+            exec_seg_base: text.file_off,
+            exec_seg_limit: text.file_size,
+            exec_seg_flags: if executable {
+                CS_EXECSEG_MAIN_BINARY
+            } else {
+                0
+            },
         })
     }
 
@@ -113,30 +124,6 @@ fn output_identifier(opts: &LinkOptions) -> String {
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "a.out".to_string())
-}
-
-fn exec_segment_info(layout: &Layout, executable: bool) -> (u64, u64, u64) {
-    let mut min_off: Option<u64> = None;
-    let mut max_end = 0u64;
-    for section in &layout.sections {
-        if !is_executable(section.kind) || section.is_zerofill() {
-            continue;
-        }
-        min_off = Some(min_off.map_or(section.file_off, |min_off: u64| {
-            min_off.min(section.file_off)
-        }));
-        max_end = max_end.max(section.file_off + section.size);
-    }
-    let exec_seg_limit = min_off.map_or(0, |min_off| max_end.saturating_sub(min_off));
-    (
-        0,
-        exec_seg_limit,
-        if executable && exec_seg_limit != 0 {
-            CS_EXECSEG_MAIN_BINARY
-        } else {
-            0
-        },
-    )
 }
 
 fn blob_len(code_limit: usize, identifier: &str) -> usize {
@@ -319,6 +306,10 @@ mod tests {
         u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap())
     }
 
+    fn read_be_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
     #[test]
     fn sha256_matches_known_vectors() {
         assert_eq!(
@@ -368,6 +359,39 @@ mod tests {
         assert_eq!(read_be_u32(&blob, 48), 5);
         assert_eq!(read_be_u32(&blob, 52), 16_512);
         assert_eq!(&blob[108..114], b"apple\0");
+    }
+
+    #[test]
+    fn code_signature_describes_text_segment() {
+        let opts = LinkOptions::default();
+        for (kind, expected_flags) in [
+            (crate::OutputKind::Executable, CS_EXECSEG_MAIN_BINARY),
+            (crate::OutputKind::Dylib, 0),
+        ] {
+            let layout = Layout::empty(kind, 0x200);
+            let text = layout.segment("__TEXT").unwrap();
+            let plan = CodeSignaturePlan::new(
+                &layout,
+                &opts,
+                text.file_size,
+                kind == crate::OutputKind::Executable,
+            )
+            .unwrap();
+            let blob = plan.build(&vec![0; text.file_size as usize]);
+
+            assert_eq!(
+                read_be_u64(&blob, SUPERBLOB_HEADER_SIZE + 64),
+                text.file_off
+            );
+            assert_eq!(
+                read_be_u64(&blob, SUPERBLOB_HEADER_SIZE + 72),
+                text.file_size
+            );
+            assert_eq!(
+                read_be_u64(&blob, SUPERBLOB_HEADER_SIZE + 80),
+                expected_flags
+            );
+        }
     }
 
     #[test]

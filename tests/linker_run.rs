@@ -423,6 +423,154 @@ fn synthetic_absolute_reference_object(entry: &str, target: &str) -> Vec<u8> {
     bytes
 }
 
+fn synthetic_custom_segment_rebase_object(pointer_section: &str) -> Vec<u8> {
+    let text = [
+        0x00, 0x00, 0x80, 0x52, // mov w0, #0
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+    let pointer = [0; 8];
+    let target = 7u64.to_le_bytes();
+    let relocs = [Reloc {
+        offset: 0,
+        kind: RelocKind::Unsigned,
+        length: RelocLength::Quad,
+        pcrel: false,
+        referent: Referent::Section(3),
+        addend: 0,
+        subtrahend: None,
+    }];
+    let raw_relocs = write_relocs(&relocs).unwrap();
+    let mut reloc_bytes = Vec::new();
+    write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+
+    let mut strings = vec![0];
+    let mut add_string = |name: &str| {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        strx
+    };
+    let symbols = [
+        RawNlist {
+            strx: add_string("_main"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: add_string("_p"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 2,
+            n_desc: 0,
+            n_value: 8,
+        },
+        RawNlist {
+            strx: add_string("_target"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 3,
+            n_desc: 0,
+            n_value: 16,
+        },
+    ];
+
+    let mut segment = Segment64 {
+        segname: [0; 16],
+        vmaddr: 0,
+        vmsize: 24,
+        fileoff: 0,
+        filesize: 24,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections: vec![
+            Section64Header {
+                sectname: name16("__text"),
+                segname: name16("__TEXT"),
+                addr: 0,
+                size: text.len() as u64,
+                offset: 0,
+                align: 2,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+            Section64Header {
+                sectname: name16(pointer_section),
+                segname: name16("__CUSTOM"),
+                addr: 8,
+                size: pointer.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: raw_relocs.len() as u32,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+            Section64Header {
+                sectname: name16("__data"),
+                segname: name16("__DATA"),
+                addr: 16,
+                size: target.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+        ],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    for (index, section) in segment.sections.iter_mut().enumerate() {
+        section.offset = data_offset + (index as u32) * 8;
+    }
+    segment.sections[1].reloff = data_offset + 24;
+    let symoff = segment.sections[1].reloff + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&pointer);
+    bytes.extend_from_slice(&target);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
 #[derive(Clone, Copy)]
 enum SyntheticAliasEncoding {
     Indirect,
@@ -743,6 +891,17 @@ fn segment_flags(bytes: &[u8], segname: &str) -> Option<u32> {
         }
     }
     None
+}
+
+fn segment_protections(bytes: &[u8], segname: &str) -> Option<(u32, u32)> {
+    let header = parse_header(bytes).ok()?;
+    let commands = parse_commands(&header, bytes).ok()?;
+    commands.into_iter().find_map(|cmd| match cmd {
+        LoadCommand::Segment64(seg) if seg.segname_str() == segname => {
+            Some((seg.maxprot, seg.initprot))
+        }
+        _ => None,
+    })
 }
 
 fn segment_vmaddr(bytes: &[u8], segname: &str) -> Option<u64> {
@@ -4855,6 +5014,170 @@ fn linker_run_handles_non_standard_segment_without_panicking() {
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_rebases_local_pointers_in_custom_segments() {
+    for pointer_section in ["__ptrs", "__thread_vars"] {
+        let obj = scratch(&format!("custom-segment-{pointer_section}-synthetic.o"));
+        let out = scratch(&format!("custom-segment-{pointer_section}-synthetic.out"));
+        fs::write(
+            &obj,
+            synthetic_custom_segment_rebase_object(pointer_section),
+        )
+        .unwrap();
+
+        let opts = LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            entry: Some("_main".into()),
+            kind: OutputKind::Executable,
+            ..LinkOptions::default()
+        };
+        Linker::run(&opts).unwrap();
+
+        let bytes = fs::read(&out).unwrap();
+        assert_eq!(segment_protections(&bytes, "__CUSTOM"), Some((3, 3)));
+        let (target_addr, _) = output_section(&bytes, "__DATA", "__data").unwrap();
+        let (_, pointer) = output_section(&bytes, "__CUSTOM", pointer_section).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(pointer.try_into().unwrap()),
+            target_addr,
+            "custom-segment pointer should contain the target preferred address"
+        );
+        assert_eq!(
+            decode_rebase_records(&bytes).unwrap(),
+            vec![RebaseRecord {
+                segment: "__CUSTOM".into(),
+                section: pointer_section.into(),
+                section_offset: 0,
+                rebase_type: REBASE_TYPE_POINTER,
+            }]
+        );
+
+        let _ = fs::remove_file(obj);
+        let _ = fs::remove_file(out);
+    }
+}
+
+#[test]
+fn linker_run_rebases_custom_segment_pointers_like_apple_ld() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("custom-segment-rebase.o");
+    let our_out = scratch("custom-segment-rebase-ours.out");
+    let apple_out = scratch("custom-segment-rebase-apple.out");
+    let src = r#"
+        .section __CUSTOM,__ptrs,regular
+        .p2align 3
+        .globl _p
+        _p: .quad _target
+
+        .data
+        .p2align 3
+        .globl _target
+        _target: .quad 7
+
+        .text
+        .globl _main
+        _main:
+            adrp x8, _p@PAGE
+            add x8, x8, _p@PAGEOFF
+            ldr x9, [x8]
+            adrp x10, _target@PAGE
+            add x10, x10, _target@PAGEOFF
+            cmp x9, x10
+            cset w0, ne
+            ret
+    "#;
+    if let Err(e) = assemble(src, &obj) {
+        eprintln!("skipping: assemble failed: {e}");
+        return;
+    }
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        entry: Some("_main".into()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    let apple = Command::new("xcrun")
+        .args([
+            "ld",
+            "-arch",
+            "arm64",
+            "-platform_version",
+            "macos",
+            &sdk_ver,
+            &sdk_ver,
+            "-syslibroot",
+            &sdk,
+            "-no_fixup_chains",
+            "-e",
+            "_main",
+            "-o",
+        ])
+        .arg(&apple_out)
+        .arg(&obj)
+        .arg("-lSystem")
+        .output()
+        .unwrap();
+    assert!(
+        apple.status.success(),
+        "xcrun ld failed: {}",
+        String::from_utf8_lossy(&apple.stderr)
+    );
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    let our_rebases = decode_rebase_records(&our_bytes).unwrap();
+    assert!(
+        our_rebases.iter().any(|record| {
+            record.segment == "__CUSTOM"
+                && record.section == "__ptrs"
+                && record.section_offset == 0
+                && record.rebase_type == REBASE_TYPE_POINTER
+        }),
+        "missing custom-segment rebase: {our_rebases:#?}"
+    );
+    assert_eq!(our_rebases, decode_rebase_records(&apple_bytes).unwrap());
+
+    for output in [&our_out, &apple_out] {
+        let verify = Command::new("codesign")
+            .arg("-v")
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "codesign verify failed for {}: {}",
+            output.display(),
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        assert_eq!(Command::new(output).status().unwrap().code(), Some(0));
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
 }
 
 #[test]

@@ -25,7 +25,7 @@ use crate::reloc::{
 };
 use crate::resolve::{AtomId, InputId};
 use crate::resolve::{Symbol, SymbolId, SymbolTable};
-use crate::section::is_executable;
+use crate::section::{is_executable, SectionKind};
 use crate::string_table::StringTableBuilder;
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind, NLIST_SIZE};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
@@ -96,6 +96,7 @@ pub struct LinkMapSymbol {
 pub enum WriteError {
     MissingSegment(&'static str),
     OffsetTooLarge(&'static str),
+    DyldInfoSegmentIndexTooLarge(usize),
     EntryAtomMissing(crate::resolve::AtomId),
     DefinedSymbolAtomMissing(SymbolId, crate::resolve::AtomId),
     DefinedSymbolSectionMissing(SymbolId, crate::resolve::AtomId),
@@ -115,6 +116,10 @@ impl fmt::Display for WriteError {
             WriteError::OffsetTooLarge(what) => {
                 write!(f, "{what} exceeds 32-bit Mach-O field width")
             }
+            WriteError::DyldInfoSegmentIndexTooLarge(index) => write!(
+                f,
+                "output segment index {index} cannot be represented in classic dyld info; maximum index is 15"
+            ),
             WriteError::EntryAtomMissing(atom) => {
                 write!(f, "entry atom {:?} missing from layout", atom)
             }
@@ -1207,9 +1212,7 @@ fn build_rebase_stream(
     let mut idx = 0usize;
     while idx < sites.len() {
         let segment_index = sites[idx].segment_index;
-        out.byte(
-            REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segment_index & REBASE_IMMEDIATE_MASK),
-        );
+        out.byte(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segment_index);
         out.uleb(sites[idx].segment_offset);
         let mut cursor = sites[idx].segment_offset;
         while idx < sites.len() && sites[idx].segment_index == segment_index {
@@ -1254,16 +1257,10 @@ fn collect_rebase_sites(
     let symbol_name_index = build_symbol_name_index(inputs.0.sym_table);
 
     for section in &layout.sections {
-        if !matches!(section.segment.as_str(), "__DATA" | "__DATA_CONST") {
+        if section.kind == SectionKind::ThreadLocalVariables {
             continue;
         }
-        if section.name == "__thread_vars" {
-            continue;
-        }
-        let segment = layout
-            .segment(&section.segment)
-            .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
-        let segment_index = segment_index(layout, &section.segment)?;
+        let mut segment_metadata = None;
         for placed in &section.atoms {
             let atom = inputs.0.atom_table.get(placed.atom);
             let Some(obj) = input_map.get(&atom.origin).copied() else {
@@ -1279,10 +1276,18 @@ fn collect_rebase_sites(
                 if !reloc_needs_rebase(obj, reloc, inputs.0.sym_table, &symbol_name_index) {
                     continue;
                 }
+                if segment_metadata.is_none() {
+                    let segment = layout
+                        .segment(&section.segment)
+                        .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
+                    segment_metadata =
+                        Some((segment_index(layout, &section.segment)?, segment.vm_addr));
+                }
+                let (segment_index, segment_vm_addr) = segment_metadata.unwrap();
                 let local_offset = reloc.offset.saturating_sub(atom.input_offset) as u64;
                 sites.push(RebaseSite {
                     segment_index,
-                    segment_offset: section.addr + placed.offset + local_offset - segment.vm_addr,
+                    segment_offset: section.addr + placed.offset + local_offset - segment_vm_addr,
                 });
             }
         }
@@ -2572,7 +2577,7 @@ fn build_bind_streams(
         }
         let slot_addr = placement.addr + entry.atom_offset as u64;
         bind_specs.push(BindRecordSpec {
-            segment_index: placement.segment_index,
+            segment_index: checked_dyld_segment_index(placement.segment_index)?,
             segment_offset: slot_addr - placement.segment_vm_addr,
             ordinal: import.ordinal,
             name: &import.name,
@@ -2629,7 +2634,7 @@ struct BindLayoutIndex {
 #[derive(Clone, Copy)]
 struct BindAtomPlacement {
     addr: u64,
-    segment_index: u8,
+    segment_index: usize,
     segment_vm_addr: u64,
     is_thread_vars: bool,
 }
@@ -2638,13 +2643,7 @@ impl BindLayoutIndex {
     fn build(layout: &Layout) -> Result<Self, WriteError> {
         let mut segment_meta = HashMap::with_capacity(layout.segments.len());
         for (idx, segment) in layout.segments.iter().enumerate() {
-            segment_meta.insert(
-                segment.name.as_str(),
-                (
-                    u8::try_from(idx).map_err(|_| WriteError::OffsetTooLarge("segment index"))?,
-                    segment.vm_addr,
-                ),
-            );
+            segment_meta.insert(segment.name.as_str(), (idx, segment.vm_addr));
         }
         let atom_count: usize = layout
             .sections
@@ -2687,7 +2686,14 @@ fn segment_index(layout: &Layout, name: &str) -> Result<u8, WriteError> {
             "__LINKEDIT" => "__LINKEDIT",
             _ => "__UNKNOWN",
         }))?;
-    u8::try_from(idx).map_err(|_| WriteError::OffsetTooLarge("segment index"))
+    checked_dyld_segment_index(idx)
+}
+
+fn checked_dyld_segment_index(index: usize) -> Result<u8, WriteError> {
+    if index > REBASE_IMMEDIATE_MASK as usize {
+        return Err(WriteError::DyldInfoSegmentIndexTooLarge(index));
+    }
+    Ok(index as u8)
 }
 
 fn apply_indirect_starts(layout: &mut Layout, linkedit: &LinkEditPlan) {
@@ -2892,6 +2898,34 @@ mod tests {
         assert!(segment_names.iter().any(|name| name == "__LINKEDIT"));
         assert!(!segment_names.iter().any(|name| name == "__DATA_CONST"));
         assert!(!segment_names.iter().any(|name| name == "__DATA"));
+    }
+
+    #[test]
+    fn classic_dyld_info_rejects_unencodable_segment_indices() {
+        let segments = (0..=16)
+            .map(|index| OutputSegment {
+                name: format!("__SEG{index}"),
+                sections: Vec::new(),
+                vm_addr: 0,
+                vm_size: 0,
+                file_off: 0,
+                file_size: 0,
+                init_prot: Prot::READ_WRITE,
+                max_prot: Prot::READ_WRITE,
+                flags: 0,
+            })
+            .collect();
+        let layout = Layout {
+            kind: OutputKind::Executable,
+            segments,
+            sections: Vec::new(),
+        };
+
+        let error = segment_index(&layout, "__SEG16").unwrap_err();
+        assert!(matches!(
+            error,
+            WriteError::DyldInfoSegmentIndexTooLarge(16)
+        ));
     }
 
     #[test]

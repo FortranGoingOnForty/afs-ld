@@ -1309,15 +1309,14 @@ fn collect_lazy_pointer_rebase_sites(
         .segment("__DATA")
         .ok_or(WriteError::MissingSegment("__DATA"))?;
     let section = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
+        .synthetic_section("__DATA", "__la_symbol_ptr")
         .ok_or(WriteError::MissingSegment("__DATA"))?;
 
     Ok((0..synthetic_plan.lazy_pointers.entries.len())
         .map(|idx| RebaseSite {
             segment_index,
-            segment_offset: section.addr + (idx as u64) * 8 - segment.vm_addr,
+            segment_offset: section.addr + section.synthetic_offset + (idx as u64) * 8
+                - segment.vm_addr,
         })
         .collect())
 }
@@ -1336,9 +1335,7 @@ fn collect_local_got_rebase_sites(
         .segment("__DATA_CONST")
         .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
     let section = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
+        .synthetic_section("__DATA_CONST", "__got")
         .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
 
     Ok(synthetic_plan
@@ -1349,7 +1346,8 @@ fn collect_local_got_rebase_sites(
         .filter(|(_, entry)| matches!(sym_table.get(entry.symbol), Symbol::Defined { .. }))
         .map(|(idx, _)| RebaseSite {
             segment_index,
-            segment_offset: section.addr + (idx as u64) * 8 - segment.vm_addr,
+            segment_offset: section.addr + section.synthetic_offset + (idx as u64) * 8
+                - segment.vm_addr,
         })
         .collect())
 }
@@ -2003,11 +2001,7 @@ fn collect_synthetic_local_symbols(
         return Ok(());
     }
 
-    let Some((section_index, section)) = layout
-        .sections
-        .iter()
-        .enumerate()
-        .find(|(_, section)| section.segment == "__DATA" && section.name == "__data")
+    let Some((section_index, section)) = layout.synthetic_section_with_index("__DATA", "__data")
     else {
         return Err(WriteError::MissingSegment("__DATA"));
     };
@@ -2510,15 +2504,13 @@ fn build_bind_streams(
             .segment("__DATA_CONST")
             .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
         let section = layout
-            .sections
-            .iter()
-            .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
+            .synthetic_section("__DATA_CONST", "__got")
             .ok_or(WriteError::MissingSegment("__DATA_CONST"))?;
         for (idx, entry) in synthetic_plan.got.entries.iter().enumerate() {
             let Some(import) = imports.get(&entry.symbol).copied() else {
                 continue;
             };
-            let slot_addr = section.addr + (idx as u64) * 8;
+            let slot_addr = section.addr + section.synthetic_offset + (idx as u64) * 8;
             bind_specs.push(BindRecordSpec {
                 segment_index,
                 segment_offset: slot_addr - segment.vm_addr,
@@ -2537,16 +2529,14 @@ fn build_bind_streams(
             .segment("__DATA")
             .ok_or(WriteError::MissingSegment("__DATA"))?;
         let section = layout
-            .sections
-            .iter()
-            .find(|section| section.segment == "__DATA" && section.name == "__thread_ptrs")
+            .synthetic_section("__DATA", "__thread_ptrs")
             .ok_or(WriteError::MissingSegment("__DATA"))?;
         for (idx, entry) in synthetic_plan.thread_pointers.entries.iter().enumerate() {
             let import = imports
                 .get(&entry.symbol)
                 .copied()
                 .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
-            let slot_addr = section.addr + (idx as u64) * 8;
+            let slot_addr = section.addr + section.synthetic_offset + (idx as u64) * 8;
             bind_specs.push(BindRecordSpec {
                 segment_index,
                 segment_offset: slot_addr - segment.vm_addr,
@@ -2597,16 +2587,14 @@ fn build_bind_streams(
             .segment("__DATA")
             .ok_or(WriteError::MissingSegment("__DATA"))?;
         let section = layout
-            .sections
-            .iter()
-            .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
+            .synthetic_section("__DATA", "__la_symbol_ptr")
             .ok_or(WriteError::MissingSegment("__DATA"))?;
         for (idx, entry) in synthetic_plan.lazy_pointers.entries.iter().enumerate() {
             let import = imports
                 .get(&entry.symbol)
                 .copied()
                 .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
-            let slot_addr = section.addr + (idx as u64) * 8;
+            let slot_addr = section.addr + section.synthetic_offset + (idx as u64) * 8;
             lazy_offsets.insert(entry.symbol, lazy_bind.len() as u32);
             emit_lazy_bind_record(
                 &mut lazy_bind,
@@ -2698,6 +2686,9 @@ fn checked_dyld_segment_index(index: usize) -> Result<u8, WriteError> {
 
 fn apply_indirect_starts(layout: &mut Layout, linkedit: &LinkEditPlan) {
     for section in &mut layout.sections {
+        if section.synthetic_data.is_empty() {
+            continue;
+        }
         if let Some(&start) = linkedit
             .indirect_starts
             .get(&(section.segment.clone(), section.name.clone()))

@@ -471,61 +471,54 @@ fn synthetic_address_maps(
     };
 
     let mut stub_addrs = HashMap::new();
-    if let Some(section) = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__TEXT" && section.name == "__stubs")
-    {
+    if let Some(section) = layout.synthetic_section("__TEXT", "__stubs") {
         for (idx, entry) in plan.stubs.entries.iter().enumerate() {
-            stub_addrs.insert(entry.symbol, section.addr + (idx as u64) * STUB_SIZE as u64);
+            stub_addrs.insert(
+                entry.symbol,
+                section.addr + section.synthetic_offset + (idx as u64) * STUB_SIZE as u64,
+            );
         }
     }
 
     let mut got_addrs = HashMap::new();
-    if let Some(section) = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
-    {
+    if let Some(section) = layout.synthetic_section("__DATA_CONST", "__got") {
         for (idx, entry) in plan.got.entries.iter().enumerate() {
-            got_addrs.insert(entry.symbol, section.addr + (idx as u64) * 8);
+            got_addrs.insert(
+                entry.symbol,
+                section.addr + section.synthetic_offset + (idx as u64) * 8,
+            );
         }
     }
 
     let mut thread_pointer_addrs = HashMap::new();
-    if let Some(section) = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__DATA" && section.name == "__thread_ptrs")
-    {
+    if let Some(section) = layout.synthetic_section("__DATA", "__thread_ptrs") {
         for (idx, entry) in plan.thread_pointers.entries.iter().enumerate() {
-            thread_pointer_addrs.insert(entry.symbol, section.addr + (idx as u64) * 8);
+            thread_pointer_addrs.insert(
+                entry.symbol,
+                section.addr + section.synthetic_offset + (idx as u64) * 8,
+            );
         }
     }
 
     let mut lazy_pointer_addrs = HashMap::new();
-    if let Some(section) = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
-    {
+    if let Some(section) = layout.synthetic_section("__DATA", "__la_symbol_ptr") {
         for (idx, entry) in plan.lazy_pointers.entries.iter().enumerate() {
-            lazy_pointer_addrs.insert(entry.symbol, section.addr + (idx as u64) * 8);
+            lazy_pointer_addrs.insert(
+                entry.symbol,
+                section.addr + section.synthetic_offset + (idx as u64) * 8,
+            );
         }
     }
 
     let mut stub_helper_entry_addrs = HashMap::new();
     let mut stub_helper_header_addr = None;
-    if let Some(section) = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__TEXT" && section.name == "__stub_helper")
-    {
-        stub_helper_header_addr = Some(section.addr);
+    if let Some(section) = layout.synthetic_section("__TEXT", "__stub_helper") {
+        let start = section.addr + section.synthetic_offset;
+        stub_helper_header_addr = Some(start);
         for (idx, entry) in plan.lazy_pointers.entries.iter().enumerate() {
             stub_helper_entry_addrs.insert(
                 entry.symbol,
-                section.addr
+                start
                     + STUB_HELPER_HEADER_SIZE as u64
                     + (idx as u64) * STUB_HELPER_ENTRY_SIZE as u64,
             );
@@ -533,12 +526,9 @@ fn synthetic_address_maps(
     }
 
     let dyld_private_addr = layout
-        .sections
-        .iter()
-        .find(|section| {
-            section.segment == "__DATA"
-                && section.name == "__data"
-                && section.synthetic_data.len() >= crate::synth::stubs::DYLD_PRIVATE_SIZE as usize
+        .synthetic_section("__DATA", "__data")
+        .filter(|section| {
+            section.synthetic_data.len() >= crate::synth::stubs::DYLD_PRIVATE_SIZE as usize
         })
         .map(|section| section.addr + section.synthetic_offset);
 
@@ -2191,11 +2181,7 @@ fn synthesize_got_section(
     plan: &SyntheticPlan,
     resolve: &ResolveView<'_>,
 ) -> Result<(), RelocError> {
-    let Some(section) = layout
-        .sections
-        .iter_mut()
-        .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
-    else {
+    let Some(section) = layout.synthetic_section_mut("__DATA_CONST", "__got") else {
         return Ok(());
     };
 
@@ -2249,18 +2235,14 @@ fn synthesize_stub_section(
     plan: &SyntheticPlan,
     resolve: &ResolveView<'_>,
 ) -> Result<(), RelocError> {
-    let Some(section) = layout
-        .sections
-        .iter_mut()
-        .find(|section| section.segment == "__TEXT" && section.name == "__stubs")
-    else {
+    let Some(section) = layout.synthetic_section_mut("__TEXT", "__stubs") else {
         return Ok(());
     };
 
     for (idx, entry) in plan.stubs.entries.iter().enumerate() {
         let start = idx * STUB_SIZE as usize;
         let end = start + STUB_SIZE as usize;
-        let stub_addr = section.addr + (idx as u64) * STUB_SIZE as u64;
+        let stub_addr = section.addr + section.synthetic_offset + (idx as u64) * STUB_SIZE as u64;
         let lazy_addr = resolve
             .lazy_pointer_addrs
             .get(&entry.symbol)
@@ -2285,11 +2267,7 @@ fn synthesize_lazy_pointer_section(
     plan: &SyntheticPlan,
     resolve: &ResolveView<'_>,
 ) -> Result<(), RelocError> {
-    let Some(section) = layout
-        .sections
-        .iter_mut()
-        .find(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
-    else {
+    let Some(section) = layout.synthetic_section_mut("__DATA", "__la_symbol_ptr") else {
         return Ok(());
     };
 
@@ -2323,11 +2301,7 @@ fn synthesize_stub_helper_section(
     let Some(binder_symbol) = plan.binder_symbol else {
         return Ok(());
     };
-    let Some(section) = layout
-        .sections
-        .iter_mut()
-        .find(|section| section.segment == "__TEXT" && section.name == "__stub_helper")
-    else {
+    let Some(section) = layout.synthetic_section_mut("__TEXT", "__stub_helper") else {
         return Ok(());
     };
 

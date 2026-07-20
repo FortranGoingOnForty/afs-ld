@@ -7,7 +7,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::atom::{AtomSection, AtomTable};
 use crate::input::ObjectFile;
-use crate::macho::constants::{SG_READ_ONLY, S_ZEROFILL};
+use crate::macho::constants::{
+    SECTION_TYPE_MASK, SG_READ_ONLY, S_ATTR_EXT_RELOC, S_ATTR_LIVE_SUPPORT, S_ATTR_LOC_RELOC,
+    S_ATTR_NO_DEAD_STRIP, S_SYMBOL_STUBS, S_ZEROFILL,
+};
 use crate::resolve::{AtomId, InputId};
 use crate::section::{
     is_zerofill, InputSection, OutputAtom, OutputSection, OutputSectionId, OutputSegment, Prot,
@@ -46,6 +49,8 @@ pub struct Layout {
 struct SectionKey {
     segment: String,
     name: String,
+    flags: u32,
+    stub_size: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -67,19 +72,47 @@ pub struct ExtraLayoutSections<'a> {
 }
 
 fn output_section_key(input_section: &InputSection) -> SectionKey {
-    match (
+    let (segment, name) = match (
         input_section.segname.as_str(),
         input_section.sectname.as_str(),
     ) {
-        ("__DATA", "__const") => SectionKey {
-            segment: "__DATA_CONST".to_string(),
-            name: "__const".to_string(),
-        },
-        _ => SectionKey {
-            segment: input_section.segname.clone(),
-            name: input_section.sectname.clone(),
+        ("__DATA", "__const") => ("__DATA_CONST".to_string(), "__const".to_string()),
+        _ => (
+            input_section.segname.clone(),
+            input_section.sectname.clone(),
+        ),
+    };
+    section_key(segment, name, input_section.flags, input_section.reserved2)
+}
+
+fn output_section_key_from_output(section: &OutputSection) -> SectionKey {
+    section_key(
+        section.segment.clone(),
+        section.name.clone(),
+        section.flags,
+        section.reserved2,
+    )
+}
+
+fn section_key(segment: String, name: String, flags: u32, reserved2: u32) -> SectionKey {
+    SectionKey {
+        segment,
+        name,
+        flags: compatibility_flags(flags),
+        stub_size: if flags & SECTION_TYPE_MASK == S_SYMBOL_STUBS {
+            reserved2
+        } else {
+            0
         },
     }
+}
+
+fn compatibility_flags(flags: u32) -> u32 {
+    output_section_flags(flags) & !(S_ATTR_NO_DEAD_STRIP | S_ATTR_LIVE_SUPPORT)
+}
+
+fn output_section_flags(flags: u32) -> u32 {
+    flags & !(S_ATTR_EXT_RELOC | S_ATTR_LOC_RELOC)
 }
 
 impl Layout {
@@ -184,6 +217,8 @@ impl Layout {
                 None => SectionKey {
                     segment: "__DATA".to_string(),
                     name: "__common".to_string(),
+                    flags: S_ZEROFILL,
+                    stub_size: 0,
                 },
             };
             let idx = match section_index.get(&key) {
@@ -199,7 +234,7 @@ impl Layout {
                                 input_section.kind,
                                 input_section.align_pow2.min(u8::MAX as u32) as u8,
                             ),
-                            flags: input_section.flags,
+                            flags: output_section_flags(input_section.flags),
                             reserved1: input_section.reserved1,
                             reserved2: input_section.reserved2,
                             reserved3: input_section.reserved3,
@@ -234,6 +269,9 @@ impl Layout {
             };
 
             let out = &mut sections[idx];
+            if let Some(input_section) = input_section {
+                out.flags |= output_section_flags(input_section.flags);
+            }
             out.align_pow2 =
                 normalize_output_alignment(out.kind, out.align_pow2.max(atom.align_pow2));
             out.atoms.push(OutputAtom {
@@ -245,25 +283,23 @@ impl Layout {
         }
 
         if let Some(plan) = synthetic_plan {
-            for synthetic in plan.output_sections() {
-                if let Some(existing) = sections.iter_mut().find(|section| {
-                    section.segment == synthetic.segment && section.name == synthetic.name
-                }) {
-                    merge_synthetic_section(existing, synthetic);
-                } else {
-                    sections.push(synthetic);
+            for mut synthetic in plan.output_sections() {
+                synthetic.flags = output_section_flags(synthetic.flags);
+                // Dyld scratch intentionally prefixes __data; generated tables keep independent indices.
+                if synthetic.segment == "__DATA" && synthetic.name == "__data" {
+                    let key = output_section_key_from_output(&synthetic);
+                    if let Some(existing) = sections
+                        .iter_mut()
+                        .find(|section| output_section_key_from_output(section) == key)
+                    {
+                        merge_synthetic_section(existing, synthetic);
+                        continue;
+                    }
                 }
+                sections.push(synthetic);
             }
         }
-        sections.sort_by(|a, b| {
-            segment_rank(kind, &a.segment)
-                .cmp(&segment_rank(kind, &b.segment))
-                .then_with(|| {
-                    section_rank(&a.segment, &a.name).cmp(&section_rank(&b.segment, &b.name))
-                })
-                .then_with(|| a.segment.cmp(&b.segment))
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        sections.sort_by(|a, b| compare_output_sections(kind, a, b));
 
         for section in &mut sections {
             section.atoms.sort_by(|a, b| {
@@ -338,6 +374,32 @@ impl Layout {
 
     pub fn segment_mut(&mut self, name: &str) -> Option<&mut OutputSegment> {
         self.segments.iter_mut().find(|seg| seg.name == name)
+    }
+
+    pub fn synthetic_section(&self, segment: &str, name: &str) -> Option<&OutputSection> {
+        self.sections.iter().find(|section| {
+            section.segment == segment && section.name == name && !section.synthetic_data.is_empty()
+        })
+    }
+
+    pub fn synthetic_section_with_index(
+        &self,
+        segment: &str,
+        name: &str,
+    ) -> Option<(usize, &OutputSection)> {
+        self.sections.iter().enumerate().find(|(_, section)| {
+            section.segment == segment && section.name == name && !section.synthetic_data.is_empty()
+        })
+    }
+
+    pub fn synthetic_section_mut(
+        &mut self,
+        segment: &str,
+        name: &str,
+    ) -> Option<&mut OutputSection> {
+        self.sections.iter_mut().find(|section| {
+            section.segment == segment && section.name == name && !section.synthetic_data.is_empty()
+        })
     }
 
     pub fn relayout(&mut self, header_size: u64) {
@@ -578,11 +640,14 @@ fn insert_extra_sections(sections: &mut Vec<OutputSection>, extra_sections: &[Ex
 }
 
 fn merge_synthetic_section(existing: &mut OutputSection, synthetic: OutputSection) {
-    debug_assert_eq!(existing.segment, synthetic.segment);
-    debug_assert_eq!(existing.name, synthetic.name);
+    debug_assert_eq!(
+        output_section_key_from_output(existing),
+        output_section_key_from_output(&synthetic)
+    );
+    debug_assert_eq!(existing.kind, synthetic.kind);
     existing.align_pow2 =
         normalize_output_alignment(existing.kind, existing.align_pow2.max(synthetic.align_pow2));
-    existing.flags = synthetic.flags;
+    existing.flags |= synthetic.flags;
     existing.reserved1 = synthetic.reserved1;
     existing.reserved2 = synthetic.reserved2;
     existing.reserved3 = synthetic.reserved3;
@@ -679,6 +744,19 @@ fn segment_rank(kind: OutputKind, segment: &str) -> usize {
         .iter()
         .position(|name| *name == segment)
         .unwrap_or(order.len())
+}
+
+fn compare_output_sections(
+    kind: OutputKind,
+    a: &OutputSection,
+    b: &OutputSection,
+) -> std::cmp::Ordering {
+    segment_rank(kind, &a.segment)
+        .cmp(&segment_rank(kind, &b.segment))
+        .then_with(|| a.segment.cmp(&b.segment))
+        .then_with(|| is_zerofill(a.kind).cmp(&is_zerofill(b.kind)))
+        .then_with(|| section_rank(&a.segment, &a.name).cmp(&section_rank(&b.segment, &b.name)))
+        .then_with(|| a.name.cmp(&b.name))
 }
 
 fn section_rank(segment: &str, section: &str) -> usize {
@@ -801,8 +879,10 @@ mod tests {
     use crate::atom::{Atom, AtomFlags, AtomSection, AtomTable};
     use crate::input::ObjectFile;
     use crate::macho::constants::{
-        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, S_ATTR_PURE_INSTRUCTIONS,
-        S_ATTR_SOME_INSTRUCTIONS, S_CSTRING_LITERALS, S_REGULAR, S_ZEROFILL,
+        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, S_ATTR_EXT_RELOC,
+        S_ATTR_LIVE_SUPPORT, S_ATTR_LOC_RELOC, S_ATTR_NO_DEAD_STRIP, S_ATTR_PURE_INSTRUCTIONS,
+        S_ATTR_SOME_INSTRUCTIONS, S_CSTRING_LITERALS, S_LAZY_SYMBOL_POINTERS, S_REGULAR,
+        S_SYMBOL_STUBS, S_ZEROFILL,
     };
     use crate::macho::reader::MachHeader64;
     use crate::resolve::{DylibId, InputId, SymbolId};
@@ -1037,6 +1117,302 @@ mod tests {
         let bss = layout.sections.iter().find(|s| s.name == "__bss").unwrap();
         assert_eq!(bss.file_off, 0);
         assert!(bss.addr >= EXECUTABLE_TEXT_BASE + PAGE_SIZE);
+    }
+
+    #[test]
+    fn layout_keeps_regular_and_zerofill_same_name_sections_separate() {
+        let mut zerofill = input_section("__DATA", "__foo", SectionKind::ZeroFill, 3, S_ZEROFILL);
+        zerofill.size = 8;
+        let mut regular = input_section("__DATA", "__foo", SectionKind::Data, 3, S_REGULAR);
+        regular.size = 8;
+        regular.data = 42u64.to_le_bytes().to_vec();
+
+        let objects = [
+            object_with_sections("zero.o", vec![zerofill]),
+            object_with_sections("regular.o", vec![regular]),
+        ];
+        let inputs = [
+            LayoutInput {
+                id: InputId(0),
+                object: &objects[0],
+                load_order: 0,
+                archive_member_offset: None,
+            },
+            LayoutInput {
+                id: InputId(1),
+                object: &objects[1],
+                load_order: 1,
+                archive_member_offset: None,
+            },
+        ];
+        let mut atoms = AtomTable::new();
+        atoms.push(atom(
+            InputId(0),
+            1,
+            AtomSection::ZeroFill,
+            0,
+            8,
+            3,
+            Vec::new(),
+        ));
+        atoms.push(atom(
+            InputId(1),
+            1,
+            AtomSection::Data,
+            0,
+            8,
+            3,
+            42u64.to_le_bytes().to_vec(),
+        ));
+
+        let layout = Layout::build(OutputKind::Executable, &inputs, &atoms, 0x200);
+        let matching: Vec<_> = layout
+            .sections
+            .iter()
+            .filter(|section| section.segment == "__DATA" && section.name == "__foo")
+            .collect();
+
+        assert_eq!(matching.len(), 2);
+        assert_eq!(matching[0].kind, SectionKind::Data);
+        assert_eq!(matching[1].kind, SectionKind::ZeroFill);
+        let zerofill = matching
+            .iter()
+            .find(|section| section.kind == SectionKind::ZeroFill)
+            .unwrap();
+        assert_eq!(zerofill.file_off, 0);
+        let regular = matching
+            .iter()
+            .find(|section| section.kind == SectionKind::Data)
+            .unwrap();
+        assert_ne!(regular.file_off, 0);
+        assert_eq!(regular.atoms[0].data, 42u64.to_le_bytes());
+        let data_segment = layout.segment("__DATA").unwrap();
+        assert_eq!(
+            regular.addr - data_segment.vm_addr,
+            regular.file_off - data_segment.file_off
+        );
+    }
+
+    #[test]
+    fn output_section_key_distinguishes_section_attributes() {
+        let data = input_section("__CUSTOM", "__mixed", SectionKind::Data, 2, S_REGULAR);
+        let text = input_section(
+            "__CUSTOM",
+            "__mixed",
+            SectionKind::Text,
+            2,
+            S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+        );
+
+        assert_ne!(output_section_key(&data), output_section_key(&text));
+    }
+
+    #[test]
+    fn output_section_key_ignores_mergeable_input_metadata() {
+        let relocated = input_section(
+            "__DATA",
+            "__mixed",
+            SectionKind::Data,
+            3,
+            S_REGULAR | S_ATTR_EXT_RELOC,
+        );
+        let live = input_section(
+            "__DATA",
+            "__mixed",
+            SectionKind::Data,
+            3,
+            S_REGULAR | S_ATTR_LOC_RELOC | S_ATTR_NO_DEAD_STRIP | S_ATTR_LIVE_SUPPORT,
+        );
+
+        assert_eq!(output_section_key(&relocated), output_section_key(&live));
+    }
+
+    #[test]
+    fn output_section_key_distinguishes_stub_widths() {
+        let mut narrow = input_section(
+            "__TEXT",
+            "__stubs",
+            SectionKind::SymbolStubs,
+            2,
+            S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+        );
+        narrow.reserved2 = 12;
+        let mut wide = narrow.clone();
+        wide.reserved2 = 16;
+
+        assert_ne!(output_section_key(&narrow), output_section_key(&wide));
+    }
+
+    #[test]
+    fn layout_merges_relocation_markers_without_emitting_them() {
+        let first = input_section(
+            "__DATA",
+            "__mixed",
+            SectionKind::Data,
+            3,
+            S_REGULAR | S_ATTR_EXT_RELOC,
+        );
+        let second = input_section(
+            "__DATA",
+            "__mixed",
+            SectionKind::Data,
+            3,
+            S_REGULAR | S_ATTR_LOC_RELOC | S_ATTR_NO_DEAD_STRIP,
+        );
+        let object = object_with_sections("metadata.o", vec![first, second]);
+        let mut atoms = AtomTable::new();
+        atoms.push(atom(InputId(0), 1, AtomSection::Data, 0, 8, 3, vec![1; 8]));
+        atoms.push(atom(InputId(0), 2, AtomSection::Data, 0, 8, 3, vec![2; 8]));
+
+        let layout = Layout::build(
+            OutputKind::Executable,
+            &[LayoutInput {
+                id: InputId(0),
+                object: &object,
+                load_order: 0,
+                archive_member_offset: None,
+            }],
+            &atoms,
+            0x200,
+        );
+        let matching: Vec<_> = layout
+            .sections
+            .iter()
+            .filter(|section| section.segment == "__DATA" && section.name == "__mixed")
+            .collect();
+
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].atoms.len(), 2);
+        assert_eq!(matching[0].flags & (S_ATTR_EXT_RELOC | S_ATTR_LOC_RELOC), 0);
+        assert_ne!(matching[0].flags & S_ATTR_NO_DEAD_STRIP, 0);
+    }
+
+    #[test]
+    fn layout_identifies_synthetic_sections_across_name_collisions() {
+        let mut zerofill = input_section(
+            "__DATA",
+            "__la_symbol_ptr",
+            SectionKind::ZeroFill,
+            3,
+            S_ZEROFILL,
+        );
+        zerofill.size = 8;
+        let mut collision = input_section(
+            "__DATA",
+            "__la_symbol_ptr",
+            SectionKind::LazySymbolPointers,
+            3,
+            S_LAZY_SYMBOL_POINTERS,
+        );
+        collision.size = 8;
+        collision.data = 7u64.to_le_bytes().to_vec();
+        let object = object_with_sections("collision.o", vec![zerofill, collision]);
+        let mut atoms = AtomTable::new();
+        atoms.push(atom(
+            InputId(0),
+            1,
+            AtomSection::ZeroFill,
+            0,
+            8,
+            3,
+            Vec::new(),
+        ));
+        atoms.push(atom(
+            InputId(0),
+            2,
+            AtomSection::LazySymbolPointers,
+            0,
+            8,
+            3,
+            7u64.to_le_bytes().to_vec(),
+        ));
+        let plan = SyntheticPlan {
+            got: GotSection::default(),
+            stubs: StubsSection::default(),
+            lazy_pointers: LazyPointerSection {
+                entries: vec![LazyPointerEntry {
+                    symbol: SymbolId(1),
+                    dylib: DylibId(0),
+                    weak_import: false,
+                }],
+                index: [(SymbolId(1), 0)].into_iter().collect(),
+            },
+            thread_pointers: crate::synth::tlv::ThreadPointerSection::default(),
+            direct_binds: Vec::new(),
+            binder_symbol: None,
+            tlv_bootstrap_symbol: None,
+            needs_dyld_private: false,
+        };
+
+        let layout = Layout::build_with_synthetics(
+            OutputKind::Executable,
+            &[LayoutInput {
+                id: InputId(0),
+                object: &object,
+                load_order: 0,
+                archive_member_offset: None,
+            }],
+            &atoms,
+            0x200,
+            Some(&plan),
+        );
+        let matching: Vec<_> = layout
+            .sections
+            .iter()
+            .filter(|section| section.segment == "__DATA" && section.name == "__la_symbol_ptr")
+            .collect();
+
+        assert_eq!(matching.len(), 3);
+        assert_eq!(matching[0].kind, SectionKind::LazySymbolPointers);
+        assert_eq!(matching[0].atoms.len(), 1);
+        assert!(matching[0].synthetic_data.is_empty());
+        assert_eq!(matching[2].kind, SectionKind::ZeroFill);
+        let synthetic = layout
+            .synthetic_section("__DATA", "__la_symbol_ptr")
+            .unwrap();
+        assert_eq!(synthetic.kind, SectionKind::LazySymbolPointers);
+        assert!(synthetic.atoms.is_empty());
+        assert_eq!(synthetic.synthetic_data.len(), 8);
+    }
+
+    #[test]
+    fn output_section_order_groups_custom_segments_and_places_zerofill_last() {
+        let section = |segment: &str, name: &str, kind: SectionKind| OutputSection {
+            segment: segment.into(),
+            name: name.into(),
+            kind,
+            align_pow2: 0,
+            flags: if is_zerofill(kind) {
+                S_ZEROFILL
+            } else {
+                S_REGULAR
+            },
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            atoms: Vec::new(),
+            synthetic_offset: 0,
+            synthetic_data: Vec::new(),
+            addr: 0,
+            size: 0,
+            file_off: 0,
+        };
+        let mut sections = [
+            section("__A", "__zero", SectionKind::ZeroFill),
+            section("__B", "__data", SectionKind::Data),
+            section("__A", "__data", SectionKind::Data),
+        ];
+
+        sections.sort_by(|a, b| compare_output_sections(OutputKind::Executable, a, b));
+
+        let order: Vec<_> = sections
+            .iter()
+            .map(|section| (section.segment.as_str(), section.name.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![("__A", "__data"), ("__A", "__zero"), ("__B", "__data"),]
+        );
     }
 
     #[test]
@@ -1478,6 +1854,30 @@ mod tests {
             reserved3: 0,
             data: Vec::new(),
             raw_relocs: Vec::new(),
+        }
+    }
+
+    fn object_with_sections(path: &str, sections: Vec<InputSection>) -> ObjectFile {
+        ObjectFile {
+            path: PathBuf::from(path),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections,
+            symbols: Vec::new(),
+            strings: crate::string_table::StringTable::from_bytes(vec![0]),
+            symtab: None,
+            dysymtab: None,
+            loh: Vec::new(),
+            data_in_code: Vec::new(),
         }
     }
 

@@ -540,18 +540,14 @@ fn personality_got_addr(
             detail: format!("{label} import is missing synthetic GOT planning"),
         });
     };
-    let Some(section) = layout
-        .sections
-        .iter()
-        .find(|section| section.segment == "__DATA_CONST" && section.name == "__got")
-    else {
+    let Some(section) = layout.synthetic_section("__DATA_CONST", "__got") else {
         return Err(UnwindError {
             input: obj.path.clone(),
             atom: atom_id,
             detail: format!("{label} import is missing the output __got section"),
         });
     };
-    Ok(section.addr + (idx as u64) * 8)
+    Ok(section.addr + section.synthetic_offset + (idx as u64) * 8)
 }
 
 fn read_u64(atom: &Atom, offset: usize) -> Result<u64, UnwindError> {

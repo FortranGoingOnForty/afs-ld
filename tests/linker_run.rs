@@ -27,7 +27,8 @@ use afs_ld::macho::constants::{
     REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB, REBASE_OPCODE_MASK,
     REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM, REBASE_TYPE_POINTER,
-    SG_READ_ONLY, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_REGULAR,
+    SECTION_TYPE_MASK, SG_READ_ONLY, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_REGULAR,
+    S_ZEROFILL,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::{ExportKind, Exports};
@@ -7271,6 +7272,114 @@ fn linker_run_dead_strip_keeps_and_runs_initializers() {
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_preserves_initialized_same_name_section_data() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let zerofill_obj = scratch("same-name-zerofill.o");
+    let regular_obj = scratch("same-name-regular.o");
+    let main_obj = scratch("same-name-main.o");
+    let output = scratch("same-name-sections.out");
+    assemble(
+        r#"
+        .globl _z
+        .zerofill __DATA,__foo,_z,8,3
+        "#,
+        &zerofill_obj,
+    )
+    .unwrap();
+    assemble(
+        r#"
+        .section __DATA,__foo,regular
+        .p2align 3
+        .globl _x
+        _x:
+            .quad 42
+        "#,
+        &regular_obj,
+    )
+    .unwrap();
+    assemble(
+        r#"
+        .text
+        .globl _main
+        _main:
+            adrp x8, _x@PAGE
+            ldr x0, [x8, _x@PAGEOFF]
+            ret
+        .subsections_via_symbols
+        "#,
+        &main_obj,
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![
+            zerofill_obj.clone(),
+            regular_obj.clone(),
+            main_obj.clone(),
+            tbd,
+        ],
+        output: Some(output.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
+    let mut matching = Vec::new();
+    for command in &commands {
+        let LoadCommand::Segment64(segment) = command else {
+            continue;
+        };
+        matching.extend(segment.sections.iter().filter(|section| {
+            section.segname_str() == "__DATA" && section.sectname_str() == "__foo"
+        }));
+    }
+    assert_eq!(matching.len(), 2);
+    assert!(matching
+        .iter()
+        .any(|section| section.flags & SECTION_TYPE_MASK == S_ZEROFILL));
+    let regular = matching
+        .iter()
+        .find(|section| section.flags & SECTION_TYPE_MASK == S_REGULAR)
+        .unwrap();
+    let regular_start = usize::try_from(regular.offset).unwrap();
+    let regular_end = regular_start + usize::try_from(regular.size).unwrap();
+    assert_eq!(&bytes[regular_start..regular_end], &42u64.to_le_bytes());
+
+    let verify = Command::new("codesign")
+        .arg("-v")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "codesign verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    assert_eq!(Command::new(&output).status().unwrap().code(), Some(42));
+
+    let _ = fs::remove_file(zerofill_obj);
+    let _ = fs::remove_file(regular_obj);
+    let _ = fs::remove_file(main_obj);
+    let _ = fs::remove_file(output);
 }
 
 #[test]

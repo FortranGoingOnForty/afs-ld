@@ -8,11 +8,11 @@ use std::process::Command;
 
 mod common;
 
-use afs_ld::leb::read_uleb;
+use afs_ld::leb::{read_sleb, read_uleb};
 use afs_ld::macho::constants::{
     BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DONE, BIND_OPCODE_DO_BIND,
     BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED, BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB,
-    BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_MASK,
+    BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB, BIND_OPCODE_MASK, BIND_OPCODE_SET_ADDEND_SLEB,
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
@@ -1599,6 +1599,7 @@ struct BindRecord {
     ordinal: u16,
     symbol: String,
     weak_import: bool,
+    addend: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1850,6 +1851,7 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
     let mut ordinal = 0u16;
     let mut symbol = String::new();
     let mut weak_import = false;
+    let mut addend = 0i64;
     while cursor < stream.len() {
         let byte = stream[cursor];
         cursor += 1;
@@ -1860,6 +1862,7 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
                 if lazy {
                     symbol.clear();
                     weak_import = false;
+                    addend = 0;
                 } else {
                     break;
                 }
@@ -1880,6 +1883,12 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
                 symbol = read_cstr(stream, &mut cursor)?;
             }
             BIND_OPCODE_SET_TYPE_IMM => {}
+            BIND_OPCODE_SET_ADDEND_SLEB => {
+                let (value, len) =
+                    read_sleb(&stream[cursor..]).map_err(|e| format!("bind SLEB: {e}"))?;
+                cursor += len;
+                addend = value;
+            }
             BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
                 segment_index = imm;
                 let (offset, len) =
@@ -1903,6 +1912,7 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
                     ordinal,
                     symbol: symbol.clone(),
                     weak_import,
+                    addend,
                 });
                 segment_offset += 8;
             }
@@ -1916,6 +1926,7 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
                     ordinal,
                     symbol: symbol.clone(),
                     weak_import,
+                    addend,
                 });
                 segment_offset += 8;
                 let (delta, len) =
@@ -1933,6 +1944,7 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
                     ordinal,
                     symbol: symbol.clone(),
                     weak_import,
+                    addend,
                 });
                 segment_offset += 8 + (imm as u64) * 8;
             }
@@ -1953,6 +1965,7 @@ fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, Stri
                         ordinal,
                         symbol: symbol.clone(),
                         weak_import,
+                        addend,
                     });
                     segment_offset += 8 + skip;
                 }
@@ -2415,6 +2428,31 @@ fn assert_direct_bind_case_matches_apple_ld(
             "{}: lazy-bind stream diverged from Apple ld",
             case.name
         ));
+    }
+
+    for (label, output) in [("afs-ld", &our_out), ("Apple ld", &apple_out)] {
+        let verify = Command::new("codesign")
+            .arg("-v")
+            .arg(output)
+            .output()
+            .map_err(|e| format!("spawn codesign for {label}: {e}"))?;
+        if !verify.status.success() {
+            return Err(format!(
+                "{}: {label} codesign verification failed: {}",
+                case.name,
+                String::from_utf8_lossy(&verify.stderr)
+            ));
+        }
+        let status = Command::new(output)
+            .status()
+            .map_err(|e| format!("run {label} output for {}: {e}", case.name))?;
+        if status.code() != Some(0) {
+            return Err(format!(
+                "{}: {label} output exited with {:?}",
+                case.name,
+                status.code()
+            ));
+        }
     }
 
     let _ = fs::remove_file(dylib);
@@ -6730,6 +6768,17 @@ fn direct_bind_surfaces_match_apple_ld_across_fixture_matrix() {
                 int *p = &ext_data;
                 int *q = &ext_data;
                 int main(void) { return (*p == 5 && *q == 5) ? 0 : 1; }
+            "#,
+        },
+        DirectBindParityCase {
+            name: "direct-addend",
+            dylib_src: r#"
+                char ext_data[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+            "#,
+            main_src: r#"
+                extern char ext_data[];
+                char *p = ext_data + 4;
+                int main(void) { return p == &ext_data[4] ? 0 : 1; }
             "#,
         },
     ];

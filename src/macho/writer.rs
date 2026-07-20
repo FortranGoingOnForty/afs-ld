@@ -1833,6 +1833,9 @@ fn build_output_symbols_profiled(
         if no_dead_strip {
             n_desc |= N_NO_DEAD_STRIP;
         }
+        if is_alias && atom.is_some() {
+            n_desc |= N_ALT_ENTRY;
+        }
         let partition = if hidden {
             OutputSymbolPartition::Local
         } else {

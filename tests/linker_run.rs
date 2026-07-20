@@ -20,8 +20,8 @@ use afs_ld::macho::constants::{
     EXPORT_SYMBOL_FLAGS_REEXPORT, EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, INDIRECT_SYMBOL_ABS,
     INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
     LC_FUNCTION_STARTS, LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, MH_MAGIC_64,
-    MH_OBJECT, MH_SUBSECTIONS_VIA_SYMBOLS, N_ABS, N_EXT, N_INDR, N_PEXT, N_SECT, N_UNDF,
-    N_WEAK_REF, REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED,
+    MH_OBJECT, MH_SUBSECTIONS_VIA_SYMBOLS, N_ABS, N_ALT_ENTRY, N_EXT, N_INDR, N_PEXT, N_SECT,
+    N_UNDF, N_WEAK_REF, REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED,
     REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB,
     REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB, REBASE_OPCODE_MASK,
@@ -3547,6 +3547,7 @@ fn linker_run_resolves_indirect_aliases_and_preserves_visibility() {
             N_SECT | if private_alias { N_PEXT } else { N_EXT }
         );
         assert_eq!(alias.n_sect, target.n_sect);
+        assert_eq!(alias.n_desc, N_ALT_ENTRY);
         assert_eq!(alias.value, target.value);
 
         let (_, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
@@ -3708,6 +3709,7 @@ fn linker_run_emits_aliases_to_absolute_symbols() {
         let record = records.get(name).unwrap();
         assert_eq!(record.n_type, N_ABS | N_EXT);
         assert_eq!(record.n_sect, 0);
+        assert_eq!(record.n_desc, 0);
         assert_eq!(record.value, ABSOLUTE_VALUE);
     }
     let exports = canonical_export_records(&bytes);

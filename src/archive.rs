@@ -18,6 +18,7 @@
 //! object files are read from their external paths on demand.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::ffi::OsString;
 use std::fmt;
@@ -36,6 +37,26 @@ pub const AR_MAGIC_THIN: &[u8; 8] = b"!<thin>\n";
 pub const AR_FMAG: &[u8; 2] = b"`\n";
 /// Size of `ar_hdr` on the wire.
 pub const AR_HDR_SIZE: usize = 60;
+
+#[cfg(test)]
+thread_local! {
+    static ARCHIVE_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_archive_parse_count() {
+    ARCHIVE_PARSE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn archive_parse_count() -> usize {
+    ARCHIVE_PARSE_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_archive_parse() {
+    ARCHIVE_PARSE_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+}
 
 /// Every parser error the archive reader can produce.
 #[derive(Debug)]
@@ -219,6 +240,25 @@ pub struct Archive<'a> {
     pub flavor: Flavor,
     data: &'a [u8],
     members: Vec<Member<'a>>,
+    member_by_offset: HashMap<u64, usize>,
+    symbol_index: Option<SymbolIndex>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ArchiveMemberMetadata {
+    name: PathBuf,
+    nested_member_offset: Option<u64>,
+    header_offset: u64,
+    body_offset: usize,
+    body_len: usize,
+    special: SpecialMember,
+}
+
+#[derive(Debug)]
+pub(crate) struct ArchiveMetadata {
+    flavor: Flavor,
+    members: Vec<ArchiveMemberMetadata>,
+    member_by_offset: HashMap<u64, usize>,
     symbol_index: Option<SymbolIndex>,
 }
 
@@ -244,6 +284,10 @@ pub enum MemberLoadError {
     NestingTooDeep {
         path: PathBuf,
     },
+    CachedMemberOutOfBounds {
+        path: PathBuf,
+        member_header_offset: u64,
+    },
 }
 
 impl fmt::Display for MemberLoadError {
@@ -268,6 +312,14 @@ impl fmt::Display for MemberLoadError {
                 "{}: nested thin archive depth exceeds the supported limit",
                 path.display()
             ),
+            MemberLoadError::CachedMemberOutOfBounds {
+                path,
+                member_header_offset,
+            } => write!(
+                f,
+                "{}: cached archive member at ar_hdr offset {member_header_offset:#x} is out of bounds",
+                path.display()
+            ),
         }
     }
 }
@@ -278,27 +330,109 @@ impl std::error::Error for MemberLoadError {
             MemberLoadError::Io { source, .. } => Some(source),
             MemberLoadError::NestedArchive { source, .. } => Some(source),
             MemberLoadError::MissingNestedMember { .. }
-            | MemberLoadError::NestingTooDeep { .. } => None,
+            | MemberLoadError::NestingTooDeep { .. }
+            | MemberLoadError::CachedMemberOutOfBounds { .. } => None,
         }
     }
 }
 
 const MAX_THIN_ARCHIVE_NESTING: usize = 32;
 
+impl ArchiveMetadata {
+    pub(crate) fn parse(path: &Path, data: &[u8]) -> Result<Self, ArchiveError> {
+        Ok(Archive::open(path, data)?.into_metadata())
+    }
+
+    pub(crate) fn symbol_index(&self) -> Option<&SymbolIndex> {
+        self.symbol_index.as_ref()
+    }
+
+    pub(crate) fn member_at_offset(&self, header_offset: u64) -> Option<&ArchiveMemberMetadata> {
+        let index = *self.member_by_offset.get(&header_offset)?;
+        self.members.get(index)
+    }
+
+    pub(crate) fn object_member_offsets(&self) -> impl Iterator<Item = u64> + '_ {
+        self.members
+            .iter()
+            .filter(|member| member.special == SpecialMember::None)
+            .map(|member| member.header_offset)
+    }
+
+    pub(crate) fn load_member<'a>(
+        &self,
+        archive_path: &Path,
+        archive_data: &'a [u8],
+        member: &ArchiveMemberMetadata,
+    ) -> Result<LoadedMember<'a>, MemberLoadError> {
+        if self.flavor == Flavor::GnuThin {
+            return load_thin_member(archive_path, &member.name, member.nested_member_offset, 0);
+        }
+
+        let end = member
+            .body_offset
+            .checked_add(member.body_len)
+            .ok_or_else(|| MemberLoadError::CachedMemberOutOfBounds {
+                path: archive_path.to_path_buf(),
+                member_header_offset: member.header_offset,
+            })?;
+        let body = archive_data.get(member.body_offset..end).ok_or_else(|| {
+            MemberLoadError::CachedMemberOutOfBounds {
+                path: archive_path.to_path_buf(),
+                member_header_offset: member.header_offset,
+            }
+        })?;
+        Ok(LoadedMember {
+            logical_path: inline_member_logical_path(archive_path, &member.name),
+            bytes: Cow::Borrowed(body),
+        })
+    }
+}
+
 impl<'a> Archive<'a> {
     /// Open an archive given its raw bytes and the source path (for
     /// diagnostics and GNU-thin external-file resolution).
     pub fn open(path: impl Into<PathBuf>, data: &'a [u8]) -> Result<Self, ArchiveError> {
+        #[cfg(test)]
+        record_archive_parse();
+
         let flavor = detect_flavor(data)?;
         let (members, flavor) = parse_members(data, flavor)?;
         let symbol_index = build_symbol_index(&members)?;
+        let member_by_offset = members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| (member.header_offset as u64, index))
+            .collect();
         Ok(Archive {
             path: path.into(),
             flavor,
             data,
             members,
+            member_by_offset,
             symbol_index,
         })
+    }
+
+    pub(crate) fn into_metadata(self) -> ArchiveMetadata {
+        let members = self
+            .members
+            .into_iter()
+            .map(|member| ArchiveMemberMetadata {
+                name: member.name,
+                nested_member_offset: member.nested_member_offset,
+                header_offset: member.header_offset as u64,
+                body_offset: member.body_offset,
+                body_len: member.body.len(),
+                special: member.special,
+            })
+            .collect();
+        ArchiveMetadata {
+            flavor: self.flavor,
+            members,
+            member_by_offset: self.member_by_offset,
+            symbol_index: self.symbol_index,
+        }
     }
 
     pub fn symbol_index(&self) -> Option<&SymbolIndex> {
@@ -330,9 +464,8 @@ impl<'a> Archive<'a> {
     /// Find the first member whose `ar_hdr` begins at `header_offset`. The
     /// symbol-index's `member_header_offset` fields feed into this lookup.
     pub fn member_at_offset(&self, header_offset: u64) -> Option<&Member<'a>> {
-        self.members
-            .iter()
-            .find(|m| m.header_offset as u64 == header_offset)
+        let index = *self.member_by_offset.get(&header_offset)?;
+        self.members.get(index)
     }
 
     /// First member that defines `name` according to the archive's symbol
@@ -373,62 +506,63 @@ impl<'a> Archive<'a> {
     ) -> Result<LoadedMember<'m>, MemberLoadError> {
         if self.flavor != Flavor::GnuThin {
             return Ok(LoadedMember {
-                logical_path: self.inline_member_logical_path(member),
+                logical_path: inline_member_logical_path(&self.path, &member.name),
                 bytes: Cow::Borrowed(member.body),
             });
         }
+        load_thin_member(&self.path, &member.name, member.nested_member_offset, depth)
+    }
+}
 
-        let external_path = self.member_external_path(member);
-        let bytes = std::fs::read(&external_path).map_err(|source| MemberLoadError::Io {
+fn inline_member_logical_path(archive_path: &Path, member_name: &Path) -> PathBuf {
+    let mut path = archive_path.as_os_str().to_owned();
+    path.push("(");
+    path.push(member_name.as_os_str());
+    path.push(")");
+    PathBuf::from(path)
+}
+
+fn load_thin_member<'a>(
+    archive_path: &Path,
+    member_name: &Path,
+    nested_member_offset: Option<u64>,
+    depth: usize,
+) -> Result<LoadedMember<'a>, MemberLoadError> {
+    let base = archive_path.parent().unwrap_or_else(|| Path::new("."));
+    let external_path = base.join(member_name);
+    let bytes = std::fs::read(&external_path).map_err(|source| MemberLoadError::Io {
+        path: external_path.clone(),
+        source,
+    })?;
+    let Some(member_header_offset) = nested_member_offset else {
+        return Ok(LoadedMember {
+            logical_path: external_path,
+            bytes: Cow::Owned(bytes),
+        });
+    };
+
+    if depth >= MAX_THIN_ARCHIVE_NESTING {
+        return Err(MemberLoadError::NestingTooDeep {
+            path: external_path,
+        });
+    }
+    let nested =
+        Archive::open(&external_path, &bytes).map_err(|source| MemberLoadError::NestedArchive {
             path: external_path.clone(),
             source,
         })?;
-        let Some(member_header_offset) = member.nested_member_offset else {
-            return Ok(LoadedMember {
-                logical_path: external_path,
-                bytes: Cow::Owned(bytes),
-            });
-        };
-
-        if depth >= MAX_THIN_ARCHIVE_NESTING {
-            return Err(MemberLoadError::NestingTooDeep {
-                path: external_path,
-            });
-        }
-        let nested = Archive::open(&external_path, &bytes).map_err(|source| {
-            MemberLoadError::NestedArchive {
-                path: external_path.clone(),
-                source,
-            }
+    let nested_member = nested
+        .member_at_offset(member_header_offset)
+        .filter(|member| member.special == SpecialMember::None)
+        .ok_or_else(|| MemberLoadError::MissingNestedMember {
+            path: external_path.clone(),
+            member_header_offset,
         })?;
-        let nested_member = nested
-            .member_at_offset(member_header_offset)
-            .filter(|member| member.special == SpecialMember::None)
-            .ok_or_else(|| MemberLoadError::MissingNestedMember {
-                path: external_path.clone(),
-                member_header_offset,
-            })?;
-        let loaded = nested.load_member_at_depth(nested_member, depth + 1)?;
-        Ok(LoadedMember {
-            logical_path: loaded.logical_path,
-            bytes: Cow::Owned(loaded.bytes.into_owned()),
-        })
-    }
-
-    /// Produce the display path for an inline archive member:
-    /// `/abs/path/libfoo.a(foo.o)`.
-    fn inline_member_logical_path(&self, member: &Member<'a>) -> PathBuf {
-        let mut s = self.path.as_os_str().to_owned();
-        s.push("(");
-        s.push(member.name.as_os_str());
-        s.push(")");
-        PathBuf::from(s)
-    }
-
-    fn member_external_path(&self, member: &Member<'a>) -> PathBuf {
-        let base = self.path.parent().unwrap_or_else(|| Path::new("."));
-        base.join(&member.name)
-    }
+    let loaded = nested.load_member_at_depth(nested_member, depth + 1)?;
+    Ok(LoadedMember {
+        logical_path: loaded.logical_path,
+        bytes: Cow::Owned(loaded.bytes.into_owned()),
+    })
 }
 
 /// Unified error for member fetching — I/O (GNU-thin only) or Mach-O parse.

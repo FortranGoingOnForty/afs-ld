@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
-use crate::archive::{Archive, ArchiveError, MemberLoadError};
+use crate::archive::{Archive, ArchiveError, ArchiveMetadata, MemberLoadError};
 use crate::input::ObjectFile;
 use crate::macho::dylib::DylibFile;
 use crate::macho::reader::ReadError;
@@ -157,12 +157,20 @@ pub struct ObjectInput {
 pub struct ArchiveInput {
     pub path: PathBuf,
     pub load_order: usize,
-    pub bytes: Vec<u8>,
+    /// Immutable after metadata parsing so cached body ranges stay valid.
+    bytes: Vec<u8>,
+    metadata: ArchiveMetadata,
     /// Members we've already fetched (keyed by `ar_hdr` offset). Prevents
     /// the fixed-point loop from re-ingesting the same object twice —
     /// important both for correctness (no duplicate-strong errors from
     /// our own symbols) and for keeping transitions deterministic.
     pub fetched: HashSet<u64>,
+}
+
+impl ArchiveInput {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 #[derive(Debug)]
@@ -319,8 +327,26 @@ impl Inputs {
         bytes: Vec<u8>,
         load_order: usize,
     ) -> Result<ArchiveId, InputAddError> {
-        Archive::open(&path, &bytes)?; // validate
-        Ok(self.add_validated_archive(path, bytes, load_order))
+        let metadata = ArchiveMetadata::parse(&path, &bytes)?;
+        Ok(self.add_parsed_archive(path, bytes, metadata, load_order))
+    }
+
+    pub(crate) fn add_parsed_archive(
+        &mut self,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        metadata: ArchiveMetadata,
+        load_order: usize,
+    ) -> ArchiveId {
+        let id = ArchiveId(self.archives.len() as u32);
+        self.archives.push(ArchiveInput {
+            path,
+            load_order,
+            bytes,
+            metadata,
+            fetched: std::collections::HashSet::new(),
+        });
+        id
     }
 
     pub fn add_validated_archive(
@@ -329,14 +355,13 @@ impl Inputs {
         bytes: Vec<u8>,
         load_order: usize,
     ) -> ArchiveId {
-        let id = ArchiveId(self.archives.len() as u32);
-        self.archives.push(ArchiveInput {
-            path,
-            load_order,
-            bytes,
-            fetched: std::collections::HashSet::new(),
+        let metadata = ArchiveMetadata::parse(&path, &bytes).unwrap_or_else(|error| {
+            panic!(
+                "validated archive {} failed metadata parsing: {error}",
+                path.display()
+            )
         });
-        id
+        self.add_parsed_archive(path, bytes, metadata, load_order)
     }
 
     /// Register a `.dylib`. TBD-backed dylibs go through
@@ -421,11 +446,11 @@ impl Inputs {
         Ok(&o.parsed)
     }
 
-    /// Open an `Archive` view, borrowing from the registry's bytes for the
-    /// returned lifetime.
+    /// Construct a standalone archive view for callers that need the public
+    /// archive reader. Link resolution uses the retained metadata instead.
     pub fn archive_view(&self, id: ArchiveId) -> Result<Archive<'_>, ArchiveError> {
-        let a = &self.archives[id.0 as usize];
-        Archive::open(&a.path, &a.bytes)
+        let archive = &self.archives[id.0 as usize];
+        Archive::open(&archive.path, &archive.bytes)
     }
 }
 
@@ -1195,8 +1220,7 @@ fn seed_archive(
     report: &mut SeedReport,
 ) -> Result<(), SeedError> {
     let ai = inputs.archive(archive_id);
-    let archive = Archive::open(&ai.path, &ai.bytes)?;
-    let Some(idx) = archive.symbol_index() else {
+    let Some(idx) = ai.metadata.symbol_index() else {
         // Archives without a symbol index are legal. They require -all_load
         // or -force_load to pull members.
         return Ok(());
@@ -1223,8 +1247,7 @@ fn seed_archive_for_unresolved(
     report: &mut SeedReport,
 ) -> Result<(), SeedError> {
     let ai = inputs.archive(archive_id);
-    let archive = Archive::open(&ai.path, &ai.bytes)?;
-    let Some(index) = archive.symbol_index() else {
+    let Some(index) = ai.metadata.symbol_index() else {
         return Ok(());
     };
 
@@ -1560,6 +1583,7 @@ struct ArchiveMemberLoadJob<'a> {
     key: ArchiveMemberKey,
     archive_path: &'a Path,
     archive_bytes: &'a [u8],
+    archive_metadata: &'a ArchiveMetadata,
     archive_load_order: usize,
 }
 
@@ -1584,6 +1608,7 @@ fn make_archive_member_jobs<'a>(
                 key,
                 archive_path: &archive.path,
                 archive_bytes: &archive.bytes,
+                archive_metadata: &archive.metadata,
                 archive_load_order: archive.load_order,
             }
         })
@@ -1644,15 +1669,16 @@ fn load_archive_member_job(
     Result<LoadedArchiveMember, FetchError>,
 ) {
     let result = (|| {
-        let archive = Archive::open(job.archive_path, job.archive_bytes)?;
-        let member =
-            archive
-                .member_at_offset(job.key.member.0)
-                .ok_or(FetchError::MemberNotFound {
-                    archive: job.key.archive,
-                    member: job.key.member,
-                })?;
-        let loaded = archive.load_member(member)?;
+        let member = job
+            .archive_metadata
+            .member_at_offset(job.key.member.0)
+            .ok_or(FetchError::MemberNotFound {
+                archive: job.key.archive,
+                member: job.key.member,
+            })?;
+        let loaded =
+            job.archive_metadata
+                .load_member(job.archive_path, job.archive_bytes, member)?;
         let logical_path = loaded.logical_path;
         let bytes = loaded.bytes.into_owned();
         let parsed = ObjectFile::parse(&logical_path, &bytes)?;
@@ -1769,11 +1795,7 @@ pub fn force_load_archive(
 ) -> Result<(), FetchError> {
     let member_offsets: Vec<u64> = {
         let ai = &inputs.archives[archive_id.0 as usize];
-        let archive = Archive::open(&ai.path, &ai.bytes)?;
-        archive
-            .object_members()
-            .map(|m| m.header_offset as u64)
-            .collect()
+        ai.metadata.object_member_offsets().collect()
     };
     let keys = member_offsets
         .into_iter()
@@ -2785,6 +2807,43 @@ mod tests {
             table.get(symbol),
             Symbol::Absolute { value: 17, .. }
         ));
+    }
+
+    #[test]
+    fn force_load_reuses_registered_archive_metadata() {
+        use crate::macho::constants::{N_ABS, N_EXT};
+
+        let first = object_with_symbol("_first", N_ABS | N_EXT, 11);
+        let second = object_with_symbol("_second", N_ABS | N_EXT, 22);
+        let mut inputs = Inputs::new();
+        crate::archive::reset_archive_parse_count();
+        let archive = inputs
+            .add_archive(
+                PathBuf::from("libCached.a"),
+                archive_with_members(
+                    &[("_first", 0), ("_second", 1)],
+                    &[("first.o/", first), ("second.o/", second)],
+                ),
+                0,
+            )
+            .unwrap();
+
+        let mut table = SymbolTable::new();
+        let mut report = DrainReport::default();
+        force_load_archive(&mut inputs, &mut table, archive, &mut report, 1).unwrap();
+
+        assert_eq!(crate::archive::archive_parse_count(), 1);
+        assert_eq!(report.fetched_members, 2);
+        for (name, value) in [("_first", 11), ("_second", 22)] {
+            let symbol = table.lookup_str(name).unwrap();
+            assert!(matches!(
+                table.get(symbol),
+                Symbol::Absolute {
+                    value: actual,
+                    ..
+                } if *actual == value
+            ));
+        }
     }
 
     #[test]

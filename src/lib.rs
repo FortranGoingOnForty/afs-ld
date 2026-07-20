@@ -32,7 +32,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::{collections::VecDeque, fs, io};
 
-use archive::Archive;
+use archive::ArchiveMetadata;
 use atom::{
     atomize_object, backpatch_symbol_atoms, materialize_common_symbols, AtomTable,
     CommonMaterializationError,
@@ -1208,6 +1208,7 @@ struct LoadedArchiveInput {
     path: PathBuf,
     load_order: usize,
     bytes: Vec<u8>,
+    metadata: ArchiveMetadata,
     timings: InputLoadTimings,
 }
 
@@ -1220,7 +1221,7 @@ struct LoadedDylibInput {
 
 enum LoadedInitialInput {
     Object(Box<LoadedObjectInput>),
-    Archive(LoadedArchiveInput),
+    Archive(Box<LoadedArchiveInput>),
     Dylib(Box<LoadedDylibInput>),
 }
 
@@ -1386,7 +1387,7 @@ fn load_archive_input(
     timings.read = phase_started.elapsed();
 
     let phase_started = Instant::now();
-    Archive::open(&path, &bytes).map_err(|error| InitialLoadError {
+    let metadata = ArchiveMetadata::parse(&path, &bytes).map_err(|error| InitialLoadError {
         load_order,
         error: if force_archive {
             LinkError::ForceLoadNotArchive(path.clone())
@@ -1396,12 +1397,13 @@ fn load_archive_input(
     })?;
     timings.archive_parse = phase_started.elapsed();
 
-    Ok(LoadedInitialInput::Archive(LoadedArchiveInput {
+    Ok(LoadedInitialInput::Archive(Box::new(LoadedArchiveInput {
         path,
         load_order,
         bytes,
+        metadata,
         timings,
-    }))
+    })))
 }
 
 fn register_loaded_initial_input(
@@ -1418,7 +1420,12 @@ fn register_loaded_initial_input(
             )
         }
         LoadedInitialInput::Archive(input) => {
-            let id = inputs.add_validated_archive(input.path, input.bytes, input.load_order);
+            let id = inputs.add_parsed_archive(
+                input.path,
+                input.bytes,
+                input.metadata,
+                input.load_order,
+            );
             RegisteredInput::one(
                 input.timings,
                 OrderedInputEntry::archive(input.load_order, id),

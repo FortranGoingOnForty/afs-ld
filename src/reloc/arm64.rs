@@ -813,12 +813,13 @@ fn apply_one(
                 patch_pageoff12(bytes, atom, obj, local_offset, reloc, target)
             }
         }
-        RelocKind::PointerToGot => patch_unsigned(
+        RelocKind::PointerToGot => patch_pointer_to_got(
             bytes,
             atom,
             obj,
             local_offset,
             reloc,
+            place,
             resolve_got_target(obj, atom, reloc, resolve)?,
         ),
         RelocKind::TlvpLoadPage21 => patch_page21(
@@ -1564,6 +1565,66 @@ fn patch_unsigned(
             reloc.kind,
             &describe_referent(obj, reloc.referent),
             format!("unsupported UNSIGNED width {:?}", other),
+        )),
+    }
+}
+
+fn patch_pointer_to_got(
+    bytes: &mut [u8],
+    atom: &Atom,
+    obj: &ObjectFile,
+    local_offset: u32,
+    reloc: Reloc,
+    place: u64,
+    target: u64,
+) -> Result<(), RelocError> {
+    if !reloc.pcrel {
+        return patch_unsigned(bytes, atom, obj, local_offset, reloc, target);
+    }
+
+    let implicit_addend = read_implicit_addend(
+        bytes,
+        local_offset,
+        reloc.length,
+        atom,
+        obj,
+        reloc.kind,
+        reloc.referent,
+    )?;
+    let delta = i128::from(target) + i128::from(reloc.addend) + i128::from(implicit_addend)
+        - i128::from(place);
+    let referent = describe_referent(obj, reloc.referent);
+    match reloc.length {
+        RelocLength::Word => {
+            let value = i32::try_from(delta).map_err(|_| {
+                reloc_error(
+                    atom,
+                    &obj.path,
+                    local_offset,
+                    reloc.kind,
+                    &referent,
+                    format!(
+                        "PC-relative POINTER_TO_GOT delta is out of signed 32-bit range ({delta:#x})"
+                    ),
+                )
+            })?;
+            write_u32(
+                bytes,
+                local_offset,
+                value as u32,
+                atom,
+                obj,
+                reloc.kind,
+                &referent,
+            )
+        }
+        other => Err(reloc_error(
+            atom,
+            &obj.path,
+            local_offset,
+            reloc.kind,
+            &referent,
+            format!("PC-relative POINTER_TO_GOT must use Word width, got {other:?}"),
         )),
     }
 }
@@ -2677,6 +2738,84 @@ mod tests {
     use crate::symbol::{InputSymbol, RawNlist};
     use crate::OutputKind;
 
+    fn apply_pointer_to_got_fixture(
+        place: u64,
+        got: u64,
+        length: RelocLength,
+        pcrel: bool,
+        explicit_addend: i64,
+        implicit_addend: i64,
+    ) -> Result<Vec<u8>, RelocError> {
+        let width = match length {
+            RelocLength::Word => 4,
+            RelocLength::Quad => 8,
+            other => panic!("unsupported fixture width {other:?}"),
+        };
+        let object = thunk_test_object(Vec::new(), 0, width);
+        let mut atoms = AtomTable::new();
+        let atom_id = atoms.push(test_atom(0, width as u32));
+        let mut symbols = SymbolTable::new();
+        let target_name = symbols.intern("_target");
+        symbols
+            .insert(Symbol::Defined {
+                name: target_name,
+                origin: InputId(0),
+                atom: atom_id,
+                value: 0,
+                weak: false,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap();
+        let target = symbols.lookup(target_name).unwrap();
+        let symbol_name_index = build_symbol_name_index(&symbols);
+        let atom_addrs = HashMap::from([(atom_id, place)]);
+        let atoms_by_input_section = atoms.by_input_section();
+        let section_addrs = HashMap::new();
+        let got_addrs = HashMap::from([(target, got)]);
+        let empty_symbol_addrs = HashMap::new();
+        let resolve = ResolveView {
+            sym_table: &symbols,
+            symbol_name_index: &symbol_name_index,
+            atom_table: &atoms,
+            atom_addrs: &atom_addrs,
+            atoms_by_input_section: &atoms_by_input_section,
+            section_addrs: &section_addrs,
+            stub_addrs: &empty_symbol_addrs,
+            got_addrs: &got_addrs,
+            thread_pointer_addrs: &empty_symbol_addrs,
+            lazy_pointer_addrs: &empty_symbol_addrs,
+            stub_helper_entry_addrs: &empty_symbol_addrs,
+            stub_helper_header_addr: None,
+            dyld_private_addr: None,
+            icf_redirects: None,
+        };
+        let mut bytes = match length {
+            RelocLength::Word => (implicit_addend as i32).to_le_bytes().to_vec(),
+            RelocLength::Quad => implicit_addend.to_le_bytes().to_vec(),
+            _ => unreachable!(),
+        };
+
+        apply_one(
+            &mut bytes,
+            atoms.get(atom_id),
+            &object,
+            Reloc {
+                offset: 0,
+                kind: RelocKind::PointerToGot,
+                length,
+                pcrel,
+                referent: Referent::Symbol(0),
+                addend: explicit_addend,
+                subtrahend: None,
+            },
+            &resolve,
+            None,
+            None,
+        )?;
+        Ok(bytes)
+    }
+
     #[test]
     fn branch26_patches_low_bits() {
         let insn = 0x9400_0000u32;
@@ -2737,6 +2876,70 @@ mod tests {
         assert!(fits_signed(-(1 << 25), 26));
         assert!(!fits_signed(1 << 25, 26));
         assert!(!fits_signed(-(1 << 25) - 1, 26));
+    }
+
+    #[test]
+    fn pointer_to_got_word_uses_place_and_addends() {
+        let place = 0x1_0000_5000;
+        let got = 0x1_0000_1000;
+
+        let bytes =
+            apply_pointer_to_got_fixture(place, got, RelocLength::Word, true, 12, -4).unwrap();
+
+        assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), -0x3ff8);
+    }
+
+    #[test]
+    fn pointer_to_got_word_accepts_signed_range_endpoints() {
+        let place = 0x1_0000_0000;
+
+        for (got, expected) in [
+            (place + i32::MAX as u64, i32::MAX),
+            (place - (1_u64 << 31), i32::MIN),
+        ] {
+            let bytes =
+                apply_pointer_to_got_fixture(place, got, RelocLength::Word, true, 0, 0).unwrap();
+
+            assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn pointer_to_got_word_rejects_out_of_range_delta() {
+        let place = 0x1_0000_0000;
+
+        for got in [place + (1_u64 << 31), place - (1_u64 << 31) - 1] {
+            let error = apply_pointer_to_got_fixture(place, got, RelocLength::Word, true, 0, 0)
+                .unwrap_err();
+
+            assert!(error.detail.contains("signed 32-bit"), "{error}");
+        }
+    }
+
+    #[test]
+    fn pcrel_pointer_to_got_rejects_quad_width() {
+        let error = apply_pointer_to_got_fixture(
+            0x1_0000_0000,
+            0x1_0000_1000,
+            RelocLength::Quad,
+            true,
+            0,
+            0,
+        )
+        .unwrap_err();
+
+        assert!(error.detail.contains("must use Word width"), "{error}");
+    }
+
+    #[test]
+    fn absolute_pointer_to_got_quad_preserves_pointer_value() {
+        let got = 0x1234_5678_9abc_def0;
+
+        let bytes =
+            apply_pointer_to_got_fixture(0x1_0000_0000, got, RelocLength::Quad, false, -8, 4)
+                .unwrap();
+
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), got - 4);
     }
 
     #[test]

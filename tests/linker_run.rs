@@ -323,16 +323,36 @@ fn synthetic_got_reference_object(entry: &str, target: &str, weak_ref: bool) -> 
 }
 
 fn synthetic_absolute_reference_object(entry: &str, target: &str) -> Vec<u8> {
-    let text = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // .quad target
+    synthetic_data_reference_object(entry, target, RelocKind::Unsigned, RelocLength::Quad, false)
+}
+
+fn synthetic_pointer_to_got_reference_object(
+    entry: &str,
+    target: &str,
+    length: RelocLength,
+    pcrel: bool,
+) -> Vec<u8> {
+    synthetic_data_reference_object(entry, target, RelocKind::PointerToGot, length, pcrel)
+}
+
+fn synthetic_data_reference_object(
+    entry: &str,
+    target: &str,
+    kind: RelocKind,
+    length: RelocLength,
+    pcrel: bool,
+) -> Vec<u8> {
+    let field_size = length.byte_width();
+    let mut text = vec![0; field_size];
+    text.extend_from_slice(&[
         0x00, 0x00, 0x80, 0x52, // mov w0, #0
         0xc0, 0x03, 0x5f, 0xd6, // ret
-    ];
+    ]);
     let relocs = [Reloc {
         offset: 0,
-        kind: RelocKind::Unsigned,
-        length: RelocLength::Quad,
-        pcrel: false,
+        kind,
+        length,
+        pcrel,
         referent: Referent::Symbol(1),
         addend: 0,
         subtrahend: None,
@@ -354,7 +374,7 @@ fn synthetic_absolute_reference_object(entry: &str, target: &str) -> Vec<u8> {
             n_type: N_SECT | N_EXT,
             n_sect: 1,
             n_desc: 0,
-            n_value: 8,
+            n_value: field_size as u64,
         },
         RawNlist {
             strx: target_strx,
@@ -380,7 +400,7 @@ fn synthetic_absolute_reference_object(entry: &str, target: &str) -> Vec<u8> {
             addr: 0,
             size: text.len() as u64,
             offset: 0,
-            align: 3,
+            align: field_size.trailing_zeros(),
             reloff: 0,
             nreloc: raw_relocs.len() as u32,
             flags: S_REGULAR,
@@ -4156,6 +4176,82 @@ fn linker_run_routes_far_absolute_got_loads_through_unrebased_slot() {
 }
 
 #[test]
+fn linker_run_writes_pcrel_pointer_to_got_as_delta_from_place() {
+    const ABSOLUTE_VALUE: u64 = 0x1234_5678_9abc_def0;
+
+    let reference = scratch("pcrel-pointer-to-got-reference.o");
+    let definition = scratch("pcrel-pointer-to-got-definition.o");
+    let out = scratch("pcrel-pointer-to-got.out");
+    fs::write(
+        &reference,
+        synthetic_pointer_to_got_reference_object("_main", "_absolute", RelocLength::Word, true),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        synthetic_absolute_object("_absolute", ABSOLUTE_VALUE),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![reference.clone(), definition.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let (got_addr, got) = output_section(&bytes, "__DATA_CONST", "__got").unwrap();
+    let actual = i32::from_le_bytes(text[0..4].try_into().unwrap());
+    let expected = i32::try_from(i128::from(got_addr) - i128::from(text_addr)).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(got, ABSOLUTE_VALUE.to_le_bytes());
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_preserves_absolute_pointer_to_got() {
+    const ABSOLUTE_VALUE: u64 = 0x1234_5678_9abc_def0;
+
+    let reference = scratch("absolute-pointer-to-got-reference.o");
+    let definition = scratch("absolute-pointer-to-got-definition.o");
+    let out = scratch("absolute-pointer-to-got.out");
+    fs::write(
+        &reference,
+        synthetic_pointer_to_got_reference_object("_main", "_absolute", RelocLength::Quad, false),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        synthetic_absolute_object("_absolute", ABSOLUTE_VALUE),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![reference.clone(), definition.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (_, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let (got_addr, got) = output_section(&bytes, "__DATA_CONST", "__got").unwrap();
+    assert_eq!(u64::from_le_bytes(text[0..8].try_into().unwrap()), got_addr);
+    assert_eq!(got, ABSOLUTE_VALUE.to_le_bytes());
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_resolves_external_absolute_symbols_without_atoms() {
     const ABSOLUTE_VALUE: u64 = 0x1234_5678_9abc_def0;
 
@@ -6756,6 +6852,104 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
 
     let _ = fs::remove_file(out);
     let _ = fs::remove_file(obj);
+}
+
+#[test]
+fn linker_run_applies_pcrel_pointer_to_got_like_apple_ld() {
+    if !have_xcrun() || !have_xcrun_tool("ld") || !have_tool("codesign") {
+        eprintln!("skipping: xcrun as/ld or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("pcrel-pointer-to-got.o");
+    let our_out = scratch("pcrel-pointer-to-got-ours.out");
+    let apple_out = scratch("pcrel-pointer-to-got-apple.out");
+    let src = r#"
+        .data
+        .globl _delta
+        _delta:
+            .long _puts@GOT - .
+
+        .text
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
+        .subsections_via_symbols
+    "#;
+    assemble(src, &obj).unwrap();
+
+    let object_bytes = fs::read(&obj).unwrap();
+    let object = ObjectFile::parse(&obj, &object_bytes).unwrap();
+    let relocs: Vec<_> = object
+        .sections
+        .iter()
+        .flat_map(|section| {
+            let raw = parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).unwrap();
+            parse_relocs(&raw).unwrap()
+        })
+        .collect();
+    assert!(relocs.iter().any(|reloc| {
+        reloc.kind == RelocKind::PointerToGot && reloc.length == RelocLength::Word && reloc.pcrel
+    }));
+
+    Linker::run(&LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+    apple_link_with_args(
+        &obj,
+        &apple_out,
+        "_main",
+        &sdk,
+        &sdk_ver,
+        &["-no_fixup_chains"],
+    )
+    .unwrap();
+
+    for output in [&our_out, &apple_out] {
+        let bytes = fs::read(output).unwrap();
+        let (data_addr, data) = output_section(&bytes, "__DATA", "__data").unwrap();
+        let (got_addr, _) = output_section(&bytes, "__DATA_CONST", "__got").unwrap();
+        let delta_addr = symbol_values(&bytes)["_delta"];
+        let delta_offset = usize::try_from(delta_addr - data_addr).unwrap();
+        let actual = i32::from_le_bytes(data[delta_offset..delta_offset + 4].try_into().unwrap());
+        let expected = i32::try_from(i128::from(got_addr) - i128::from(delta_addr)).unwrap();
+        assert_eq!(actual, expected);
+
+        let verify = Command::new("codesign")
+            .arg("-v")
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "codesign verify failed for {}: {}",
+            output.display(),
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        assert_eq!(Command::new(output).status().unwrap().code(), Some(0));
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
 }
 
 #[test]

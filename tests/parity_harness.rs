@@ -2,9 +2,41 @@
 
 mod common;
 
-use common::harness::{
-    apply_section_tolerances, diff_macho, parse_case_tolerances, string_table_within_five_percent,
+use afs_ld::macho::constants::{CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_EXECUTE, MH_MAGIC_64};
+use afs_ld::macho::reader::{
+    write_commands, write_header, LinkEditDataCmd, LoadCommand, MachHeader64,
 };
+use common::harness::{
+    apply_section_tolerances, diff_macho, macho_exports, parse_case_tolerances,
+    string_table_within_five_percent,
+};
+
+#[test]
+fn export_trie_reader_accepts_executable_images() {
+    let command = LoadCommand::DyldExportsTrie(LinkEditDataCmd {
+        dataoff: 48,
+        datasize: 2,
+    });
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_EXECUTE,
+            ncmds: 1,
+            sizeofcmds: command.cmdsize(),
+            flags: 0,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    write_commands(&[command], &mut bytes);
+    bytes.extend_from_slice(&[0, 0]);
+
+    let exports = macho_exports(&bytes).expect("read executable export trie");
+    assert!(exports.entries().expect("decode export trie").is_empty());
+}
 
 #[test]
 fn notes_tolerance_block_parses_section_range() {

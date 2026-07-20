@@ -27,8 +27,7 @@ use afs_ld::macho::constants::{
     LC_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_SEGMENT_64,
     LC_SYMTAB, LC_UUID, N_TYPE, N_UNDF,
 };
-use afs_ld::macho::dylib::DylibFile;
-use afs_ld::macho::exports::ExportKind;
+use afs_ld::macho::exports::{ExportKind, Exports};
 use afs_ld::macho::reader::{
     parse_commands, parse_header, u32_le, BuildVersionCmd, DyldInfoCmd, LoadCommand,
     Section64Header,
@@ -1760,13 +1759,12 @@ fn is_optional_dyld_stub_binder_record(record: &CanonicalSymbolRecord) -> bool {
 }
 
 fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExportRecord>, String> {
-    let dylib = DylibFile::parse("/tmp/canonical.dylib", bytes).map_err(|e| e.to_string())?;
+    let exports = macho_exports(bytes)?;
     let symbol_values: BTreeMap<String, u64> = canonical_symbol_records(bytes)?
         .into_iter()
         .map(|record| (record.name, record.value))
         .collect();
-    let mut out = dylib
-        .exports
+    let mut out = exports
         .entries()
         .map_err(|e| e.to_string())?
         .into_iter()
@@ -1801,6 +1799,37 @@ fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExportRecord>, 
         .collect::<Vec<_>>();
     out.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
     Ok(out)
+}
+
+pub(crate) fn macho_exports(bytes: &[u8]) -> Result<Exports, String> {
+    let header = parse_header(bytes).map_err(|e| e.to_string())?;
+    let commands = parse_commands(&header, bytes).map_err(|e| e.to_string())?;
+    for command in commands {
+        let range = match command {
+            LoadCommand::DyldInfoOnly(info) if info.export_size != 0 => {
+                Some((info.export_off, info.export_size))
+            }
+            LoadCommand::DyldExportsTrie(linkedit) if linkedit.datasize != 0 => {
+                Some((linkedit.dataoff, linkedit.datasize))
+            }
+            _ => None,
+        };
+        let Some((offset, size)) = range else {
+            continue;
+        };
+        let start = offset as usize;
+        let end = start
+            .checked_add(size as usize)
+            .ok_or_else(|| "export trie offset and size overflow".to_string())?;
+        let trie = bytes.get(start..end).ok_or_else(|| {
+            format!(
+                "export trie range 0x{start:x}..0x{end:x} exceeds file size 0x{:x}",
+                bytes.len()
+            )
+        })?;
+        return Ok(Exports::from_trie_bytes(trie));
+    }
+    Ok(Exports::empty())
 }
 
 fn symbol_partition_names(bytes: &[u8]) -> Result<SymbolPartitions, String> {

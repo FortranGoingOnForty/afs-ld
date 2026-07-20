@@ -602,7 +602,7 @@ pub enum InsertOutcome {
     /// conservatively merge reference attributes into that slot.
     Kept(SymbolId),
     /// Two Common symbols with the same name were coalesced by selecting the
-    /// larger tentative definition and retaining the earlier one on a tie.
+    /// larger tentative definition and the later declaration on a tie.
     CommonCoalesced { id: SymbolId },
     /// Inserting an Undefined whose slot currently holds a LazyArchive.
     /// The caller (Sprint 8 resolver) must fetch the named archive member

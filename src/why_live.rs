@@ -31,6 +31,7 @@ enum LiveCause {
     Root(RootReason),
     ReferencedBy(AtomId),
     ParentOf(AtomId),
+    RefersToLive(AtomId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +62,7 @@ impl DeadStripAnalysis {
         let forward_edges =
             build_forward_edges(layout_inputs, atom_table, sym_table, &resolved_by_name);
         let parent_edges = parent_edges(atom_table);
+        let live_support_edges = live_support_edges(atom_table, &forward_edges);
 
         let mut live_atoms = HashSet::new();
         let mut causes = HashMap::new();
@@ -86,6 +88,14 @@ impl DeadStripAnalysis {
                     if live_atoms.insert(target) {
                         causes.insert(target, LiveCause::ReferencedBy(atom_id));
                         worklist.push_back(target);
+                    }
+                }
+            }
+            if let Some(supporters) = live_support_edges.get(&atom_id) {
+                for &supporter in supporters {
+                    if live_atoms.insert(supporter) {
+                        causes.insert(supporter, LiveCause::RefersToLive(atom_id));
+                        worklist.push_back(supporter);
                     }
                 }
             }
@@ -232,6 +242,20 @@ impl DeadStripAnalysis {
                     .unwrap();
                     cursor = parent;
                 }
+                LiveCause::RefersToLive(target) => {
+                    let source_name = if first {
+                        requested_name.as_str()
+                    } else {
+                        &self.atom_name(sym_table, cursor)
+                    };
+                    writeln!(
+                        &mut out,
+                        "  {source_name} is retained because it references live {}",
+                        self.atom_name(sym_table, target)
+                    )
+                    .unwrap();
+                    cursor = target;
+                }
             }
             first = false;
         }
@@ -351,7 +375,7 @@ impl<'a> WhyLiveGraph<'a> {
         entry_symbol: Option<SymbolId>,
     ) -> Self {
         let resolved_by_name = resolved_symbol_map(sym_table);
-        let roots = root_symbols(opts, sym_table, entry_symbol);
+        let roots = root_symbols(opts, atom_table, sym_table, entry_symbol);
         let reverse_edges = build_reverse_edges(layout_inputs, atom_table, &resolved_by_name);
         Self {
             sym_table,
@@ -417,6 +441,7 @@ fn resolved_symbol_map(sym_table: &SymbolTable) -> HashMap<String, SymbolId> {
 
 fn root_symbols(
     opts: &LinkOptions,
+    atom_table: &AtomTable,
     sym_table: &SymbolTable,
     entry_symbol: Option<SymbolId>,
 ) -> HashMap<SymbolId, RootReason> {
@@ -430,10 +455,13 @@ fn root_symbols(
     for (symbol_id, symbol) in sym_table.iter() {
         match symbol {
             Symbol::Defined {
+                atom,
                 no_dead_strip: true,
                 ..
+            } if symbol_no_dead_strip_is_root(atom_table, *atom) => {
+                roots.entry(symbol_id).or_insert(RootReason::NoDeadStrip);
             }
-            | Symbol::Absolute {
+            Symbol::Absolute {
                 no_dead_strip: true,
                 ..
             } => {
@@ -498,7 +526,7 @@ fn root_atoms(
                 atom,
                 no_dead_strip: true,
                 ..
-            } if atom.0 != 0 => {
+            } if atom.0 != 0 && symbol_no_dead_strip_is_root(atom_table, *atom) => {
                 roots.entry(*atom).or_insert(RootReason::NoDeadStrip);
             }
             Symbol::Defined {
@@ -524,6 +552,14 @@ fn root_atoms(
     }
 
     roots
+}
+
+fn symbol_no_dead_strip_is_root(atom_table: &AtomTable, atom_id: AtomId) -> bool {
+    atom_id.0 == 0
+        || !atom_table
+            .get(atom_id)
+            .flags
+            .has(crate::atom::AtomFlags::LIVE_SUPPORT)
 }
 
 fn build_reverse_edges(
@@ -668,6 +704,26 @@ fn parent_edges(atom_table: &AtomTable) -> HashMap<AtomId, Vec<AtomId>> {
     }
     for children in out.values_mut() {
         children.sort_by_key(|aid| aid.0);
+    }
+    out
+}
+
+fn live_support_edges(
+    atom_table: &AtomTable,
+    forward_edges: &HashMap<AtomId, Vec<AtomId>>,
+) -> HashMap<AtomId, Vec<AtomId>> {
+    let mut out = HashMap::<AtomId, Vec<AtomId>>::new();
+    for (source, atom) in atom_table.iter() {
+        if !atom.flags.has(crate::atom::AtomFlags::LIVE_SUPPORT) {
+            continue;
+        }
+        for &target in forward_edges.get(&source).into_iter().flatten() {
+            out.entry(target).or_default().push(source);
+        }
+    }
+    for sources in out.values_mut() {
+        sources.sort_by_key(|aid| aid.0);
+        sources.dedup();
     }
     out
 }
@@ -872,8 +928,18 @@ fn symbol_name(sym_table: &SymbolTable, symbol_id: SymbolId) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::atom::AtomFlags;
+    use crate::input::ObjectFile;
+    use crate::macho::constants::{
+        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, S_REGULAR,
+    };
+    use crate::macho::reader::MachHeader64;
+    use crate::reloc::{write_raw_relocs, write_relocs, Reloc, RelocKind, RelocLength};
+    use crate::section::{InputSection, SectionKind};
+    use crate::string_table::StringTable;
 
     fn alias_roots_private_target(private_alias: bool) -> (bool, bool) {
         let mut atoms = AtomTable::new();
@@ -920,7 +986,7 @@ mod tests {
         };
 
         (
-            root_symbols(&opts, &symbols, None).contains_key(&target_symbol),
+            root_symbols(&opts, &atoms, &symbols, None).contains_key(&target_symbol),
             root_atoms(&opts, &atoms, &symbols, None).contains_key(&target_atom),
         )
     }
@@ -929,5 +995,146 @@ mod tests {
     fn dylib_alias_roots_follow_alias_visibility() {
         assert_eq!(alias_roots_private_target(false), (true, true));
         assert_eq!(alias_roots_private_target(true), (false, false));
+    }
+
+    fn live_support_result(
+        target_is_root: bool,
+        support_symbol_no_dead_strip: bool,
+    ) -> (bool, bool, bool) {
+        let relocs = [Reloc {
+            offset: 0,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Section(2),
+            addend: 0,
+            subtrahend: None,
+        }];
+        let raw_relocs = write_relocs(&relocs).unwrap();
+        let mut reloc_bytes = Vec::new();
+        write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+        let section = |name: &str, raw_relocs: Vec<u8>| InputSection {
+            segname: "__DATA".into(),
+            sectname: name.into(),
+            kind: SectionKind::Data,
+            addr: 0,
+            size: 8,
+            align_pow2: 3,
+            flags: S_REGULAR,
+            offset: 0,
+            reloff: 0,
+            nreloc: (raw_relocs.len() / 8) as u32,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            data: vec![0; 8],
+            raw_relocs,
+        };
+        let object = ObjectFile {
+            path: PathBuf::from("live-support.o"),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections: vec![
+                section("__support", reloc_bytes),
+                section("__target", Vec::new()),
+            ],
+            symbols: Vec::new(),
+            strings: StringTable::from_bytes(vec![0]),
+            symtab: None,
+            dysymtab: None,
+            loh: Vec::new(),
+            data_in_code: Vec::new(),
+        };
+        let mut atoms = AtomTable::new();
+        let support = atoms.push(Atom {
+            id: AtomId(0),
+            origin: InputId(0),
+            input_section: 1,
+            section: AtomSection::Data,
+            input_offset: 0,
+            size: 8,
+            align_pow2: 3,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 8],
+            flags: AtomFlags::NONE.with(AtomFlags::LIVE_SUPPORT),
+            parent_of: None,
+        });
+        let target = atoms.push(Atom {
+            id: AtomId(0),
+            origin: InputId(0),
+            input_section: 2,
+            section: AtomSection::Data,
+            input_offset: 0,
+            size: 8,
+            align_pow2: 3,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 8],
+            flags: if target_is_root {
+                AtomFlags::NONE.with(AtomFlags::NO_DEAD_STRIP)
+            } else {
+                AtomFlags::NONE
+            },
+            parent_of: None,
+        });
+        let inputs = [LayoutInput {
+            id: InputId(0),
+            object: &object,
+            load_order: 0,
+            archive_member_offset: None,
+        }];
+        let mut symbols = SymbolTable::new();
+        let support_symbol = if support_symbol_no_dead_strip {
+            let support_name = symbols.intern("_support");
+            symbols
+                .insert(Symbol::Defined {
+                    name: support_name,
+                    origin: InputId(0),
+                    atom: support,
+                    value: 0,
+                    weak: false,
+                    private_extern: true,
+                    no_dead_strip: true,
+                })
+                .unwrap();
+            symbols.lookup(support_name)
+        } else {
+            None
+        };
+        let analysis =
+            DeadStripAnalysis::build(&LinkOptions::default(), &inputs, &atoms, &symbols, None);
+
+        (
+            analysis.live_atoms().contains(&support),
+            analysis.live_atoms().contains(&target),
+            support_symbol.is_some_and(|symbol| {
+                root_symbols(&LinkOptions::default(), &atoms, &symbols, None).contains_key(&symbol)
+            }),
+        )
+    }
+
+    #[test]
+    fn live_support_atom_is_kept_when_its_target_is_live() {
+        assert_eq!(live_support_result(true, false), (true, true, false));
+    }
+
+    #[test]
+    fn live_support_atom_is_not_an_unconditional_root() {
+        assert_eq!(live_support_result(false, false), (false, false, false));
+    }
+
+    #[test]
+    fn live_support_ignores_symbol_no_dead_strip() {
+        assert_eq!(live_support_result(false, true), (false, false, false));
     }
 }

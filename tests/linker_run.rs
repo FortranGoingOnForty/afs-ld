@@ -7177,6 +7177,103 @@ fn linker_run_dead_strip_prunes_synthetic_import_sections() {
 }
 
 #[test]
+fn linker_run_dead_strip_keeps_and_runs_initializers() {
+    if !have_xcrun() || !have_tool("codesign") {
+        eprintln!("skipping: xcrun or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("dead-strip-initializers.o");
+    let our_out = scratch("dead-strip-initializers-ours.out");
+    let apple_out = scratch("dead-strip-initializers-apple.out");
+    let src = r#"
+        .data
+        .p2align 2
+        Lstate:
+            .long 0
+
+        .text
+        .private_extern _ctor
+        _ctor:
+            adrp x8, Lstate@PAGE
+            add x8, x8, Lstate@PAGEOFF
+            mov w9, #1
+            str w9, [x8]
+            ret
+
+        .globl _main
+        _main:
+            adrp x8, Lstate@PAGE
+            add x8, x8, Lstate@PAGEOFF
+            ldr w0, [x8]
+            ret
+
+        .section __DATA,__mod_init_func,mod_init_funcs
+        .p2align 3
+            .quad _ctor
+        .subsections_via_symbols
+    "#;
+    assemble(src, &obj).unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        dead_strip: true,
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_with_args(
+        &obj,
+        &apple_out,
+        "_main",
+        &sdk,
+        &sdk_ver,
+        &["-dead_strip", "-no_fixup_chains"],
+    )
+    .unwrap();
+
+    for output in [&our_out, &apple_out] {
+        let bytes = fs::read(output).unwrap();
+        assert!([
+            ("__DATA", "__mod_init_func"),
+            ("__DATA_CONST", "__mod_init_func"),
+        ]
+        .into_iter()
+        .any(|(segment, section)| output_section(&bytes, segment, section).is_some()));
+        let verify = Command::new("codesign")
+            .arg("-v")
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "codesign verify failed for {}: {}",
+            output.display(),
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        assert_eq!(Command::new(output).status().unwrap().code(), Some(1));
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
 fn linker_run_relaxes_hidden_got_loads_like_apple_ld() {
     if !have_xcrun() || !have_tool("codesign") {
         eprintln!("skipping: xcrun or codesign unavailable");

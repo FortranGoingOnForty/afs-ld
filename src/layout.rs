@@ -603,7 +603,9 @@ fn normalize_output_alignment(kind: crate::section::SectionKind, align_pow2: u8)
         | crate::section::SectionKind::ThreadLocalZeroFill
         | crate::section::SectionKind::ThreadLocalVariables
         | crate::section::SectionKind::ThreadLocalVariablePointers
-        | crate::section::SectionKind::ThreadLocalInitPointers => align_pow2.max(3),
+        | crate::section::SectionKind::ThreadLocalInitPointers
+        | crate::section::SectionKind::InitializerPointers
+        | crate::section::SectionKind::TerminatorPointers => align_pow2.max(3),
         _ => align_pow2,
     }
 }

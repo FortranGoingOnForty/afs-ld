@@ -21,7 +21,10 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::input::ObjectFile;
-use crate::macho::constants::MH_SUBSECTIONS_VIA_SYMBOLS;
+use crate::macho::constants::{
+    MH_SUBSECTIONS_VIA_SYMBOLS, SECTION_TYPE_MASK, S_ATTR_LIVE_SUPPORT, S_ATTR_NO_DEAD_STRIP,
+    S_MOD_INIT_FUNC_POINTERS, S_MOD_TERM_FUNC_POINTERS,
+};
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent};
 use crate::resolve::{AtomId, InputId, Symbol, SymbolId, SymbolTable};
 use crate::section::{InputSection, SectionKind};
@@ -79,7 +82,10 @@ impl AtomSection {
             SectionKind::SymbolStubs => AtomSection::SymbolStubs,
             SectionKind::NonLazySymbolPointers => AtomSection::NonLazySymbolPointers,
             SectionKind::LazySymbolPointers => AtomSection::LazySymbolPointers,
-            SectionKind::Regular | SectionKind::Unknown(_) => AtomSection::Other,
+            SectionKind::InitializerPointers
+            | SectionKind::TerminatorPointers
+            | SectionKind::Regular
+            | SectionKind::Unknown(_) => AtomSection::Other,
         }
     }
 
@@ -117,6 +123,7 @@ impl AtomFlags {
     pub const PURE_INSTRUCTIONS: u32 = 1 << 4;
     pub const ADDRESS_TAKEN: u32 = 1 << 5; // set during reloc scan (Sprint 24's ICF gate)
     pub const ALT_ENTRY: u32 = 1 << 6;
+    pub const LIVE_SUPPORT: u32 = 1 << 7;
 
     pub fn has(self, bit: u32) -> bool {
         self.bits & bit != 0
@@ -719,9 +726,9 @@ fn atomize_cstring(
         let owner_entry = syms.iter().find(|(_, _, off)| *off as usize == offset);
         let owner_idx = owner_entry.map(|(i, _, _)| *i);
 
-        let mut flags = AtomFlags::default().with(AtomFlags::LITERAL);
+        let mut flags = section_atom_flags(sect).with(AtomFlags::LITERAL);
         if let Some((_, sym, _)) = owner_entry {
-            flags.set(symbol_flags(sym).bits());
+            flags.set(symbol_flags(sect, sym).bits());
         }
 
         let atom = Atom {
@@ -773,9 +780,9 @@ fn atomize_fixed_literal(
         let owner_entry = syms.iter().find(|(_, _, off)| *off as usize == offset);
         let owner_idx = owner_entry.map(|(i, _, _)| *i);
 
-        let mut flags = AtomFlags::default().with(AtomFlags::LITERAL);
+        let mut flags = section_atom_flags(sect).with(AtomFlags::LITERAL);
         if let Some((_, sym, _)) = owner_entry {
-            flags.set(symbol_flags(sym).bits());
+            flags.set(symbol_flags(sect, sym).bits());
         }
 
         let atom = Atom {
@@ -837,7 +844,7 @@ fn atomize_compact_unwind(
             owner: None,
             alt_entries: Vec::new(),
             data,
-            flags: AtomFlags::default(),
+            flags: section_atom_flags(sect),
             parent_of: None, // filled by link_unwind_parents
         };
         let id = table.push(atom);
@@ -880,7 +887,7 @@ fn atomize_eh_frame(
             owner: None,
             alt_entries: Vec::new(),
             data: sect.data[offset..end].to_vec(),
-            flags: AtomFlags::default(),
+            flags: section_atom_flags(sect),
             parent_of: None,
         };
         let id = table.push(atom);
@@ -1031,7 +1038,7 @@ fn atomize_zerofill(
             owner: Some(SymbolId(*sym_idx as u32)),
             alt_entries: Vec::new(),
             data: Vec::new(), // zerofill
-            flags: symbol_flags(sym),
+            flags: symbol_flags(sect, sym),
             parent_of: None,
         };
         let id = table.push(atom);
@@ -1051,10 +1058,7 @@ fn build_section_atom(
     } else {
         sect.data.clone()
     };
-    let mut flags = AtomFlags::default();
-    if sect.kind == SectionKind::Text {
-        flags.set(AtomFlags::PURE_INSTRUCTIONS);
-    }
+    let flags = section_atom_flags(sect);
     Atom {
         id: AtomId(0),
         origin: input_id,
@@ -1089,12 +1093,9 @@ fn build_slice_atom(
         let end = (offset + size) as usize;
         sect.data[start..end.min(sect.data.len())].to_vec()
     };
-    let mut flags = AtomFlags::default();
-    if sect.kind == SectionKind::Text {
-        flags.set(AtomFlags::PURE_INSTRUCTIONS);
-    }
+    let mut flags = section_atom_flags(sect);
     if let Some(sym) = owner {
-        flags.set(symbol_flags(sym).bits());
+        flags.set(symbol_flags(sect, sym).bits());
     }
     if size == 0 && offset < sect.size as u32 {
         flags.set(AtomFlags::ALT_ENTRY);
@@ -1117,9 +1118,29 @@ fn build_slice_atom(
     }
 }
 
-fn symbol_flags(sym: &InputSymbol) -> AtomFlags {
-    let mut f = AtomFlags::default();
-    if sym.no_dead_strip() {
+fn section_atom_flags(sect: &InputSection) -> AtomFlags {
+    let mut f = AtomFlags::NONE;
+    let section_type = sect.flags & SECTION_TYPE_MASK;
+    if sect.flags & S_ATTR_NO_DEAD_STRIP != 0
+        || matches!(
+            section_type,
+            S_MOD_INIT_FUNC_POINTERS | S_MOD_TERM_FUNC_POINTERS
+        )
+    {
+        f.set(AtomFlags::NO_DEAD_STRIP);
+    }
+    if sect.flags & S_ATTR_LIVE_SUPPORT != 0 {
+        f.set(AtomFlags::LIVE_SUPPORT);
+    }
+    if sect.kind == SectionKind::Text {
+        f.set(AtomFlags::PURE_INSTRUCTIONS);
+    }
+    f
+}
+
+fn symbol_flags(sect: &InputSection, sym: &InputSymbol) -> AtomFlags {
+    let mut f = section_atom_flags(sect);
+    if sym.no_dead_strip() && !f.has(AtomFlags::LIVE_SUPPORT) {
         f.set(AtomFlags::NO_DEAD_STRIP);
     }
     if sym.weak_def() {
@@ -1142,6 +1163,30 @@ fn find_next_non_alt_entry(syms: &[(usize, &InputSymbol, u32)], from: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::macho::constants::{
+        S_ATTR_LIVE_SUPPORT, S_ATTR_NO_DEAD_STRIP, S_MOD_INIT_FUNC_POINTERS,
+        S_MOD_TERM_FUNC_POINTERS, S_REGULAR,
+    };
+
+    fn input_section(kind: SectionKind, flags: u32) -> InputSection {
+        InputSection {
+            segname: "__DATA".into(),
+            sectname: "__test".into(),
+            kind,
+            addr: 0,
+            size: 8,
+            align_pow2: 3,
+            flags,
+            offset: 0,
+            reloff: 0,
+            nreloc: 0,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            data: vec![0; 8],
+            raw_relocs: Vec::new(),
+        }
+    }
 
     fn make_text_atom(origin: InputId, sect: u8, off: u32, size: u32) -> Atom {
         Atom {
@@ -1306,6 +1351,31 @@ mod tests {
         assert!(f.has(AtomFlags::NO_DEAD_STRIP));
         assert!(f.has(AtomFlags::WEAK_DEF));
         assert!(!f.has(AtomFlags::THREAD_LOCAL));
+    }
+
+    #[test]
+    fn section_liveness_attributes_apply_to_whole_and_sliced_atoms() {
+        let section = input_section(
+            SectionKind::Data,
+            S_REGULAR | S_ATTR_NO_DEAD_STRIP | S_ATTR_LIVE_SUPPORT,
+        );
+
+        let whole = build_section_atom(InputId(0), 1, &section, AtomSection::Data);
+        let sliced = build_slice_atom(InputId(0), 1, &section, AtomSection::Data, 0, 8, None, &[]);
+
+        for atom in [whole, sliced] {
+            assert!(atom.flags.has(AtomFlags::NO_DEAD_STRIP));
+            assert!(atom.flags.has(AtomFlags::LIVE_SUPPORT));
+        }
+    }
+
+    #[test]
+    fn initializer_and_terminator_sections_are_no_dead_strip() {
+        for section_type in [S_MOD_INIT_FUNC_POINTERS, S_MOD_TERM_FUNC_POINTERS] {
+            let section = input_section(SectionKind::Unknown(section_type as u8), section_type);
+            let atom = build_section_atom(InputId(0), 1, &section, AtomSection::Other);
+            assert!(atom.flags.has(AtomFlags::NO_DEAD_STRIP));
+        }
     }
 
     #[test]

@@ -1,0 +1,2 @@
+__TEXT __text 0 add _shared
+__TEXT __text 8 load _shared

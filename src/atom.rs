@@ -18,11 +18,12 @@
 //! `Symbol::Defined { atom }` before atomization back-patches it).
 
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::input::ObjectFile;
 use crate::macho::constants::MH_SUBSECTIONS_VIA_SYMBOLS;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent};
-use crate::resolve::{AtomId, InputId, SymbolId, SymbolTable};
+use crate::resolve::{AtomId, InputId, Symbol, SymbolId, SymbolTable};
 use crate::section::{InputSection, SectionKind};
 use crate::symbol::{InputSymbol, SymKind};
 
@@ -43,6 +44,8 @@ pub enum AtomSection {
     ThreadLocalVariables,
     ThreadLocalInitPointers,
     Coalesced,
+    /// Resolver-owned tentative storage emitted as `__DATA,__common`.
+    Common,
     CompactUnwind,
     EhFrame,
     SymbolStubs,
@@ -81,7 +84,10 @@ impl AtomSection {
     }
 
     pub fn is_zerofill(self) -> bool {
-        matches!(self, AtomSection::ZeroFill | AtomSection::ThreadLocalBss)
+        matches!(
+            self,
+            AtomSection::ZeroFill | AtomSection::ThreadLocalBss | AtomSection::Common
+        )
     }
 
     pub fn is_literal(self) -> bool {
@@ -144,7 +150,7 @@ pub struct AltEntry {
 pub struct Atom {
     pub id: AtomId,
     pub origin: InputId,
-    /// 1-based section index within `origin`'s Mach-O section list.
+    /// 1-based index within `origin`'s Mach-O sections; zero for synthetic atoms.
     pub input_section: u8,
     pub section: AtomSection,
     /// Offset within the input section where this atom's content starts.
@@ -227,6 +233,74 @@ impl AtomTable {
         }
         out
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommonMaterializationError {
+    pub symbol: String,
+    pub size: u64,
+}
+
+impl fmt::Display for CommonMaterializationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "common symbol `{}` has size {} bytes, exceeding the current 32-bit atom size limit",
+            self.symbol, self.size
+        )
+    }
+}
+
+impl std::error::Error for CommonMaterializationError {}
+
+/// Allocate one zero-fill atom for every coalesced COMMON that survived
+/// resolution, then expose it to downstream passes as a normal definition.
+pub fn materialize_common_symbols(
+    table: &mut AtomTable,
+    symbols: &mut SymbolTable,
+) -> Result<(), CommonMaterializationError> {
+    let commons = symbols
+        .iter()
+        .filter_map(|(symbol_id, symbol)| {
+            let Symbol::Common {
+                name,
+                origin,
+                size,
+                align_pow2,
+                ..
+            } = symbol
+            else {
+                return None;
+            };
+            Some((symbol_id, *name, *origin, *size, *align_pow2))
+        })
+        .map(|(symbol_id, name, origin, size, align_pow2)| {
+            let atom_size = u32::try_from(size).map_err(|_| CommonMaterializationError {
+                symbol: symbols.interner.resolve(name).to_string(),
+                size,
+            })?;
+            Ok((symbol_id, origin, atom_size, align_pow2))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (symbol_id, origin, size, align_pow2) in commons {
+        let atom = table.push(Atom {
+            id: AtomId(0),
+            origin,
+            input_section: 0,
+            section: AtomSection::Common,
+            input_offset: 0,
+            size,
+            align_pow2,
+            owner: Some(symbol_id),
+            alt_entries: Vec::new(),
+            data: Vec::new(),
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        });
+        symbols.materialize_common(symbol_id, atom);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,8 +1197,101 @@ mod tests {
             AtomSection::ZeroFill
         );
         assert!(AtomSection::from_section_kind(SectionKind::ZeroFill).is_zerofill());
+        assert!(AtomSection::Common.is_zerofill());
         assert!(AtomSection::from_section_kind(SectionKind::CStringLiterals).is_literal());
         assert!(!AtomSection::from_section_kind(SectionKind::Text).is_literal());
+    }
+
+    #[test]
+    fn materializes_common_symbols_as_owned_zerofill_atoms() {
+        let mut symbols = SymbolTable::new();
+        let shared_name = symbols.intern("_shared");
+        symbols
+            .insert(Symbol::Common {
+                name: shared_name,
+                origin: InputId(7),
+                size: 32,
+                align_pow2: 5,
+                private_extern: true,
+                no_dead_strip: true,
+            })
+            .unwrap();
+        let shared_id = symbols.lookup(shared_name).unwrap();
+        let mut atoms = AtomTable::new();
+
+        materialize_common_symbols(&mut atoms, &mut symbols).unwrap();
+
+        let atom_id = match symbols.get(shared_id) {
+            Symbol::Defined { atom, .. } => *atom,
+            symbol => panic!("expected materialized definition, got {symbol:?}"),
+        };
+        assert_eq!(atom_id, AtomId(1));
+        let atom = atoms.get(atom_id);
+        assert_eq!(atom.origin, InputId(7));
+        assert_eq!(atom.section, AtomSection::Common);
+        assert_eq!(atom.size, 32);
+        assert_eq!(atom.align_pow2, 5);
+        assert_eq!(atom.owner, Some(shared_id));
+        assert!(atom.data.is_empty());
+        assert_eq!(
+            symbols.get(shared_id),
+            &Symbol::Defined {
+                name: shared_name,
+                origin: InputId(7),
+                atom: atom_id,
+                value: 0,
+                weak: false,
+                private_extern: true,
+                no_dead_strip: true,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_common_symbols_before_mutating_state() {
+        let mut symbols = SymbolTable::new();
+        let small_name = symbols.intern("_small");
+        symbols
+            .insert(Symbol::Common {
+                name: small_name,
+                origin: InputId(0),
+                size: 8,
+                align_pow2: 3,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap();
+        let huge_name = symbols.intern("_huge");
+        symbols
+            .insert(Symbol::Common {
+                name: huge_name,
+                origin: InputId(1),
+                size: u32::MAX as u64 + 1,
+                align_pow2: 4,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap();
+        let mut atoms = AtomTable::new();
+
+        let error = materialize_common_symbols(&mut atoms, &mut symbols).unwrap_err();
+
+        assert_eq!(
+            error,
+            CommonMaterializationError {
+                symbol: "_huge".to_string(),
+                size: u32::MAX as u64 + 1,
+            }
+        );
+        assert!(atoms.is_empty());
+        assert!(matches!(
+            symbols.get(symbols.lookup(small_name).unwrap()),
+            Symbol::Common { .. }
+        ));
+        assert!(matches!(
+            symbols.get(symbols.lookup(huge_name).unwrap()),
+            Symbol::Common { .. }
+        ));
     }
 
     #[test]

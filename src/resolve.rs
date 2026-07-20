@@ -465,6 +465,8 @@ pub enum Symbol {
         origin: InputId,
         size: u64,
         align_pow2: u8,
+        private_extern: bool,
+        no_dead_strip: bool,
     },
     DylibImport {
         name: Istr,
@@ -671,6 +673,30 @@ impl SymbolTable {
         }
     }
 
+    /// Replace a resolved tentative definition with its allocated atom.
+    pub(crate) fn materialize_common(&mut self, id: SymbolId, atom: AtomId) {
+        let slot = &mut self.symbols[id.0 as usize];
+        let (name, origin, private_extern, no_dead_strip) = match slot {
+            Symbol::Common {
+                name,
+                origin,
+                private_extern,
+                no_dead_strip,
+                ..
+            } => (*name, *origin, *private_extern, *no_dead_strip),
+            _ => unreachable!("materialize_common requires a Common symbol"),
+        };
+        *slot = Symbol::Defined {
+            name,
+            origin,
+            atom,
+            value: 0,
+            weak: false,
+            private_extern,
+            no_dead_strip,
+        };
+    }
+
     /// Insert a symbol, running the resolution matrix. See Sprint 7's
     /// `.docs/sprints/sprint07.md` for the full matrix.
     pub fn insert(&mut self, sym: Symbol) -> Result<InsertOutcome, InsertError> {
@@ -848,11 +874,15 @@ impl SymbolTable {
             Symbol::Common {
                 size: a_size,
                 align_pow2: a_align,
+                private_extern: a_private_extern,
+                no_dead_strip: a_no_dead_strip,
                 ..
             },
             Symbol::Common {
                 size: b_size,
                 align_pow2: b_align,
+                private_extern: b_private_extern,
+                no_dead_strip: b_no_dead_strip,
                 ..
             },
         ) = (slot.clone(), incoming)
@@ -860,11 +890,19 @@ impl SymbolTable {
             unreachable!("coalesce_common requires two Common entries");
         };
         if let Symbol::Common {
-            size, align_pow2, ..
+            size,
+            align_pow2,
+            private_extern,
+            no_dead_strip,
+            ..
         } = slot
         {
             *size = a_size.max(b_size);
             *align_pow2 = a_align.max(b_align);
+            // Merge declaration-wide attributes without making the result
+            // depend on which input happened to contribute the larger size.
+            *private_extern = a_private_extern && b_private_extern;
+            *no_dead_strip = a_no_dead_strip || b_no_dead_strip;
         }
     }
 
@@ -2038,6 +2076,8 @@ fn symbolize_input(
                     origin,
                     size,
                     align_pow2,
+                    private_extern: input_sym.is_private_ext(),
+                    no_dead_strip: input_sym.no_dead_strip(),
                 })
             } else {
                 Some(Symbol::Undefined {
@@ -2725,7 +2765,9 @@ mod tests {
                 name: n(3),
                 origin: InputId(0),
                 size: 8,
-                align_pow2: 3
+                align_pow2: 3,
+                private_extern: false,
+                no_dead_strip: false,
             }
             .kind(),
             SymbolKindTag::Common
@@ -2774,6 +2816,8 @@ mod tests {
             origin: InputId(0),
             size: 16,
             align_pow2: 4,
+            private_extern: false,
+            no_dead_strip: false,
         };
         assert_eq!(sym.name(), n(42));
     }
@@ -2818,6 +2862,8 @@ mod tests {
             origin: InputId(0),
             size,
             align_pow2: align,
+            private_extern: false,
+            no_dead_strip: false,
         }
     }
 
@@ -3060,6 +3106,41 @@ mod tests {
             assert_eq!(*size, 16);
             assert_eq!(*align_pow2, 5);
         }
+    }
+
+    #[test]
+    fn common_coalescing_keeps_public_visibility_and_retention() {
+        let mut t = SymbolTable::new();
+        let name = t.intern("_x");
+        t.insert(Symbol::Common {
+            name,
+            origin: InputId(0),
+            size: 16,
+            align_pow2: 3,
+            private_extern: true,
+            no_dead_strip: false,
+        })
+        .unwrap();
+        t.insert(Symbol::Common {
+            name,
+            origin: InputId(1),
+            size: 8,
+            align_pow2: 5,
+            private_extern: false,
+            no_dead_strip: true,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            t.get(SymbolId(0)),
+            Symbol::Common {
+                size: 16,
+                align_pow2: 5,
+                private_extern: false,
+                no_dead_strip: true,
+                ..
+            }
+        ));
     }
 
     #[test]

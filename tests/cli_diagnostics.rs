@@ -4,13 +4,17 @@ use std::process::Command;
 
 use afs_ld::macho::constants::{
     CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_ID_DYLIB, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_UUID,
-    MH_DYLIB, MH_MAGIC_64, MH_OBJECT, N_ABS, N_EXT, N_UNDF,
+    MH_DYLIB, MH_MAGIC_64, MH_OBJECT, N_ABS, N_EXT, N_NO_DEAD_STRIP, N_PEXT, N_SECT, N_UNDF,
+    SECTION_TYPE_MASK, S_REGULAR, S_ZEROFILL,
 };
+use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::reader::{
-    parse_commands, parse_header, write_header, DylibCmd, LoadCommand, MachHeader64, SymtabCmd,
+    parse_commands, parse_header, write_header, DylibCmd, LoadCommand, MachHeader64,
+    Section64Header, Segment64, SymtabCmd,
 };
-use afs_ld::symbol::{RawNlist, NLIST_SIZE};
-use afs_ld::{InputSpec, LinkError, LinkOptions, Linker};
+use afs_ld::string_table::StringTable;
+use afs_ld::symbol::{parse_nlist_table, RawNlist, SymKind, NLIST_SIZE};
+use afs_ld::{InputSpec, LinkError, LinkOptions, Linker, OutputKind};
 
 const EXPECTED_HELP: &str = include_str!("snapshots/help.txt");
 
@@ -78,9 +82,17 @@ fn synthetic_undefined_object(name: &str) -> Vec<u8> {
 }
 
 fn synthetic_symbol_object(symbols: &[(&str, u8, u64)]) -> Vec<u8> {
+    let symbols = symbols
+        .iter()
+        .map(|&(name, n_type, value)| (name, n_type, 0, value))
+        .collect::<Vec<_>>();
+    synthetic_symbol_object_with_desc(&symbols)
+}
+
+fn synthetic_symbol_object_with_desc(symbols: &[(&str, u8, u16, u64)]) -> Vec<u8> {
     let mut strings = vec![0];
     let mut raw_symbols = Vec::with_capacity(symbols.len());
-    for &(name, n_type, value) in symbols {
+    for &(name, n_type, n_desc, value) in symbols {
         let strx = strings.len() as u32;
         strings.extend_from_slice(name.as_bytes());
         strings.push(0);
@@ -88,7 +100,7 @@ fn synthetic_symbol_object(symbols: &[(&str, u8, u64)]) -> Vec<u8> {
             strx,
             n_type,
             n_sect: 0,
-            n_desc: 0,
+            n_desc,
             n_value: value,
         });
     }
@@ -120,6 +132,80 @@ fn synthetic_symbol_object(symbols: &[(&str, u8, u64)]) -> Vec<u8> {
         symbol.write(&mut bytes);
     }
     bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn name16(name: &str) -> [u8; 16] {
+    assert!(name.len() <= 16);
+    let mut out = [0; 16];
+    out[..name.len()].copy_from_slice(name.as_bytes());
+    out
+}
+
+fn synthetic_common_with_regular_common_section() -> Vec<u8> {
+    let strings = b"\0_collision\0";
+    let mut segment = Segment64 {
+        segname: name16("__DATA"),
+        vmaddr: 0,
+        vmsize: 1,
+        fileoff: 0,
+        filesize: 1,
+        maxprot: 3,
+        initprot: 3,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16("__common"),
+            segname: name16("__DATA"),
+            addr: 0,
+            size: 1,
+            offset: 0,
+            align: 0,
+            reloff: 0,
+            nreloc: 0,
+            flags: S_REGULAR,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = afs_ld::macho::reader::HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    let symoff = data_offset + 1;
+    let stroff = symoff + NLIST_SIZE as u32;
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: 0,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: 1,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.push(0xaa);
+    RawNlist {
+        strx: 1,
+        n_type: N_UNDF | N_EXT,
+        n_sect: 0,
+        n_desc: 3 << 8,
+        n_value: 8,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(strings);
     bytes
 }
 
@@ -1590,6 +1676,227 @@ fn thin_archive_loads_external_macho_members() {
     }
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn common_symbols_allocate_coalesced_zerofill_storage() {
+    let first = scratch("common-first.o");
+    let second = scratch("common-second.o");
+    let output = scratch("common-output.dylib");
+    fs::write(
+        &first,
+        synthetic_symbol_object_with_desc(&[
+            ("_shared", N_UNDF | N_EXT, 5 << 8, 8),
+            ("_unused", N_UNDF | N_EXT, 4 << 8, 24),
+        ]),
+    )
+    .unwrap();
+    fs::write(
+        &second,
+        synthetic_symbol_object_with_desc(&[("_shared", N_UNDF | N_EXT, 3 << 8, 32)]),
+    )
+    .unwrap();
+
+    let inputs = [
+        InputSpec::Path(first.clone()),
+        InputSpec::Path(second.clone()),
+    ];
+    let mut baseline = None;
+    for jobs in [1, 4] {
+        let opts = LinkOptions {
+            kind: OutputKind::Dylib,
+            install_name: Some("@rpath/libcommon.dylib".to_string()),
+            emit_uuid: false,
+            jobs: Some(jobs),
+            output: Some(output.clone()),
+            ..LinkOptions::default()
+        };
+        Linker::run_ordered(&opts, &inputs).unwrap();
+        let bytes = fs::read(&output).unwrap();
+        if let Some(expected) = &baseline {
+            assert_eq!(&bytes, expected, "COMMON layout changed with -j{jobs}");
+        } else {
+            baseline = Some(bytes.clone());
+        }
+
+        let header = parse_header(&bytes).unwrap();
+        let commands = parse_commands(&header, &bytes).unwrap();
+        let mut section_ordinal = 0_u8;
+        let mut common = None;
+        let mut symtab = None;
+        for command in &commands {
+            match command {
+                LoadCommand::Segment64(segment) => {
+                    for section in &segment.sections {
+                        section_ordinal += 1;
+                        if section.segname_str() == "__DATA" && section.sectname_str() == "__common"
+                        {
+                            common = Some((section_ordinal, section.clone()));
+                        }
+                    }
+                }
+                LoadCommand::Symtab(command) => symtab = Some(*command),
+                _ => {}
+            }
+        }
+        let (common_ordinal, common) = common.expect("missing __DATA,__common");
+        assert_eq!(common.flags & SECTION_TYPE_MASK, S_ZEROFILL);
+        assert_eq!(common.offset, 0);
+        assert_eq!(common.align, 5);
+        assert_eq!(common.size, 56);
+
+        let symtab = symtab.unwrap();
+        let symbols = parse_nlist_table(&bytes, symtab.symoff, symtab.nsyms).unwrap();
+        let strings = StringTable::from_file(&bytes, symtab.stroff, symtab.strsize).unwrap();
+        let symbol = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| strings.get(symbol.strx()).is_ok_and(|found| found == name))
+                .unwrap_or_else(|| panic!("missing output symbol {name}"))
+        };
+        let shared = symbol("_shared");
+        let unused = symbol("_unused");
+        for symbol in [shared, unused] {
+            assert_eq!(symbol.kind(), SymKind::Sect);
+            assert!(symbol.is_ext());
+            assert_eq!(symbol.raw.n_type, N_SECT | N_EXT);
+            assert_eq!(symbol.sect_idx(), common_ordinal);
+            assert!(
+                (common.addr..common.addr + common.size).contains(&symbol.value()),
+                "symbol is outside __DATA,__common"
+            );
+        }
+        assert_eq!(shared.value() & 31, 0);
+        assert!(
+            shared.value() + 32 <= unused.value() || unused.value() + 24 <= shared.value(),
+            "coalesced COMMON allocations overlap"
+        );
+    }
+
+    let _ = fs::remove_file(first);
+    let _ = fs::remove_file(second);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn oversized_common_symbol_is_rejected_before_output() {
+    let object = scratch("oversized-common.o");
+    let output = scratch("oversized-common.dylib");
+    let _ = fs::remove_file(&output);
+    fs::write(
+        &object,
+        synthetic_symbol_object(&[("_huge", N_UNDF | N_EXT, u32::MAX as u64 + 1)]),
+    )
+    .unwrap();
+    let opts = LinkOptions {
+        kind: OutputKind::Dylib,
+        install_name: Some("@rpath/liboversized-common.dylib".to_string()),
+        output: Some(output.clone()),
+        ..LinkOptions::default()
+    };
+
+    let error = Linker::run_ordered(&opts, &[InputSpec::Path(object.clone())]).unwrap_err();
+
+    assert!(matches!(
+        error,
+        LinkError::CommonMaterialization(ref error)
+            if error.symbol == "_huge" && error.size == u32::MAX as u64 + 1
+    ));
+    assert!(!output.exists());
+    let _ = fs::remove_file(object);
+}
+
+#[test]
+fn private_retained_common_survives_dead_strip_without_exporting() {
+    let object = scratch("private-retained-common.o");
+    let output = scratch("private-retained-common.dylib");
+    fs::write(
+        &object,
+        synthetic_symbol_object_with_desc(&[(
+            "_private_common",
+            N_UNDF | N_EXT | N_PEXT,
+            (3 << 8) | N_NO_DEAD_STRIP,
+            8,
+        )]),
+    )
+    .unwrap();
+    let opts = LinkOptions {
+        kind: OutputKind::Dylib,
+        install_name: Some("@rpath/libprivate-common.dylib".to_string()),
+        dead_strip: true,
+        emit_uuid: false,
+        output: Some(output.clone()),
+        ..LinkOptions::default()
+    };
+
+    Linker::run_ordered(&opts, &[InputSpec::Path(object.clone())]).unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    let header = parse_header(&bytes).unwrap();
+    let commands = parse_commands(&header, &bytes).unwrap();
+    let mut common_ordinal = None;
+    let mut section_ordinal = 0_u8;
+    let mut symtab = None;
+    for command in &commands {
+        match command {
+            LoadCommand::Segment64(segment) => {
+                for section in &segment.sections {
+                    section_ordinal += 1;
+                    if section.segname_str() == "__DATA" && section.sectname_str() == "__common" {
+                        common_ordinal = Some(section_ordinal);
+                    }
+                }
+            }
+            LoadCommand::Symtab(command) => symtab = Some(*command),
+            _ => {}
+        }
+    }
+    let symtab = symtab.unwrap();
+    let symbols = parse_nlist_table(&bytes, symtab.symoff, symtab.nsyms).unwrap();
+    let strings = StringTable::from_file(&bytes, symtab.stroff, symtab.strsize).unwrap();
+    let symbol = symbols
+        .iter()
+        .find(|symbol| {
+            strings
+                .get(symbol.strx())
+                .is_ok_and(|name| name == "_private_common")
+        })
+        .expect("missing retained private COMMON symbol");
+    assert_eq!(symbol.raw.n_type, N_SECT | N_PEXT);
+    assert_eq!(symbol.sect_idx(), common_ordinal.unwrap());
+    assert_ne!(symbol.raw.n_desc & N_NO_DEAD_STRIP, 0);
+    let exports = DylibFile::parse(output.clone(), &bytes)
+        .unwrap()
+        .exports
+        .entries()
+        .unwrap();
+    assert!(!exports.iter().any(|entry| entry.name == "_private_common"));
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn common_symbols_reject_file_backed_common_section_collision() {
+    let object = scratch("regular-common-section.o");
+    let output = scratch("regular-common-section.dylib");
+    let _ = fs::remove_file(&output);
+    fs::write(&object, synthetic_common_with_regular_common_section()).unwrap();
+    let opts = LinkOptions {
+        kind: OutputKind::Dylib,
+        install_name: Some("@rpath/libregular-common-section.dylib".to_string()),
+        output: Some(output.clone()),
+        ..LinkOptions::default()
+    };
+
+    let error = Linker::run_ordered(&opts, &[InputSpec::Path(object.clone())]).unwrap_err();
+
+    assert!(matches!(
+        error,
+        LinkError::IncompatibleCommonSection(ref path) if path == &object
+    ));
+    assert!(!output.exists());
+    let _ = fs::remove_file(object);
 }
 
 #[test]

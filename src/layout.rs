@@ -5,9 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::atom::AtomTable;
+use crate::atom::{AtomSection, AtomTable};
 use crate::input::ObjectFile;
-use crate::macho::constants::SG_READ_ONLY;
+use crate::macho::constants::{SG_READ_ONLY, S_ZEROFILL};
 use crate::resolve::{AtomId, InputId};
 use crate::section::{
     is_zerofill, InputSection, OutputAtom, OutputSection, OutputSectionId, OutputSegment, Prot,
@@ -158,46 +158,76 @@ impl Layout {
             if live_atoms.is_some_and(|live_atoms| !live_atoms.contains(&atom_id)) {
                 continue;
             }
-            let input = input_map
-                .get(&atom.origin)
-                .unwrap_or_else(|| panic!("missing object for input {:?}", atom.origin));
-            let input_section = input
-                .object
-                .sections
-                .get((atom.input_section as usize).saturating_sub(1))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "input {} section {} missing for atom {:?}",
-                        input.object.path.display(),
-                        atom.input_section,
-                        atom_id
-                    )
-                });
-
-            let key = output_section_key(input_section);
+            let input_section = if atom.section == AtomSection::Common {
+                None
+            } else {
+                let input = input_map
+                    .get(&atom.origin)
+                    .unwrap_or_else(|| panic!("missing object for input {:?}", atom.origin));
+                Some(
+                    input
+                        .object
+                        .sections
+                        .get((atom.input_section as usize).saturating_sub(1))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "input {} section {} missing for atom {:?}",
+                                input.object.path.display(),
+                                atom.input_section,
+                                atom_id
+                            )
+                        }),
+                )
+            };
+            let key = match input_section {
+                Some(input_section) => output_section_key(input_section),
+                None => SectionKey {
+                    segment: "__DATA".to_string(),
+                    name: "__common".to_string(),
+                },
+            };
             let idx = match section_index.get(&key) {
                 Some(&idx) => idx,
                 None => {
                     let idx = sections.len();
-                    sections.push(OutputSection {
-                        segment: key.segment.clone(),
-                        name: key.name.clone(),
-                        kind: input_section.kind,
-                        align_pow2: normalize_output_alignment(
-                            input_section.kind,
-                            input_section.align_pow2.min(u8::MAX as u32) as u8,
-                        ),
-                        flags: input_section.flags,
-                        reserved1: input_section.reserved1,
-                        reserved2: input_section.reserved2,
-                        reserved3: input_section.reserved3,
-                        atoms: Vec::new(),
-                        synthetic_offset: 0,
-                        synthetic_data: Vec::new(),
-                        addr: 0,
-                        size: 0,
-                        file_off: 0,
-                    });
+                    let section = match input_section {
+                        Some(input_section) => OutputSection {
+                            segment: key.segment.clone(),
+                            name: key.name.clone(),
+                            kind: input_section.kind,
+                            align_pow2: normalize_output_alignment(
+                                input_section.kind,
+                                input_section.align_pow2.min(u8::MAX as u32) as u8,
+                            ),
+                            flags: input_section.flags,
+                            reserved1: input_section.reserved1,
+                            reserved2: input_section.reserved2,
+                            reserved3: input_section.reserved3,
+                            atoms: Vec::new(),
+                            synthetic_offset: 0,
+                            synthetic_data: Vec::new(),
+                            addr: 0,
+                            size: 0,
+                            file_off: 0,
+                        },
+                        None => OutputSection {
+                            segment: key.segment.clone(),
+                            name: key.name.clone(),
+                            kind: crate::section::SectionKind::ZeroFill,
+                            align_pow2: atom.align_pow2,
+                            flags: S_ZEROFILL,
+                            reserved1: 0,
+                            reserved2: 0,
+                            reserved3: 0,
+                            atoms: Vec::new(),
+                            synthetic_offset: 0,
+                            synthetic_data: Vec::new(),
+                            addr: 0,
+                            size: 0,
+                            file_off: 0,
+                        },
+                    };
+                    sections.push(section);
                     section_index.insert(key, idx);
                     idx
                 }

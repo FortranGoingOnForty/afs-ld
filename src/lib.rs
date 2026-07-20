@@ -33,11 +33,14 @@ use std::time::{Duration, Instant};
 use std::{collections::VecDeque, fs, io};
 
 use archive::Archive;
-use atom::{atomize_object, backpatch_symbol_atoms, AtomTable};
+use atom::{
+    atomize_object, backpatch_symbol_atoms, materialize_common_symbols, AtomTable,
+    CommonMaterializationError,
+};
 use icf::IcfError;
 use input::ObjectFile;
 use layout::{ExtraLayoutSections, Layout, LayoutInput};
-use macho::constants::MH_DYLIB;
+use macho::constants::{MH_DYLIB, SECTION_TYPE_MASK, S_ZEROFILL};
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
 use macho::reader::{parse_header, ReadError};
 use macho::tbd::{
@@ -225,6 +228,8 @@ pub enum LinkError {
     Unwind(synth::unwind::UnwindError),
     Icf(IcfError),
     Loh(loh::LohError),
+    CommonMaterialization(CommonMaterializationError),
+    IncompatibleCommonSection(PathBuf),
     DuplicateSymbols(String),
     UndefinedSymbols(String),
     UnsupportedArch(String),
@@ -327,6 +332,12 @@ impl std::fmt::Display for LinkError {
             LinkError::Unwind(e) => write!(f, "{e}"),
             LinkError::Icf(e) => write!(f, "{e}"),
             LinkError::Loh(e) => write!(f, "{e}"),
+            LinkError::CommonMaterialization(e) => write!(f, "{e}"),
+            LinkError::IncompatibleCommonSection(path) => write!(
+                f,
+                "{}: __DATA,__common must be an S_ZEROFILL section",
+                path.display()
+            ),
             LinkError::DuplicateSymbols(msg) | LinkError::UndefinedSymbols(msg) => {
                 write!(f, "{msg}")
             }
@@ -433,6 +444,34 @@ impl From<loh::LohError> for LinkError {
     fn from(value: loh::LohError) -> Self {
         LinkError::Loh(value)
     }
+}
+
+impl From<CommonMaterializationError> for LinkError {
+    fn from(value: CommonMaterializationError) -> Self {
+        LinkError::CommonMaterialization(value)
+    }
+}
+
+fn validate_common_sections(
+    symbols: &SymbolTable,
+    objects: &[(InputId, &ObjectFile)],
+) -> Result<(), LinkError> {
+    if !symbols
+        .iter()
+        .any(|(_, symbol)| matches!(symbol, Symbol::Common { .. }))
+    {
+        return Ok(());
+    }
+    for (_, object) in objects {
+        if object.sections.iter().any(|section| {
+            section.segname == "__DATA"
+                && section.sectname == "__common"
+                && section.flags & SECTION_TYPE_MASK != S_ZEROFILL
+        }) {
+            return Err(LinkError::IncompatibleCommonSection(object.path.clone()));
+        }
+    }
+    Ok(())
 }
 
 /// The linker itself. Sprint 0 only validates that inputs exist; later sprints
@@ -718,6 +757,8 @@ impl Linker {
             backpatch_symbol_atoms(&atomization, input_id, obj, &mut sym_table, &mut atom_table);
             objects.push((input_id, obj));
         }
+        validate_common_sections(&sym_table, &objects)?;
+        materialize_common_symbols(&mut atom_table, &mut sym_table)?;
         phases.atomization = phase_started.elapsed();
 
         let layout_inputs: Vec<LayoutInput<'_>> = objects

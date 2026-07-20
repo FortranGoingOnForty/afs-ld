@@ -8,7 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::atom::AtomTable;
+use crate::atom::{AtomSection, AtomTable};
 use crate::input::ObjectFile;
 use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
 use crate::leb::write_uleb;
@@ -1673,11 +1673,14 @@ fn build_output_symbols_profiled(
         else {
             continue;
         };
-        if *private_extern {
+        let materialized_private_common = *private_extern
+            && atom.0 != 0
+            && inputs.0.atom_table.get(*atom).section == AtomSection::Common;
+        if *private_extern && !materialized_private_common {
             continue;
         }
         let name = sym_table.interner.resolve(*name).to_string();
-        let hidden = visibility.hides(&name);
+        let hidden = *private_extern || visibility.hides(&name);
         let (n_type, n_sect, n_value) = if atom.0 == 0 {
             (absolute_symbol_type(hidden), NO_SECT, *value)
         } else {

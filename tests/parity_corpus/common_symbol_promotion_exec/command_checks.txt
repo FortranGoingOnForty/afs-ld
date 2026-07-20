@@ -1,2 +1,3 @@
 build_version
 load_dylib_names
+symbol_record_map

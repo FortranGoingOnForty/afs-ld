@@ -110,7 +110,7 @@ pub fn fold_safe(
     });
     let mut redirects = HashMap::new();
 
-    let order_by_input: HashMap<InputId, (usize, Option<u32>)> = layout_inputs
+    let order_by_input: HashMap<InputId, (usize, Option<u64>)> = layout_inputs
         .iter()
         .map(|input| (input.id, (input.load_order, input.archive_member_offset)))
         .collect();
@@ -222,9 +222,9 @@ enum FoldReferent {
 
 fn fold_order_key(
     atom: &Atom,
-    order_by_input: &HashMap<InputId, (usize, Option<u32>)>,
+    order_by_input: &HashMap<InputId, (usize, Option<u64>)>,
     atom_id: AtomId,
-) -> (usize, u32, u32, u32) {
+) -> (usize, u64, u32, u32) {
     let (load_order, archive_member_offset) = order_by_input
         .get(&atom.origin)
         .copied()

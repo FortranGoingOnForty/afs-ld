@@ -76,6 +76,24 @@ fn archive(ar: &Path, dir: &Path, name: &str, object: &Path) -> PathBuf {
     archive
 }
 
+fn thin_archive(ar: &Path, dir: &Path, name: &str, object: &Path) -> Result<PathBuf, String> {
+    let archive = dir.join(format!("lib{name}.a"));
+    let object_name = object
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", object.display()))?;
+    let output = Command::new(ar)
+        .current_dir(dir)
+        .arg("rcsT")
+        .arg(&archive)
+        .arg(object_name)
+        .output()
+        .map_err(|error| format!("spawn ar: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    Ok(archive)
+}
+
 fn link(output: &Path, args: &[&OsStr]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_afs-ld"))
         .arg("-o")
@@ -174,6 +192,143 @@ fn archive_search_is_left_to_right_unless_grouped() {
         String::from_utf8_lossy(&grouped_output.stderr)
     );
     assert_eq!(run(&grouped), 35);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn thin_archive_loads_external_members() {
+    let (Some(gas), Some(ar)) = (gas(), ar()) else {
+        eprintln!("\nHARNESS_SKIP suite=elf_archive_scan test=thin_archive_loads_external_members count=1 reason=\"no GNU assembler or ar on this host\"");
+        return;
+    };
+
+    let dir = scratch("thin_archive");
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_syscall = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let main_asm = format!(
+        ".text\n\
+         .globl _start\n\
+         .type _start,@function\n\
+         _start:\n\
+             call thin_value\n\
+             movl %eax, %edi\n\
+             movl ${exit_syscall}, %eax\n\
+             syscall\n\
+         .size _start,.-_start\n"
+    );
+    let member_asm = ".text\n\
+                      .globl thin_value\n\
+                      .type thin_value,@function\n\
+                      thin_value:\n\
+                          movl $37, %eax\n\
+                          ret\n\
+                      .size thin_value,.-thin_value\n";
+    let main_o = assemble(&gas, &dir, "thin_main", &main_asm);
+    let member_o = assemble(&gas, &dir, "thin_member_with_a_long_name", member_asm);
+    let direct_archive = match thin_archive(&ar, &dir, "thin", &member_o) {
+        Ok(archive) => archive,
+        Err(error) => {
+            eprintln!("\nHARNESS_SKIP suite=elf_archive_scan test=thin_archive_loads_external_members count=1 reason=\"ar lacks thin-archive support: {error}\"");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+    };
+
+    let executable = dir.join("thin-linked");
+    let output = link(
+        &executable,
+        &[main_o.as_os_str(), direct_archive.as_os_str()],
+    );
+    assert!(
+        output.status.success(),
+        "thin archive link failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(run(&executable), 37);
+
+    let inner_archive = archive(&ar, &dir, "thin-inner", &member_o);
+    let nested_archive = match thin_archive(&ar, &dir, "thin-nested", &inner_archive) {
+        Ok(archive) => archive,
+        Err(error) => {
+            eprintln!("\nHARNESS_SKIP suite=elf_archive_scan test=thin_archive_loads_external_members count=1 reason=\"ar cannot flatten archive members: {error}\"");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+    };
+    let nested_executable = dir.join("thin-nested-linked");
+    let nested = link(
+        &nested_executable,
+        &[main_o.as_os_str(), nested_archive.as_os_str()],
+    );
+    assert!(
+        nested.status.success(),
+        "nested thin archive link failed: {}",
+        String::from_utf8_lossy(&nested.stderr)
+    );
+    assert_eq!(run(&nested_executable), 37);
+
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let non_utf8_member = dir.join(OsString::from_vec(b"thin-member-\xff.o".to_vec()));
+        std::fs::copy(&member_o, &non_utf8_member).unwrap();
+        let non_utf8_member_archive =
+            thin_archive(&ar, &dir, "thin-nonutf8-member", &non_utf8_member).unwrap();
+        let non_utf8_member_output = dir.join("thin-nonutf8-member-linked");
+        let output = link(
+            &non_utf8_member_output,
+            &[main_o.as_os_str(), non_utf8_member_archive.as_os_str()],
+        );
+        assert!(
+            output.status.success(),
+            "non-UTF8 thin member link failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(run(&non_utf8_member_output), 37);
+
+        let non_utf8_archive = dir.join(OsString::from_vec(b"libthin-\xff.a".to_vec()));
+        std::fs::rename(&direct_archive, &non_utf8_archive).unwrap();
+        let main_object =
+            afs_ld::elf::parse_rel("display-main.o", &std::fs::read(&main_o).unwrap()).unwrap();
+        let image = afs_ld::elf::link_static(
+            vec![
+                afs_ld::elf::LinkInput::Object(main_object),
+                afs_ld::elf::LinkInput::Archive(afs_ld::elf::Library {
+                    name: "display-only-thin-library".to_string(),
+                    path: non_utf8_archive.clone(),
+                    bytes: std::fs::read(&non_utf8_archive).unwrap(),
+                }),
+            ],
+            "_start",
+            false,
+        )
+        .unwrap();
+        let api_output = dir.join("thin-api-linked");
+        std::fs::write(&api_output, image).unwrap();
+        let mut permissions = std::fs::metadata(&api_output).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&api_output, permissions).unwrap();
+        assert_eq!(run(&api_output), 37);
+        std::fs::rename(non_utf8_archive, &direct_archive).unwrap();
+    }
+
+    std::fs::remove_file(&member_o).unwrap();
+    let missing_output = dir.join("thin-missing");
+    let missing = link(
+        &missing_output,
+        &[main_o.as_os_str(), direct_archive.as_os_str()],
+    );
+    assert!(!missing.status.success());
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("thin_member_with_a_long_name.o"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("thin archive member I/O"), "{stderr}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

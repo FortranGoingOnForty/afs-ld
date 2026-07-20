@@ -32,7 +32,7 @@ pub struct LayoutInput<'a> {
     pub id: InputId,
     pub object: &'a ObjectFile,
     pub load_order: usize,
-    pub archive_member_offset: Option<u32>,
+    pub archive_member_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

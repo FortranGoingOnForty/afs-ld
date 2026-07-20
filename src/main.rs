@@ -491,6 +491,7 @@ fn link_static(
         if bytes.starts_with(archive::AR_MAGIC) || bytes.starts_with(archive::AR_MAGIC_THIN) {
             inputs.push(elf::LinkInput::Archive(elf::Library {
                 name: p.display().to_string(),
+                path: p,
                 bytes,
             }));
         } else {
@@ -565,6 +566,7 @@ fn push_dynamic_path(
     if bytes.starts_with(archive::AR_MAGIC) || bytes.starts_with(archive::AR_MAGIC_THIN) {
         inputs.push(elf::DynamicLinkInput::Archive(elf::Library {
             name: p.display().to_string(),
+            path: p.to_path_buf(),
             bytes,
         }));
         return Ok(());

@@ -149,8 +149,9 @@ fn synthetic_dylib(install_name: &str) -> Vec<u8> {
     bytes
 }
 
-fn synthetic_ar_member(raw_name: &str, body: &[u8]) -> Vec<u8> {
+fn synthetic_ar_header(raw_name: &str, size: usize) -> Vec<u8> {
     fn field(out: &mut Vec<u8>, value: &str, width: usize) {
+        assert!(value.len() <= width);
         out.extend_from_slice(value.as_bytes());
         out.resize(out.len() + width - value.len(), b' ');
     }
@@ -161,8 +162,13 @@ fn synthetic_ar_member(raw_name: &str, body: &[u8]) -> Vec<u8> {
     field(&mut encoded, "0", 6);
     field(&mut encoded, "0", 6);
     field(&mut encoded, "100644", 8);
-    field(&mut encoded, &body.len().to_string(), 10);
+    field(&mut encoded, &size.to_string(), 10);
     encoded.extend_from_slice(b"`\n");
+    encoded
+}
+
+fn synthetic_ar_member(raw_name: &str, body: &[u8]) -> Vec<u8> {
+    let mut encoded = synthetic_ar_header(raw_name, body.len());
     encoded.extend_from_slice(body);
     if body.len() & 1 != 0 {
         encoded.push(b'\n');
@@ -196,6 +202,42 @@ fn synthetic_indexed_archive(symbol: &str, member_name: &str, member_body: &[u8]
 
 fn synthetic_malformed_archive(symbol: &str) -> Vec<u8> {
     synthetic_indexed_archive(symbol, "bad.o/", &[0; 32])
+}
+
+fn synthetic_thin_archive(symbol: &str, member_name: &str, member_size: usize) -> Vec<u8> {
+    synthetic_thin_archive_reference(symbol, member_name, member_size, None)
+}
+
+fn synthetic_thin_archive_reference(
+    symbol: &str,
+    member_name: &str,
+    member_size: usize,
+    nested_member_offset: Option<u64>,
+) -> Vec<u8> {
+    fn index_body(symbol: &str, member_offset: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1_u32.to_be_bytes());
+        body.extend_from_slice(&member_offset.to_be_bytes());
+        body.extend_from_slice(symbol.as_bytes());
+        body.push(0);
+        body
+    }
+
+    let long_names = format!("{member_name}/\n");
+    let placeholder_index = synthetic_ar_member("/", &index_body(symbol, 0));
+    let long_name_member = synthetic_ar_member("//", long_names.as_bytes());
+    let member_offset = 8 + placeholder_index.len() as u32 + long_name_member.len() as u32;
+    let index = synthetic_ar_member("/", &index_body(symbol, member_offset));
+    assert_eq!(index.len(), placeholder_index.len());
+
+    let mut archive = b"!<thin>\n".to_vec();
+    archive.extend_from_slice(&index);
+    archive.extend_from_slice(&long_name_member);
+    let member_reference = nested_member_offset
+        .map(|offset| format!("/0:{offset}"))
+        .unwrap_or_else(|| "/0".to_string());
+    archive.extend_from_slice(&synthetic_ar_header(&member_reference, member_size));
+    archive
 }
 
 fn assemble_minimal_main(name: &str) -> Result<PathBuf, String> {
@@ -1315,6 +1357,239 @@ fn force_load_resolves_references_from_later_archive() {
 
     let _ = fs::remove_file(forced_archive);
     let _ = fs::remove_file(later_archive);
+}
+
+#[test]
+fn thin_archive_loads_external_macho_members() {
+    let root = scratch("thin-macho-root");
+    let member_relative = PathBuf::from("members/thin_member_with_a_long_name.o");
+    let member = root.join(&member_relative);
+    let main = root.join("main.o");
+    let archive = root.join("libthin.a");
+    fs::create_dir_all(member.parent().unwrap()).unwrap();
+    fs::write(&main, synthetic_undefined_object("_thin_symbol")).unwrap();
+    let member_bytes = synthetic_symbol_object(&[("_thin_symbol", N_ABS | N_EXT, 37)]);
+    fs::write(&member, &member_bytes).unwrap();
+    fs::write(
+        &archive,
+        synthetic_thin_archive(
+            "_thin_symbol",
+            member_relative.to_str().unwrap(),
+            member_bytes.len(),
+        ),
+    )
+    .unwrap();
+
+    let nested_member_name = "nested.o";
+    let nested_source = root.join("nested-source.a");
+    let nested_source_bytes = synthetic_indexed_archive("_thin_symbol", "nested.o/", &member_bytes);
+    let nested_member_offset = afs_ld::archive::Archive::open(&nested_source, &nested_source_bytes)
+        .unwrap()
+        .object_members()
+        .next()
+        .unwrap()
+        .header_offset as u64;
+    fs::write(&nested_source, &nested_source_bytes).unwrap();
+    let nested_archive = root.join("libthin-nested.a");
+    fs::write(
+        &nested_archive,
+        synthetic_thin_archive_reference(
+            "_thin_symbol",
+            nested_source.file_name().unwrap().to_str().unwrap(),
+            member_bytes.len(),
+            Some(nested_member_offset),
+        ),
+    )
+    .unwrap();
+
+    let inner_thin = root.join("libthin-inner.a");
+    let inner_thin_bytes = synthetic_thin_archive(
+        "_thin_symbol",
+        member_relative.to_str().unwrap(),
+        member_bytes.len(),
+    );
+    let inner_member_offset = afs_ld::archive::Archive::open(&inner_thin, &inner_thin_bytes)
+        .unwrap()
+        .object_members()
+        .next()
+        .unwrap()
+        .header_offset as u64;
+    fs::write(&inner_thin, inner_thin_bytes).unwrap();
+    let recursive_archive = root.join("libthin-recursive.a");
+    fs::write(
+        &recursive_archive,
+        synthetic_thin_archive_reference(
+            "_thin_symbol",
+            inner_thin.file_name().unwrap().to_str().unwrap(),
+            member_bytes.len(),
+            Some(inner_member_offset),
+        ),
+    )
+    .unwrap();
+
+    for jobs in [1, 4] {
+        let output = root.join(format!("thin-lazy-{jobs}.out"));
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-t")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&main)
+            .arg(&archive)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            result.status.success(),
+            "thin archive lazy link failed with -j{jobs}:\n{stderr}"
+        );
+        let main_trace = stderr
+            .find(&format!("afs-ld: loading {}", main.display()))
+            .unwrap_or_else(|| panic!("missing main trace with -j{jobs}:\n{stderr}"));
+        let archive_trace = stderr
+            .find(&format!("afs-ld: loading {}", archive.display()))
+            .unwrap_or_else(|| panic!("missing thin archive trace with -j{jobs}:\n{stderr}"));
+        let member_trace = stderr
+            .find(&format!("afs-ld: loading {}", member.display()))
+            .unwrap_or_else(|| panic!("missing external member trace with -j{jobs}:\n{stderr}"));
+        assert!(main_trace < archive_trace && archive_trace < member_trace);
+
+        let force_output = root.join(format!("thin-force-{jobs}.out"));
+        let forced = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-t")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg("-force_load")
+            .arg(&archive)
+            .arg("-o")
+            .arg(&force_output)
+            .output()
+            .expect("afs-ld should run");
+        let force_stderr = String::from_utf8_lossy(&forced.stderr);
+        assert!(
+            forced.status.success(),
+            "thin archive force-load failed with -j{jobs}:\n{force_stderr}"
+        );
+        let archive_trace = force_stderr
+            .find(&format!("afs-ld: loading {}", archive.display()))
+            .unwrap_or_else(|| {
+                panic!("missing forced archive trace with -j{jobs}:\n{force_stderr}")
+            });
+        let member_trace = force_stderr
+            .find(&format!("afs-ld: loading {}", member.display()))
+            .unwrap_or_else(|| {
+                panic!("missing forced member trace with -j{jobs}:\n{force_stderr}")
+            });
+        assert!(archive_trace < member_trace);
+
+        let nested_output = root.join(format!("thin-nested-lazy-{jobs}.out"));
+        let nested = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-t")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&main)
+            .arg(&nested_archive)
+            .arg("-o")
+            .arg(&nested_output)
+            .output()
+            .expect("afs-ld should run");
+        let nested_stderr = String::from_utf8_lossy(&nested.stderr);
+        assert!(
+            nested.status.success(),
+            "nested thin archive lazy link failed with -j{jobs}:\n{nested_stderr}"
+        );
+        assert!(
+            nested_stderr.contains(&format!(
+                "{}({nested_member_name})",
+                nested_source.display()
+            )),
+            "{nested_stderr}"
+        );
+
+        let nested_force_output = root.join(format!("thin-nested-force-{jobs}.out"));
+        let nested_forced = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-t")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg("-force_load")
+            .arg(&nested_archive)
+            .arg("-o")
+            .arg(&nested_force_output)
+            .output()
+            .expect("afs-ld should run");
+        let nested_force_stderr = String::from_utf8_lossy(&nested_forced.stderr);
+        assert!(
+            nested_forced.status.success(),
+            "nested thin archive force-load failed with -j{jobs}:\n{nested_force_stderr}"
+        );
+        assert!(
+            nested_force_stderr.contains(&format!(
+                "{}({nested_member_name})",
+                nested_source.display()
+            )),
+            "{nested_force_stderr}"
+        );
+
+        let recursive_output = root.join(format!("thin-recursive-lazy-{jobs}.out"));
+        let recursive = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-t")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&main)
+            .arg(&recursive_archive)
+            .arg("-o")
+            .arg(&recursive_output)
+            .output()
+            .expect("afs-ld should run");
+        let recursive_stderr = String::from_utf8_lossy(&recursive.stderr);
+        assert!(
+            recursive.status.success(),
+            "recursive thin archive lazy link failed with -j{jobs}:\n{recursive_stderr}"
+        );
+        assert!(
+            recursive_stderr.contains(&format!("afs-ld: loading {}", member.display())),
+            "{recursive_stderr}"
+        );
+
+        let recursive_force_output = root.join(format!("thin-recursive-force-{jobs}.out"));
+        let recursive_forced = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-t")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg("-force_load")
+            .arg(&recursive_archive)
+            .arg("-o")
+            .arg(&recursive_force_output)
+            .output()
+            .expect("afs-ld should run");
+        let recursive_force_stderr = String::from_utf8_lossy(&recursive_forced.stderr);
+        assert!(
+            recursive_forced.status.success(),
+            "recursive thin archive force-load failed with -j{jobs}:\n{recursive_force_stderr}"
+        );
+        assert!(
+            recursive_force_stderr.contains(&format!("afs-ld: loading {}", member.display())),
+            "{recursive_force_stderr}"
+        );
+    }
+
+    fs::remove_file(&member).unwrap();
+    for jobs in [1, 4] {
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&main)
+            .arg(&archive)
+            .output()
+            .expect("afs-ld should run");
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(&member.display().to_string()), "{stderr}");
+        assert!(stderr.contains("thin archive member I/O"), "{stderr}");
+    }
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

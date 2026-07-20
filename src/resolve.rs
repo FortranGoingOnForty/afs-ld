@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
-use crate::archive::{Archive, ArchiveError};
+use crate::archive::{Archive, ArchiveError, MemberLoadError};
 use crate::input::ObjectFile;
 use crate::macho::dylib::DylibFile;
 use crate::macho::reader::ReadError;
@@ -118,10 +118,15 @@ opaque_id!(
     /// in a per-linker instance): one slot per `.a` on the link line.
     ArchiveId
 );
-opaque_id!(
-    /// Per-archive handle identifying a member by its `ar_hdr` offset.
-    MemberId
-);
+/// Per-archive handle identifying a member by its 64-bit `ar_hdr` offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MemberId(pub u64);
+
+impl MemberId {
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
 opaque_id!(
     /// Index into `SymbolTable::symbols`. Stable across the whole link.
     SymbolId
@@ -140,7 +145,7 @@ opaque_id!(
 pub struct ObjectInput {
     pub path: PathBuf,
     pub load_order: usize,
-    pub archive_member_offset: Option<u32>,
+    pub archive_member_offset: Option<u64>,
     /// Raw bytes retained for diagnostics and future low-level readers.
     pub bytes: Vec<u8>,
     /// Parsed object view. It owns section/relocation/string-table buffers,
@@ -157,7 +162,7 @@ pub struct ArchiveInput {
     /// the fixed-point loop from re-ingesting the same object twice —
     /// important both for correctness (no duplicate-strong errors from
     /// our own symbols) and for keeping transitions deterministic.
-    pub fetched: HashSet<u32>,
+    pub fetched: HashSet<u64>,
 }
 
 #[derive(Debug)]
@@ -1339,6 +1344,7 @@ pub(crate) fn resolve_inputs_in_order(
 pub enum FetchError {
     Read(ReadError),
     Archive(ArchiveError),
+    MemberLoad(MemberLoadError),
     MemberNotFound {
         archive: ArchiveId,
         member: MemberId,
@@ -1350,6 +1356,7 @@ impl std::fmt::Display for FetchError {
         match self {
             FetchError::Read(e) => write!(f, "{e}"),
             FetchError::Archive(e) => write!(f, "{e}"),
+            FetchError::MemberLoad(e) => write!(f, "{e}"),
             FetchError::MemberNotFound { archive, member } => write!(
                 f,
                 "archive #{} has no member at ar_hdr offset 0x{:x}",
@@ -1359,7 +1366,16 @@ impl std::fmt::Display for FetchError {
     }
 }
 
-impl std::error::Error for FetchError {}
+impl std::error::Error for FetchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FetchError::Read(error) => Some(error),
+            FetchError::Archive(error) => Some(error),
+            FetchError::MemberLoad(error) => Some(error),
+            FetchError::MemberNotFound { .. } => None,
+        }
+    }
+}
 
 impl From<ReadError> for FetchError {
     fn from(e: ReadError) -> Self {
@@ -1370,6 +1386,12 @@ impl From<ReadError> for FetchError {
 impl From<ArchiveError> for FetchError {
     fn from(e: ArchiveError) -> Self {
         FetchError::Archive(e)
+    }
+}
+
+impl From<MemberLoadError> for FetchError {
+    fn from(error: MemberLoadError) -> Self {
+        FetchError::MemberLoad(error)
     }
 }
 
@@ -1500,9 +1522,9 @@ fn load_archive_member_job(
                     archive: job.key.archive,
                     member: job.key.member,
                 })?;
-        let logical_path =
-            PathBuf::from(format!("{}({})", job.archive_path.display(), member.name));
-        let bytes = member.body.to_vec();
+        let loaded = archive.load_member(member)?;
+        let logical_path = loaded.logical_path;
+        let bytes = loaded.bytes.into_owned();
         let parsed = ObjectFile::parse(&logical_path, &bytes)?;
         Ok(LoadedArchiveMember {
             key: job.key,
@@ -1615,12 +1637,12 @@ pub fn force_load_archive(
     report: &mut DrainReport,
     parallel_jobs: usize,
 ) -> Result<(), FetchError> {
-    let member_offsets: Vec<u32> = {
+    let member_offsets: Vec<u64> = {
         let ai = &inputs.archives[archive_id.0 as usize];
         let archive = Archive::open(&ai.path, &ai.bytes)?;
         archive
             .object_members()
-            .map(|m| m.header_offset as u32)
+            .map(|m| m.header_offset as u64)
             .collect()
     };
     let keys = member_offsets

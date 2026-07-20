@@ -749,7 +749,10 @@ fn output_rank(flags: u64, is_bss: bool) -> u32 {
 /// bytes are the whole `ar` container; members are parsed as ELF only
 /// when pulled to satisfy an undefined symbol.
 pub struct Library {
+    /// Display name retained in diagnostics and public API output.
     pub name: String,
+    /// Filesystem location used to resolve external GNU-thin members.
+    pub path: std::path::PathBuf,
     pub bytes: Vec<u8>,
 }
 
@@ -777,7 +780,7 @@ pub enum DynamicLinkInput {
 
 struct ArchiveInput {
     lib: Library,
-    pulled: HashSet<usize>,
+    pulled: HashSet<u64>,
 }
 
 enum StaticInput {
@@ -987,7 +990,7 @@ fn defined_names(obj: &ElfObject, out: &mut HashSet<String>) {
 /// Resolve a symbol name to its defining member's header offset in an
 /// archive, tolerant of symbol versioning: an exact hit wins, else a
 /// default-version (`name@@V`) entry, else any versioned (`name@V`).
-fn armap_offset(ar: &crate::archive::Archive, name: &str) -> Option<u32> {
+fn armap_offset(ar: &crate::archive::Archive, name: &str) -> Option<u64> {
     let si = ar.symbol_index()?;
     if let Some(o) = si.first_defining_offset(name) {
         return Some(o);
@@ -1228,7 +1231,7 @@ fn scan_archive(
 ) -> Result<bool, ElfError> {
     use crate::archive::Archive as ArContainer;
 
-    let archive = ArContainer::open(input.lib.name.clone(), &input.lib.bytes)
+    let archive = ArContainer::open(input.lib.path.clone(), &input.lib.bytes)
         .map_err(|e| ElfError(format!("{}: {}", input.lib.name, e)))?;
     let mut pulled_any = false;
     loop {
@@ -1238,7 +1241,7 @@ fn scan_archive(
             let Some(off) = armap_offset(&archive, name) else {
                 continue;
             };
-            if !input.pulled.insert(off as usize) {
+            if !input.pulled.insert(off) {
                 continue;
             }
             let member = archive.member_at_offset(off).ok_or_else(|| {
@@ -1247,14 +1250,13 @@ fn scan_archive(
                     input.lib.name, off
                 ))
             })?;
-            if member.body.is_empty() {
-                return err(format!(
-                    "{}({}): thin-archive members are out of scope for ELF {} linking",
-                    input.lib.name, member.name, mode
-                ));
-            }
-            let logical = format!("{}({})", input.lib.name, member.name);
-            let obj = parse_rel(&logical, member.body)?;
+            let loaded = archive
+                .load_member(member)
+                .map_err(|error| ElfError(format!("ELF {mode} link: {error}")))?;
+            let obj = parse_rel(
+                &loaded.logical_path.to_string_lossy(),
+                loaded.bytes.as_ref(),
+            )?;
             add_object(obj, objects, defined);
             changed = true;
             pulled_any = true;

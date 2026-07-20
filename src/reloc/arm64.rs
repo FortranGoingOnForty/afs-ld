@@ -437,8 +437,15 @@ fn input_section_address_map(layout: &Layout, atoms: &AtomTable) -> HashMap<(Inp
     for section in &layout.sections {
         for placed in &section.atoms {
             let atom = atoms.get(placed.atom);
+            let Some(input_section_addr) = section
+                .addr
+                .checked_add(placed.offset)
+                .and_then(|addr| addr.checked_sub(atom.input_offset as u64))
+            else {
+                continue;
+            };
             out.entry((atom.origin, atom.input_section))
-                .or_insert(section.addr);
+                .or_insert(input_section_addr);
         }
     }
     out
@@ -2969,6 +2976,58 @@ mod tests {
             ],
         };
         assert!(!layout_fits_branch26_span(&large));
+    }
+
+    #[test]
+    fn input_section_addresses_track_each_object_contribution() {
+        let mut atoms = AtomTable::new();
+        let first = atoms.push(Atom {
+            origin: InputId(0),
+            input_section: 2,
+            ..test_atom(0, 8)
+        });
+        let second = atoms.push(Atom {
+            origin: InputId(1),
+            input_section: 2,
+            ..test_atom(0, 8)
+        });
+        let layout = Layout {
+            kind: OutputKind::Executable,
+            segments: Vec::new(),
+            sections: vec![OutputSection {
+                segment: "__DATA".into(),
+                name: "__data".into(),
+                kind: SectionKind::Data,
+                align_pow2: 3,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+                atoms: vec![
+                    crate::section::OutputAtom {
+                        atom: first,
+                        offset: 0,
+                        size: 8,
+                        data: vec![1; 8],
+                    },
+                    crate::section::OutputAtom {
+                        atom: second,
+                        offset: 8,
+                        size: 8,
+                        data: vec![2; 8],
+                    },
+                ],
+                synthetic_offset: 16,
+                synthetic_data: Vec::new(),
+                addr: 0x1_0000_4000,
+                size: 16,
+                file_off: 0x4000,
+            }],
+        };
+
+        let addrs = input_section_address_map(&layout, &atoms);
+        assert_eq!(addrs[&(InputId(0), 2)], 0x1_0000_4000);
+        assert_eq!(addrs[&(InputId(1), 2)], 0x1_0000_4008);
     }
 
     #[test]

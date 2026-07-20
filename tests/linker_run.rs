@@ -598,23 +598,32 @@ fn synthetic_custom_segment_rebase_object(pointer_section: &str) -> Vec<u8> {
 
 fn synthetic_icf_section_reference_object(symbol: &str, data_value: u64) -> Vec<u8> {
     let text = [
-        0x80, 0x00, 0x00, 0x10, // adr x0, +16
-        0x00, 0x00, 0x40, 0xf9, // ldr x0, [x0]
+        0x00, 0x00, 0x00, 0x90, // adrp x0, __data@PAGE
+        0x00, 0x00, 0x00, 0x91, // add x0, x0, __data@PAGEOFF
         0x00, 0x00, 0x40, 0xb9, // ldr w0, [x0]
         0xc0, 0x03, 0x5f, 0xd6, // ret
-        0x00, 0x00, 0x00, 0x00, // .quad __DATA,__data
-        0x00, 0x00, 0x00, 0x00,
     ];
     let data = data_value.to_le_bytes();
-    let relocs = [Reloc {
-        offset: 16,
-        kind: RelocKind::Unsigned,
-        length: RelocLength::Quad,
-        pcrel: false,
-        referent: Referent::Section(2),
-        addend: 0,
-        subtrahend: None,
-    }];
+    let relocs = [
+        Reloc {
+            offset: 0,
+            kind: RelocKind::Page21,
+            length: RelocLength::Word,
+            pcrel: true,
+            referent: Referent::Section(2),
+            addend: 0,
+            subtrahend: None,
+        },
+        Reloc {
+            offset: 4,
+            kind: RelocKind::PageOff12,
+            length: RelocLength::Word,
+            pcrel: false,
+            referent: Referent::Section(2),
+            addend: 0,
+            subtrahend: None,
+        },
+    ];
     let raw_relocs = write_relocs(&relocs).unwrap();
     let mut reloc_bytes = Vec::new();
     write_raw_relocs(&raw_relocs, &mut reloc_bytes);
@@ -5379,6 +5388,12 @@ fn linker_run_handles_non_standard_segment_without_panicking() {
         .globl _custom
         _custom:
             .quad 1
+
+        .text
+        .globl _main
+        _main:
+            mov w0, #0
+            ret
         .subsections_via_symbols
     "#;
     if let Err(e) = assemble(src, &obj) {
@@ -6547,10 +6562,12 @@ fn linker_run_replans_thunks_until_layout_converges() {
             bl _borderline
             mov w0, #0
             ret
+            .space 0x3fe8
 
-        .zerofill __TEXT,__apad,_gap,0x7ffffec,2
+        .zerofill __DATA,__bss,_gap,0x7ff8000,2
 
-        .section __TEXT,__late,regular,pure_instructions
+        .section __FAR,__text,regular,pure_instructions
+            .space 0x3ffc
         .globl _borderline
         _borderline:
             ret
@@ -6597,7 +6614,7 @@ fn linker_run_replans_thunks_until_layout_converges() {
 }
 
 #[test]
-fn linker_run_uses_multiple_thunk_islands_within_text_segment() {
+fn linker_run_emits_multiple_thunk_islands_within_text_segment() {
     if !have_xcrun() || !have_tool("codesign") {
         eprintln!("skipping: xcrun or codesign unavailable");
         return;
@@ -6613,8 +6630,6 @@ fn linker_run_uses_multiple_thunk_islands_within_text_segment() {
             mov w0, #0
             ret
 
-        .zerofill __TEXT,__apad1,_gap1,0x9000000,2
-
         .section __TEXT,__bmid,regular,pure_instructions
         .globl _midcaller
         _midcaller:
@@ -6623,8 +6638,6 @@ fn linker_run_uses_multiple_thunk_islands_within_text_segment() {
             bl _helper
             ldp x29, x30, [sp], #16
             ret
-
-        .zerofill __TEXT,__cpad2,_gap2,0x9000000,2
 
         .section __TEXT,__dlate,regular,pure_instructions
         .globl _helper
@@ -6641,6 +6654,7 @@ fn linker_run_uses_multiple_thunk_islands_within_text_segment() {
         inputs: vec![obj.clone()],
         output: Some(out.clone()),
         kind: OutputKind::Executable,
+        thunks: afs_ld::ThunkMode::All,
         ..LinkOptions::default()
     };
     Linker::run(&opts).unwrap();
@@ -6650,7 +6664,7 @@ fn linker_run_uses_multiple_thunk_islands_within_text_segment() {
     assert_eq!(
         thunk_sections.len(),
         2,
-        "expected one thunk island after __text and one after __mid"
+        "expected one thunk island after each caller"
     );
     assert!(
         thunk_sections.iter().all(|(_, bytes)| bytes.len() == 12),
@@ -9856,9 +9870,17 @@ fn synthetic_icf_fixture_uses_section_relocation() {
     let raw = parse_raw_relocs(&text.raw_relocs, 0, text.nreloc).unwrap();
     let relocs = parse_relocs(&raw).unwrap();
 
-    assert_eq!(relocs.len(), 1);
-    assert_eq!(relocs[0].offset, 16);
-    assert_eq!(relocs[0].referent, Referent::Section(2));
+    assert_eq!(relocs.len(), 2);
+    assert!(relocs.iter().any(|reloc| {
+        reloc.offset == 0
+            && reloc.kind == RelocKind::Page21
+            && reloc.referent == Referent::Section(2)
+    }));
+    assert!(relocs.iter().any(|reloc| {
+        reloc.offset == 4
+            && reloc.kind == RelocKind::PageOff12
+            && reloc.referent == Referent::Section(2)
+    }));
 }
 
 #[test]

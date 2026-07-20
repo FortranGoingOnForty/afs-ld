@@ -7,6 +7,7 @@ use crate::input::ObjectFile;
 use crate::layout::LayoutInput;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent};
 use crate::resolve::{AtomId, InputId, Symbol, SymbolId, SymbolTable};
+use crate::symbol::SymKind;
 use crate::{LinkOptions, OutputKind};
 
 #[derive(Debug, Clone)]
@@ -718,6 +719,13 @@ fn live_support_edges(
             continue;
         }
         for &target in forward_edges.get(&source).into_iter().flatten() {
+            if atom_table
+                .get(target)
+                .flags
+                .has(crate::atom::AtomFlags::LIVE_SUPPORT)
+            {
+                continue;
+            }
             out.entry(target).or_default().push(source);
         }
     }
@@ -757,12 +765,20 @@ fn find_atom_for_offset(
     atoms_by_input_section
         .get(&(input_id, input_section))
         .and_then(|ids| {
-            ids.iter().find_map(|atom_id| {
-                let atom = atom_table.get(*atom_id);
-                let start = atom.input_offset;
-                let end = atom.input_offset.saturating_add(atom.size);
-                (start <= offset && offset < end).then_some(*atom_id)
-            })
+            ids.iter()
+                .find_map(|atom_id| {
+                    let atom = atom_table.get(*atom_id);
+                    let start = atom.input_offset;
+                    let end = atom.input_offset.saturating_add(atom.size);
+                    (start <= offset && offset < end).then_some(*atom_id)
+                })
+                .or_else(|| {
+                    ids.iter().find_map(|atom_id| {
+                        let atom = atom_table.get(*atom_id);
+                        let end = atom.input_offset.saturating_add(atom.size);
+                        (offset == end).then_some(*atom_id)
+                    })
+                })
         })
 }
 
@@ -825,6 +841,26 @@ fn referent_atoms(
             let Some(input_sym) = object.symbols.get(symbol_index as usize) else {
                 return Vec::new();
             };
+            if input_sym.kind() == SymKind::Sect && !input_sym.is_ext() {
+                let Some(section) = object.section_for_symbol(input_sym) else {
+                    return Vec::new();
+                };
+                let Some(section_offset) = input_sym.value().checked_sub(section.addr) else {
+                    return Vec::new();
+                };
+                let Ok(section_offset) = u32::try_from(section_offset) else {
+                    return Vec::new();
+                };
+                return find_atom_for_offset(
+                    atom_table,
+                    atoms_by_input_section,
+                    input_id,
+                    input_sym.sect_idx(),
+                    section_offset,
+                )
+                .into_iter()
+                .collect();
+            }
             let Some(name) = object.symbol_name(input_sym).ok() else {
                 return Vec::new();
             };
@@ -934,12 +970,30 @@ mod tests {
     use crate::atom::AtomFlags;
     use crate::input::ObjectFile;
     use crate::macho::constants::{
-        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, S_REGULAR,
+        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, N_SECT, S_REGULAR,
     };
     use crate::macho::reader::MachHeader64;
     use crate::reloc::{write_raw_relocs, write_relocs, Reloc, RelocKind, RelocLength};
     use crate::section::{InputSection, SectionKind};
     use crate::string_table::StringTable;
+    use crate::symbol::{InputSymbol, RawNlist};
+
+    fn bare_test_atom() -> Atom {
+        Atom {
+            id: AtomId(0),
+            origin: InputId(0),
+            input_section: 1,
+            section: AtomSection::Data,
+            input_offset: 0,
+            size: 8,
+            align_pow2: 3,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 8],
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        }
+    }
 
     fn alias_roots_private_target(private_alias: bool) -> (bool, bool) {
         let mut atoms = AtomTable::new();
@@ -1136,5 +1190,150 @@ mod tests {
     #[test]
     fn live_support_ignores_symbol_no_dead_strip() {
         assert_eq!(live_support_result(false, true), (false, false, false));
+    }
+
+    #[test]
+    fn live_support_preserves_section_no_dead_strip() {
+        let mut atoms = AtomTable::new();
+        let atom = atoms.push(Atom {
+            flags: AtomFlags::NONE
+                .with(AtomFlags::NO_DEAD_STRIP)
+                .with(AtomFlags::LIVE_SUPPORT),
+            ..bare_test_atom()
+        });
+
+        let roots = root_atoms(&LinkOptions::default(), &atoms, &SymbolTable::new(), None);
+        assert!(roots.contains_key(&atom));
+    }
+
+    #[test]
+    fn live_support_does_not_reverse_through_shared_support_atoms() {
+        let mut atoms = AtomTable::new();
+        let first_fde = atoms.push(Atom {
+            flags: AtomFlags::NONE.with(AtomFlags::LIVE_SUPPORT),
+            ..bare_test_atom()
+        });
+        let second_fde = atoms.push(Atom {
+            flags: AtomFlags::NONE.with(AtomFlags::LIVE_SUPPORT),
+            ..bare_test_atom()
+        });
+        let cie = atoms.push(Atom {
+            flags: AtomFlags::NONE.with(AtomFlags::LIVE_SUPPORT),
+            ..bare_test_atom()
+        });
+        let function = atoms.push(bare_test_atom());
+        let forward = HashMap::from([(first_fde, vec![function, cie]), (second_fde, vec![cie])]);
+
+        let reverse = live_support_edges(&atoms, &forward);
+        assert_eq!(reverse.get(&function), Some(&vec![first_fde]));
+        assert!(!reverse.contains_key(&cie));
+    }
+
+    #[test]
+    fn local_section_symbol_relocation_keeps_target_atom() {
+        let relocs = [Reloc {
+            offset: 0,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(0),
+            addend: 0,
+            subtrahend: None,
+        }];
+        let raw_relocs = write_relocs(&relocs).unwrap();
+        let mut reloc_bytes = Vec::new();
+        write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+        let section = |name: &str, raw_relocs: Vec<u8>| InputSection {
+            segname: "__DATA".into(),
+            sectname: name.into(),
+            kind: SectionKind::Data,
+            addr: 0,
+            size: 8,
+            align_pow2: 3,
+            flags: S_REGULAR,
+            offset: 0,
+            reloff: 0,
+            nreloc: (raw_relocs.len() / 8) as u32,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            data: vec![0; 8],
+            raw_relocs,
+        };
+        let object = ObjectFile {
+            path: PathBuf::from("local-section-symbol.o"),
+            header: MachHeader64 {
+                magic: MH_MAGIC_64,
+                cputype: CPU_TYPE_ARM64,
+                cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+                filetype: MH_OBJECT,
+                ncmds: 0,
+                sizeofcmds: 0,
+                flags: 0,
+                reserved: 0,
+            },
+            commands: Vec::new(),
+            sections: vec![
+                section("__source", reloc_bytes),
+                section("__target", Vec::new()),
+            ],
+            symbols: vec![InputSymbol::from_raw(RawNlist {
+                strx: 1,
+                n_type: N_SECT,
+                n_sect: 2,
+                n_desc: 0,
+                n_value: 0,
+            })],
+            strings: StringTable::from_bytes(b"\0Ltarget\0".to_vec()),
+            symtab: None,
+            dysymtab: None,
+            loh: Vec::new(),
+            data_in_code: Vec::new(),
+        };
+        let mut atoms = AtomTable::new();
+        let source = atoms.push(Atom {
+            id: AtomId(0),
+            origin: InputId(0),
+            input_section: 1,
+            section: AtomSection::Data,
+            input_offset: 0,
+            size: 8,
+            align_pow2: 3,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 8],
+            flags: AtomFlags::NONE.with(AtomFlags::NO_DEAD_STRIP),
+            parent_of: None,
+        });
+        let target = atoms.push(Atom {
+            id: AtomId(0),
+            origin: InputId(0),
+            input_section: 2,
+            section: AtomSection::Data,
+            input_offset: 0,
+            size: 8,
+            align_pow2: 3,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 8],
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        });
+        let inputs = [LayoutInput {
+            id: InputId(0),
+            object: &object,
+            load_order: 0,
+            archive_member_offset: None,
+        }];
+        let analysis = DeadStripAnalysis::build(
+            &LinkOptions::default(),
+            &inputs,
+            &atoms,
+            &SymbolTable::new(),
+            None,
+        );
+
+        assert!(analysis.live_atoms().contains(&source));
+        assert!(analysis.live_atoms().contains(&target));
     }
 }

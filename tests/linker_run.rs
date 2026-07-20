@@ -8493,7 +8493,6 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
             &sdk_ver,
             "-syslibroot",
             &sdk,
-            "-lSystem",
             "-e",
             "_main",
             "-no_fixup_chains",
@@ -8502,6 +8501,7 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
         .arg(&apple_out)
         .arg(&obj)
         .arg(&runtime)
+        .arg("-lSystem")
         .output()
         .unwrap();
     assert!(
@@ -8672,7 +8672,6 @@ fn linker_run_rebases_runtime_init_metadata_like_apple_ld() {
             &sdk_ver,
             "-syslibroot",
             &sdk,
-            "-lSystem",
             "-e",
             "_main",
             "-no_fixup_chains",
@@ -8681,6 +8680,7 @@ fn linker_run_rebases_runtime_init_metadata_like_apple_ld() {
         .arg(&apple_out)
         .arg(&obj)
         .arg(&runtime)
+        .arg("-lSystem")
         .output()
         .unwrap();
     assert!(

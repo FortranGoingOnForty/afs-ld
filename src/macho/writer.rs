@@ -8,7 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::atom::{AtomSection, AtomTable};
+use crate::atom::{AtomFlags, AtomSection, AtomTable};
 use crate::input::ObjectFile;
 use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
 use crate::leb::write_uleb;
@@ -1670,6 +1670,7 @@ fn build_output_symbols_profiled(
 
     let phase_started = std::time::Instant::now();
     for (symbol_id, symbol) in sym_table.iter() {
+        let indirect_alias = matches!(symbol, Symbol::Alias { .. });
         if let Symbol::Alias {
             name,
             origin,
@@ -1738,7 +1739,7 @@ fn build_output_symbols_profiled(
                     *weak,
                     *private_extern,
                     *no_dead_strip,
-                    false,
+                    is_defined_section_alias(inputs.0.atom_table, *atom, symbol_id),
                 ),
                 Symbol::Absolute {
                     name,
@@ -1798,7 +1799,7 @@ fn build_output_symbols_profiled(
         let materialized_private_common = private_extern
             && atom
                 .is_some_and(|atom| inputs.0.atom_table.get(atom).section == AtomSection::Common);
-        if private_extern && !materialized_private_common && !is_alias {
+        if private_extern && !materialized_private_common && !indirect_alias {
             continue;
         }
         let name = sym_table.interner.resolve(name).to_string();
@@ -2028,7 +2029,8 @@ fn collect_local_symbols(
     object: &ObjectFile,
     out: &mut Vec<OutputSymbolSpec>,
 ) -> Result<(), WriteError> {
-    for input_sym in &object.symbols {
+    let last_symbol_at_location = last_section_symbol_at_each_location(object);
+    for (symbol_index, input_sym) in object.symbols.iter().enumerate() {
         if input_sym.stab_kind().is_some() {
             continue;
         }
@@ -2058,13 +2060,17 @@ fn collect_local_symbols(
                 let n_sect = *ctx.atom_sections.get(&atom_id).ok_or(
                     WriteError::DefinedSymbolSectionMissing(SymbolId(u32::MAX), atom_id),
                 )?;
+                let mut n_desc = input_sym.raw.n_desc;
+                if is_overlapping_section_alias(&last_symbol_at_location, symbol_index, input_sym) {
+                    n_desc |= N_ALT_ENTRY;
+                }
                 out.push(OutputSymbolSpec {
                     symbol: None,
                     name,
                     partition: OutputSymbolPartition::Local,
                     n_type: input_symbol_type(input_sym),
                     n_sect,
-                    n_desc: input_sym.raw.n_desc,
+                    n_desc,
                     n_value: addr,
                     size: ctx.atom_table.get(atom_id).size.saturating_sub(delta) as u64,
                     file_index: ctx.file_index,
@@ -2093,6 +2099,50 @@ fn collect_local_symbols(
         }
     }
     Ok(())
+}
+
+fn is_defined_section_alias(atom_table: &AtomTable, atom_id: AtomId, symbol_id: SymbolId) -> bool {
+    if atom_id.0 == 0 {
+        return false;
+    }
+    let atom = atom_table.get(atom_id);
+    atom.flags.has(AtomFlags::ALT_ENTRY)
+        || atom
+            .alt_entries
+            .iter()
+            .any(|entry| entry.symbol == symbol_id)
+}
+
+fn last_section_symbol_at_each_location(object: &ObjectFile) -> HashMap<(u8, u64), usize> {
+    object
+        .symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, symbol)| {
+            symbol.stab_kind().is_none()
+                && symbol.kind() == SymKind::Sect
+                && !symbol.alt_entry()
+                && (symbol.is_ext() || symbol.is_private_ext())
+        })
+        .map(|(index, symbol)| ((symbol.sect_idx(), symbol.value()), index))
+        .collect()
+}
+
+fn is_overlapping_section_alias(
+    last_symbol_at_location: &HashMap<(u8, u64), usize>,
+    symbol_index: usize,
+    symbol: &InputSymbol,
+) -> bool {
+    if symbol.kind() != SymKind::Sect
+        || symbol.alt_entry()
+        || !(symbol.is_ext() || symbol.is_private_ext())
+    {
+        return false;
+    }
+
+    last_symbol_at_location
+        .get(&(symbol.sect_idx(), symbol.value()))
+        .is_some_and(|last_index| symbol_index < *last_index)
 }
 
 struct LocalSymbolContext<'a> {

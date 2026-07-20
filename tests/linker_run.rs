@@ -423,11 +423,19 @@ fn synthetic_absolute_reference_object(entry: &str, target: &str) -> Vec<u8> {
     bytes
 }
 
+#[derive(Clone, Copy)]
+enum SyntheticAliasEncoding {
+    Indirect,
+    ExplicitAlternateEntry,
+    OverlappingSection,
+}
+
 fn synthetic_defined_alias_object(
     private_alias: bool,
     private_main: bool,
     private_target: bool,
     reference_alias: bool,
+    encoding: SyntheticAliasEncoding,
 ) -> Vec<u8> {
     let first_instruction = if reference_alias {
         [0x00, 0x00, 0x00, 0x94] // bl _alias
@@ -447,7 +455,11 @@ fn synthetic_defined_alias_object(
             kind: RelocKind::Branch26,
             length: RelocLength::Word,
             pcrel: true,
-            referent: Referent::Symbol(1),
+            referent: Referent::Symbol(match encoding {
+                SyntheticAliasEncoding::Indirect => 1,
+                SyntheticAliasEncoding::ExplicitAlternateEntry => 2,
+                SyntheticAliasEncoding::OverlappingSection => 1,
+            }),
             addend: 0,
             subtrahend: None,
         }]
@@ -468,29 +480,49 @@ fn synthetic_defined_alias_object(
     let main_strx = add_string("_main");
     let alias_strx = add_string("_alias");
     let target_strx = add_string("_target");
-    let symbols = [
-        RawNlist {
-            strx: main_strx,
-            n_type: N_SECT | N_EXT | if private_main { N_PEXT } else { 0 },
-            n_sect: 1,
-            n_desc: 0,
-            n_value: 0,
-        },
-        RawNlist {
+    let main = RawNlist {
+        strx: main_strx,
+        n_type: N_SECT | N_EXT | if private_main { N_PEXT } else { 0 },
+        n_sect: 1,
+        n_desc: 0,
+        n_value: 0,
+    };
+    let target = RawNlist {
+        strx: target_strx,
+        n_type: N_SECT | N_EXT | if private_target { N_PEXT } else { 0 },
+        n_sect: 1,
+        n_desc: 0,
+        n_value: 12,
+    };
+    let alias = match encoding {
+        SyntheticAliasEncoding::Indirect => RawNlist {
             strx: alias_strx,
             n_type: N_INDR | N_EXT | if private_alias { N_PEXT } else { 0 },
             n_sect: 0,
             n_desc: 0,
             n_value: target_strx as u64,
         },
-        RawNlist {
-            strx: target_strx,
-            n_type: N_SECT | N_EXT | if private_target { N_PEXT } else { 0 },
+        SyntheticAliasEncoding::ExplicitAlternateEntry => RawNlist {
+            strx: alias_strx,
+            n_type: N_SECT | N_EXT | if private_alias { N_PEXT } else { 0 },
+            n_sect: 1,
+            n_desc: N_ALT_ENTRY,
+            n_value: 12,
+        },
+        SyntheticAliasEncoding::OverlappingSection => RawNlist {
+            strx: alias_strx,
+            n_type: N_SECT | N_EXT | if private_alias { N_PEXT } else { 0 },
             n_sect: 1,
             n_desc: 0,
             n_value: 12,
         },
-    ];
+    };
+    let symbols = match encoding {
+        SyntheticAliasEncoding::Indirect | SyntheticAliasEncoding::OverlappingSection => {
+            [main, alias, target]
+        }
+        SyntheticAliasEncoding::ExplicitAlternateEntry => [main, target, alias],
+    };
 
     let mut segment = Segment64 {
         segname: name16("__TEXT"),
@@ -3524,7 +3556,13 @@ fn linker_run_resolves_indirect_aliases_and_preserves_visibility() {
         let map = scratch(&format!("indirect-alias-{visibility}.map"));
         fs::write(
             &obj,
-            synthetic_defined_alias_object(private_alias, false, false, true),
+            synthetic_defined_alias_object(
+                private_alias,
+                false,
+                false,
+                true,
+                SyntheticAliasEncoding::Indirect,
+            ),
         )
         .unwrap();
 
@@ -3575,6 +3613,49 @@ fn linker_run_resolves_indirect_aliases_and_preserves_visibility() {
         let _ = fs::remove_file(obj);
         let _ = fs::remove_file(out);
         let _ = fs::remove_file(map);
+    }
+}
+
+#[test]
+fn linker_run_marks_section_alias_descriptors() {
+    for (encoding_name, encoding) in [
+        ("explicit", SyntheticAliasEncoding::ExplicitAlternateEntry),
+        ("overlapping", SyntheticAliasEncoding::OverlappingSection),
+    ] {
+        for private_alias in [false, true] {
+            let visibility = if private_alias { "private" } else { "public" };
+            let obj = scratch(&format!("section-alias-{encoding_name}-{visibility}.o"));
+            let out = scratch(&format!("section-alias-{encoding_name}-{visibility}.out"));
+            fs::write(
+                &obj,
+                synthetic_defined_alias_object(private_alias, false, false, true, encoding),
+            )
+            .unwrap();
+
+            let opts = LinkOptions {
+                inputs: vec![obj.clone()],
+                output: Some(out.clone()),
+                kind: OutputKind::Executable,
+                ..LinkOptions::default()
+            };
+            Linker::run(&opts).unwrap();
+
+            let bytes = fs::read(&out).unwrap();
+            let records = canonical_symbol_record_map(&bytes);
+            let alias = records.get("_alias").unwrap();
+            let target = records.get("_target").unwrap();
+            assert_eq!(
+                alias.n_type,
+                N_SECT | if private_alias { N_PEXT } else { N_EXT }
+            );
+            assert_eq!(alias.n_sect, target.n_sect);
+            assert_eq!(alias.n_desc, N_ALT_ENTRY);
+            assert_eq!(alias.value, target.value);
+            assert_eq!(target.n_desc & N_ALT_ENTRY, 0);
+
+            let _ = fs::remove_file(obj);
+            let _ = fs::remove_file(out);
+        }
     }
 }
 
@@ -3732,7 +3813,7 @@ fn linker_run_keeps_public_alias_targets_live_in_dead_stripped_dylibs() {
     let out = scratch("indirect-alias-dead-strip.dylib");
     fs::write(
         &obj,
-        synthetic_defined_alias_object(false, false, true, false),
+        synthetic_defined_alias_object(false, false, true, false, SyntheticAliasEncoding::Indirect),
     )
     .unwrap();
 

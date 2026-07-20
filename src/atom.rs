@@ -116,6 +116,7 @@ impl AtomFlags {
     pub const LITERAL: u32 = 1 << 3;
     pub const PURE_INSTRUCTIONS: u32 = 1 << 4;
     pub const ADDRESS_TAKEN: u32 = 1 << 5; // set during reloc scan (Sprint 24's ICF gate)
+    pub const ALT_ENTRY: u32 = 1 << 6;
 
     pub fn has(self, bit: u32) -> bool {
         self.bits & bit != 0
@@ -1094,6 +1095,9 @@ fn build_slice_atom(
     }
     if let Some(sym) = owner {
         flags.set(symbol_flags(sym).bits());
+    }
+    if size == 0 && offset < sect.size as u32 {
+        flags.set(AtomFlags::ALT_ENTRY);
     }
     Atom {
         id: AtomId(0),

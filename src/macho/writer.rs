@@ -1265,7 +1265,7 @@ fn collect_rebase_sites(
     let symbol_name_index = build_symbol_name_index(inputs.0.sym_table);
 
     for section in &layout.sections {
-        if section.kind == SectionKind::ThreadLocalVariables {
+        if section.kind == SectionKind::ThreadLocalVariables || section.flags & S_ATTR_DEBUG != 0 {
             continue;
         }
         let mut segment_metadata = None;

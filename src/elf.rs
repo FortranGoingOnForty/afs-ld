@@ -509,9 +509,25 @@ pub struct SharedLib {
     pub undefs: Vec<String>,
 }
 
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct SharedLinkMetadata {
+    strong_undefs: Vec<String>,
+    needed: Vec<String>,
+    complete: bool,
+}
+
 /// Read an ET_DYN shared object's SONAME and exported dynamic symbols
 /// via its section headers (which `ld`-produced `.so`s always carry).
 pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
+    parse_shared_with_metadata(name, bytes).map(|(lib, _)| lib)
+}
+
+#[doc(hidden)]
+pub fn parse_shared_with_metadata(
+    name: &str,
+    bytes: &[u8],
+) -> Result<(SharedLib, SharedLinkMetadata), ElfError> {
     if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" {
         return err(format!("{}: not an ELF file", name));
     }
@@ -579,6 +595,7 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
 
     // SONAME from .dynamic, else the file's own name.
     let mut soname = String::new();
+    let mut needed = Vec::new();
     if let Some((doff, dsz)) = dynamic {
         let dyn_tab = subslice(bytes, doff, dsz, name, ".dynamic")?;
         for k in 0..dsz / 16 {
@@ -589,6 +606,8 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
             }
             if tag == DT_SONAME {
                 soname = cstr(dynstr, ru64(e, 8) as usize, name, ".dynstr")?;
+            } else if tag == DT_NEEDED {
+                needed.push(cstr(dynstr, ru64(e, 8) as usize, name, ".dynstr")?);
             }
         }
     }
@@ -634,6 +653,7 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
     let mut exports: HashMap<String, Export> = HashMap::new();
     let mut is_default_export: HashMap<String, bool> = HashMap::new();
     let mut undefs: Vec<String> = Vec::new();
+    let mut strong_undefs: Vec<String> = Vec::new();
     let nsyms = ssize / sent;
     for k in 0..nsyms {
         let e = &sym_tab[k * sent..k * sent + 24];
@@ -648,6 +668,9 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
         // the executable (or another library) to provide.
         if shndx == SHN_UNDEF {
             if bind != STB_LOCAL {
+                if bind == STB_GLOBAL {
+                    strong_undefs.push(nm.clone());
+                }
                 undefs.push(nm);
             }
             continue;
@@ -686,11 +709,18 @@ pub fn parse_shared(name: &str, bytes: &[u8]) -> Result<SharedLib, ElfError> {
             },
         );
     }
-    Ok(SharedLib {
-        soname,
-        exports,
-        undefs,
-    })
+    Ok((
+        SharedLib {
+            soname,
+            exports,
+            undefs,
+        },
+        SharedLinkMetadata {
+            strong_undefs,
+            needed,
+            complete: true,
+        },
+    ))
 }
 
 // ---- Static layout + link ----
@@ -793,9 +823,23 @@ enum StaticInput {
 enum DynamicInput {
     Object(Option<ElfObject>),
     Archive(ArchiveInput),
-    Shared(Option<SharedLib>),
+    Shared {
+        lib: Option<SharedLib>,
+        metadata: Option<SharedLinkMetadata>,
+        as_needed: bool,
+    },
     GroupStart,
     GroupEnd,
+}
+
+#[derive(Default)]
+struct DynamicResolution {
+    objects: Vec<ElfObject>,
+    defined: HashSet<String>,
+    shared: Vec<SharedLib>,
+    shared_metadata: Vec<SharedLinkMetadata>,
+    selected_sonames: HashSet<String>,
+    dependency_exports: HashMap<String, HashSet<String>>,
 }
 
 /// The base of a versioned symbol name (`foo@V` or `foo@@V` -> `foo`);
@@ -1012,7 +1056,11 @@ fn armap_offset(ar: &crate::archive::Archive, name: &str) -> Option<u64> {
 /// Strong-undefined names an object references, in first-seen order,
 /// skipping any already defined. Weak-undefined does not pull archive
 /// members (it resolves to 0 if left unsatisfied).
-fn undefined_demand(objects: &[ElfObject], defined: &HashSet<String>) -> Vec<String> {
+fn undefined_demand(
+    objects: &[ElfObject],
+    additional: &[String],
+    defined: &HashSet<String>,
+) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut demand = Vec::new();
     for obj in objects {
@@ -1030,7 +1078,52 @@ fn undefined_demand(objects: &[ElfObject], defined: &HashSet<String>) -> Vec<Str
             }
         }
     }
+    for name in additional {
+        if name.is_empty()
+            || defined.contains(name)
+            || LINKER_SYMS.contains(&name.as_str())
+            || !seen.insert(name.clone())
+        {
+            continue;
+        }
+        demand.push(name.clone());
+    }
     demand
+}
+
+fn uncovered_shared_demand(
+    metadata: &[SharedLinkMetadata],
+    defined: &HashSet<String>,
+    dependency_exports: &HashMap<String, HashSet<String>>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut demand = Vec::new();
+    for details in metadata {
+        if !details.complete {
+            continue;
+        }
+        for name in &details.strong_undefs {
+            if !defined.contains(name)
+                && !dependency_covers(details, name, dependency_exports)
+                && seen.insert(name.clone())
+            {
+                demand.push(name.clone());
+            }
+        }
+    }
+    demand
+}
+
+fn dependency_covers(
+    metadata: &SharedLinkMetadata,
+    symbol: &str,
+    dependency_exports: &HashMap<String, HashSet<String>>,
+) -> bool {
+    metadata.needed.iter().any(|soname| {
+        dependency_exports
+            .get(soname)
+            .is_some_and(|exports| exports.contains(symbol))
+    })
 }
 
 fn common_align(sym: &Symbol) -> u64 {
@@ -1205,14 +1298,22 @@ fn static_state(input: LinkInput) -> StaticInput {
     }
 }
 
-fn dynamic_state(input: DynamicLinkInput) -> DynamicInput {
+fn dynamic_state(
+    input: DynamicLinkInput,
+    as_needed: bool,
+    metadata: Option<SharedLinkMetadata>,
+) -> DynamicInput {
     match input {
         DynamicLinkInput::Object(obj) => DynamicInput::Object(Some(obj)),
         DynamicLinkInput::Archive(lib) => DynamicInput::Archive(ArchiveInput {
             lib,
             pulled: HashSet::new(),
         }),
-        DynamicLinkInput::Shared(lib) => DynamicInput::Shared(Some(lib)),
+        DynamicLinkInput::Shared(lib) => DynamicInput::Shared {
+            lib: Some(lib),
+            metadata: Some(metadata.unwrap_or_default()),
+            as_needed,
+        },
         DynamicLinkInput::GroupStart => DynamicInput::GroupStart,
         DynamicLinkInput::GroupEnd => DynamicInput::GroupEnd,
     }
@@ -1227,6 +1328,7 @@ fn scan_archive(
     input: &mut ArchiveInput,
     objects: &mut Vec<ElfObject>,
     defined: &mut HashSet<String>,
+    additional_demand: &[String],
     mode: &str,
 ) -> Result<bool, ElfError> {
     use crate::archive::Archive as ArContainer;
@@ -1235,7 +1337,7 @@ fn scan_archive(
         .map_err(|e| ElfError(format!("{}: {}", input.lib.name, e)))?;
     let mut pulled_any = false;
     loop {
-        let demand = undefined_demand(objects, defined);
+        let demand = undefined_demand(objects, additional_demand, defined);
         let mut changed = false;
         for name in &demand {
             let Some(off) = armap_offset(&archive, name) else {
@@ -1319,7 +1421,7 @@ fn process_static_range(
                 }
             }
             StaticInput::Archive(archive) => {
-                changed |= scan_archive(archive, objects, defined, "static")?;
+                changed |= scan_archive(archive, objects, defined, &[], "static")?;
             }
             StaticInput::GroupStart | StaticInput::GroupEnd => unreachable!(),
         }
@@ -2309,9 +2411,7 @@ fn process_dynamic_range(
     inputs: &mut [DynamicInput],
     start: usize,
     end: usize,
-    objects: &mut Vec<ElfObject>,
-    defined: &mut HashSet<String>,
-    shared: &mut Vec<SharedLib>,
+    state: &mut DynamicResolution,
 ) -> Result<bool, ElfError> {
     let mut changed = false;
     let mut i = start;
@@ -2319,8 +2419,7 @@ fn process_dynamic_range(
         if matches!(inputs[i], DynamicInput::GroupStart) {
             let group_end = find_dynamic_group_end(inputs, i + 1, end)?;
             loop {
-                let pass_changed =
-                    process_dynamic_range(inputs, i + 1, group_end, objects, defined, shared)?;
+                let pass_changed = process_dynamic_range(inputs, i + 1, group_end, state)?;
                 if !pass_changed {
                     break;
                 }
@@ -2335,19 +2434,65 @@ fn process_dynamic_range(
         match &mut inputs[i] {
             DynamicInput::Object(obj) => {
                 if let Some(obj) = obj.take() {
-                    add_object(obj, objects, defined);
+                    add_object(obj, &mut state.objects, &mut state.defined);
                     changed = true;
                 }
             }
             DynamicInput::Archive(archive) => {
-                changed |= scan_archive(archive, objects, defined, "dynamic")?;
+                let additional_demand = uncovered_shared_demand(
+                    &state.shared_metadata,
+                    &state.defined,
+                    &state.dependency_exports,
+                );
+                changed |= scan_archive(
+                    archive,
+                    &mut state.objects,
+                    &mut state.defined,
+                    &additional_demand,
+                    "dynamic",
+                )?;
             }
-            DynamicInput::Shared(lib) => {
-                if let Some(lib) = lib.take() {
-                    defined.extend(lib.exports.keys().cloned());
-                    shared.push(lib);
+            DynamicInput::Shared {
+                lib,
+                metadata,
+                as_needed,
+            } => {
+                let Some(candidate) = lib.as_ref() else {
+                    i += 1;
+                    continue;
+                };
+                if state.selected_sonames.contains(&candidate.soname) {
+                    lib.take();
+                    i += 1;
+                    continue;
+                }
+                let candidate_soname = candidate.soname.clone();
+                let candidate_exports: HashSet<String> =
+                    candidate.exports.keys().cloned().collect();
+                let regular_select = undefined_demand(&state.objects, &[], &state.defined)
+                    .iter()
+                    .any(|name| candidate.exports.contains_key(name));
+                let shared_select = state.shared_metadata.iter().any(|details| {
+                    details.complete
+                        && !details.needed.contains(&candidate.soname)
+                        && details.strong_undefs.iter().any(|name| {
+                            !state.defined.contains(name) && candidate.exports.contains_key(name)
+                        })
+                });
+                let select = !*as_needed || regular_select || shared_select;
+                if select {
+                    let selected = lib.take().expect("shared input checked above");
+                    let selected_metadata = metadata.take().unwrap_or_default();
+                    state.defined.extend(selected.exports.keys().cloned());
+                    state.selected_sonames.insert(selected.soname.clone());
+                    state.shared.push(selected);
+                    state.shared_metadata.push(selected_metadata);
                     changed = true;
                 }
+                state
+                    .dependency_exports
+                    .entry(candidate_soname)
+                    .or_insert(candidate_exports);
             }
             DynamicInput::GroupStart | DynamicInput::GroupEnd => unreachable!(),
         }
@@ -2365,14 +2510,58 @@ pub fn link_dynamic(
     interp: &str,
     eh_frame_hdr: bool,
 ) -> Result<Vec<u8>, ElfError> {
-    let mut inputs: Vec<DynamicInput> = inputs.into_iter().map(dynamic_state).collect();
-    let mut objects = Vec::new();
-    let mut defined = HashSet::new();
-    let mut shared = Vec::new();
-    let end = inputs.len();
-    process_dynamic_range(&mut inputs, 0, end, &mut objects, &mut defined, &mut shared)?;
+    link_dynamic_with_as_needed(
+        inputs
+            .into_iter()
+            .map(|input| (input, false, None))
+            .collect(),
+        entry,
+        interp,
+        eh_frame_hdr,
+    )
+}
 
-    link_dynamic_exec(&objects, &shared, entry, interp, eh_frame_hdr)
+#[doc(hidden)]
+pub fn link_dynamic_with_as_needed(
+    inputs: Vec<(DynamicLinkInput, bool, Option<SharedLinkMetadata>)>,
+    entry: &str,
+    interp: &str,
+    eh_frame_hdr: bool,
+) -> Result<Vec<u8>, ElfError> {
+    let mut inputs: Vec<DynamicInput> = inputs
+        .into_iter()
+        .map(|(input, as_needed, metadata)| dynamic_state(input, as_needed, metadata))
+        .collect();
+    let mut state = DynamicResolution::default();
+    let end = inputs.len();
+    process_dynamic_range(&mut inputs, 0, end, &mut state)?;
+
+    if let Some((lib, name)) =
+        state
+            .shared
+            .iter()
+            .zip(&state.shared_metadata)
+            .find_map(|(lib, details)| {
+                if !details.complete {
+                    return None;
+                }
+                details
+                    .strong_undefs
+                    .iter()
+                    .find(|name| {
+                        !state.defined.contains(*name)
+                            && !dependency_covers(details, name, &state.dependency_exports)
+                    })
+                    .map(|name| (lib, name))
+            })
+    {
+        return err(format!(
+            "undefined symbol '{}' (referenced from shared object '{}')",
+            name, lib.soname
+        ));
+    }
+
+    link_dynamic_exec(&state.objects, &state.shared, entry, interp, eh_frame_hdr)
 }
 
 pub fn link_dynamic_exec(
@@ -2561,7 +2750,6 @@ pub fn link_dynamic_exec(
     let mut import_ver: Vec<String> = Vec::new();
     let mut import_is_func: Vec<bool> = Vec::new();
     let mut import_index: HashMap<String, usize> = HashMap::new();
-    let mut used_lib = vec![false; shared.len()];
     for obj in objects {
         for sym in &obj.symbols {
             if sym.shndx != SHN_UNDEF
@@ -2584,7 +2772,6 @@ pub fn link_dynamic_exec(
                 ));
             };
             let export = &shared[li].exports[&sym.name];
-            used_lib[li] = true;
             import_index.insert(sym.name.clone(), imports.len());
             import_lib.push(li);
             import_ver.push(export.version.clone());
@@ -2723,10 +2910,7 @@ pub fn link_dynamic_exec(
     let mut export_def: Vec<(usize, usize)> = Vec::new(); // (obj, sym) of the definition
     {
         let mut seen: HashSet<String> = HashSet::new();
-        for (li, lib) in shared.iter().enumerate() {
-            if !used_lib[li] {
-                continue;
-            }
+        for lib in shared {
             for u in &lib.undefs {
                 if seen.contains(u) {
                     continue;
@@ -2751,12 +2935,17 @@ pub fn link_dynamic_exec(
     };
     let mut needed_offsets: Vec<u32> = Vec::new();
     let mut soname_off: Vec<u32> = vec![0; shared.len()];
+    let mut soname_offsets: HashMap<&str, u32> = HashMap::new();
     for (li, lib) in shared.iter().enumerate() {
-        if used_lib[li] {
+        let off = if let Some(&off) = soname_offsets.get(lib.soname.as_str()) {
+            off
+        } else {
             let off = str_off(&lib.soname, &mut dynstr);
-            soname_off[li] = off;
+            soname_offsets.insert(&lib.soname, off);
             needed_offsets.push(off);
-        }
+            off
+        };
+        soname_off[li] = off;
     }
     let import_name_off: Vec<u32> = imports.iter().map(|n| str_off(n, &mut dynstr)).collect();
     // Version-name strings (parallel to ver_reqs) for VERNEED.

@@ -601,8 +601,8 @@ pub enum InsertOutcome {
     /// Existing entry keeps its identity. Duplicate Undefined entries may
     /// conservatively merge reference attributes into that slot.
     Kept(SymbolId),
-    /// Two Common symbols with the same name were coalesced: size grew to
-    /// the max and alignment grew to the stricter of the two.
+    /// Two Common symbols with the same name were coalesced by selecting the
+    /// larger tentative definition and retaining the earlier one on a tie.
     CommonCoalesced { id: SymbolId },
     /// Inserting an Undefined whose slot currently holds a LazyArchive.
     /// The caller (Sprint 8 resolver) must fetch the named archive member
@@ -985,6 +985,7 @@ impl SymbolTable {
         let slot = &mut self.symbols[id.0 as usize];
         let (
             Symbol::Common {
+                origin: a_origin,
                 size: a_size,
                 align_pow2: a_align,
                 private_extern: a_private_extern,
@@ -992,6 +993,7 @@ impl SymbolTable {
                 ..
             },
             Symbol::Common {
+                origin: b_origin,
                 size: b_size,
                 align_pow2: b_align,
                 private_extern: b_private_extern,
@@ -1002,7 +1004,13 @@ impl SymbolTable {
         else {
             unreachable!("coalesce_common requires two Common entries");
         };
+        let (winner_origin, winner_size, winner_align) = if b_size > a_size {
+            (b_origin, b_size, b_align)
+        } else {
+            (a_origin, a_size, a_align)
+        };
         if let Symbol::Common {
+            origin,
             size,
             align_pow2,
             private_extern,
@@ -1010,8 +1018,9 @@ impl SymbolTable {
             ..
         } = slot
         {
-            *size = a_size.max(b_size);
-            *align_pow2 = a_align.max(b_align);
+            *origin = winner_origin;
+            *size = winner_size;
+            *align_pow2 = winner_align;
             // Merge declaration-wide attributes without making the result
             // depend on which input happened to contribute the larger size.
             *private_extern = a_private_extern && b_private_extern;
@@ -3454,20 +3463,74 @@ mod tests {
     }
 
     #[test]
-    fn common_coalesces_to_larger_size_and_stricter_alignment() {
+    fn common_coalescing_selects_the_larger_declaration_as_a_unit() {
         let mut t = SymbolTable::new();
-        let a = common(&mut t, "_x", 8, 2);
-        t.insert(a).unwrap();
-        let b = common(&mut t, "_x", 16, 5);
-        let out = t.insert(b).unwrap();
+        let name = t.intern("_x");
+        t.insert(Symbol::Common {
+            name,
+            origin: InputId(0),
+            size: 8,
+            align_pow2: 5,
+            private_extern: false,
+            no_dead_strip: false,
+        })
+        .unwrap();
+        let out = t
+            .insert(Symbol::Common {
+                name,
+                origin: InputId(1),
+                size: 16,
+                align_pow2: 3,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap();
         assert!(matches!(out, InsertOutcome::CommonCoalesced { .. }));
         if let Symbol::Common {
-            size, align_pow2, ..
+            origin,
+            size,
+            align_pow2,
+            ..
         } = t.get(SymbolId(0))
         {
+            assert_eq!(*origin, InputId(1));
             assert_eq!(*size, 16);
-            assert_eq!(*align_pow2, 5);
+            assert_eq!(*align_pow2, 3);
         }
+    }
+
+    #[test]
+    fn common_coalescing_keeps_the_earlier_equal_size_declaration() {
+        let mut t = SymbolTable::new();
+        let name = t.intern("_x");
+        t.insert(Symbol::Common {
+            name,
+            origin: InputId(0),
+            size: 16,
+            align_pow2: 2,
+            private_extern: false,
+            no_dead_strip: false,
+        })
+        .unwrap();
+        t.insert(Symbol::Common {
+            name,
+            origin: InputId(1),
+            size: 16,
+            align_pow2: 5,
+            private_extern: false,
+            no_dead_strip: false,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            t.get(SymbolId(0)),
+            Symbol::Common {
+                origin: InputId(0),
+                size: 16,
+                align_pow2: 2,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3497,7 +3560,7 @@ mod tests {
             t.get(SymbolId(0)),
             Symbol::Common {
                 size: 16,
-                align_pow2: 5,
+                align_pow2: 3,
                 private_extern: false,
                 no_dead_strip: true,
                 ..

@@ -238,6 +238,7 @@ pub enum LinkError {
     UndefinedSymbols(String),
     UnsupportedArch(String),
     NoTbdDocument(PathBuf),
+    MissingExecutableEntry,
     EntrySymbolNotFound(String),
     AbsoluteEntrySymbol(String),
     ForceLoadNotArchive(PathBuf),
@@ -364,6 +365,10 @@ impl std::fmt::Display for LinkError {
             LinkError::NoTbdDocument(path) => {
                 write!(f, "{}: no arm64-macos TBD document found", path.display())
             }
+            LinkError::MissingExecutableEntry => write!(
+                f,
+                "executable has no entry symbol; define `_main` or `_start`, or use `-e <symbol>`"
+            ),
             LinkError::EntrySymbolNotFound(name) => {
                 write!(f, "entry symbol `{name}` was not found in linked objects")
             }
@@ -1594,7 +1599,7 @@ fn find_entry_symbol_id(
         } else if symbol_defined(sym_table, "_start") {
             "_start"
         } else {
-            return Ok(None);
+            return Err(LinkError::MissingExecutableEntry);
         }
     } else {
         return Ok(None);

@@ -983,48 +983,21 @@ impl SymbolTable {
 
     fn coalesce_common(&mut self, id: SymbolId, incoming: Symbol) {
         let slot = &mut self.symbols[id.0 as usize];
-        let (
-            Symbol::Common {
-                origin: a_origin,
-                size: a_size,
-                align_pow2: a_align,
-                private_extern: a_private_extern,
-                no_dead_strip: a_no_dead_strip,
-                ..
-            },
-            Symbol::Common {
-                origin: b_origin,
-                size: b_size,
-                align_pow2: b_align,
-                private_extern: b_private_extern,
-                no_dead_strip: b_no_dead_strip,
-                ..
-            },
-        ) = (slot.clone(), incoming)
-        else {
-            unreachable!("coalesce_common requires two Common entries");
+        let replace = match (&*slot, &incoming) {
+            (
+                Symbol::Common {
+                    size: existing_size,
+                    ..
+                },
+                Symbol::Common {
+                    size: incoming_size,
+                    ..
+                },
+            ) => incoming_size >= existing_size,
+            _ => unreachable!("coalesce_common requires two Common entries"),
         };
-        let (winner_origin, winner_size, winner_align) = if b_size > a_size {
-            (b_origin, b_size, b_align)
-        } else {
-            (a_origin, a_size, a_align)
-        };
-        if let Symbol::Common {
-            origin,
-            size,
-            align_pow2,
-            private_extern,
-            no_dead_strip,
-            ..
-        } = slot
-        {
-            *origin = winner_origin;
-            *size = winner_size;
-            *align_pow2 = winner_align;
-            // Merge declaration-wide attributes without making the result
-            // depend on which input happened to contribute the larger size.
-            *private_extern = a_private_extern && b_private_extern;
-            *no_dead_strip = a_no_dead_strip || b_no_dead_strip;
+        if replace {
+            *slot = incoming;
         }
     }
 
@@ -3471,7 +3444,7 @@ mod tests {
             origin: InputId(0),
             size: 8,
             align_pow2: 5,
-            private_extern: false,
+            private_extern: true,
             no_dead_strip: false,
         })
         .unwrap();
@@ -3482,7 +3455,7 @@ mod tests {
                 size: 16,
                 align_pow2: 3,
                 private_extern: false,
-                no_dead_strip: false,
+                no_dead_strip: true,
             })
             .unwrap();
         assert!(matches!(out, InsertOutcome::CommonCoalesced { .. }));
@@ -3490,17 +3463,21 @@ mod tests {
             origin,
             size,
             align_pow2,
+            private_extern,
+            no_dead_strip,
             ..
         } = t.get(SymbolId(0))
         {
             assert_eq!(*origin, InputId(1));
             assert_eq!(*size, 16);
             assert_eq!(*align_pow2, 3);
+            assert!(!private_extern);
+            assert!(*no_dead_strip);
         }
     }
 
     #[test]
-    fn common_coalescing_keeps_the_earlier_equal_size_declaration() {
+    fn common_coalescing_selects_the_later_equal_size_declaration() {
         let mut t = SymbolTable::new();
         let name = t.intern("_x");
         t.insert(Symbol::Common {
@@ -3508,7 +3485,7 @@ mod tests {
             origin: InputId(0),
             size: 16,
             align_pow2: 2,
-            private_extern: false,
+            private_extern: true,
             no_dead_strip: false,
         })
         .unwrap();
@@ -3518,23 +3495,25 @@ mod tests {
             size: 16,
             align_pow2: 5,
             private_extern: false,
-            no_dead_strip: false,
+            no_dead_strip: true,
         })
         .unwrap();
 
         assert!(matches!(
             t.get(SymbolId(0)),
             Symbol::Common {
-                origin: InputId(0),
+                origin: InputId(1),
                 size: 16,
-                align_pow2: 2,
+                align_pow2: 5,
+                private_extern: false,
+                no_dead_strip: true,
                 ..
             }
         ));
     }
 
     #[test]
-    fn common_coalescing_keeps_public_visibility_and_retention() {
+    fn common_coalescing_keeps_every_attribute_from_the_larger_declaration() {
         let mut t = SymbolTable::new();
         let name = t.intern("_x");
         t.insert(Symbol::Common {
@@ -3559,10 +3538,11 @@ mod tests {
         assert!(matches!(
             t.get(SymbolId(0)),
             Symbol::Common {
+                origin: InputId(0),
                 size: 16,
                 align_pow2: 3,
-                private_extern: false,
-                no_dead_strip: true,
+                private_extern: true,
+                no_dead_strip: false,
                 ..
             }
         ));

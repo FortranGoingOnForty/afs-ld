@@ -435,6 +435,7 @@ impl Inputs {
 // Every state a name can be in during resolution:
 //   * Undefined — referenced but not yet satisfied
 //   * Defined — an object file provides a concrete body at `atom + value`
+//   * Absolute — an object file provides a fixed value without storage
 //   * Common — tentative definition (`N_UNDF + N_EXT + n_value>0`); picks
 //     a winner by size/alignment, then morphs into Defined during atomization
 //   * DylibImport — resolved from a dylib's export trie / TBD
@@ -455,6 +456,14 @@ pub enum Symbol {
         name: Istr,
         origin: InputId,
         atom: AtomId,
+        value: u64,
+        weak: bool,
+        private_extern: bool,
+        no_dead_strip: bool,
+    },
+    Absolute {
+        name: Istr,
+        origin: InputId,
         value: u64,
         weak: bool,
         private_extern: bool,
@@ -496,6 +505,7 @@ impl Symbol {
         match self {
             Symbol::Undefined { name, .. }
             | Symbol::Defined { name, .. }
+            | Symbol::Absolute { name, .. }
             | Symbol::Common { name, .. }
             | Symbol::DylibImport { name, .. }
             | Symbol::LazyArchive { name, .. }
@@ -507,7 +517,7 @@ impl Symbol {
     pub fn kind(&self) -> SymbolKindTag {
         match self {
             Symbol::Undefined { .. } => SymbolKindTag::Undefined,
-            Symbol::Defined { .. } => SymbolKindTag::Defined,
+            Symbol::Defined { .. } | Symbol::Absolute { .. } => SymbolKindTag::Defined,
             Symbol::Common { .. } => SymbolKindTag::Common,
             Symbol::DylibImport { .. } => SymbolKindTag::DylibImport,
             Symbol::LazyArchive { .. } => SymbolKindTag::LazyArchive,
@@ -516,14 +526,20 @@ impl Symbol {
         }
     }
 
-    /// True for `Defined` without the weak flag — ld's "strong" category,
-    /// the only one where duplicates are an error.
+    /// True for a concrete definition without the weak flag — ld's "strong"
+    /// category, the only one where duplicates are an error.
     pub fn is_strong_defined(&self) -> bool {
-        matches!(self, Symbol::Defined { weak: false, .. })
+        matches!(
+            self,
+            Symbol::Defined { weak: false, .. } | Symbol::Absolute { weak: false, .. }
+        )
     }
 
     pub fn is_weak_defined(&self) -> bool {
-        matches!(self, Symbol::Defined { weak: true, .. })
+        matches!(
+            self,
+            Symbol::Defined { weak: true, .. } | Symbol::Absolute { weak: true, .. }
+        )
     }
 
     pub fn is_strong_definition(&self) -> bool {
@@ -1989,12 +2005,18 @@ pub fn format_duplicate_diagnostic(
     let name_str = table.interner.resolve(*name);
     let mut out = String::new();
     out.push_str(&format!("afs-ld: error: duplicate symbol {name_str}\n"));
-    if let Symbol::Defined { origin, .. } | Symbol::Alias { origin, .. } = table.get(*first) {
+    if let Symbol::Defined { origin, .. }
+    | Symbol::Absolute { origin, .. }
+    | Symbol::Alias { origin, .. } = table.get(*first)
+    {
         if let Some(oi) = inputs.objects.get(origin.0 as usize) {
             out.push_str(&format!("  defined in {}\n", oi.path.display()));
         }
     }
-    if let Symbol::Defined { origin, .. } | Symbol::Alias { origin, .. } = second.as_ref() {
+    if let Symbol::Defined { origin, .. }
+    | Symbol::Absolute { origin, .. }
+    | Symbol::Alias { origin, .. } = second.as_ref()
+    {
         if let Some(oi) = inputs.objects.get(origin.0 as usize) {
             out.push_str(&format!("  also in {}\n", oi.path.display()));
         }
@@ -2166,7 +2188,15 @@ fn symbolize_input(name: Istr, input_sym: &crate::symbol::InputSymbol, origin: I
                 }
             }
         }
-        SymKind::Abs | SymKind::Sect => Symbol::Defined {
+        SymKind::Abs => Symbol::Absolute {
+            name,
+            origin,
+            value: input_sym.value(),
+            weak: input_sym.weak_def(),
+            private_extern: input_sym.is_private_ext(),
+            no_dead_strip: input_sym.no_dead_strip(),
+        },
+        SymKind::Sect => Symbol::Defined {
             name,
             origin,
             // AtomId(0) is a placeholder; atomization replaces section
@@ -2184,6 +2214,46 @@ fn symbolize_input(name: Istr, input_sym: &crate::symbol::InputSymbol, origin: I
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_absolute_symbols_are_atomless_definitions() {
+        use crate::macho::constants::{N_ABS, N_EXT, N_SECT};
+        use crate::symbol::{InputSymbol, RawNlist};
+
+        let name = Istr(1);
+        let absolute = InputSymbol::from_raw(RawNlist {
+            strx: 0,
+            n_type: N_ABS | N_EXT,
+            n_sect: 0,
+            n_desc: 0,
+            n_value: 0x1234,
+        });
+        assert!(matches!(
+            symbolize_input(name, &absolute, InputId(7)),
+            Symbol::Absolute {
+                name: Istr(1),
+                origin: InputId(7),
+                value: 0x1234,
+                ..
+            }
+        ));
+
+        let section = InputSymbol::from_raw(RawNlist {
+            strx: 0,
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0x20,
+        });
+        assert!(matches!(
+            symbolize_input(name, &section, InputId(7)),
+            Symbol::Defined {
+                atom: AtomId(0),
+                value: 0x20,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn interner_dedups_same_string() {
@@ -2448,7 +2518,7 @@ mod tests {
         assert_eq!(report.fetched_members, 1);
         let symbol = table.lookup_str("_choice").unwrap();
         match table.get(symbol) {
-            Symbol::Defined { value, .. } => *value,
+            Symbol::Absolute { value, .. } => *value,
             other => panic!("expected fetched definition, got {other:?}"),
         }
     }
@@ -2535,7 +2605,7 @@ mod tests {
             let symbol = table.lookup_str("_choice").unwrap();
             if archive_first {
                 assert_eq!(report.fetched_members, 1);
-                assert!(matches!(table.get(symbol), Symbol::Defined { .. }));
+                assert!(matches!(table.get(symbol), Symbol::Absolute { .. }));
             } else {
                 assert_eq!(report.fetched_members, 0);
                 assert!(matches!(table.get(symbol), Symbol::DylibImport { .. }));
@@ -2582,7 +2652,7 @@ mod tests {
                 let symbol = table.lookup_str(name).unwrap();
                 assert!(matches!(
                     table.get(symbol),
-                    Symbol::Defined { value, .. } if *value == expected
+                    Symbol::Absolute { value, .. } if *value == expected
                 ));
             }
             assert_eq!(
@@ -2713,7 +2783,7 @@ mod tests {
         let symbol = table.lookup_str("_unused").unwrap();
         assert!(matches!(
             table.get(symbol),
-            Symbol::Defined { value: 17, .. }
+            Symbol::Absolute { value: 17, .. }
         ));
     }
 
@@ -2786,7 +2856,7 @@ mod tests {
             let later_symbol = table.lookup_str("_later").unwrap();
             assert!(matches!(
                 table.get(later_symbol),
-                Symbol::Defined { value: 22, .. }
+                Symbol::Absolute { value: 22, .. }
             ));
             assert_eq!(
                 report.loaded_paths,
@@ -2821,6 +2891,18 @@ mod tests {
         assert_eq!(defined.kind(), SymbolKindTag::Defined);
         assert!(defined.is_strong_defined());
         assert!(!defined.is_weak_defined());
+
+        let absolute = Symbol::Absolute {
+            name: n(8),
+            origin: InputId(0),
+            value: 0x1234,
+            weak: false,
+            private_extern: false,
+            no_dead_strip: false,
+        };
+        assert_eq!(absolute.kind(), SymbolKindTag::Defined);
+        assert!(absolute.is_strong_defined());
+        assert!(!absolute.is_weak_defined());
 
         let weak = Symbol::Defined {
             name: n(2),

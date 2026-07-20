@@ -216,6 +216,7 @@ struct FoldReloc {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum FoldReferent {
     Atom(AtomId),
+    Absolute(u64),
     Symbol(SymbolId),
     Section(u8),
 }
@@ -447,6 +448,7 @@ fn normalize_referent(
                 Symbol::Defined { atom, .. } if atom.0 != 0 => {
                     Some(FoldReferent::Atom(canonical_atom(*atom, redirects)))
                 }
+                Symbol::Absolute { value, .. } => Some(FoldReferent::Absolute(*value)),
                 _ => Some(FoldReferent::Symbol(symbol_id)),
             }
         }

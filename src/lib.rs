@@ -235,6 +235,7 @@ pub enum LinkError {
     UnsupportedArch(String),
     NoTbdDocument(PathBuf),
     EntrySymbolNotFound(String),
+    AbsoluteEntrySymbol(String),
     ForceLoadNotArchive(PathBuf),
     LibraryNotFound(String),
     FrameworkNotFound(String),
@@ -350,6 +351,10 @@ impl std::fmt::Display for LinkError {
             LinkError::EntrySymbolNotFound(name) => {
                 write!(f, "entry symbol `{name}` was not found in linked objects")
             }
+            LinkError::AbsoluteEntrySymbol(name) => write!(
+                f,
+                "entry symbol `{name}` is absolute and cannot be used as an executable entry point"
+            ),
             LinkError::ForceLoadNotArchive(path) => {
                 write!(
                     f,
@@ -1537,9 +1542,16 @@ fn resolve_entry_point(
     let Some(symbol_id) = find_entry_symbol_id(opts, sym_table)? else {
         return Ok(None);
     };
-    let Symbol::Defined { atom, value, .. } = sym_table.get(symbol_id) else {
-        let name = sym_table.interner.resolve(sym_table.get(symbol_id).name());
-        return Err(LinkError::EntrySymbolNotFound(name.to_string()));
+    let symbol = sym_table.get(symbol_id);
+    let Symbol::Defined { atom, value, .. } = symbol else {
+        let name = opts
+            .entry
+            .as_deref()
+            .unwrap_or_else(|| sym_table.interner.resolve(symbol.name()));
+        return match symbol {
+            Symbol::Absolute { .. } => Err(LinkError::AbsoluteEntrySymbol(name.to_string())),
+            _ => Err(LinkError::EntrySymbolNotFound(name.to_string())),
+        };
     };
     Ok(Some(macho::writer::EntryPoint {
         atom: *atom,
@@ -1573,6 +1585,11 @@ fn find_entry_symbol_id(
 fn symbol_defined(sym_table: &SymbolTable, name: &str) -> bool {
     sym_table
         .lookup_resolved_str(name)
-        .map(|symbol_id| matches!(sym_table.get(symbol_id), Symbol::Defined { .. }))
+        .map(|symbol_id| {
+            matches!(
+                sym_table.get(symbol_id),
+                Symbol::Defined { .. } | Symbol::Absolute { .. }
+            )
+        })
         .unwrap_or(false)
 }

@@ -1341,7 +1341,7 @@ fn collect_local_got_rebase_sites(
         .entries
         .iter()
         .enumerate()
-        .filter(|(_, entry)| !matches!(sym_table.get(entry.symbol), Symbol::DylibImport { .. }))
+        .filter(|(_, entry)| matches!(sym_table.get(entry.symbol), Symbol::Defined { .. }))
         .map(|(idx, _)| RebaseSite {
             segment_index,
             segment_offset: section.addr + (idx as u64) * 8 - segment.vm_addr,
@@ -1733,7 +1733,24 @@ fn build_output_symbols_profiled(
                 } => (
                     *name,
                     *origin,
-                    *atom,
+                    Some(*atom),
+                    *value,
+                    *weak,
+                    *private_extern,
+                    *no_dead_strip,
+                    false,
+                ),
+                Symbol::Absolute {
+                    name,
+                    origin,
+                    value,
+                    weak,
+                    private_extern,
+                    no_dead_strip,
+                } => (
+                    *name,
+                    *origin,
+                    None,
                     *value,
                     *weak,
                     *private_extern,
@@ -1749,40 +1766,44 @@ fn build_output_symbols_profiled(
                     let Ok((_, target)) = sym_table.resolve_chain(*name) else {
                         continue;
                     };
-                    let Symbol::Defined {
-                        atom,
-                        value,
-                        weak,
-                        no_dead_strip,
-                        ..
-                    } = target
-                    else {
-                        continue;
+                    let (atom, value, weak, no_dead_strip) = match target {
+                        Symbol::Defined {
+                            atom,
+                            value,
+                            weak,
+                            no_dead_strip,
+                            ..
+                        } => (Some(*atom), *value, *weak, *no_dead_strip),
+                        Symbol::Absolute {
+                            value,
+                            weak,
+                            no_dead_strip,
+                            ..
+                        } => (None, *value, *weak, *no_dead_strip),
+                        _ => continue,
                     };
                     (
                         *name,
                         *origin,
-                        *atom,
-                        *value,
-                        *weak,
+                        atom,
+                        value,
+                        weak,
                         *private_extern,
-                        *no_dead_strip,
+                        no_dead_strip,
                         true,
                     )
                 }
                 _ => continue,
             };
         let materialized_private_common = private_extern
-            && atom.0 != 0
-            && inputs.0.atom_table.get(atom).section == AtomSection::Common;
+            && atom
+                .is_some_and(|atom| inputs.0.atom_table.get(atom).section == AtomSection::Common);
         if private_extern && !materialized_private_common && !is_alias {
             continue;
         }
         let name = sym_table.interner.resolve(name).to_string();
         let hidden = private_extern || visibility.hides(&name);
-        let (n_type, n_sect, n_value) = if atom.0 == 0 {
-            (absolute_symbol_type(hidden), NO_SECT, value)
-        } else {
+        let (n_type, n_sect, n_value) = if let Some(atom) = atom {
             let Some(addr) = atom_addrs.get(&atom).copied() else {
                 if dead_strip {
                     continue;
@@ -1793,16 +1814,17 @@ fn build_output_symbols_profiled(
                 .get(&atom)
                 .ok_or(WriteError::DefinedSymbolSectionMissing(symbol_id, atom))?;
             (defined_symbol_type(hidden), sect, addr + value)
-        };
-        let size = if is_alias || atom.0 == 0 {
-            0
         } else {
-            inputs
+            (absolute_symbol_type(hidden), NO_SECT, value)
+        };
+        let size = match atom {
+            Some(atom) if !is_alias => inputs
                 .0
                 .atom_table
                 .get(atom)
                 .size
-                .saturating_sub(value as u32) as u64
+                .saturating_sub(value as u32) as u64,
+            _ => 0,
         };
         let mut n_desc = 0;
         if weak {

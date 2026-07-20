@@ -159,6 +159,7 @@ impl DeadStripAnalysis {
     fn is_live_symbol(&self, sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
         match sym_table.get(symbol_id) {
             Symbol::Defined { atom, .. } if atom.0 != 0 => self.live_atoms.contains(atom),
+            Symbol::Absolute { .. } => true,
             _ => false,
         }
     }
@@ -171,6 +172,9 @@ impl DeadStripAnalysis {
         let requested_name = self.symbol_name(sym_table, requested_symbol);
         if !self.is_live_symbol(sym_table, requested_symbol) {
             return format!("{requested_name} is not live (dead-stripped)\n");
+        }
+        if matches!(sym_table.get(requested_symbol), Symbol::Absolute { .. }) {
+            return format!("{requested_name} is absolute and is not subject to dead stripping\n");
         }
 
         let Symbol::Defined { atom, .. } = sym_table.get(requested_symbol) else {
@@ -428,10 +432,20 @@ fn root_symbols(
             Symbol::Defined {
                 no_dead_strip: true,
                 ..
+            }
+            | Symbol::Absolute {
+                no_dead_strip: true,
+                ..
             } => {
                 roots.entry(symbol_id).or_insert(RootReason::NoDeadStrip);
             }
             Symbol::Defined {
+                private_extern: false,
+                ..
+            } if opts.kind == OutputKind::Dylib => {
+                roots.entry(symbol_id).or_insert(RootReason::ExportedDylib);
+            }
+            Symbol::Absolute {
                 private_extern: false,
                 ..
             } if opts.kind == OutputKind::Dylib => {
@@ -442,8 +456,10 @@ fn root_symbols(
                 private_extern: false,
                 ..
             } if opts.kind == OutputKind::Dylib => {
-                if let Ok((target_id, Symbol::Defined { .. })) = sym_table.resolve_chain(*name) {
-                    roots.entry(target_id).or_insert(RootReason::ExportedDylib);
+                if let Ok((target_id, target)) = sym_table.resolve_chain(*name) {
+                    if matches!(target, Symbol::Defined { .. } | Symbol::Absolute { .. }) {
+                        roots.entry(target_id).or_insert(RootReason::ExportedDylib);
+                    }
                 }
             }
             _ => {}

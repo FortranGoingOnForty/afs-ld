@@ -967,6 +967,7 @@ fn resolve_branch_target_from_key(
                         "target atom missing final address".to_string(),
                     )
                 }),
+            Symbol::Absolute { value, .. } => Ok(*value),
             Symbol::DylibImport { .. } => Err(reloc_error(
                 atom,
                 &obj.path,
@@ -1082,6 +1083,7 @@ fn synthesize_thunk_section(
                     .get(&canonical_atom(*atom, resolve.icf_redirects))
                     .copied()
                     .map(|addr| addr + *value),
+                Symbol::Absolute { value, .. } => Some(*value),
                 _ => None,
             },
             BranchTargetKey::Stub(symbol_id) => resolve.stub_addrs.get(&symbol_id).copied(),
@@ -1160,7 +1162,7 @@ fn resolve_got_target(
 fn got_reloc_relaxes_locally(obj: &ObjectFile, reloc: Reloc, resolve: &ResolveView<'_>) -> bool {
     match symbol_referent_id(obj, reloc.referent, resolve) {
         Some(symbol_id) => match resolve.sym_table.get(symbol_id) {
-            Symbol::DylibImport { .. } => false,
+            Symbol::DylibImport { .. } | Symbol::Absolute { .. } => false,
             Symbol::Defined { .. } => true,
             _ => true,
         },
@@ -1333,6 +1335,7 @@ fn resolve_global_symbol(
                     "target atom missing final address".to_string(),
                 )
             }),
+        Symbol::Absolute { value, .. } => Ok(*value),
         Symbol::DylibImport { .. } => Err(reloc_error(
             atom,
             &obj.path,
@@ -2220,6 +2223,7 @@ fn synthesize_got_section(
                     })?
                     + *value
             }
+            Symbol::Absolute { value, .. } => *value,
             other => {
                 return Err(RelocError {
                     input: PathBuf::from("<synthetic got>"),

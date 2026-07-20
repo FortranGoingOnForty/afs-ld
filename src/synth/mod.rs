@@ -583,7 +583,7 @@ fn got_page_symbol_needs_slot(
     symbol_id: SymbolId,
 ) -> bool {
     match sym_table.get(symbol_id) {
-        Symbol::DylibImport { .. } => true,
+        Symbol::DylibImport { .. } | Symbol::Absolute { .. } => true,
         Symbol::Defined {
             atom,
             private_extern,

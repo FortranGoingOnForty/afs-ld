@@ -596,6 +596,78 @@ fn objc_flag_warns_but_links_successfully() {
 }
 
 #[test]
+fn explicit_absolute_entry_symbol_is_rejected() {
+    let object = scratch("absolute-entry.o");
+    let output = scratch("absolute-entry.out");
+    let _ = fs::remove_file(&output);
+    fs::write(
+        &object,
+        synthetic_symbol_object(&[("_absolute_entry", N_ABS | N_EXT, 0x1234)]),
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-e")
+        .arg("_absolute_entry")
+        .arg("-o")
+        .arg(&output)
+        .arg(&object)
+        .output()
+        .expect("afs-ld should run");
+
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains(
+            "entry symbol `_absolute_entry` is absolute and cannot be used as an executable entry point"
+        ),
+        "unexpected diagnostic:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("AtomId"),
+        "leaked internal sentinel:\n{stderr}"
+    );
+    assert!(!output.exists());
+
+    let _ = fs::remove_file(object);
+}
+
+#[test]
+fn why_live_reports_absolute_symbols_outside_dead_stripping() {
+    let object = scratch("absolute-why-live.o");
+    let output = scratch("absolute-why-live.dylib");
+    fs::write(
+        &object,
+        synthetic_symbol_object(&[("_absolute", N_ABS | N_EXT, 0x1234)]),
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-dylib")
+        .arg("-dead_strip")
+        .arg("-why_live")
+        .arg("_absolute")
+        .arg("-o")
+        .arg(&output)
+        .arg(&object)
+        .output()
+        .expect("afs-ld should run");
+
+    assert!(
+        result.status.success(),
+        "absolute why-live link failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "_absolute is absolute and is not subject to dead stripping\n"
+    );
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
 fn relocatable_flag_errors_loudly() {
     assert_flag_errors(
         "-r",

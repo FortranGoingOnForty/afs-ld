@@ -699,6 +699,11 @@ enum SyntheticAliasEncoding {
     OverlappingSection,
 }
 
+const SAME_ADDRESS_ENTRY_CODE: [u8; 8] = [
+    0x40, 0x05, 0x80, 0x52, // mov w0, #42
+    0xc0, 0x03, 0x5f, 0xd6, // ret
+];
+
 fn synthetic_defined_alias_object(
     private_alias: bool,
     private_main: bool,
@@ -849,6 +854,106 @@ fn synthetic_defined_alias_object(
     .write(&mut bytes);
     bytes.extend_from_slice(&text);
     bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_same_address_entry_alias_object() -> Vec<u8> {
+    let text = [
+        SAME_ADDRESS_ENTRY_CODE.as_slice(),
+        &[
+            0xe0, 0x00, 0x80, 0x52, // _unused: mov w0, #7
+            0xc0, 0x03, 0x5f, 0xd6, // ret
+        ],
+    ]
+    .concat();
+    let mut strings = vec![0];
+    let mut add_string = |name: &str| {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        strx
+    };
+    let symbols = [
+        RawNlist {
+            strx: add_string("_main"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: add_string("_zalias"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: add_string("_unused"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: SAME_ADDRESS_ENTRY_CODE.len() as u64,
+        },
+    ];
+    let mut segment = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: 0,
+        vmsize: text.len() as u64,
+        fileoff: 0,
+        filesize: text.len() as u64,
+        maxprot: 5,
+        initprot: 5,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: 0,
+            size: text.len() as u64,
+            offset: 0,
+            align: 2,
+            reloff: 0,
+            nreloc: 0,
+            flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = u64::from(data_offset);
+    segment.sections[0].offset = data_offset;
+    let symoff = data_offset + text.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
     for symbol in symbols {
         symbol.write(&mut bytes);
     }
@@ -1154,6 +1259,36 @@ fn canonical_symbol_record_map(bytes: &[u8]) -> HashMap<String, CanonicalSymbolR
         .into_iter()
         .map(|record| (record.name.clone(), record))
         .collect()
+}
+
+fn assert_same_address_entry_alias_output(bytes: &[u8]) {
+    let records = canonical_symbol_record_map(bytes);
+    let main = records.get("_main").unwrap();
+    let alias = records.get("_zalias").unwrap();
+    assert_eq!(main.n_sect, alias.n_sect);
+    assert_eq!(main.value, 0);
+    assert_eq!(alias.value, 0);
+    assert_eq!(main.n_desc & N_ALT_ENTRY, N_ALT_ENTRY);
+    assert_eq!(alias.n_desc & N_ALT_ENTRY, 0);
+    assert!(!records.contains_key("_unused"));
+
+    let text = output_section_header(bytes, "__TEXT", "__text").unwrap();
+    assert_eq!(
+        output_section(bytes, "__TEXT", "__text").unwrap().1,
+        SAME_ADDRESS_ENTRY_CODE
+    );
+    let header = parse_header(bytes).unwrap();
+    let entryoff = parse_commands(&header, bytes)
+        .unwrap()
+        .into_iter()
+        .find_map(|command| match command {
+            LoadCommand::Raw { cmd, data, .. } if cmd == afs_ld::macho::constants::LC_MAIN => {
+                Some(u64::from_le_bytes(data[0..8].try_into().unwrap()))
+            }
+            _ => None,
+        })
+        .expect("LC_MAIN");
+    assert_eq!(entryoff, u64::from(text.offset));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5405,6 +5540,101 @@ fn linker_run_uses_requested_entry_symbol() {
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_dead_strip_keeps_same_address_entry_alias_bytes() {
+    let obj = scratch("same-address-entry-alias-synthetic.o");
+    let out = scratch("same-address-entry-alias-synthetic.out");
+    fs::write(&obj, synthetic_same_address_entry_alias_object()).unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        dead_strip: true,
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    assert_same_address_entry_alias_output(&fs::read(&out).unwrap());
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_dead_strip_keeps_same_address_entry_alias() {
+    if !have_xcrun_tool("ld") || !have_tool("codesign") {
+        eprintln!("skipping: xcrun ld or codesign unavailable");
+        return;
+    }
+    let Some(sdk) = sdk_path() else {
+        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let Some(sdk_ver) = sdk_version() else {
+        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        return;
+    };
+    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    if !tbd.exists() {
+        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        return;
+    }
+
+    let obj = scratch("same-address-entry-alias.o");
+    let our_out = scratch("same-address-entry-alias-ours.out");
+    let apple_out = scratch("same-address-entry-alias-apple.out");
+    fs::write(&obj, synthetic_same_address_entry_alias_object()).unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![obj.clone(), tbd],
+        output: Some(our_out.clone()),
+        dead_strip: true,
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+    apple_link_with_args(
+        &obj,
+        &apple_out,
+        "_main",
+        &sdk,
+        &sdk_ver,
+        &["-dead_strip", "-no_fixup_chains"],
+    )
+    .unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    for bytes in [&our_bytes, &apple_bytes] {
+        assert_same_address_entry_alias_output(bytes);
+    }
+    let our_records = canonical_symbol_record_map(&our_bytes);
+    let apple_records = canonical_symbol_record_map(&apple_bytes);
+    for name in ["_main", "_zalias"] {
+        assert_eq!(our_records.get(name), apple_records.get(name));
+    }
+
+    for output in [&our_out, &apple_out] {
+        let verify = Command::new("codesign")
+            .arg("-v")
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            verify.status.success(),
+            "codesign verify failed for {}: {}",
+            output.display(),
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        assert_eq!(Command::new(output).status().unwrap().code(), Some(42));
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
 }
 
 #[test]

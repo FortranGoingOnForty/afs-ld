@@ -251,13 +251,15 @@ fn is_foldable_atom(atom: &Atom, sym_table: &SymbolTable) -> bool {
     if atom.flags.has(AtomFlags::NO_DEAD_STRIP) || atom.flags.has(AtomFlags::ADDRESS_TAKEN) {
         return false;
     }
-    !matches!(
-        atom.owner.map(|owner| sym_table.get(owner)),
-        Some(Symbol::Defined {
-            private_extern: false,
-            ..
-        })
-    )
+    !atom_symbols(atom).any(|symbol| {
+        matches!(
+            sym_table.get(symbol),
+            Symbol::Defined {
+                private_extern: false,
+                ..
+            }
+        )
+    })
 }
 
 fn rebind_folded_symbols(sym_table: &mut SymbolTable, atom: &Atom, winner: AtomId) {
@@ -519,6 +521,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::atom::AltEntry;
     use crate::input::ObjectFile;
     use crate::macho::constants::{
         CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, S_ATTR_PURE_INSTRUCTIONS,
@@ -613,6 +616,27 @@ mod tests {
         }
     }
 
+    fn defined_symbol(
+        symbols: &mut SymbolTable,
+        name: &str,
+        atom: AtomId,
+        private_extern: bool,
+    ) -> SymbolId {
+        let name = symbols.intern(name);
+        symbols
+            .insert(Symbol::Defined {
+                name,
+                origin: InputId(0),
+                atom,
+                value: 0,
+                weak: false,
+                private_extern,
+                no_dead_strip: false,
+            })
+            .unwrap();
+        symbols.lookup(name).unwrap()
+    }
+
     fn section_reloc(offset: u32) -> Reloc {
         Reloc {
             offset,
@@ -675,5 +699,39 @@ mod tests {
 
         assert_eq!(plan.redirects().len(), 1);
         assert_eq!(plan.kept_atoms().len(), 1);
+    }
+
+    #[test]
+    fn public_same_address_alias_prevents_safe_fold() {
+        let object = section_reloc_object("aliases.o", 16, &[], 0);
+        let inputs = [LayoutInput {
+            id: InputId(0),
+            object: &object,
+            load_order: 0,
+            archive_member_offset: None,
+        }];
+        let mut atoms = AtomTable::new();
+        let private_only = atoms.push(foldable_atom(InputId(0), 0));
+        let public_alias = atoms.push(foldable_atom(InputId(0), 8));
+        let mut symbols = SymbolTable::new();
+        let private_only_owner = defined_symbol(&mut symbols, "_private_only", private_only, true);
+        let public = defined_symbol(&mut symbols, "_public", public_alias, false);
+        let private_alias = defined_symbol(&mut symbols, "_private_alias", public_alias, true);
+        atoms.get_mut(private_only).owner = Some(private_only_owner);
+        atoms.get_mut(public_alias).owner = Some(private_alias);
+        atoms.get_mut(public_alias).alt_entries.push(AltEntry {
+            symbol: public,
+            offset_within_atom: 0,
+        });
+
+        let plan = fold_safe(&inputs, &mut atoms, &mut symbols, None).unwrap();
+
+        assert!(plan.redirects().is_empty());
+        assert!(plan.kept_atoms().contains(&private_only));
+        assert!(plan.kept_atoms().contains(&public_alias));
+        assert!(matches!(
+            symbols.get(public),
+            Symbol::Defined { atom, .. } if *atom == public_alias
+        ));
     }
 }

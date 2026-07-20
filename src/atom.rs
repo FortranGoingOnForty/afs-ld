@@ -322,10 +322,12 @@ pub fn materialize_common_symbols(
 pub struct ObjectAtomization {
     pub atoms: Vec<AtomId>,
     /// `(symbol_index_in_object → atom that owns it)`. Populated for every
-    /// external/private-extern SECT symbol that started a new atom.
+    /// ordinary external/private-extern SECT definition. Multiple symbols
+    /// at one address map to the same atom.
     pub owner_by_sym: Vec<(usize, AtomId)>,
     /// `(symbol_index_in_object → (containing_atom, offset_within_atom))`.
-    /// Populated for `.alt_entry` symbols that folded into an existing atom.
+    /// Populated for explicit alternate entries and same-address definitions
+    /// that precede the canonical owner.
     pub alt_entries_by_sym: Vec<(usize, AtomId, u32)>,
 }
 
@@ -583,11 +585,43 @@ fn atomize_regular_section(
         return;
     }
 
-    // If there's content before the first symbol, carve a head atom
-    // (unowned). afs-as emits a leading symbol in practice so this is
-    // typically zero bytes, but the fallback keeps the byte-flow intact.
-    let first_offset = syms[0].2;
+    let section_size = sect.size as u32;
+    let Some((first_boundary, first_offset)) = find_next_atom_boundary(syms, 0) else {
+        let alts: Vec<_> = syms
+            .iter()
+            .map(|(symbol_idx, _, offset)| AltEntry {
+                symbol: SymbolId(*symbol_idx as u32),
+                offset_within_atom: *offset,
+            })
+            .collect();
+        let atom = build_slice_atom(
+            input_id,
+            section_idx,
+            sect,
+            atom_section,
+            0,
+            section_size,
+            None,
+            &alts,
+        );
+        let id = table.push(atom);
+        out.atoms.push(id);
+        for (symbol_idx, _, offset) in syms {
+            out.alt_entries_by_sym.push((*symbol_idx, id, *offset));
+        }
+        return;
+    };
+
+    // If there's content before the first ordinary definition, carve an
+    // unowned head atom and attach any explicit alternate entries in it.
     if first_offset > 0 {
+        let alts: Vec<_> = syms[..first_boundary]
+            .iter()
+            .map(|(symbol_idx, _, offset)| AltEntry {
+                symbol: SymbolId(*symbol_idx as u32),
+                offset_within_atom: *offset,
+            })
+            .collect();
         let head = build_slice_atom(
             input_id,
             section_idx,
@@ -596,59 +630,87 @@ fn atomize_regular_section(
             0,
             first_offset,
             None,
-            &[],
+            &alts,
         );
         let head_id = table.push(head);
         out.atoms.push(head_id);
+        for (symbol_idx, _, offset) in &syms[..first_boundary] {
+            out.alt_entries_by_sym.push((*symbol_idx, head_id, *offset));
+        }
     }
 
-    // Walk symbol boundaries.
-    let section_size = sect.size as u32;
-    let mut i = 0;
+    // Walk unique ordinary-definition boundaries. Consecutive ordinary
+    // definitions at one address are aliases of one byte-owning atom.
+    let mut i = first_boundary;
     while i < syms.len() {
-        let (primary_idx, primary, atom_offset) = syms[i];
-        let next_real_boundary = find_next_non_alt_entry(syms, i + 1)
-            .map(|j| syms[j].2)
+        let atom_offset = syms[i].2;
+        let same_offset_end = syms[i..]
+            .iter()
+            .position(|(_, _, offset)| *offset > atom_offset)
+            .map(|delta| i + delta)
+            .unwrap_or(syms.len());
+        let canonical = (i..same_offset_end)
+            .rev()
+            .find(|index| !syms[*index].1.alt_entry())
+            .expect("atom boundary must contain an ordinary definition");
+        let next_boundary = find_next_atom_boundary(syms, same_offset_end);
+        let next_start = next_boundary.map(|(start, _)| start).unwrap_or(syms.len());
+        let next_offset = next_boundary
+            .map(|(_, offset)| offset)
             .unwrap_or(section_size);
-        let size = next_real_boundary.saturating_sub(atom_offset);
+        let size = next_offset.saturating_sub(atom_offset);
 
-        // Collect alt_entries that fall into [atom_offset, atom_offset+size).
+        // Explicit alternate entries fold into the containing atom. Earlier
+        // ordinary definitions at the canonical owner's address are also
+        // recorded as aliases for output symbol descriptors.
         let mut alts: Vec<AltEntry> = Vec::new();
         let mut alt_folded: Vec<(usize, u32)> = Vec::new();
-        for (alt_idx, alt_sym, alt_off) in syms.iter().skip(i + 1) {
-            if *alt_off >= atom_offset + size {
+        for (index, (symbol_idx, symbol, offset)) in
+            syms.iter().enumerate().take(next_start).skip(i)
+        {
+            if *offset > atom_offset && *offset >= atom_offset.saturating_add(size) {
                 break;
             }
-            if !alt_sym.alt_entry() {
-                break;
+            let same_address_alias =
+                *offset == atom_offset && !symbol.alt_entry() && index != canonical;
+            if !symbol.alt_entry() && !same_address_alias {
+                continue;
             }
-            let local = *alt_off - atom_offset;
+            let local = *offset - atom_offset;
             alts.push(AltEntry {
-                symbol: SymbolId(*alt_idx as u32),
+                symbol: SymbolId(*symbol_idx as u32),
                 offset_within_atom: local,
             });
-            alt_folded.push((*alt_idx, local));
+            alt_folded.push((*symbol_idx, local));
         }
 
-        let atom = build_slice_atom(
+        let mut atom = build_slice_atom(
             input_id,
             section_idx,
             sect,
             atom_section,
             atom_offset,
             size,
-            Some(primary),
+            Some(syms[canonical].1),
             &alts,
         );
+        for (_, symbol, _) in &syms[i..same_offset_end] {
+            if !symbol.alt_entry() {
+                atom.flags.set(symbol_flags(sect, symbol).bits());
+            }
+        }
         let id = table.push(atom);
         out.atoms.push(id);
-        out.owner_by_sym.push((primary_idx, id));
+        for (symbol_idx, symbol, _) in &syms[i..same_offset_end] {
+            if !symbol.alt_entry() {
+                out.owner_by_sym.push((*symbol_idx, id));
+            }
+        }
         for (alt_idx, local_off) in alt_folded {
             out.alt_entries_by_sym.push((alt_idx, id, local_off));
         }
 
-        // Advance past the primary and its folded alt_entries.
-        i = find_next_non_alt_entry(syms, i + 1).unwrap_or(syms.len());
+        i = next_start;
     }
 }
 
@@ -1149,24 +1211,35 @@ fn symbol_flags(sect: &InputSection, sym: &InputSymbol) -> AtomFlags {
     f
 }
 
-/// Find the next non-alt_entry symbol starting from index `i`. Returns the
-/// index (into `syms`), or `None` if every remaining symbol is an alt
-/// entry.
-fn find_next_non_alt_entry(syms: &[(usize, &InputSymbol, u32)], from: usize) -> Option<usize> {
-    syms.iter()
+/// Find the next address containing an ordinary definition and return the
+/// first symbol at that address. Explicit alternate entries ordered before
+/// the ordinary definition therefore stay attached to the new atom.
+fn find_next_atom_boundary(
+    syms: &[(usize, &InputSymbol, u32)],
+    from: usize,
+) -> Option<(usize, u32)> {
+    let boundary_offset = syms
+        .iter()
+        .skip(from)
+        .find(|(_, symbol, _)| !symbol.alt_entry())?
+        .2;
+    let boundary_start = syms
+        .iter()
         .enumerate()
         .skip(from)
-        .find(|(_, (_, s, _))| !s.alt_entry())
-        .map(|(i, _)| i)
+        .find(|(_, (_, _, offset))| *offset == boundary_offset)?
+        .0;
+    Some((boundary_start, boundary_offset))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::macho::constants::{
-        S_ATTR_LIVE_SUPPORT, S_ATTR_NO_DEAD_STRIP, S_MOD_INIT_FUNC_POINTERS,
-        S_MOD_TERM_FUNC_POINTERS, S_REGULAR,
+        N_ALT_ENTRY, N_EXT, N_NO_DEAD_STRIP, N_SECT, N_WEAK_DEF, S_ATTR_LIVE_SUPPORT,
+        S_ATTR_NO_DEAD_STRIP, S_MOD_INIT_FUNC_POINTERS, S_MOD_TERM_FUNC_POINTERS, S_REGULAR,
     };
+    use crate::symbol::RawNlist;
 
     fn input_section(kind: SectionKind, flags: u32) -> InputSection {
         InputSection {
@@ -1376,6 +1449,100 @@ mod tests {
             let atom = build_section_atom(InputId(0), 1, &section, AtomSection::Other);
             assert!(atom.flags.has(AtomFlags::NO_DEAD_STRIP));
         }
+    }
+
+    #[test]
+    fn coalesces_same_address_definitions_into_one_atom() {
+        let mut section = input_section(SectionKind::Text, S_REGULAR);
+        section.segname = "__TEXT".into();
+        section.sectname = "__text".into();
+        section.size = 12;
+        section.align_pow2 = 2;
+        section.data = (0..12).collect();
+        let symbols = [
+            InputSymbol::from_raw(RawNlist {
+                strx: 1,
+                n_type: N_SECT | N_EXT,
+                n_sect: 1,
+                n_desc: N_NO_DEAD_STRIP,
+                n_value: 0,
+            }),
+            InputSymbol::from_raw(RawNlist {
+                strx: 7,
+                n_type: N_SECT | N_EXT,
+                n_sect: 1,
+                n_desc: N_WEAK_DEF,
+                n_value: 0,
+            }),
+            InputSymbol::from_raw(RawNlist {
+                strx: 15,
+                n_type: N_SECT | N_EXT,
+                n_sect: 1,
+                n_desc: N_ALT_ENTRY,
+                n_value: 4,
+            }),
+            InputSymbol::from_raw(RawNlist {
+                strx: 23,
+                n_type: N_SECT | N_EXT,
+                n_sect: 1,
+                n_desc: 0,
+                n_value: 8,
+            }),
+        ];
+        let boundaries: Vec<_> = symbols
+            .iter()
+            .enumerate()
+            .map(|(index, symbol)| (index, symbol, symbol.value() as u32))
+            .collect();
+        let mut atoms = AtomTable::new();
+        let mut atomization = ObjectAtomization::default();
+
+        atomize_regular_section(
+            InputId(3),
+            1,
+            &section,
+            &boundaries,
+            true,
+            &mut atoms,
+            &mut atomization,
+        );
+
+        assert_eq!(atomization.atoms.len(), 2);
+        let first = atomization.atoms[0];
+        let second = atomization.atoms[1];
+        assert_eq!(
+            atomization.owner_by_sym,
+            vec![(0, first), (1, first), (3, second)]
+        );
+        assert_eq!(
+            atomization.alt_entries_by_sym,
+            vec![(0, first, 0), (2, first, 4)]
+        );
+
+        let first_atom = atoms.get(first);
+        assert_eq!(first_atom.input_offset, 0);
+        assert_eq!(first_atom.size, 8);
+        assert_eq!(first_atom.data, (0..8).collect::<Vec<_>>());
+        assert_eq!(
+            first_atom.alt_entries,
+            vec![
+                AltEntry {
+                    symbol: SymbolId(0),
+                    offset_within_atom: 0,
+                },
+                AltEntry {
+                    symbol: SymbolId(2),
+                    offset_within_atom: 4,
+                },
+            ]
+        );
+        assert!(first_atom.flags.has(AtomFlags::NO_DEAD_STRIP));
+        assert!(first_atom.flags.has(AtomFlags::WEAK_DEF));
+
+        let second_atom = atoms.get(second);
+        assert_eq!(second_atom.input_offset, 8);
+        assert_eq!(second_atom.size, 4);
+        assert_eq!(second_atom.data, (8..12).collect::<Vec<_>>());
     }
 
     #[test]

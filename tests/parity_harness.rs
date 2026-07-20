@@ -3,20 +3,19 @@
 mod common;
 
 use afs_ld::macho::constants::{CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_EXECUTE, MH_MAGIC_64};
+use afs_ld::macho::exports::ExportKind;
 use afs_ld::macho::reader::{
-    write_commands, write_header, LinkEditDataCmd, LoadCommand, MachHeader64,
+    write_commands, write_header, DyldInfoCmd, LinkEditDataCmd, LoadCommand, MachHeader64,
+    HEADER_SIZE,
 };
 use common::harness::{
     apply_section_tolerances, diff_macho, macho_exports, parse_case_tolerances,
     string_table_within_five_percent,
 };
 
-#[test]
-fn export_trie_reader_accepts_executable_images() {
-    let command = LoadCommand::DyldExportsTrie(LinkEditDataCmd {
-        dataoff: 48,
-        datasize: 2,
-    });
+const SINGLE_EXPORT_TRIE: &[u8] = &[0, 1, b'_', b'x', 0, 6, 2, 0, 7, 0];
+
+fn executable_with_commands(commands: &[LoadCommand], payload: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::new();
     write_header(
         &MachHeader64 {
@@ -24,18 +23,84 @@ fn export_trie_reader_accepts_executable_images() {
             cputype: CPU_TYPE_ARM64,
             cpusubtype: CPU_SUBTYPE_ARM64_ALL,
             filetype: MH_EXECUTE,
-            ncmds: 1,
-            sizeofcmds: command.cmdsize(),
+            ncmds: commands.len() as u32,
+            sizeofcmds: commands.iter().map(LoadCommand::cmdsize).sum(),
             flags: 0,
             reserved: 0,
         },
         &mut bytes,
     );
-    write_commands(&[command], &mut bytes);
-    bytes.extend_from_slice(&[0, 0]);
+    write_commands(commands, &mut bytes);
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+fn assert_single_regular_export(bytes: &[u8]) {
+    let entries = macho_exports(bytes)
+        .expect("read executable export trie")
+        .entries()
+        .expect("decode export trie");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "_x");
+    assert!(matches!(
+        entries[0].kind,
+        ExportKind::Regular { address: 7 }
+    ));
+}
+
+#[test]
+fn export_trie_reader_accepts_executable_exports_command() {
+    let command = LoadCommand::DyldExportsTrie(LinkEditDataCmd {
+        dataoff: HEADER_SIZE as u32 + LinkEditDataCmd::WIRE_SIZE,
+        datasize: SINGLE_EXPORT_TRIE.len() as u32,
+    });
+    let bytes = executable_with_commands(&[command], SINGLE_EXPORT_TRIE);
+
+    assert_single_regular_export(&bytes);
+}
+
+#[test]
+fn export_trie_reader_accepts_executable_dyld_info_command() {
+    let command = LoadCommand::DyldInfoOnly(DyldInfoCmd {
+        export_off: HEADER_SIZE as u32 + DyldInfoCmd::WIRE_SIZE,
+        export_size: SINGLE_EXPORT_TRIE.len() as u32,
+        ..DyldInfoCmd::default()
+    });
+    let bytes = executable_with_commands(&[command], SINGLE_EXPORT_TRIE);
+
+    assert_single_regular_export(&bytes);
+}
+
+#[test]
+fn export_trie_reader_accepts_executable_without_export_metadata() {
+    let bytes = executable_with_commands(&[], &[]);
 
     let exports = macho_exports(&bytes).expect("read executable export trie");
     assert!(exports.entries().expect("decode export trie").is_empty());
+}
+
+#[test]
+fn export_trie_reader_rejects_out_of_bounds_ranges() {
+    let commands = [
+        LoadCommand::DyldExportsTrie(LinkEditDataCmd {
+            dataoff: 4096,
+            datasize: 16,
+        }),
+        LoadCommand::DyldInfoOnly(DyldInfoCmd {
+            export_off: 4096,
+            export_size: 16,
+            ..DyldInfoCmd::default()
+        }),
+    ];
+
+    for command in commands {
+        let bytes = executable_with_commands(&[command], &[]);
+        let error = macho_exports(&bytes).expect_err("reject out-of-bounds export trie");
+        assert!(
+            error.contains("exceeds file size"),
+            "unexpected error: {error}"
+        );
+    }
 }
 
 #[test]

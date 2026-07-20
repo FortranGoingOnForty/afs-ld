@@ -11,6 +11,21 @@ use common::harness::{
     assemble, have_tool, have_xcrun, have_xcrun_tool, scratch, sdk_path, sdk_version,
 };
 
+const WARM_SAMPLES: usize = 11;
+const REQUIRED_BUDGET_PASSES: usize = 9;
+
+fn performance_prerequisites_available() -> bool {
+    if have_xcrun() && have_xcrun_tool("ld") {
+        return true;
+    }
+
+    if std::env::var_os("AFS_LD_REQUIRE_PERF_PREREQUISITES").is_some() {
+        panic!("required performance-test prerequisites are unavailable");
+    }
+    eprintln!("skipping: xcrun as/ld unavailable");
+    false
+}
+
 fn runtime_archive_fixture() -> Result<PathBuf, String> {
     if let Some(runtime) = workspace_artifact("libarmfortas_rt.a") {
         return Ok(runtime);
@@ -192,10 +207,52 @@ fn assert_profile_basics(name: &str, profile: &LinkProfile) {
     );
 }
 
+fn budget_pass_count(samples: &[Duration], limit: Duration) -> usize {
+    samples.iter().filter(|sample| **sample <= limit).count()
+}
+
+fn assert_warm_budget(name: &str, env_name: &str, inputs: &[PathBuf], output_stem: &str) {
+    let Ok(limit_ms) = std::env::var(env_name) else {
+        return;
+    };
+    let limit = Duration::from_millis(limit_ms.parse().expect("parse performance budget"));
+    let mut profiles = Vec::with_capacity(WARM_SAMPLES);
+    for sample in 1..=WARM_SAMPLES {
+        let label = format!("{name} warm sample {sample}");
+        let output = scratch(&format!("{output_stem}-warm-{sample}.out"));
+        let profile = Linker::run_profiled(&executable_opts(inputs.to_vec(), output))
+            .unwrap_or_else(|error| panic!("profile {label}: {error}"));
+        assert_profile_basics(&label, &profile);
+        profiles.push(profile);
+    }
+
+    let mut totals: Vec<_> = profiles.iter().map(|profile| profile.total_wall).collect();
+    totals.sort_unstable();
+    let mut tbd_decode: Vec<_> = profiles
+        .iter()
+        .map(|profile| profile.phases.input_tbd_decode)
+        .collect();
+    tbd_decode.sort_unstable();
+    let passes = budget_pass_count(&totals, limit);
+    let median = totals[WARM_SAMPLES / 2];
+    let p90 = totals[WARM_SAMPLES * 9 / 10];
+    eprintln!(
+        "{name}: warm budget passes={passes}/{WARM_SAMPLES} limit={limit:?} min={:?} median={median:?} p90={p90:?} max={:?} tbd_decode_median={:?}",
+        totals[0],
+        totals[WARM_SAMPLES - 1],
+        tbd_decode[WARM_SAMPLES / 2],
+    );
+    assert!(
+        passes >= REQUIRED_BUDGET_PASSES,
+        "{name}: only {passes}/{WARM_SAMPLES} warm samples met {limit:?}; min={:?} median={median:?} p90={p90:?} max={:?}",
+        totals[0],
+        totals[WARM_SAMPLES - 1],
+    );
+}
+
 #[test]
 fn bench_hello_world_profile_reports_baseline_timings() {
-    if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+    if !performance_prerequisites_available() {
         return;
     }
 
@@ -213,24 +270,20 @@ fn bench_hello_world_profile_reports_baseline_timings() {
     )
     .expect("assemble hello");
 
-    let profile = Linker::run_profiled(&executable_opts(vec![obj], out)).expect("profile hello");
+    let profile =
+        Linker::run_profiled(&executable_opts(vec![obj.clone()], out)).expect("profile hello");
     assert_profile_basics("hello", &profile);
-
-    if let Ok(limit_ms) = std::env::var("AFS_LD_HELLO_BUDGET_MS") {
-        let limit = Duration::from_millis(limit_ms.parse().expect("parse hello budget"));
-        assert!(
-            profile.total_wall <= limit,
-            "hello baseline exceeded budget: {:?} > {:?}",
-            profile.total_wall,
-            limit
-        );
-    }
+    assert_warm_budget(
+        "hello",
+        "AFS_LD_HELLO_BUDGET_MS",
+        std::slice::from_ref(&obj),
+        "perf-hello",
+    );
 }
 
 #[test]
 fn bench_runtime_link_profile_reports_baseline_timings() {
-    if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+    if !performance_prerequisites_available() {
         return;
     }
     let runtime = match runtime_archive_fixture() {
@@ -260,17 +313,28 @@ fn bench_runtime_link_profile_reports_baseline_timings() {
     )
     .expect("assemble runtime");
 
-    let profile = Linker::run_profiled(&executable_opts(vec![obj, runtime], out))
-        .expect("profile runtime link");
+    let inputs = vec![obj, runtime];
+    let profile =
+        Linker::run_profiled(&executable_opts(inputs.clone(), out)).expect("profile runtime link");
     assert_profile_basics("runtime", &profile);
+    assert_warm_budget(
+        "runtime",
+        "AFS_LD_RUNTIME_BUDGET_MS",
+        &inputs,
+        "perf-runtime",
+    );
+}
 
-    if let Ok(limit_ms) = std::env::var("AFS_LD_RUNTIME_BUDGET_MS") {
-        let limit = Duration::from_millis(limit_ms.parse().expect("parse runtime budget"));
-        assert!(
-            profile.total_wall <= limit,
-            "runtime baseline exceeded budget: {:?} > {:?}",
-            profile.total_wall,
-            limit
-        );
-    }
+#[test]
+fn warm_budget_tolerates_at_most_two_slow_samples() {
+    let limit = Duration::from_millis(150);
+    let mut samples = vec![limit; REQUIRED_BUDGET_PASSES];
+    samples.extend([Duration::from_millis(151); 2]);
+    assert_eq!(budget_pass_count(&samples, limit), REQUIRED_BUDGET_PASSES);
+
+    samples[0] = Duration::from_millis(151);
+    assert_eq!(
+        budget_pass_count(&samples, limit),
+        REQUIRED_BUDGET_PASSES - 1
+    );
 }

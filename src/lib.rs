@@ -1564,18 +1564,15 @@ fn find_entry_symbol_id(
     } else {
         return Ok(None);
     };
-    let Some((symbol_id, _)) = sym_table
-        .iter()
-        .find(|(_, symbol)| sym_table.interner.resolve(symbol.name()) == name)
-    else {
+    let Some(symbol_id) = sym_table.lookup_resolved_str(name) else {
         return Err(LinkError::EntrySymbolNotFound(name.to_string()));
     };
     Ok(Some(symbol_id))
 }
 
 fn symbol_defined(sym_table: &SymbolTable, name: &str) -> bool {
-    sym_table.iter().any(|(_, symbol)| {
-        sym_table.interner.resolve(symbol.name()) == name
-            && matches!(symbol, Symbol::Defined { .. })
-    })
+    sym_table
+        .lookup_resolved_str(name)
+        .map(|symbol_id| matches!(sym_table.get(symbol_id), Symbol::Defined { .. }))
+        .unwrap_or(false)
 }

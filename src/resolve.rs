@@ -486,6 +486,8 @@ pub enum Symbol {
     Alias {
         name: Istr,
         aliased: Istr,
+        origin: InputId,
+        private_extern: bool,
     },
 }
 
@@ -522,6 +524,10 @@ impl Symbol {
 
     pub fn is_weak_defined(&self) -> bool {
         matches!(self, Symbol::Defined { weak: true, .. })
+    }
+
+    pub fn is_strong_definition(&self) -> bool {
+        self.is_strong_defined() || matches!(self, Symbol::Alias { .. })
     }
 }
 
@@ -635,6 +641,11 @@ impl SymbolTable {
         self.interner.get(name).and_then(|name| self.lookup(name))
     }
 
+    pub fn lookup_resolved_str(&self, name: &str) -> Option<SymbolId> {
+        let name = self.interner.get(name)?;
+        self.resolve_chain(name).ok().map(|(id, _)| id)
+    }
+
     pub fn get(&self, id: SymbolId) -> &Symbol {
         &self.symbols[id.0 as usize]
     }
@@ -705,6 +716,11 @@ impl SymbolTable {
 
         // Vacant slot: just store it.
         let Some(&existing_id) = self.by_name.get(&name) else {
+            if let Symbol::Alias { aliased, .. } = &sym {
+                if self.alias_would_cycle(name, *aliased) {
+                    return Err(InsertError::AliasCycle { name });
+                }
+            }
             let id = self.push_new(sym.clone());
             self.transitions.push(Transition {
                 id,
@@ -718,9 +734,31 @@ impl SymbolTable {
         let existing_kind = self.symbols[existing_id.0 as usize].kind();
         let new_kind = sym.kind();
 
-        // Alias insertions have their own rules (cycle detection).
+        // An alias is a strong, non-coalescing definition. It replaces weak
+        // definitions and unresolved states, but collides with another strong
+        // definition regardless of input order.
         if new_kind == SymbolKindTag::Alias {
-            return self.insert_alias_over(existing_id, sym);
+            let existing = &self.symbols[existing_id.0 as usize];
+            if existing.is_strong_definition() {
+                return Err(InsertError::DuplicateStrong {
+                    name,
+                    first: existing_id,
+                    second: Box::new(sym),
+                });
+            }
+            let Symbol::Alias { aliased, .. } = &sym else {
+                unreachable!();
+            };
+            if self.alias_would_cycle(name, *aliased) {
+                return Err(InsertError::AliasCycle { name });
+            }
+            return Ok(self.apply_action(
+                existing_id,
+                sym,
+                existing_kind,
+                new_kind,
+                Action::Replace,
+            ));
         }
 
         // Resolve the existing × new pair via the matrix.
@@ -769,8 +807,16 @@ impl SymbolTable {
             | (LazyObject, LazyArchive) => Action::Replace,
             (LazyObject, LazyObject) => Action::Keep,
 
-            // --- existing Alias: a direct form replaces it ---
-            (Alias, _) => Action::Replace,
+            // --- existing Alias: keep against unresolved/weak forms and
+            // reject another strong definition ---
+            (Alias, Defined) if sym.is_strong_defined() => {
+                return Err(InsertError::DuplicateStrong {
+                    name,
+                    first: existing_id,
+                    second: Box::new(sym),
+                });
+            }
+            (Alias, _) => Action::Keep,
 
             // Shouldn't hit — Alias insertions diverged above.
             (_, Alias) => unreachable!(),
@@ -938,32 +984,6 @@ impl SymbolTable {
         self.symbols.push(sym);
         self.by_name.insert(name, id);
         id
-    }
-
-    fn insert_alias_over(
-        &mut self,
-        existing_id: SymbolId,
-        sym: Symbol,
-    ) -> Result<InsertOutcome, InsertError> {
-        let Symbol::Alias { name, aliased } = &sym else {
-            unreachable!("insert_alias_over called with non-Alias symbol");
-        };
-        if self.alias_would_cycle(*name, *aliased) {
-            return Err(InsertError::AliasCycle { name: *name });
-        }
-        let from = self.symbols[existing_id.0 as usize].kind();
-        self.symbols[existing_id.0 as usize] = sym;
-        self.transitions.push(Transition {
-            id: existing_id,
-            from,
-            to: SymbolKindTag::Alias,
-            cause: TransitionCause::Replaced,
-        });
-        Ok(InsertOutcome::Replaced {
-            id: existing_id,
-            from,
-            to: SymbolKindTag::Alias,
-        })
     }
 
     /// Walk alias chains to a concrete (non-Alias) symbol. Used by Sprint 8
@@ -1238,11 +1258,40 @@ pub fn seed_object(
         };
         let name = table.intern(name_str);
         report.referrers.add(name, input_id);
-        let Some(sym) = symbolize_input(name, input_sym, input_id) else {
-            continue;
+        let alias_target = if input_sym.kind() == crate::symbol::SymKind::Indirect {
+            let target_name = obj
+                .indirect_target_name(input_sym)
+                .expect("indirect symbol should have a target name")?;
+            Some(table.intern(target_name))
+        } else {
+            None
+        };
+        let sym = if let Some(aliased) = alias_target {
+            Symbol::Alias {
+                name,
+                aliased,
+                origin: input_id,
+                private_extern: input_sym.is_private_ext(),
+            }
+        } else {
+            symbolize_input(name, input_sym, input_id)
         };
         match table.insert(sym) {
-            Ok(outcome) => report.record_outcome(outcome),
+            Ok(outcome) => {
+                report.record_outcome(outcome);
+                if let Some(target) = alias_target {
+                    report.referrers.add(target, input_id);
+                    let target_ref = Symbol::Undefined {
+                        name: target,
+                        origin: input_id,
+                        weak_ref: false,
+                    };
+                    match table.insert(target_ref) {
+                        Ok(outcome) => report.record_outcome(outcome),
+                        Err(error) => report.record_error(error),
+                    }
+                }
+            }
             Err(e) => report.record_error(e),
         }
     }
@@ -1917,31 +1966,35 @@ pub fn format_undefined_warning_diagnostic(
     format_undefined_diagnostic_with_level(table, inputs, referrers, unresolved, "warning")
 }
 
-/// Format a `DuplicateStrong` insertion error for user consumption. Needs
-/// the incumbent symbol (from the table) plus the losing second symbol
-/// carried in the error itself.
+/// Format a symbol insertion error for user consumption.
 pub fn format_duplicate_diagnostic(
     table: &SymbolTable,
     inputs: &Inputs,
     err: &InsertError,
 ) -> String {
+    if let InsertError::AliasCycle { name } = err {
+        return format!(
+            "afs-ld: error: alias cycle involving {}\n",
+            table.interner.resolve(*name)
+        );
+    }
     let InsertError::DuplicateStrong {
         name,
         first,
         second,
     } = err
     else {
-        return String::new();
+        unreachable!("all symbol insertion errors should be formatted");
     };
     let name_str = table.interner.resolve(*name);
     let mut out = String::new();
     out.push_str(&format!("afs-ld: error: duplicate symbol {name_str}\n"));
-    if let Symbol::Defined { origin, .. } = table.get(*first) {
+    if let Symbol::Defined { origin, .. } | Symbol::Alias { origin, .. } = table.get(*first) {
         if let Some(oi) = inputs.objects.get(origin.0 as usize) {
             out.push_str(&format!("  defined in {}\n", oi.path.display()));
         }
     }
-    if let Symbol::Defined { origin, .. } = second.as_ref() {
+    if let Symbol::Defined { origin, .. } | Symbol::Alias { origin, .. } = second.as_ref() {
         if let Some(oi) = inputs.objects.get(origin.0 as usize) {
             out.push_str(&format!("  also in {}\n", oi.path.display()));
         }
@@ -2090,52 +2143,41 @@ fn preparse_pending_fetches(
     }
 }
 
-/// Turn a wire-form `InputSymbol` into a resolver-side `Symbol`. Returns
-/// `None` for kinds the resolver does not track (currently: aliases with
-/// unresolved target strx — Sprint 8's resolver defers those for now).
-fn symbolize_input(
-    name: Istr,
-    input_sym: &crate::symbol::InputSymbol,
-    origin: InputId,
-) -> Option<Symbol> {
+/// Turn a non-indirect wire-form `InputSymbol` into a resolver-side `Symbol`.
+fn symbolize_input(name: Istr, input_sym: &crate::symbol::InputSymbol, origin: InputId) -> Symbol {
     use crate::symbol::SymKind;
     match input_sym.kind() {
         SymKind::Undef => {
             if let Some(size) = input_sym.common_size() {
                 let align_pow2 = input_sym.common_align_pow2().unwrap_or(0);
-                Some(Symbol::Common {
+                Symbol::Common {
                     name,
                     origin,
                     size,
                     align_pow2,
                     private_extern: input_sym.is_private_ext(),
                     no_dead_strip: input_sym.no_dead_strip(),
-                })
+                }
             } else {
-                Some(Symbol::Undefined {
+                Symbol::Undefined {
                     name,
                     origin,
                     weak_ref: input_sym.weak_ref(),
-                })
+                }
             }
         }
-        SymKind::Abs | SymKind::Sect => Some(Symbol::Defined {
+        SymKind::Abs | SymKind::Sect => Symbol::Defined {
             name,
             origin,
-            // AtomId(0) is a placeholder; Sprint 9's atomization pass
-            // replaces these with real atom handles in-place.
+            // AtomId(0) is a placeholder; atomization replaces section
+            // definitions with real atom handles in-place.
             atom: AtomId(0),
             value: input_sym.value(),
             weak: input_sym.weak_def(),
             private_extern: input_sym.is_private_ext(),
             no_dead_strip: input_sym.no_dead_strip(),
-        }),
-        SymKind::Indirect => {
-            // Sprint 8 does not wire indirect-strx lookups yet — Sprint 9's
-            // atomization pass (which has the string table at hand) will
-            // rewrite these. For now, skip.
-            None
-        }
+        },
+        SymKind::Indirect => unreachable!("indirect symbols are handled by seed_object"),
     }
 }
 
@@ -2834,7 +2876,9 @@ mod tests {
         assert_eq!(
             Symbol::Alias {
                 name: n(7),
-                aliased: n(0)
+                aliased: n(0),
+                origin: InputId(0),
+                private_extern: false,
             }
             .kind(),
             SymbolKindTag::Alias
@@ -2937,6 +2981,8 @@ mod tests {
         Symbol::Alias {
             name: name_i,
             aliased: target_i,
+            origin: InputId(0),
+            private_extern: false,
         }
     }
 
@@ -3421,27 +3467,58 @@ mod tests {
     }
 
     #[test]
-    fn direct_definition_replaces_alias() {
+    fn strong_definition_and_alias_are_duplicates_in_both_orders() {
+        for alias_first in [false, true] {
+            let mut t = SymbolTable::new();
+            let alias = alias_sym(&mut t, "_alias", "_target");
+            let defined = defined_strong(&mut t, "_alias");
+            let error = if alias_first {
+                t.insert(alias).unwrap();
+                t.insert(defined).unwrap_err()
+            } else {
+                t.insert(defined).unwrap();
+                t.insert(alias).unwrap_err()
+            };
+            assert!(matches!(error, InsertError::DuplicateStrong { .. }));
+        }
+    }
+
+    #[test]
+    fn self_target_alias_collides_with_an_existing_strong_definition() {
         let mut t = SymbolTable::new();
-        let al = alias_sym(&mut t, "_alias", "_target");
-        t.insert(al).unwrap();
-        let def = defined_strong(&mut t, "_alias");
-        let out = t.insert(def).unwrap();
+        let defined = defined_strong(&mut t, "_same");
+        t.insert(defined).unwrap();
+        let alias = alias_sym(&mut t, "_same", "_same");
+
         assert!(matches!(
-            out,
-            InsertOutcome::Replaced {
-                from: SymbolKindTag::Alias,
-                to: SymbolKindTag::Defined,
-                ..
-            }
+            t.insert(alias).unwrap_err(),
+            InsertError::DuplicateStrong { .. }
         ));
     }
 
     #[test]
-    fn self_loop_alias_rejected() {
+    fn alias_wins_against_weak_definition_in_both_orders() {
+        for alias_first in [false, true] {
+            let mut t = SymbolTable::new();
+            let alias = alias_sym(&mut t, "_alias", "_target");
+            let weak = defined_weak(&mut t, "_alias");
+            if alias_first {
+                t.insert(alias).unwrap();
+                assert!(matches!(t.insert(weak).unwrap(), InsertOutcome::Kept(_)));
+            } else {
+                t.insert(weak).unwrap();
+                assert!(matches!(
+                    t.insert(alias).unwrap(),
+                    InsertOutcome::Replaced { .. }
+                ));
+            }
+            assert!(matches!(t.get(SymbolId(0)), Symbol::Alias { .. }));
+        }
+    }
+
+    #[test]
+    fn self_loop_alias_rejected_in_vacant_slot() {
         let mut t = SymbolTable::new();
-        let u = undef(&mut t, "_foo");
-        t.insert(u).unwrap();
         let looped = alias_sym(&mut t, "_foo", "_foo");
         let err = t.insert(looped).unwrap_err();
         assert!(matches!(err, InsertError::AliasCycle { .. }));
@@ -3469,6 +3546,29 @@ mod tests {
         let name = t.intern("_alias");
         let (_, sym) = t.resolve_chain(name).unwrap();
         assert!(matches!(sym, Symbol::Defined { .. }));
+        assert_eq!(t.lookup_resolved_str("_alias"), t.lookup_str("_target"));
+    }
+
+    #[test]
+    fn resolve_chain_walks_through_multiple_aliases() {
+        let mut t = SymbolTable::new();
+        let defined = defined_strong(&mut t, "_target");
+        t.insert(defined).unwrap();
+        let middle = alias_sym(&mut t, "_middle", "_target");
+        t.insert(middle).unwrap();
+        let outer = alias_sym(&mut t, "_outer", "_middle");
+        t.insert(outer).unwrap();
+
+        assert_eq!(t.lookup_resolved_str("_outer"), t.lookup_str("_target"));
+    }
+
+    #[test]
+    fn alias_cycle_diagnostic_names_the_symbol() {
+        let mut t = SymbolTable::new();
+        let looped = alias_sym(&mut t, "_loop", "_loop");
+        let error = t.insert(looped).unwrap_err();
+        let diagnostic = format_duplicate_diagnostic(&t, &Inputs::new(), &error);
+        assert_eq!(diagnostic, "afs-ld: error: alias cycle involving _loop\n");
     }
 
     #[test]

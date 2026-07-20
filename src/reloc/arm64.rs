@@ -1293,9 +1293,13 @@ fn build_symbol_name_index(sym_table: &SymbolTable) -> HashMap<String, SymbolId>
     sym_table
         .iter()
         .map(|(symbol_id, symbol)| {
+            let resolved_id = sym_table
+                .resolve_chain(symbol.name())
+                .map(|(resolved_id, _)| resolved_id)
+                .unwrap_or(symbol_id);
             (
                 sym_table.interner.resolve(symbol.name()).to_string(),
-                symbol_id,
+                resolved_id,
             )
         })
         .collect()

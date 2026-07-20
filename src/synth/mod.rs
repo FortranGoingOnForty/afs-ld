@@ -483,7 +483,7 @@ fn build_input_symbol_index(
                     .object
                     .symbol_name(input_sym)
                     .ok()
-                    .and_then(|name| sym_table.lookup_str(name));
+                    .and_then(|name| sym_table.lookup_resolved_str(name));
             }
         }
         index.insert(input.id, symbols);

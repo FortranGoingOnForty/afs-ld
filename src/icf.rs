@@ -298,9 +298,13 @@ fn rebind_symbols_to_canonical_winners(
 fn resolved_symbol_map(sym_table: &SymbolTable) -> HashMap<String, SymbolId> {
     let mut out = HashMap::new();
     for (symbol_id, symbol) in sym_table.iter() {
+        let resolved_id = sym_table
+            .resolve_chain(symbol.name())
+            .map(|(resolved_id, _)| resolved_id)
+            .unwrap_or(symbol_id);
         out.insert(
             sym_table.interner.resolve(symbol.name()).to_string(),
-            symbol_id,
+            resolved_id,
         );
     }
     out

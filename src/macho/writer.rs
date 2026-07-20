@@ -1125,6 +1125,9 @@ struct OutputSymbolSpec {
     n_value: u64,
     size: u64,
     file_index: usize,
+    indirect_target: Option<String>,
+    export_kind: Option<ExportKind>,
+    export_flags: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1395,9 +1398,13 @@ fn build_symbol_name_index(sym_table: &SymbolTable) -> HashMap<String, SymbolId>
     sym_table
         .iter()
         .map(|(symbol_id, symbol)| {
+            let resolved_id = sym_table
+                .resolve_chain(symbol.name())
+                .map(|(resolved_id, _)| resolved_id)
+                .unwrap_or(symbol_id);
             (
                 sym_table.interner.resolve(symbol.name()).to_string(),
-                symbol_id,
+                resolved_id,
             )
         })
         .collect()
@@ -1640,6 +1647,9 @@ fn build_output_symbols_profiled(
             n_value: text_vmaddr,
             size: 0,
             file_index: 0,
+            indirect_target: None,
+            export_kind: None,
+            export_flags: 0,
         });
     }
 
@@ -1660,56 +1670,145 @@ fn build_output_symbols_profiled(
 
     let phase_started = std::time::Instant::now();
     for (symbol_id, symbol) in sym_table.iter() {
-        let Symbol::Defined {
+        if let Symbol::Alias {
             name,
             origin,
-            atom,
-            value,
-            weak,
             private_extern,
-            no_dead_strip,
             ..
         } = symbol
-        else {
-            continue;
-        };
-        let materialized_private_common = *private_extern
+        {
+            if let Ok((
+                _,
+                Symbol::DylibImport {
+                    name: target_name,
+                    ordinal,
+                    weak_import,
+                    ..
+                },
+            )) = sym_table.resolve_chain(*name)
+            {
+                let name = sym_table.interner.resolve(*name).to_string();
+                let imported_name = sym_table.interner.resolve(*target_name).to_string();
+                let hidden = *private_extern || visibility.hides(&name);
+                if hidden {
+                    continue;
+                }
+                external_defineds.push(OutputSymbolSpec {
+                    symbol: Some(symbol_id),
+                    name,
+                    partition: OutputSymbolPartition::ExternalDefined,
+                    n_type: N_INDR | N_EXT,
+                    n_sect: NO_SECT,
+                    n_desc: 0,
+                    n_value: 0,
+                    size: 0,
+                    file_index: file_index_by_input.get(origin).copied().unwrap_or(0),
+                    indirect_target: Some(imported_name.clone()),
+                    export_kind: Some(ExportKind::Reexport {
+                        ordinal: u32::from(*ordinal),
+                        imported_name,
+                    }),
+                    export_flags: EXPORT_SYMBOL_FLAGS_REEXPORT
+                        | if *weak_import {
+                            EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION
+                        } else {
+                            0
+                        },
+                });
+                continue;
+            }
+        }
+
+        let (name, origin, atom, value, weak, private_extern, no_dead_strip, is_alias) =
+            match symbol {
+                Symbol::Defined {
+                    name,
+                    origin,
+                    atom,
+                    value,
+                    weak,
+                    private_extern,
+                    no_dead_strip,
+                    ..
+                } => (
+                    *name,
+                    *origin,
+                    *atom,
+                    *value,
+                    *weak,
+                    *private_extern,
+                    *no_dead_strip,
+                    false,
+                ),
+                Symbol::Alias {
+                    name,
+                    origin,
+                    private_extern,
+                    ..
+                } => {
+                    let Ok((_, target)) = sym_table.resolve_chain(*name) else {
+                        continue;
+                    };
+                    let Symbol::Defined {
+                        atom,
+                        value,
+                        weak,
+                        no_dead_strip,
+                        ..
+                    } = target
+                    else {
+                        continue;
+                    };
+                    (
+                        *name,
+                        *origin,
+                        *atom,
+                        *value,
+                        *weak,
+                        *private_extern,
+                        *no_dead_strip,
+                        true,
+                    )
+                }
+                _ => continue,
+            };
+        let materialized_private_common = private_extern
             && atom.0 != 0
-            && inputs.0.atom_table.get(*atom).section == AtomSection::Common;
-        if *private_extern && !materialized_private_common {
+            && inputs.0.atom_table.get(atom).section == AtomSection::Common;
+        if private_extern && !materialized_private_common && !is_alias {
             continue;
         }
-        let name = sym_table.interner.resolve(*name).to_string();
-        let hidden = *private_extern || visibility.hides(&name);
+        let name = sym_table.interner.resolve(name).to_string();
+        let hidden = private_extern || visibility.hides(&name);
         let (n_type, n_sect, n_value) = if atom.0 == 0 {
-            (absolute_symbol_type(hidden), NO_SECT, *value)
+            (absolute_symbol_type(hidden), NO_SECT, value)
         } else {
-            let Some(addr) = atom_addrs.get(atom).copied() else {
+            let Some(addr) = atom_addrs.get(&atom).copied() else {
                 if dead_strip {
                     continue;
                 }
-                return Err(WriteError::DefinedSymbolAtomMissing(symbol_id, *atom));
+                return Err(WriteError::DefinedSymbolAtomMissing(symbol_id, atom));
             };
             let sect = *atom_sections
-                .get(atom)
-                .ok_or(WriteError::DefinedSymbolSectionMissing(symbol_id, *atom))?;
-            (defined_symbol_type(hidden), sect, addr + *value)
+                .get(&atom)
+                .ok_or(WriteError::DefinedSymbolSectionMissing(symbol_id, atom))?;
+            (defined_symbol_type(hidden), sect, addr + value)
         };
-        let size = if atom.0 == 0 {
+        let size = if is_alias || atom.0 == 0 {
             0
         } else {
             inputs
                 .0
                 .atom_table
-                .get(*atom)
+                .get(atom)
                 .size
-                .saturating_sub(*value as u32) as u64
+                .saturating_sub(value as u32) as u64
         };
         let mut n_desc = 0;
-        if *weak {
+        if weak {
             n_desc |= N_WEAK_DEF;
         }
-        if *no_dead_strip {
+        if no_dead_strip {
             n_desc |= N_NO_DEAD_STRIP;
         }
         let partition = if hidden {
@@ -1731,7 +1830,10 @@ fn build_output_symbols_profiled(
             n_desc,
             n_value,
             size,
-            file_index: file_index_by_input.get(origin).copied().unwrap_or(0),
+            file_index: file_index_by_input.get(&origin).copied().unwrap_or(0),
+            indirect_target: None,
+            export_kind: None,
+            export_flags: 0,
         });
     }
 
@@ -1752,6 +1854,9 @@ fn build_output_symbols_profiled(
             n_value: 0,
             size: 0,
             file_index: 0,
+            indirect_target: None,
+            export_kind: None,
+            export_flags: 0,
         });
     }
     undefineds.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
@@ -1762,14 +1867,11 @@ fn build_output_symbols_profiled(
             .iter()
             .map(|spec| ExportEntry {
                 name: spec.name.clone(),
-                flags: export_symbol_flags(layout, spec.n_desc, spec.n_type, spec.n_sect),
-                kind: export_symbol_kind(
-                    layout,
-                    image_base,
-                    spec.n_type,
-                    spec.n_sect,
-                    spec.n_value,
-                ),
+                flags: export_symbol_flags(layout, spec.n_desc, spec.n_type, spec.n_sect)
+                    | spec.export_flags,
+                kind: spec.export_kind.clone().unwrap_or_else(|| {
+                    export_symbol_kind(layout, image_base, spec.n_type, spec.n_sect, spec.n_value)
+                }),
             })
             .collect()
     } else {
@@ -1787,14 +1889,22 @@ fn build_output_symbols_profiled(
     specs.extend(external_defineds);
     specs.extend(undefineds);
 
-    let (strtab_bytes, strx_by_spec) =
-        StringTableBuilder::build_with_name_offsets(specs.iter().map(|spec| spec.name.as_str()));
+    let mut string_table = StringTableBuilder::new();
+    for spec in &specs {
+        string_table.insert(&spec.name);
+        if let Some(target) = &spec.indirect_target {
+            string_table.insert(target);
+        }
+    }
+    let (strtab_bytes, strx_by_name) = string_table.finish();
 
     let mut symbols = Vec::with_capacity(specs.len());
     let mut symbol_indices = HashMap::with_capacity(specs.len());
     let map_symbols = specs
         .iter()
-        .filter(|spec| spec.partition != OutputSymbolPartition::Undefined)
+        .filter(|spec| {
+            spec.partition != OutputSymbolPartition::Undefined && spec.indirect_target.is_none()
+        })
         .map(|spec| LinkMapSymbol {
             name: spec.name.clone(),
             addr: spec.n_value,
@@ -1803,13 +1913,18 @@ fn build_output_symbols_profiled(
         })
         .collect();
     for (idx, spec) in specs.into_iter().enumerate() {
-        let strx = strx_by_spec[idx];
+        let strx = strx_by_name[&spec.name];
+        let n_value = spec
+            .indirect_target
+            .as_ref()
+            .map(|target| u64::from(strx_by_name[target]))
+            .unwrap_or(spec.n_value);
         symbols.push(InputSymbol::from_raw(RawNlist {
             strx,
             n_type: spec.n_type,
             n_sect: spec.n_sect,
             n_desc: spec.n_desc,
-            n_value: spec.n_value,
+            n_value,
         }));
         if let Some(symbol) = spec.symbol {
             symbol_indices.insert(symbol, idx as u32);
@@ -1876,6 +1991,9 @@ fn collect_synthetic_local_symbols(
         n_value: section.addr + section.synthetic_offset,
         size: 8,
         file_index: 0,
+        indirect_target: None,
+        export_kind: None,
+        export_flags: 0,
     });
     Ok(())
 }
@@ -1925,6 +2043,9 @@ fn collect_local_symbols(
                     n_value: addr,
                     size: ctx.atom_table.get(atom_id).size.saturating_sub(delta) as u64,
                     file_index: ctx.file_index,
+                    indirect_target: None,
+                    export_kind: None,
+                    export_flags: 0,
                 });
             }
             SymKind::Abs => {
@@ -1938,6 +2059,9 @@ fn collect_local_symbols(
                     n_value: input_sym.value(),
                     size: 0,
                     file_index: ctx.file_index,
+                    indirect_target: None,
+                    export_kind: None,
+                    export_flags: 0,
                 });
             }
             SymKind::Undef | SymKind::Indirect => {}

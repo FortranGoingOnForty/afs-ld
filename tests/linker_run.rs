@@ -16,20 +16,26 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
-    BIND_SYMBOL_FLAGS_WEAK_IMPORT, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION,
-    LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS,
-    LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, N_PEXT, REBASE_IMMEDIATE_MASK,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, INDIRECT_SYMBOL_ABS,
+    INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
+    LC_FUNCTION_STARTS, LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, MH_MAGIC_64,
+    MH_OBJECT, N_EXT, N_PEXT, N_SECT, N_UNDF, N_WEAK_REF, REBASE_IMMEDIATE_MASK,
     REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE,
     REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
     REBASE_OPCODE_MASK, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
-    REBASE_TYPE_POINTER, SG_READ_ONLY,
+    REBASE_TYPE_POINTER, SG_READ_ONLY, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS,
+    S_REGULAR,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::{ExportKind, Exports};
-use afs_ld::macho::reader::{parse_commands, parse_header, u32_le, LoadCommand, Section64Header};
+use afs_ld::macho::reader::{
+    parse_commands, parse_header, u32_le, write_header, LoadCommand, MachHeader64, Section64Header,
+    Segment64, SymtabCmd, HEADER_SIZE,
+};
+use afs_ld::reloc::{write_raw_relocs, write_relocs, Referent, Reloc, RelocKind, RelocLength};
 use afs_ld::string_table::StringTable;
-use afs_ld::symbol::{parse_nlist_table, SymKind};
+use afs_ld::symbol::{parse_nlist_table, RawNlist, SymKind, NLIST_SIZE};
 use afs_ld::synth::unwind::decode_unwind_info;
 use afs_ld::{FrameworkSpec, LinkError, LinkOptions, Linker, OutputKind};
 use common::artifacts::workspace_artifact;
@@ -183,6 +189,131 @@ fn compile_dylib_c(src: &str, out: &PathBuf) -> Result<(), String> {
 
 fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-linker-run-{}-{name}", std::process::id()))
+}
+
+fn name16(name: &str) -> [u8; 16] {
+    assert!(name.len() <= 16);
+    let mut out = [0; 16];
+    out[..name.len()].copy_from_slice(name.as_bytes());
+    out
+}
+
+fn synthetic_got_reference_object(entry: &str, target: &str, weak_ref: bool) -> Vec<u8> {
+    let text = [
+        0x00, 0x00, 0x00, 0x90, // adrp x0, target@GOTPAGE
+        0x00, 0x00, 0x40, 0xf9, // ldr x0, [x0, target@GOTPAGEOFF]
+        0x00, 0x00, 0x80, 0x52, // mov w0, #0
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+    let relocs = [
+        Reloc {
+            offset: 0,
+            kind: RelocKind::GotLoadPage21,
+            length: RelocLength::Word,
+            pcrel: true,
+            referent: Referent::Symbol(1),
+            addend: 0,
+            subtrahend: None,
+        },
+        Reloc {
+            offset: 4,
+            kind: RelocKind::GotLoadPageOff12,
+            length: RelocLength::Word,
+            pcrel: false,
+            referent: Referent::Symbol(1),
+            addend: 0,
+            subtrahend: None,
+        },
+    ];
+    let raw_relocs = write_relocs(&relocs).unwrap();
+    let mut reloc_bytes = Vec::new();
+    write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+
+    let mut strings = vec![0];
+    let entry_strx = strings.len() as u32;
+    strings.extend_from_slice(entry.as_bytes());
+    strings.push(0);
+    let target_strx = strings.len() as u32;
+    strings.extend_from_slice(target.as_bytes());
+    strings.push(0);
+    let symbols = [
+        RawNlist {
+            strx: entry_strx,
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: target_strx,
+            n_type: N_UNDF | N_EXT,
+            n_sect: 0,
+            n_desc: if weak_ref { N_WEAK_REF } else { 0 },
+            n_value: 0,
+        },
+    ];
+
+    let mut segment = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: 0,
+        vmsize: text.len() as u64,
+        fileoff: 0,
+        filesize: text.len() as u64,
+        maxprot: 5,
+        initprot: 5,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: 0,
+            size: text.len() as u64,
+            offset: 0,
+            align: 2,
+            reloff: 0,
+            nreloc: raw_relocs.len() as u32,
+            flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    segment.sections[0].reloff = data_offset + text.len() as u32;
+    let symoff = segment.sections[0].reloff + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: 0,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
 }
 
 fn output_section(bytes: &[u8], segname: &str, sectname: &str) -> Option<(u64, Vec<u8>)> {
@@ -2916,6 +3047,155 @@ fn linker_run_promotes_unresolved_symbol_to_dynamic_lookup() {
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
+}
+
+fn assert_flat_got_import(bytes: &[u8], symbol: &str, weak_import: bool) {
+    let bind_records = decode_bind_records(bytes, false).unwrap();
+    assert!(
+        bind_records.iter().any(|record| {
+            record.symbol == symbol
+                && record.ordinal == 0xFFFE
+                && record.weak_import == weak_import
+                && record.segment == "__DATA_CONST"
+                && record.section == "__got"
+        }),
+        "expected flat GOT bind for {symbol} with weak_import={weak_import}, got {bind_records:?}"
+    );
+    let got = output_section_header(bytes, "__DATA_CONST", "__got").unwrap();
+    let got_start = got.offset as usize;
+    let got_bytes = &bytes[got_start..got_start + got.size as usize];
+    assert_eq!(got_bytes, &[0; 8]);
+
+    let symbols = canonical_symbol_record_map(bytes);
+    let imported = symbols.get(symbol).unwrap();
+    assert_eq!(imported.n_type, N_UNDF | N_EXT);
+    assert_eq!(imported.n_sect, 0);
+    assert_eq!(imported.value, 0);
+    assert_eq!(imported.n_desc & N_WEAK_REF != 0, weak_import);
+}
+
+#[test]
+fn linker_run_reports_unresolved_weak_symbol_under_error_policy() {
+    let obj = scratch("missing-weak.o");
+    let out = scratch("missing-weak.out");
+    fs::write(
+        &obj,
+        synthetic_got_reference_object("_main", "_optional", true),
+    )
+    .unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    let err = Linker::run(&opts).unwrap_err();
+    match err {
+        LinkError::UndefinedSymbols(msg) => {
+            assert!(msg.contains("undefined symbol: _optional"), "{msg}");
+        }
+        other => panic!("expected UndefinedSymbols, got {other:?}"),
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_emits_flat_weak_bind_for_permitted_unresolved_reference() {
+    let obj = scratch("missing-weak-dynamic.o");
+    let out = scratch("missing-weak-dynamic.out");
+    fs::write(
+        &obj,
+        synthetic_got_reference_object("_main", "_optional", true),
+    )
+    .unwrap();
+
+    let mut outputs = Vec::new();
+    for jobs in [1, 4] {
+        let opts = LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Executable,
+            undefined_treatment: afs_ld::resolve::UndefinedTreatment::DynamicLookup,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        };
+        Linker::run(&opts).unwrap();
+        outputs.push(fs::read(&out).unwrap());
+    }
+    assert_eq!(outputs[0], outputs[1], "-j1 and -j4 output differs");
+
+    let bytes = &outputs[0];
+    assert_flat_got_import(bytes, "_optional", true);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_emits_required_flat_bind_for_strong_unresolved_reference() {
+    let obj = scratch("missing-strong-dynamic.o");
+    let out = scratch("missing-strong-dynamic.out");
+    let target = "_afs_ld_required_missing_symbol";
+    fs::write(&obj, synthetic_got_reference_object("_main", target, false)).unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        undefined_treatment: afs_ld::resolve::UndefinedTreatment::DynamicLookup,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    assert_flat_got_import(&bytes, target, false);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_mixed_undefined_references_are_required_in_both_orders() {
+    let target = "_afs_ld_mixed_missing_symbol";
+    for weak_first in [false, true] {
+        let order = if weak_first {
+            "weak-first"
+        } else {
+            "strong-first"
+        };
+        let first = scratch(&format!("mixed-{order}-first.o"));
+        let second = scratch(&format!("mixed-{order}-second.o"));
+        let out = scratch(&format!("mixed-{order}.out"));
+        fs::write(
+            &first,
+            synthetic_got_reference_object("_main", target, weak_first),
+        )
+        .unwrap();
+        fs::write(
+            &second,
+            synthetic_got_reference_object("_helper", target, !weak_first),
+        )
+        .unwrap();
+
+        let opts = LinkOptions {
+            inputs: vec![first.clone(), second.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Executable,
+            undefined_treatment: afs_ld::resolve::UndefinedTreatment::DynamicLookup,
+            ..LinkOptions::default()
+        };
+        Linker::run(&opts).unwrap();
+
+        let bytes = fs::read(&out).unwrap();
+        assert_flat_got_import(&bytes, target, false);
+
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
+        let _ = fs::remove_file(out);
+    }
 }
 
 #[test]

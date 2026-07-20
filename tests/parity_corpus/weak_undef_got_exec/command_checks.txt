@@ -1,0 +1,8 @@
+build_version
+load_dylib_names
+symbol_record_map
+symbol_partition_names
+indirect_symbol_identities
+dyld_info_bind
+dyld_info_weak_bind
+dyld_info_lazy_bind

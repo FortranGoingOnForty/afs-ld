@@ -1,0 +1,1 @@
+__TEXT __text 0 load @SECTION:__DATA_CONST,__got

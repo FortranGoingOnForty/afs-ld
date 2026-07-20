@@ -551,7 +551,8 @@ pub enum InsertOutcome {
         from: SymbolKindTag,
         to: SymbolKindTag,
     },
-    /// Existing entry wins; the new one was dropped on the floor.
+    /// Existing entry keeps its identity. Duplicate Undefined entries may
+    /// conservatively merge reference attributes into that slot.
     Kept(SymbolId),
     /// Two Common symbols with the same name were coalesced: size grew to
     /// the max and alignment grew to the stricter of the two.
@@ -726,7 +727,7 @@ impl SymbolTable {
         use SymbolKindTag::*;
         let action = match (existing_kind, new_kind) {
             // --- existing Undefined ---
-            (Undefined, Undefined) => Action::Keep,
+            (Undefined, Undefined) => Action::CoalesceUndefined,
             (Undefined, Defined | Common | DylibImport | LazyObject) => Action::Replace,
             (Undefined, LazyArchive) => Action::ReplaceAndPendingArchiveFetch,
 
@@ -806,6 +807,12 @@ impl SymbolTable {
     ) -> InsertOutcome {
         match action {
             Action::Keep => InsertOutcome::Kept(id),
+            Action::CoalesceUndefined => {
+                self.coalesce_undefined(id, sym);
+                // The slot's identity and origin remain unchanged; only the
+                // aggregate weak-reference attribute may become stricter.
+                InsertOutcome::Kept(id)
+            }
             Action::Replace => {
                 self.symbols[id.0 as usize] = sym;
                 self.transitions.push(Transition {
@@ -866,6 +873,25 @@ impl SymbolTable {
                 InsertOutcome::PendingObjectLoad { id, origin }
             }
         }
+    }
+
+    fn coalesce_undefined(&mut self, id: SymbolId, incoming: Symbol) {
+        let slot = &mut self.symbols[id.0 as usize];
+        let Symbol::Undefined {
+            weak_ref: existing_weak_ref,
+            ..
+        } = slot
+        else {
+            unreachable!("coalesce_undefined requires an Undefined slot");
+        };
+        let Symbol::Undefined {
+            weak_ref: incoming_weak_ref,
+            ..
+        } = incoming
+        else {
+            unreachable!("coalesce_undefined requires an Undefined input");
+        };
+        *existing_weak_ref &= incoming_weak_ref;
     }
 
     fn coalesce_common(&mut self, id: SymbolId, incoming: Symbol) {
@@ -989,6 +1015,7 @@ impl SymbolTable {
 /// performing the operation.
 enum Action {
     Keep,
+    CoalesceUndefined,
     Replace,
     ReplaceAndPendingArchiveFetch,
     CoalesceCommon,
@@ -1738,9 +1765,9 @@ pub enum UndefinedTreatment {
     /// Undefineds are errors. The default, matching Apple `ld`.
     #[default]
     Error,
-    /// Undefineds produce warnings; left in the table as Undefined.
+    /// Undefineds produce warnings and become flat-lookup imports.
     Warning,
-    /// Undefineds are silently accepted; left in the table as Undefined.
+    /// Undefineds are silently accepted as flat-lookup imports.
     Suppress,
     /// Undefineds are promoted to flat-lookup DylibImport entries — dyld
     /// searches every loaded dylib at runtime.
@@ -1761,17 +1788,17 @@ impl DylibId {
 
 #[derive(Debug, Default)]
 pub struct ClassificationReport {
-    /// Strong undefineds that triggered errors under `Error` treatment.
+    /// Undefineds that triggered errors under `Error` treatment.
     pub errors: Vec<Unresolved>,
-    /// Strong undefineds that produced warnings under `Warning` treatment and
+    /// Undefineds that produced warnings under `Warning` treatment and
     /// were promoted to flat-lookup imports for final emission.
     pub warnings: Vec<Unresolved>,
-    /// Strong undefineds that were silently accepted under `Suppress` and
+    /// Undefineds that were silently accepted under `Suppress` and
     /// were promoted to flat-lookup imports for final emission.
     pub suppressed: Vec<Unresolved>,
     /// Undefineds promoted to flat-lookup DylibImport entries.
     pub promoted_to_dynamic: Vec<SymbolId>,
-    /// Weak references that remain unresolved — always accepted.
+    /// References marked weak that had no link-time provider.
     pub weak: Vec<Unresolved>,
 }
 
@@ -1923,19 +1950,25 @@ pub fn format_duplicate_diagnostic(
 }
 
 /// After the fixed-point loop, walk the table and classify every remaining
-/// `Undefined`. Weak references always pass through cleanly.
+/// `Undefined`. Weak references follow the selected unresolved-symbol policy;
+/// permissive policies preserve their weak-import semantics at runtime.
 pub fn classify_unresolved(
     table: &mut SymbolTable,
     treatment: UndefinedTreatment,
 ) -> ClassificationReport {
     let mut report = ClassificationReport::default();
 
-    fn promote_to_flat_lookup(table: &mut SymbolTable, id: SymbolId, name: Istr) {
+    fn promote_to_flat_lookup(
+        table: &mut SymbolTable,
+        id: SymbolId,
+        name: Istr,
+        weak_import: bool,
+    ) {
         table.symbols[id.0 as usize] = Symbol::DylibImport {
             name,
             dylib: DylibId::INVALID,
             ordinal: FLAT_LOOKUP_ORDINAL,
-            weak_import: true,
+            weak_import,
         };
         table.transitions.push(Transition {
             id,
@@ -1957,7 +1990,6 @@ pub fn classify_unresolved(
     for (id, name, weak_ref) in undefs {
         if weak_ref {
             report.weak.push(Unresolved { name, id });
-            continue;
         }
         match treatment {
             UndefinedTreatment::Error => {
@@ -1965,16 +1997,16 @@ pub fn classify_unresolved(
             }
             UndefinedTreatment::Warning => {
                 report.warnings.push(Unresolved { name, id });
-                promote_to_flat_lookup(table, id, name);
+                promote_to_flat_lookup(table, id, name, weak_ref);
                 report.promoted_to_dynamic.push(id);
             }
             UndefinedTreatment::Suppress => {
                 report.suppressed.push(Unresolved { name, id });
-                promote_to_flat_lookup(table, id, name);
+                promote_to_flat_lookup(table, id, name, weak_ref);
                 report.promoted_to_dynamic.push(id);
             }
             UndefinedTreatment::DynamicLookup => {
-                promote_to_flat_lookup(table, id, name);
+                promote_to_flat_lookup(table, id, name, weak_ref);
                 report.promoted_to_dynamic.push(id);
             }
         }
@@ -2832,6 +2864,14 @@ mod tests {
         }
     }
 
+    fn weak_undef(t: &mut SymbolTable, name: &str) -> Symbol {
+        Symbol::Undefined {
+            name: t.intern(name),
+            origin: InputId(0),
+            weak_ref: true,
+        }
+    }
+
     fn defined_strong(t: &mut SymbolTable, name: &str) -> Symbol {
         Symbol::Defined {
             name: t.intern(name),
@@ -2900,6 +2940,103 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unresolved_weak_references_follow_the_requested_policy() {
+        for treatment in [
+            UndefinedTreatment::Error,
+            UndefinedTreatment::Warning,
+            UndefinedTreatment::Suppress,
+            UndefinedTreatment::DynamicLookup,
+        ] {
+            let mut table = SymbolTable::new();
+            let symbol = weak_undef(&mut table, "_optional");
+            let id = match table.insert(symbol).unwrap() {
+                InsertOutcome::Inserted(id) => id,
+                other => panic!("unexpected insert outcome: {other:?}"),
+            };
+
+            let report = classify_unresolved(&mut table, treatment);
+            assert_eq!(
+                report.weak,
+                vec![Unresolved {
+                    name: table.intern("_optional"),
+                    id
+                }]
+            );
+
+            match treatment {
+                UndefinedTreatment::Error => {
+                    assert_eq!(report.errors.len(), 1);
+                    assert!(report.promoted_to_dynamic.is_empty());
+                    assert!(matches!(
+                        table.get(id),
+                        Symbol::Undefined { weak_ref: true, .. }
+                    ));
+                }
+                UndefinedTreatment::Warning => {
+                    assert_eq!(report.warnings.len(), 1);
+                    assert_eq!(report.promoted_to_dynamic, vec![id]);
+                    assert!(matches!(
+                        table.get(id),
+                        Symbol::DylibImport {
+                            dylib: DylibId::INVALID,
+                            ordinal: FLAT_LOOKUP_ORDINAL,
+                            weak_import: true,
+                            ..
+                        }
+                    ));
+                }
+                UndefinedTreatment::Suppress => {
+                    assert_eq!(report.suppressed.len(), 1);
+                    assert_eq!(report.promoted_to_dynamic, vec![id]);
+                    assert!(matches!(
+                        table.get(id),
+                        Symbol::DylibImport {
+                            dylib: DylibId::INVALID,
+                            ordinal: FLAT_LOOKUP_ORDINAL,
+                            weak_import: true,
+                            ..
+                        }
+                    ));
+                }
+                UndefinedTreatment::DynamicLookup => {
+                    assert_eq!(report.promoted_to_dynamic, vec![id]);
+                    assert!(matches!(
+                        table.get(id),
+                        Symbol::DylibImport {
+                            dylib: DylibId::INVALID,
+                            ordinal: FLAT_LOOKUP_ORDINAL,
+                            weak_import: true,
+                            ..
+                        }
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_lookup_keeps_strong_references_required_at_runtime() {
+        let mut table = SymbolTable::new();
+        let symbol = undef(&mut table, "_required");
+        let id = match table.insert(symbol).unwrap() {
+            InsertOutcome::Inserted(id) => id,
+            other => panic!("unexpected insert outcome: {other:?}"),
+        };
+
+        let report = classify_unresolved(&mut table, UndefinedTreatment::DynamicLookup);
+        assert_eq!(report.promoted_to_dynamic, vec![id]);
+        assert!(matches!(
+            table.get(id),
+            Symbol::DylibImport {
+                dylib: DylibId::INVALID,
+                ordinal: FLAT_LOOKUP_ORDINAL,
+                weak_import: false,
+                ..
+            }
+        ));
+    }
+
     // ---- vacant-slot insertions ----
 
     #[test]
@@ -2927,6 +3064,44 @@ mod tests {
         t.insert(a).unwrap();
         let out = t.insert(b).unwrap();
         assert!(matches!(out, InsertOutcome::Kept(_)));
+    }
+
+    #[test]
+    fn mixed_undefined_references_are_strong_in_both_orders() {
+        for weak_first in [false, true] {
+            let mut table = SymbolTable::new();
+            let first = if weak_first {
+                weak_undef(&mut table, "_required")
+            } else {
+                undef(&mut table, "_required")
+            };
+            let second = if weak_first {
+                undef(&mut table, "_required")
+            } else {
+                weak_undef(&mut table, "_required")
+            };
+            let id = match table.insert(first).unwrap() {
+                InsertOutcome::Inserted(id) => id,
+                other => panic!("unexpected insert outcome: {other:?}"),
+            };
+            assert!(matches!(table.insert(second), Ok(InsertOutcome::Kept(_))));
+            assert!(matches!(
+                table.get(id),
+                Symbol::Undefined {
+                    weak_ref: false,
+                    ..
+                }
+            ));
+
+            classify_unresolved(&mut table, UndefinedTreatment::DynamicLookup);
+            assert!(matches!(
+                table.get(id),
+                Symbol::DylibImport {
+                    weak_import: false,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]

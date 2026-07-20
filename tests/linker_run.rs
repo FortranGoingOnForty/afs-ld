@@ -27,8 +27,8 @@ use afs_ld::macho::constants::{
     REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB, REBASE_OPCODE_MASK,
     REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM, REBASE_TYPE_POINTER,
-    SECTION_TYPE_MASK, SG_READ_ONLY, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_REGULAR,
-    S_ZEROFILL,
+    SECTION_TYPE_MASK, SG_READ_ONLY, S_ATTR_DEBUG, S_ATTR_PURE_INSTRUCTIONS,
+    S_ATTR_SOME_INSTRUCTIONS, S_REGULAR, S_ZEROFILL,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::{ExportKind, Exports};
@@ -448,7 +448,11 @@ fn synthetic_data_reference_object(
     bytes
 }
 
-fn synthetic_custom_segment_rebase_object(pointer_section: &str) -> Vec<u8> {
+fn synthetic_segment_rebase_object(
+    pointer_segment: &str,
+    pointer_section: &str,
+    pointer_flags: u32,
+) -> Vec<u8> {
     let text = [
         0x00, 0x00, 0x80, 0x52, // mov w0, #0
         0xc0, 0x03, 0x5f, 0xd6, // ret
@@ -525,14 +529,14 @@ fn synthetic_custom_segment_rebase_object(pointer_section: &str) -> Vec<u8> {
             },
             Section64Header {
                 sectname: name16(pointer_section),
-                segname: name16("__CUSTOM"),
+                segname: name16(pointer_segment),
                 addr: 8,
                 size: pointer.len() as u64,
                 offset: 0,
                 align: 3,
                 reloff: 0,
                 nreloc: raw_relocs.len() as u32,
-                flags: S_REGULAR,
+                flags: pointer_flags,
                 reserved1: 0,
                 reserved2: 0,
                 reserved3: 0,
@@ -5428,7 +5432,7 @@ fn linker_run_rebases_local_pointers_in_custom_segments() {
         let out = scratch(&format!("custom-segment-{pointer_section}-synthetic.out"));
         fs::write(
             &obj,
-            synthetic_custom_segment_rebase_object(pointer_section),
+            synthetic_segment_rebase_object("__CUSTOM", pointer_section, S_REGULAR),
         )
         .unwrap();
 
@@ -5463,6 +5467,41 @@ fn linker_run_rebases_local_pointers_in_custom_segments() {
         let _ = fs::remove_file(obj);
         let _ = fs::remove_file(out);
     }
+}
+
+#[test]
+fn linker_run_omits_debug_section_rebases() {
+    let obj = scratch("debug-section-rebase-synthetic.o");
+    let out = scratch("debug-section-rebase-synthetic.out");
+    fs::write(
+        &obj,
+        synthetic_segment_rebase_object("__DWARF", "__debug_info", S_REGULAR | S_ATTR_DEBUG),
+    )
+    .unwrap();
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        entry: Some("_main".into()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (target_addr, _) = output_section(&bytes, "__DATA", "__data").unwrap();
+    let (_, debug_info) = output_section(&bytes, "__DWARF", "__debug_info").unwrap();
+    assert_eq!(
+        u64::from_le_bytes(debug_info.try_into().unwrap()),
+        target_addr
+    );
+    assert!(
+        decode_rebase_records(&bytes).unwrap().is_empty(),
+        "debug relocation sites must not become runtime rebase records"
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
 }
 
 #[test]

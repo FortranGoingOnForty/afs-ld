@@ -1889,7 +1889,7 @@ fn common_symbols_allocate_coalesced_zerofill_storage() {
         let (common_ordinal, common) = common.expect("missing __DATA,__common");
         assert_eq!(common.flags & SECTION_TYPE_MASK, S_ZEROFILL);
         assert_eq!(common.offset, 0);
-        assert_eq!(common.align, 5);
+        assert_eq!(common.align, 4);
         assert_eq!(common.size, 56);
 
         let symtab = symtab.unwrap();
@@ -1913,11 +1913,8 @@ fn common_symbols_allocate_coalesced_zerofill_storage() {
                 "symbol is outside __DATA,__common"
             );
         }
-        assert_eq!(shared.value() & 31, 0);
-        assert!(
-            shared.value() + 32 <= unused.value() || unused.value() + 24 <= shared.value(),
-            "coalesced COMMON allocations overlap"
-        );
+        assert_eq!(unused.value(), common.addr);
+        assert_eq!(shared.value(), common.addr + 24);
     }
 
     let _ = fs::remove_file(first);

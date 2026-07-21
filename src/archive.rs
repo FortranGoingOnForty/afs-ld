@@ -461,6 +461,16 @@ impl<'a> Archive<'a> {
             .filter(|m| m.special == SpecialMember::None)
     }
 
+    /// Load one ordinary member's bytes without imposing an object format.
+    /// Regular archives borrow from the archive image; thin archives read
+    /// the external member on demand.
+    pub fn member_bytes<'m>(
+        &'m self,
+        member: &'m Member<'a>,
+    ) -> Result<Cow<'m, [u8]>, MemberLoadError> {
+        self.load_member(member).map(|loaded| loaded.bytes)
+    }
+
     /// Find the first member whose `ar_hdr` begins at `header_offset`. The
     /// symbol-index's `member_header_offset` fields feed into this lookup.
     pub fn member_at_offset(&self, header_offset: u64) -> Option<&Member<'a>> {

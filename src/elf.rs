@@ -743,6 +743,27 @@ struct OutSec {
     is_bss: bool,
 }
 
+type OutputSectionIndex = HashMap<(String, u64), usize>;
+
+fn validate_special_output_section_flags(
+    outs: &[OutSec],
+    object: &str,
+    section: &Section,
+) -> Result<(), ElfError> {
+    if section.name != ".eh_frame" {
+        return Ok(());
+    }
+    if let Some(existing) = outs.iter().find(|output| output.name == section.name) {
+        if existing.flags != section.sh_flags {
+            return err(format!(
+                "{}: section '.eh_frame' has flags {:#x}, conflicting with {:#x}",
+                object, section.sh_flags, existing.flags
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn output_section_type(section: &OutSec) -> u32 {
     if section.is_bss {
         return SHT_NOBITS;
@@ -1208,9 +1229,10 @@ fn resolve_defined_identity(
 
 fn ensure_common_bss(
     outs: &mut Vec<OutSec>,
-    out_index: &mut HashMap<String, usize>,
+    out_index: &mut OutputSectionIndex,
 ) -> Result<usize, ElfError> {
-    if let Some(&idx) = out_index.get(".bss") {
+    let key = (".bss".to_string(), SHF_ALLOC | SHF_WRITE);
+    if let Some(&idx) = out_index.get(&key) {
         if !outs[idx].is_bss {
             return err("section '.bss' is PROGBITS but COMMON allocation needs NOBITS .bss");
         }
@@ -1227,7 +1249,7 @@ fn ensure_common_bss(
         is_bss: true,
     });
     let idx = outs.len() - 1;
-    out_index.insert(".bss".to_string(), idx);
+    out_index.insert(key, idx);
     Ok(idx)
 }
 
@@ -1235,7 +1257,7 @@ fn place_common_symbols(
     objects: &[ElfObject],
     globals: &HashMap<String, (usize, usize)>,
     outs: &mut Vec<OutSec>,
-    out_index: &mut HashMap<String, usize>,
+    out_index: &mut OutputSectionIndex,
 ) -> Result<CommonPlacement, ElfError> {
     let mut common_place = HashMap::new();
     let mut allocated = HashSet::new();
@@ -2112,7 +2134,7 @@ pub fn link_static_exec(
     // ---- Merge input sections by (name, flags) in first-seen order,
     // ranked text / rodata / data / bss for segment assignment.
     let mut outs: Vec<OutSec> = Vec::new();
-    let mut out_index: HashMap<String, usize> = HashMap::new();
+    let mut out_index = OutputSectionIndex::new();
     let mut place: Placement = HashMap::new();
 
     for (oi, obj) in objects.iter().enumerate() {
@@ -2127,8 +2149,9 @@ pub fn link_static_exec(
             if array_kind(&sec.name).is_some() {
                 continue;
             }
+            validate_special_output_section_flags(&outs, &obj.name, sec)?;
             let is_bss = sec.sh_type == SHT_NOBITS;
-            let key = sec.name.clone();
+            let key = (sec.name.clone(), sec.sh_flags);
             let idx = *out_index.entry(key).or_insert_with(|| {
                 outs.push(OutSec {
                     name: sec.name.clone(),
@@ -2902,9 +2925,12 @@ pub fn link_static_exec(
         PAGE,
     ));
     if rw_pos < order.len() {
+        let rw_exec = order[rw_pos..]
+            .iter()
+            .any(|&i| outs[i].flags & SHF_EXECINSTR != 0);
         ph.extend(phdr(
             PT_LOAD,
-            PF_R | PF_W,
+            PF_R | PF_W | if rw_exec { PF_X } else { 0 },
             rw_file_start,
             rw_vaddr_start,
             rw_file_end - rw_file_start,
@@ -3330,15 +3356,17 @@ pub fn link_dynamic_exec(
     // merge priority-ordered in a separate pass so their bracket symbols
     // cover every contribution. TLS sections form the PT_TLS template.
     let mut outs: Vec<OutSec> = Vec::new();
-    let mut out_index: HashMap<String, usize> = HashMap::new();
+    let mut out_index = OutputSectionIndex::new();
     let mut place: Placement = HashMap::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
             if sec.sh_flags & SHF_TLS != 0 || array_kind(&sec.name).is_some() {
                 continue;
             }
+            validate_special_output_section_flags(&outs, &obj.name, sec)?;
             let is_bss = sec.sh_type == SHT_NOBITS;
-            let idx = *out_index.entry(sec.name.clone()).or_insert_with(|| {
+            let key = (sec.name.clone(), sec.sh_flags);
+            let idx = *out_index.entry(key).or_insert_with(|| {
                 outs.push(OutSec {
                     name: sec.name.clone(),
                     flags: sec.sh_flags,
@@ -3955,7 +3983,7 @@ pub fn link_dynamic_exec(
     fo = next_multiple(ro_end_fo, PAGE);
     // Keep file offset congruent to vaddr mod PAGE.
     let text_order: Vec<usize> = (0..outs.len())
-        .filter(|&i| outs[i].flags & SHF_EXECINSTR != 0)
+        .filter(|&i| outs[i].flags & SHF_EXECINSTR != 0 && outs[i].flags & SHF_WRITE == 0)
         .collect();
     let rx_start_v = v;
     let rx_start_fo = fo;
@@ -4003,6 +4031,9 @@ pub fn link_dynamic_exec(
         v = outs[i].vaddr + outs[i].bss_size;
     }
     let rw_mem_end_v = v;
+    let rw_exec = outs
+        .iter()
+        .any(|output| output.flags & (SHF_WRITE | SHF_EXECINSTR) == (SHF_WRITE | SHF_EXECINSTR));
     let rw_file_end = rw_file_end
         .max(got_fo + got_size)
         .max(gotplt_fo + gotplt_size)
@@ -4480,7 +4511,7 @@ pub fn link_dynamic_exec(
     );
     phdr(
         PT_LOAD,
-        PF_R | PF_W,
+        PF_R | PF_W | if rw_exec { PF_X } else { 0 },
         rw_start_fo,
         rw_start_v,
         rw_file_end - rw_start_fo,
@@ -5173,6 +5204,73 @@ mod resolve_globals_tests {
         for _ in 0..64 {
             assert_eq!(resolve_globals(&build()).unwrap()["foo"], (0, 0));
         }
+    }
+}
+
+#[cfg(test)]
+mod output_section_tests {
+    use super::*;
+
+    fn section(name: &str, flags: u64, data: Vec<u8>) -> Section {
+        Section {
+            name: name.to_string(),
+            sh_type: SHT_PROGBITS,
+            sh_flags: flags,
+            sh_addralign: 1,
+            data,
+            nobits_size: 0,
+            relas: Vec::new(),
+        }
+    }
+
+    fn objects_with_conflicting_eh_frame_flags() -> Vec<ElfObject> {
+        vec![
+            ElfObject {
+                name: "first.o".to_string(),
+                sections: vec![
+                    section(".text", SHF_ALLOC | SHF_EXECINSTR, vec![0xc3]),
+                    section(".eh_frame", SHF_ALLOC, vec![0, 0, 0, 0]),
+                ],
+                symbols: vec![Symbol {
+                    name: "_start".to_string(),
+                    bind: STB_GLOBAL,
+                    typ: STT_FUNC,
+                    shndx: 1,
+                    section: Some(0),
+                    value: 0,
+                    size: 1,
+                }],
+            },
+            ElfObject {
+                name: "second.o".to_string(),
+                sections: vec![section(
+                    ".eh_frame",
+                    SHF_ALLOC | SHF_WRITE,
+                    vec![0, 0, 0, 0],
+                )],
+                symbols: Vec::new(),
+            },
+        ]
+    }
+
+    #[test]
+    fn conflicting_eh_frame_flags_are_rejected_by_both_writers() {
+        let static_error =
+            link_static_exec(&objects_with_conflicting_eh_frame_flags(), "_start", true)
+                .unwrap_err();
+        assert!(static_error
+            .to_string()
+            .contains("second.o: section '.eh_frame' has flags 0x3, conflicting with 0x2"));
+
+        let dynamic_error = link_dynamic_exec(
+            &objects_with_conflicting_eh_frame_flags(),
+            &[],
+            "_start",
+            "/unused/interp",
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(dynamic_error.to_string(), static_error.to_string());
     }
 }
 

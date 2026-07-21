@@ -231,6 +231,117 @@ fn common_symbols_allocate_zeroed_bss_in_static_and_dynamic_links() {
 }
 
 #[test]
+fn same_named_sections_preserve_distinct_flags_in_static_and_dynamic_links() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=same_named_sections_preserve_distinct_flags_in_static_and_dynamic_links count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_section_flags_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    let read_only_obj = dir.join("read-only.o");
+    assemble(
+        &gas,
+        ".section .same,\"a\",@progbits\n.byte 0\n",
+        &dir.join("read-only.s"),
+        &read_only_obj,
+    );
+    let writable_obj = dir.join("writable.o");
+    assemble(
+        &gas,
+        ".section .same,\"aw\",@progbits\n\
+             .globl cell\n\
+             .type cell,@object\n\
+             cell: .long 0\n\
+             .size cell,.-cell\n",
+        &dir.join("writable.s"),
+        &writable_obj,
+    );
+    let executable_obj = dir.join("executable.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n\
+             .globl _start\n\
+             .type _start,@function\n\
+             _start:\n\
+                 call mixed_code\n\
+                 movl %eax,%edi\n\
+                 movl ${exit_nr},%eax\n\
+                 syscall\n\
+             .size _start,.-_start\n\
+             .section .same,\"awx\",@progbits\n\
+             .globl mixed_code\n\
+             .type mixed_code,@function\n\
+             mixed_code:\n\
+                 movl $42,cell(%rip)\n\
+                 movl $17,wx_cell(%rip)\n\
+                 movl cell(%rip),%eax\n\
+                 addl wx_cell(%rip),%eax\n\
+                 subl $17,%eax\n\
+                 ret\n\
+             .size mixed_code,.-mixed_code\n\
+             .p2align 2\n\
+             wx_cell: .long 0\n"
+        ),
+        &dir.join("executable.s"),
+        &executable_obj,
+    );
+
+    let link = |name: &str, dynamic_linker: Option<&str>| {
+        let output = dir.join(name);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_afs-ld"));
+        if let Some(interp) = dynamic_linker {
+            command.args(["--dynamic-linker", interp]);
+        }
+        let result = command
+            .arg("-o")
+            .arg(&output)
+            .arg(&read_only_obj)
+            .arg(&writable_obj)
+            .arg(&executable_obj)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "afs-ld {name}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        output
+    };
+
+    let mut modes = vec![("static", None)];
+    if let Some(interp) = rtld() {
+        modes.push(("dynamic", Some(interp)));
+    } else {
+        eprintln!("skipping dynamic section-flags leg: no standard dynamic loader on this host");
+    }
+
+    for (name, interp) in modes {
+        let output = link(name, interp);
+        let image = std::fs::read(&output).unwrap();
+        let mut flags = section_flags(&image, ".same");
+        flags.sort_unstable();
+        assert_eq!(
+            flags,
+            [0x2, 0x3, 0x7],
+            "{name} output must retain each .same contribution's flags"
+        );
+        assert_eq!(
+            Command::new(&output).output().unwrap().status.code(),
+            Some(42),
+            "{name} output must preserve writable and executable mappings"
+        );
+
+        let repeated = link(&format!("{name}-again"), interp);
+        assert_eq!(image, std::fs::read(repeated).unwrap());
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn static_ehdr_start_resolves_to_image_base() {
     let Some(gas) = gas() else {
         eprintln!("\nHARNESS_SKIP suite=elf_link_run test=static_ehdr_start_resolves_to_image_base count=1 reason=\"no GNU assembler on this host\"");
@@ -2852,6 +2963,27 @@ fn section_header_info(img: &[u8], name: &str) -> Option<(u16, u32, u64, u64, u6
         }
     }
     None
+}
+
+fn section_flags(img: &[u8], name: &str) -> Vec<u64> {
+    let rd16 = |o: usize| u16::from_le_bytes(img[o..o + 2].try_into().unwrap());
+    let rd32 = |o: usize| u32::from_le_bytes(img[o..o + 4].try_into().unwrap());
+    let rd64 = |o: usize| u64::from_le_bytes(img[o..o + 8].try_into().unwrap());
+    let shoff = rd64(40) as usize;
+    let shentsize = rd16(58) as usize;
+    let shnum = rd16(60) as usize;
+    let shstrndx = rd16(62) as usize;
+    let shstr_off = rd64(shoff + shstrndx * shentsize + 24) as usize;
+    let mut flags = Vec::new();
+    for i in 0..shnum {
+        let sh = shoff + i * shentsize;
+        let noff = shstr_off + rd32(sh) as usize;
+        let end = img[noff..].iter().position(|&b| b == 0).unwrap();
+        if &img[noff..noff + end] == name.as_bytes() {
+            flags.push(rd64(sh + 8));
+        }
+    }
+    flags
 }
 
 /// The `sh_addr` of a named ELF64 section, or None.

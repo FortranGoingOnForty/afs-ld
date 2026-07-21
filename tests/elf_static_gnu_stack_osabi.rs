@@ -7,6 +7,9 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
 
 fn gas() -> Option<PathBuf> {
     let cands: &[&str] = if cfg!(target_os = "freebsd") {
@@ -43,6 +46,48 @@ const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 
+fn temp_dir(label: &str) -> PathBuf {
+    let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "afs_ld_gnustack_{}_{}_{}",
+        std::process::id(),
+        label,
+        id
+    ))
+}
+
+fn assemble(gas: &PathBuf, dir: &std::path::Path, name: &str, source: &str) -> PathBuf {
+    let asm = dir.join(format!("{name}.s"));
+    let object = dir.join(format!("{name}.o"));
+    std::fs::write(&asm, source).expect("write assembly fixture");
+    let output = Command::new(gas)
+        .args(["--64", "-o"])
+        .arg(&object)
+        .arg(&asm)
+        .output()
+        .expect("run GNU assembler");
+    assert!(
+        output.status.success(),
+        "gas: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    object
+}
+
+fn gnu_stack_flags(elf: &[u8]) -> u32 {
+    let phoff = ru64(elf, 32) as usize;
+    let phentsize = ru16(elf, 54) as usize;
+    let phnum = ru16(elf, 56) as usize;
+    let flags: Vec<u32> = (0..phnum)
+        .filter_map(|index| {
+            let header = phoff + index * phentsize;
+            (ru32(elf, header) == PT_GNU_STACK).then(|| ru32(elf, header + 4))
+        })
+        .collect();
+    assert_eq!(flags.len(), 1, "expected exactly one PT_GNU_STACK");
+    flags[0]
+}
+
 /// The OSABI the output should carry: FreeBSD (9) on a FreeBSD host (the
 /// FreeBSD rtld is present even under the linuxulator), else SysV (0). This
 /// mirrors the linker's own runtime probe, so the test asserts the same
@@ -61,27 +106,14 @@ fn static_exe_has_nonexec_gnu_stack_and_host_osabi() {
         eprintln!("\nHARNESS_SKIP suite=elf_static_gnu_stack_osabi test=static_exe_has_nonexec_gnu_stack_and_host_osabi count=1 reason=\"no GNU assembler on this host\"");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("afs_ld_gnustack_{}", std::process::id()));
+    let dir = temp_dir("default");
     std::fs::create_dir_all(&dir).unwrap();
 
     let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
     let asm = format!(
         ".text\n.globl _start\n.type _start,@function\n_start:\n    movl $42, %edi\n    movl ${exit_nr}, %eax\n    syscall\n.size _start,.-_start\n"
     );
-    let s = dir.join("x.s");
-    let obj = dir.join("x.o");
-    std::fs::write(&s, asm).unwrap();
-    let out = Command::new(&gas)
-        .args(["--64", "-o"])
-        .arg(&obj)
-        .arg(&s)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "gas: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let obj = assemble(&gas, &dir, "x", &asm);
 
     let bin = dir.join("x_afsld");
     let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
@@ -107,35 +139,80 @@ fn static_exe_has_nonexec_gnu_stack_and_host_osabi() {
     );
 
     // Exactly one PT_GNU_STACK, RW and never executable.
-    let phoff = ru64(&elf, 32) as usize;
-    let phentsize = ru16(&elf, 54) as usize;
-    let phnum = ru16(&elf, 56) as usize;
-    let mut gnu_stack = 0;
-    for i in 0..phnum {
-        let p = phoff + i * phentsize;
-        if ru32(&elf, p) == PT_GNU_STACK {
-            gnu_stack += 1;
-            let flags = ru32(&elf, p + 4);
-            assert_eq!(
-                flags & PF_X,
-                0,
-                "PT_GNU_STACK must not be executable (flags={flags:#x})"
-            );
-            assert_eq!(
-                flags,
-                PF_R | PF_W,
-                "PT_GNU_STACK should be RW (flags={flags:#x})"
-            );
-        }
-    }
+    let flags = gnu_stack_flags(&elf);
     assert_eq!(
-        gnu_stack, 1,
-        "static exe must carry exactly one PT_GNU_STACK marker"
+        flags & PF_X,
+        0,
+        "PT_GNU_STACK must not be executable (flags={flags:#x})"
+    );
+    assert_eq!(
+        flags,
+        PF_R | PF_W,
+        "PT_GNU_STACK should be RW (flags={flags:#x})"
     );
 
     // Adding the marker phdr must not have disturbed the layout: it still runs.
     let run = Command::new(&bin).status().unwrap();
     assert_eq!(run.code(), Some(42), "static exe should still exit 42");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn executable_stack_requests_are_aggregated_across_objects() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_static_gnu_stack_osabi test=executable_stack_requests_are_aggregated_across_objects count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = temp_dir("aggregate");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let safe = assemble(
+        &gas,
+        &dir,
+        "safe",
+        ".text\n.globl _start\n.type _start,@function\n_start:\n    ret\n.size _start,.-_start\n.section .note.GNU-stack,\"\",@progbits\n",
+    );
+    let executable = assemble(
+        &gas,
+        &dir,
+        "executable",
+        ".text\n.globl helper\n.type helper,@function\nhelper:\n    ret\n.size helper,.-helper\n.section .note.GNU-stack,\"x\",@progbits\n",
+    );
+
+    let cases = [
+        ("safe", vec![safe.clone()], PF_R | PF_W),
+        (
+            "exec_last",
+            vec![safe.clone(), executable.clone()],
+            PF_R | PF_W | PF_X,
+        ),
+        ("exec_first", vec![executable, safe], PF_R | PF_W | PF_X),
+    ];
+    for (case, objects, expected_flags) in cases {
+        for dynamic in [false, true] {
+            let mode = if dynamic { "dynamic" } else { "static" };
+            let output = dir.join(format!("{case}_{mode}"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_afs-ld"));
+            command.arg("-o").arg(&output);
+            if dynamic {
+                command.args(["--dynamic-linker", "/nonexistent/ld.so"]);
+            }
+            command.args(&objects);
+            let result = command.output().expect("run afs-ld");
+            assert!(
+                result.status.success(),
+                "{case} {mode}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let elf = std::fs::read(&output).expect("read linked ELF");
+            assert_eq!(
+                gnu_stack_flags(&elf),
+                expected_flags,
+                "{case} {mode} stack flags"
+            );
+        }
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

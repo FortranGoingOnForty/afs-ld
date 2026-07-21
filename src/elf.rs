@@ -259,6 +259,8 @@ pub struct ElfObject {
     pub name: String,
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
+    /// An executable `.note.GNU-stack` requests PF_X on PT_GNU_STACK.
+    pub requires_executable_stack: bool,
 }
 
 fn ru16(b: &[u8], off: usize) -> u16 {
@@ -379,6 +381,9 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
             entsize: ru64(h, 56) as usize,
         });
     }
+    let requires_executable_stack = raws
+        .iter()
+        .any(|raw| raw.name == ".note.GNU-stack" && raw.flags & SHF_EXECINSTR != 0);
 
     // Keep ALLOC PROGBITS/NOBITS sections; remap indices.
     let mut sections = Vec::new();
@@ -564,6 +569,7 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
         name: name.to_string(),
         sections,
         symbols,
+        requires_executable_stack,
     })
 }
 
@@ -1538,6 +1544,18 @@ fn validate_object_relocations(objects: &[ElfObject]) -> Result<(), ElfError> {
         }
     }
     Ok(())
+}
+
+fn gnu_stack_flags(objects: &[ElfObject]) -> u32 {
+    PF_R | PF_W
+        | if objects
+            .iter()
+            .any(|object| object.requires_executable_stack)
+        {
+            PF_X
+        } else {
+            0
+        }
 }
 
 fn parse_eh_frame_gc(section: &Section, object: &str) -> Result<EhFrameGc, ElfError> {
@@ -2648,9 +2666,8 @@ pub fn link_static_exec(
     // behavioral parity.)
     let ehsize = 64u64;
     // 2 PT_LOAD + PT_GNU_STACK marker, plus PT_TLS / PT_GNU_EH_FRAME when
-    // present. PT_GNU_STACK (non-exec) is required so Linux does not fall
-    // back to READ_IMPLIES_EXEC and grant an executable stack (audit L9);
-    // the dynamic path already emits it.
+    // present. PT_GNU_STACK is required so Linux does not fall back to
+    // READ_IMPLIES_EXEC; its PF_X bit aggregates explicit input requests.
     let phnum = 3u64 + if has_tls { 1 } else { 0 } + if eh_hdr_idx.is_some() { 1 } else { 0 };
     let phsize = 56 * phnum;
     let mut cursor_file = ehsize + phsize;
@@ -3121,9 +3138,9 @@ pub fn link_static_exec(
             4,
         ));
     }
-    // Non-executable stack marker (RW, no PF_X). Its absence makes Linux
-    // grant an executable stack via READ_IMPLIES_EXEC.
-    ph.extend(phdr(PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0));
+    // Missing notes keep the secure non-executable default; an executable
+    // `.note.GNU-stack` in any selected input requests PF_X.
+    ph.extend(phdr(PT_GNU_STACK, gnu_stack_flags(objects), 0, 0, 0, 0, 0));
     image[64..64 + ph.len()].copy_from_slice(&ph);
 
     // Section bytes.
@@ -4700,7 +4717,7 @@ pub fn link_dynamic_exec(
         let len = eh_hdr_bytes.len() as u64;
         phdr(PT_GNU_EH_FRAME, PF_R, hfo, hv, len, len, 4);
     }
-    phdr(PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0);
+    phdr(PT_GNU_STACK, gnu_stack_flags(objects), 0, 0, 0, 0, 0);
     image[64..64 + ph.len()].copy_from_slice(&ph);
 
     // Write metadata sections.
@@ -5265,6 +5282,7 @@ mod resolve_globals_tests {
             name: name.to_string(),
             sections: Vec::new(),
             symbols,
+            requires_executable_stack: false,
         }
     }
 
@@ -5397,6 +5415,7 @@ mod output_section_tests {
                     value: 0,
                     size: 1,
                 }],
+                requires_executable_stack: false,
             },
             ElfObject {
                 name: "second.o".to_string(),
@@ -5406,6 +5425,7 @@ mod output_section_tests {
                     vec![0, 0, 0, 0],
                 )],
                 symbols: Vec::new(),
+                requires_executable_stack: false,
             },
         ]
     }
@@ -5564,6 +5584,7 @@ mod eh_frame_hdr_tests {
                 value: 0,
                 size: 1,
             }],
+            requires_executable_stack: false,
         };
         let error = analyze_gc_sections(&[object], "_start", &[])
             .err()

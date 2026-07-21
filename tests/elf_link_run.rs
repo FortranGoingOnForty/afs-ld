@@ -311,6 +311,269 @@ fn elf_mode_rejects_unsupported_flags_loudly() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn gc_sections_discards_unreachable_static_sections() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=gc_sections_discards_unreachable_static_sections count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_gc_static_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let obj = dir.join("gc.o");
+    assemble(
+        &gas,
+        &format!(
+            ".section .text._start,\"ax\",@progbits\n\
+             .globl _start\n\
+             .type _start,@function\n\
+             _start:\n\
+                 .cfi_startproc\n\
+                 call live\n\
+                 movl %eax, %edi\n\
+                 movl ${exit_nr}, %eax\n\
+                 syscall\n\
+                 .cfi_endproc\n\
+             .section .text.dead,\"ax\",@progbits\n\
+             .type dead,@function\n\
+             dead:\n\
+                 .cfi_startproc\n\
+                 movl dead_data(%rip), %eax\n\
+                 ret\n\
+                 .cfi_endproc\n\
+             .section .rodata.dead,\"a\",@progbits\n\
+             dead_data: .asciz \"GC_DEAD_STATIC\"\n\
+             .section .text.live,\"ax\",@progbits\n\
+             .type live,@function\n\
+             live:\n\
+                 .cfi_startproc\n\
+                 movl live_data(%rip), %eax\n\
+                 ret\n\
+                 .cfi_endproc\n\
+             .section .rodata.live,\"a\",@progbits\n\
+             live_data: .long 42\n"
+        ),
+        &dir.join("gc.s"),
+        &obj,
+    );
+
+    let baseline = dir.join("baseline");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--gc-sections", "--no-gc-sections", "-o"])
+        .arg(&baseline)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "baseline static link: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let baseline_image = std::fs::read(&baseline).unwrap();
+    assert!(section_info(&baseline_image, ".text.dead").is_some());
+    assert!(section_info(&baseline_image, ".rodata.dead").is_some());
+
+    let collected = dir.join("collected");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--gc-sections", "--eh-frame-hdr", "-o"])
+        .arg(&collected)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "GC static link: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let collected_image = std::fs::read(&collected).unwrap();
+    for section in [".text._start", ".text.live", ".rodata.live"] {
+        assert!(
+            section_info(&collected_image, section).is_some(),
+            "live section {section} was discarded"
+        );
+    }
+    assert!(section_info(&collected_image, ".eh_frame").is_some());
+    let (header_offset, _, header_size) = find_phdr(&collected_image, 0x6474_e550)
+        .expect("GC must retain unwind metadata for live functions");
+    let header = &collected_image[header_offset as usize..(header_offset + header_size) as usize];
+    assert_eq!(
+        u32::from_le_bytes(header[8..12].try_into().unwrap()),
+        2,
+        "only _start and live should retain FDEs"
+    );
+    for section in [".text.dead", ".rodata.dead"] {
+        assert!(
+            section_info(&collected_image, section).is_none(),
+            "unreachable section {section} survived"
+        );
+    }
+    assert_eq!(
+        Command::new(&baseline).output().unwrap().status.code(),
+        Some(42)
+    );
+    assert_eq!(
+        Command::new(&collected).output().unwrap().status.code(),
+        Some(42)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gc_sections_removes_dead_dynamic_import() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=gc_sections_removes_dead_dynamic_import count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let Some(ld) = system_ld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=gc_sections_removes_dead_dynamic_import count=1 reason=\"no system ld to build the reference .so\"");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=gc_sections_removes_dead_dynamic_import count=1 reason=\"no standard dynamic loader on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_gc_dynamic_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    let live_obj = dir.join("live-import.o");
+    assemble(
+        &gas,
+        ".text\n.globl live_import\n.type live_import,@function\nlive_import:\n    movl $42, %eax\n    ret\n",
+        &dir.join("live-import.s"),
+        &live_obj,
+    );
+    let live_so = dir.join("liblive.so.1");
+    let r = Command::new(&ld)
+        .args(["-shared", "-soname", "liblive.so.1", "-o"])
+        .arg(&live_so)
+        .arg(&live_obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "ld -shared: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let dead_obj = dir.join("dead-import.o");
+    assemble(
+        &gas,
+        ".text\n.globl live_import\n.type live_import,@function\nlive_import:\n    movl $99, %eax\n    ret\n.globl dead_import\n.type dead_import,@function\ndead_import:\n    movl $7, %eax\n    ret\n",
+        &dir.join("dead-import.s"),
+        &dead_obj,
+    );
+    let dead_so = dir.join("libdead.so.1");
+    let r = Command::new(&ld)
+        .args(["-shared", "-soname", "libdead.so.1", "-o"])
+        .arg(&dead_so)
+        .arg(&dead_obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "ld -shared: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(
+            ".section .text._start,\"ax\",@progbits\n\
+             .globl _start\n\
+             _start:\n\
+                 call live_import@PLT\n\
+                 movl %eax, %edi\n\
+                 movl ${exit_nr}, %eax\n\
+                 syscall\n\
+             .section .text.dead,\"ax\",@progbits\n\
+             dead:\n\
+                 call dead_import@PLT\n\
+                 ret\n"
+        ),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+
+    let link = |out: &std::path::Path, gc: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_afs-ld"));
+        if gc {
+            command.arg("--gc-sections");
+        }
+        command
+            .args(["--dynamic-linker", interp, "--as-needed", "-o"])
+            .arg(out)
+            .arg(&main_obj)
+            .arg(&live_so)
+            .arg(&dead_so)
+            .output()
+            .unwrap()
+    };
+    let baseline = dir.join("baseline");
+    let r = link(&baseline, false);
+    assert!(
+        r.status.success(),
+        "baseline dynamic link: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let baseline_image = std::fs::read(&baseline).unwrap();
+    assert!(section_info(&baseline_image, ".text.dead").is_some());
+    assert_eq!(
+        needed_libraries(&baseline_image),
+        ["liblive.so.1", "libdead.so.1"]
+    );
+
+    let collected = dir.join("collected");
+    let r = link(&collected, true);
+    assert!(
+        r.status.success(),
+        "GC dynamic link: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let collected_image = std::fs::read(&collected).unwrap();
+    assert!(section_info(&collected_image, ".text.dead").is_none());
+    assert_eq!(needed_libraries(&collected_image), ["liblive.so.1"]);
+    let dynstr = section_bytes(&collected_image, ".dynstr").unwrap();
+    let has_dead_import = section_bytes(&collected_image, ".dynsym")
+        .unwrap()
+        .chunks_exact(24)
+        .any(|symbol| {
+            let offset = u32::from_le_bytes(symbol[0..4].try_into().unwrap()) as usize;
+            let Some(length) = dynstr[offset..].iter().position(|&byte| byte == 0) else {
+                return false;
+            };
+            &dynstr[offset..offset + length] == b"dead_import"
+        });
+    assert!(
+        !has_dead_import,
+        "a discarded reference created a dynamic import"
+    );
+    assert_eq!(
+        Command::new(&baseline)
+            .env("LD_LIBRARY_PATH", &dir)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(42)
+    );
+    assert_eq!(
+        Command::new(&collected)
+            .env("LD_LIBRARY_PATH", &dir)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(42)
+    );
+
+    let collected_again = dir.join("collected-again");
+    assert!(link(&collected_again, true).status.success());
+    assert_eq!(collected_image, std::fs::read(&collected_again).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Assemble `src` with gas into `obj`. Panics on failure.
 fn assemble(gas: &std::path::Path, src: &str, s: &std::path::Path, obj: &std::path::Path) {
     std::fs::write(s, src).unwrap();
@@ -436,7 +699,7 @@ fn dynamic_array_tags_drive_loader_initialization() {
 
     let link = |input: &std::path::Path, out: &std::path::Path| {
         Command::new(env!("CARGO_BIN_EXE_afs-ld"))
-            .args(["--dynamic-linker", interp, "-o"])
+            .args(["--gc-sections", "--dynamic-linker", interp, "-o"])
             .arg(out)
             .arg(input)
             .output()
@@ -2204,7 +2467,7 @@ fn dynamic_executable_resolves_local_ifunc_before_entry() {
 
     let link = |out: &std::path::Path| {
         let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
-            .args(["--dynamic-linker", interp, "-o"])
+            .args(["--gc-sections", "--dynamic-linker", interp, "-o"])
             .arg(out)
             .arg(&main_obj)
             .arg(&so)

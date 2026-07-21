@@ -33,6 +33,8 @@ Options:
   -no_loh                         Accepted for compatibility (currently warns; no effect)
   -thunks=<none|safe|all>         Configure branch thunks
   -dead_strip                     Dead-strip unreferenced code/data
+  --gc-sections                   Discard unreachable ELF input sections
+  --no-gc-sections                Keep all ELF input sections
   -icf=safe | -icf=none | -icf=all
                                   Configure identical code folding (`all` currently errors)
   -fixup_chains | -no_fixup_chains

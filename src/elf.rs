@@ -54,6 +54,7 @@ pub const SHF_ALLOC: u64 = 0x2;
 pub const SHF_EXECINSTR: u64 = 0x4;
 pub const SHF_INFO_LINK: u64 = 0x40;
 pub const SHF_TLS: u64 = 0x400;
+const SHF_GNU_RETAIN: u64 = 0x20_0000;
 
 pub const STB_LOCAL: u8 = 0;
 pub const STB_GLOBAL: u8 = 1;
@@ -863,6 +864,7 @@ struct DynamicResolution {
     defined: HashSet<String>,
     shared: Vec<SharedLib>,
     shared_metadata: Vec<SharedLinkMetadata>,
+    shared_as_needed: Vec<bool>,
     selected_sonames: HashSet<String>,
     dependency_exports: HashMap<String, HashSet<String>>,
 }
@@ -891,10 +893,12 @@ struct FdeEntry {
 /// augmentation (`DW_EH_PE_absptr` = 0 when it carries no `R`). `content`
 /// is the offset of the CIE id; `rec_end` bounds the record.
 fn cie_fde_encoding(eh: &[u8], content: usize, rec_end: usize) -> Result<u8, ElfError> {
-    let slice_uleb = |p: usize| -> Result<usize, ElfError> {
-        let (_, n) = crate::leb::read_uleb(&eh[p..rec_end])
-            .map_err(|_| ElfError(".eh_frame: bad ULEB in CIE".into()))?;
-        Ok(p + n)
+    let read_uleb = |p: usize| -> Result<(u64, usize), ElfError> {
+        if p > rec_end {
+            return err(".eh_frame: CIE field runs past the record");
+        }
+        crate::leb::read_uleb(&eh[p..rec_end])
+            .map_err(|_| ElfError(".eh_frame: bad ULEB in CIE".into()))
     };
     let mut p = content + 4; // past the CIE id
     if p >= rec_end {
@@ -911,47 +915,75 @@ fn cie_fde_encoding(eh: &[u8], content: usize, rec_end: usize) -> Result<u8, Elf
     }
     let aug = eh[aug_start..p].to_vec();
     p += 1; // past NUL
-    p = slice_uleb(p)?; // code alignment factor
+    let (_, n) = read_uleb(p)?; // code alignment factor
+    p += n;
+    if p > rec_end {
+        return err(".eh_frame: CIE data alignment runs past the record");
+    }
     let (_, n) = crate::leb::read_sleb(&eh[p..rec_end])
         .map_err(|_| ElfError(".eh_frame: bad SLEB in CIE".into()))?;
     p += n; // data alignment factor
     if version >= 3 {
-        p = slice_uleb(p)?; // return-address register (ULEB)
+        let (_, n) = read_uleb(p)?;
+        p += n; // return-address register (ULEB)
     } else {
+        if p >= rec_end {
+            return err(".eh_frame: CIE return-address register is missing");
+        }
         p += 1; // return-address register (single byte)
     }
     if aug.first() != Some(&b'z') {
         return Ok(0); // DW_EH_PE_absptr
     }
-    p = slice_uleb(p)?; // augmentation data length
+    let (augmentation_length, n) = read_uleb(p)?;
+    p += n;
+    let augmentation_length = usize::try_from(augmentation_length)
+        .map_err(|_| ElfError(".eh_frame: CIE augmentation length is too large".into()))?;
+    let augmentation_end = p
+        .checked_add(augmentation_length)
+        .filter(|end| *end <= rec_end)
+        .ok_or_else(|| ElfError(".eh_frame: CIE augmentation data runs past the record".into()))?;
+    let mut fde_encoding = 0;
     for &c in &aug[1..] {
         match c {
             b'R' => {
-                if p >= rec_end {
+                if p >= augmentation_end {
                     return err(".eh_frame: CIE 'R' augmentation missing its byte");
                 }
-                return Ok(eh[p]);
+                fde_encoding = eh[p];
+                p += 1;
             }
-            b'L' => p += 1, // LSDA encoding byte
+            b'L' => {
+                if p >= augmentation_end {
+                    return err(".eh_frame: CIE 'L' augmentation missing its byte");
+                }
+                p += 1;
+            }
             b'P' => {
                 // personality encoding byte, then a pointer of that size.
-                if p >= rec_end {
+                if p >= augmentation_end {
                     return err(".eh_frame: CIE 'P' augmentation truncated");
                 }
                 let penc = eh[p];
                 p += 1;
-                p += match penc & 0x07 {
+                let pointer_size = match penc & 0x07 {
                     0x00 => 8, // absptr
                     0x02 => 2, // udata2
                     0x03 => 4, // udata4
                     0x04 => 8, // udata8
                     _ => return err(".eh_frame: unsupported personality encoding"),
                 };
+                p = p.checked_add(pointer_size).ok_or_else(|| {
+                    ElfError(".eh_frame: CIE personality pointer overflows".into())
+                })?;
+                if p > augmentation_end {
+                    return err(".eh_frame: CIE personality pointer is truncated");
+                }
             }
             _ => return err(".eh_frame: unsupported CIE augmentation char"),
         }
     }
-    Ok(0)
+    Ok(fde_encoding)
 }
 
 /// Parse a linked `.eh_frame` (relocations already applied) into its FDE
@@ -1311,6 +1343,585 @@ fn resolve_globals(objects: &[ElfObject]) -> Result<HashMap<String, (usize, usiz
     Ok(globals)
 }
 
+struct GcAnalysis {
+    live_sections: Vec<Vec<bool>>,
+    referenced_symbols: Vec<Vec<bool>>,
+    live_undefined: HashSet<String>,
+    eh_frames: Vec<Vec<Option<EhFrameGc>>>,
+    forced_eh_sections: HashSet<(usize, usize)>,
+}
+
+struct EhFrameRecord {
+    start: usize,
+    end: usize,
+    cie: Option<usize>,
+    initial_location: Option<usize>,
+    fde_encoding: Option<u8>,
+}
+
+struct EhFrameGc {
+    records: Vec<EhFrameRecord>,
+    keep: Vec<bool>,
+}
+
+fn is_eh_frame_section(section: &Section) -> bool {
+    section.name == ".eh_frame" || section.sh_type == SHT_X86_64_UNWIND
+}
+
+fn input_relocation_width(r_type: u32) -> Option<usize> {
+    match r_type {
+        R_X86_64_64 | R_X86_64_DTPOFF64 => Some(8),
+        R_X86_64_PC32
+        | R_X86_64_PLT32
+        | R_X86_64_GOTPCREL
+        | R_X86_64_32
+        | R_X86_64_32S
+        | R_X86_64_TLSGD
+        | R_X86_64_TLSLD
+        | R_X86_64_DTPOFF32
+        | R_X86_64_GOTTPOFF
+        | R_X86_64_TPOFF32
+        | R_X86_64_GOTPCRELX
+        | R_X86_64_REX_GOTPCRELX => Some(4),
+        _ => None,
+    }
+}
+
+fn parse_eh_frame_gc(section: &Section, object: &str) -> Result<EhFrameGc, ElfError> {
+    let mut records: Vec<EhFrameRecord> = Vec::new();
+    let mut cie_by_offset: HashMap<usize, usize> = HashMap::new();
+    let mut offset = 0usize;
+    while offset < section.data.len() {
+        if offset + 4 > section.data.len() {
+            if section.data[offset..].iter().all(|byte| *byte == 0) {
+                break;
+            }
+            return err(format!(
+                "{}: .eh_frame record length is truncated at offset {offset:#x}",
+                object
+            ));
+        }
+        let length = ru32(&section.data, offset) as usize;
+        if length == 0 {
+            if section.data[offset + 4..].iter().any(|byte| *byte != 0) {
+                return err(format!(
+                    "{}: .eh_frame has nonzero data after its terminator",
+                    object
+                ));
+            }
+            break;
+        }
+        if length == 0xffff_ffff {
+            return err(format!(
+                "{}: .eh_frame 64-bit DWARF lengths are unsupported",
+                object
+            ));
+        }
+        let content = offset + 4;
+        let end = content
+            .checked_add(length)
+            .filter(|end| *end <= section.data.len())
+            .ok_or_else(|| {
+                ElfError(format!(
+                    "{}: .eh_frame record at {offset:#x} runs past the section",
+                    object
+                ))
+            })?;
+        if content + 4 > end {
+            return err(format!(
+                "{}: .eh_frame record at {offset:#x} is truncated at its CIE id",
+                object
+            ));
+        }
+        let cie_pointer = ru32(&section.data, content) as usize;
+        let (cie, initial_location, fde_encoding) = if cie_pointer == 0 {
+            (
+                None,
+                None,
+                Some(cie_fde_encoding(&section.data, content, end)?),
+            )
+        } else {
+            let cie_offset = content.checked_sub(cie_pointer).ok_or_else(|| {
+                ElfError(format!(
+                    "{}: .eh_frame FDE at {offset:#x} has an underflowing CIE pointer",
+                    object
+                ))
+            })?;
+            let cie = cie_by_offset.get(&cie_offset).copied().ok_or_else(|| {
+                ElfError(format!(
+                    "{}: .eh_frame FDE at {offset:#x} references an unknown CIE",
+                    object
+                ))
+            })?;
+            if content + 8 > end {
+                return err(format!(
+                    "{}: .eh_frame FDE at {offset:#x} is truncated before initial_location",
+                    object
+                ));
+            }
+            if records[cie].fde_encoding != Some(DW_EH_PE_PCREL_SDATA4) {
+                return err(format!(
+                    "{}: .eh_frame FDE at {offset:#x} does not use pcrel sdata4",
+                    object
+                ));
+            }
+            (Some(cie), Some(content + 4), None)
+        };
+        let record_index = records.len();
+        records.push(EhFrameRecord {
+            start: offset,
+            end,
+            cie,
+            initial_location,
+            fde_encoding,
+        });
+        if cie.is_none() {
+            cie_by_offset.insert(offset, record_index);
+        }
+        offset = end;
+    }
+
+    for relocation in &section.relas {
+        let relocation_offset = usize::try_from(relocation.offset).map_err(|_| {
+            ElfError(format!(
+                "{}: .eh_frame relocation offset {:#x} is too large",
+                object, relocation.offset
+            ))
+        })?;
+        let record = records
+            .iter()
+            .find(|record| (record.start..record.end).contains(&relocation_offset))
+            .ok_or_else(|| {
+                ElfError(format!(
+                    "{}: .eh_frame relocation offset {:#x} is outside a record",
+                    object, relocation.offset
+                ))
+            })?;
+        let width = input_relocation_width(relocation.r_type).ok_or_else(|| {
+            ElfError(format!(
+                "{}: unsupported .eh_frame relocation type {}",
+                object, relocation.r_type
+            ))
+        })?;
+        let relocation_end = relocation_offset.checked_add(width).ok_or_else(|| {
+            ElfError(format!(
+                "{}: .eh_frame relocation at {:#x} overflows",
+                object, relocation.offset
+            ))
+        })?;
+        if relocation_offset < record.start + 8 || relocation_end > record.end {
+            return err(format!(
+                "{}: .eh_frame relocation at {:#x} overlaps record metadata or its boundary",
+                object, relocation.offset
+            ));
+        }
+    }
+
+    Ok(EhFrameGc {
+        keep: vec![false; records.len()],
+        records,
+    })
+}
+
+fn gc_root_section(section: &Section) -> bool {
+    section.sh_flags & SHF_GNU_RETAIN != 0
+        || matches!(
+            section.sh_type,
+            SHT_INIT_ARRAY | SHT_FINI_ARRAY | SHT_PREINIT_ARRAY
+        )
+        || matches!(
+            section.name.as_str(),
+            ".init" | ".fini" | ".ctors" | ".dtors"
+        )
+        || section.name.starts_with(".ctors.")
+        || section.name.starts_with(".dtors.")
+}
+
+fn mark_gc_section(
+    objects: &[ElfObject],
+    live: &mut [Vec<bool>],
+    pending: &mut Vec<(usize, usize)>,
+    oi: usize,
+    si: usize,
+) -> Result<(), ElfError> {
+    let Some(object_live) = live.get_mut(oi) else {
+        return err(format!("GC references nonexistent object index {oi}"));
+    };
+    let Some(section_live) = object_live.get_mut(si) else {
+        return err(format!(
+            "GC references nonexistent section index {si} in {}",
+            objects[oi].name
+        ));
+    };
+    if !*section_live {
+        *section_live = true;
+        pending.push((oi, si));
+    }
+    Ok(())
+}
+
+fn gc_symbol_section(
+    objects: &[ElfObject],
+    globals: &HashMap<String, (usize, usize)>,
+    oi: usize,
+    si: usize,
+) -> Result<Option<(usize, usize)>, ElfError> {
+    let object = objects
+        .get(oi)
+        .ok_or_else(|| ElfError(format!("GC references nonexistent object index {oi}")))?;
+    let symbol = object.symbols.get(si).ok_or_else(|| {
+        ElfError(format!(
+            "relocation symbol index {si} is out of range in {}",
+            object.name
+        ))
+    })?;
+    let (doi, dsi) = if symbol.shndx == SHN_UNDEF {
+        let Some(&definition) = globals.get(&symbol.name) else {
+            return Ok(None);
+        };
+        definition
+    } else {
+        resolve_defined_identity(objects, globals, oi, si)
+    };
+    Ok(objects[doi].symbols[dsi]
+        .section
+        .map(|section| (doi, section)))
+}
+
+fn follow_gc_relocation(
+    objects: &[ElfObject],
+    globals: &HashMap<String, (usize, usize)>,
+    analysis: &mut GcAnalysis,
+    pending: &mut Vec<(usize, usize)>,
+    oi: usize,
+    relocation: &Rela,
+) -> Result<(), ElfError> {
+    let symbol_index = relocation.sym as usize;
+    let object = &objects[oi];
+    let symbol = object.symbols.get(symbol_index).ok_or_else(|| {
+        ElfError(format!(
+            "relocation symbol index {} is out of range in {}",
+            relocation.sym, object.name
+        ))
+    })?;
+    analysis.referenced_symbols[oi][symbol_index] = true;
+    if symbol.shndx == SHN_UNDEF
+        && symbol.bind == STB_GLOBAL
+        && !symbol.name.is_empty()
+        && symbol.name != "__tls_get_addr"
+        && !LINKER_SYMS.contains(&symbol.name.as_str())
+        && !globals.contains_key(&symbol.name)
+    {
+        analysis.live_undefined.insert(symbol.name.clone());
+    }
+    if let Some((doi, target_section)) = gc_symbol_section(objects, globals, oi, symbol_index)? {
+        if is_eh_frame_section(&objects[doi].sections[target_section]) {
+            analysis.forced_eh_sections.insert((doi, target_section));
+        }
+        mark_gc_section(
+            objects,
+            &mut analysis.live_sections,
+            pending,
+            doi,
+            target_section,
+        )?;
+    }
+    Ok(())
+}
+
+fn analyze_gc_sections(
+    objects: &[ElfObject],
+    entry: &str,
+    export_roots: &[String],
+) -> Result<GcAnalysis, ElfError> {
+    let globals = resolve_globals(objects)?;
+    let mut eh_frames = Vec::with_capacity(objects.len());
+    for object in objects {
+        let mut object_frames = Vec::with_capacity(object.sections.len());
+        for section in &object.sections {
+            object_frames.push(if is_eh_frame_section(section) {
+                Some(parse_eh_frame_gc(section, &object.name)?)
+            } else {
+                None
+            });
+        }
+        eh_frames.push(object_frames);
+    }
+    let mut analysis = GcAnalysis {
+        live_sections: objects
+            .iter()
+            .map(|object| vec![false; object.sections.len()])
+            .collect(),
+        referenced_symbols: objects
+            .iter()
+            .map(|object| vec![false; object.symbols.len()])
+            .collect(),
+        live_undefined: HashSet::new(),
+        eh_frames,
+        forced_eh_sections: HashSet::new(),
+    };
+    let mut pending = Vec::new();
+
+    for (oi, object) in objects.iter().enumerate() {
+        for (si, section) in object.sections.iter().enumerate() {
+            if gc_root_section(section) {
+                if is_eh_frame_section(section) {
+                    analysis.forced_eh_sections.insert((oi, si));
+                }
+                mark_gc_section(objects, &mut analysis.live_sections, &mut pending, oi, si)?;
+            }
+        }
+    }
+
+    let mut mark_named_root = |name: &str| -> Result<(), ElfError> {
+        let Some(&(oi, si)) = globals.get(name) else {
+            return Ok(());
+        };
+        if let Some((doi, section)) = gc_symbol_section(objects, &globals, oi, si)? {
+            if is_eh_frame_section(&objects[doi].sections[section]) {
+                analysis.forced_eh_sections.insert((doi, section));
+            }
+            mark_gc_section(
+                objects,
+                &mut analysis.live_sections,
+                &mut pending,
+                doi,
+                section,
+            )?;
+        }
+        Ok(())
+    };
+    mark_named_root(entry)?;
+    for name in export_roots {
+        mark_named_root(name)?;
+    }
+
+    loop {
+        while let Some((oi, section_index)) = pending.pop() {
+            let section = &objects[oi].sections[section_index];
+            if is_eh_frame_section(section) {
+                continue;
+            }
+            for relocation in &section.relas {
+                follow_gc_relocation(
+                    objects,
+                    &globals,
+                    &mut analysis,
+                    &mut pending,
+                    oi,
+                    relocation,
+                )?;
+            }
+        }
+
+        let mut new_eh_records = Vec::new();
+        for (oi, object) in objects.iter().enumerate() {
+            for (section_index, section) in object.sections.iter().enumerate() {
+                let Some(plan) = analysis.eh_frames[oi][section_index].as_ref() else {
+                    continue;
+                };
+                let force_all = analysis.forced_eh_sections.contains(&(oi, section_index));
+                let candidates: Vec<(usize, Option<usize>, Option<usize>)> = plan
+                    .records
+                    .iter()
+                    .enumerate()
+                    .filter(|(record_index, _)| !plan.keep[*record_index])
+                    .map(|(record_index, record)| {
+                        (record_index, record.cie, record.initial_location)
+                    })
+                    .collect();
+
+                for (record_index, cie, initial_location) in candidates {
+                    let keep = if let (Some(_), Some(initial_location)) = (cie, initial_location) {
+                        let mut target_relocations = section
+                            .relas
+                            .iter()
+                            .filter(|relocation| relocation.offset == initial_location as u64);
+                        let relocation = target_relocations.next().ok_or_else(|| {
+                            ElfError(format!(
+                                "{}: .eh_frame FDE at {:#x} has no initial_location relocation",
+                                object.name,
+                                initial_location - 8
+                            ))
+                        })?;
+                        if target_relocations.next().is_some() {
+                            return err(format!(
+                                "{}: .eh_frame FDE at {:#x} has duplicate initial_location relocations",
+                                object.name,
+                                initial_location - 8
+                            ));
+                        }
+                        if relocation.r_type != R_X86_64_PC32 {
+                            return err(format!(
+                                "{}: .eh_frame FDE at {:#x} uses relocation type {}, expected R_X86_64_PC32",
+                                object.name,
+                                initial_location - 8,
+                                relocation.r_type
+                            ));
+                        }
+                        let (target_object, target_section) =
+                            gc_symbol_section(objects, &globals, oi, relocation.sym as usize)?
+                                .ok_or_else(|| {
+                                    ElfError(format!(
+                                "{}: .eh_frame FDE at {:#x} does not reference a defined section",
+                                object.name,
+                                initial_location - 8
+                            ))
+                                })?;
+                        if objects[target_object].sections[target_section].sh_flags & SHF_EXECINSTR
+                            == 0
+                        {
+                            return err(format!(
+                                "{}: .eh_frame FDE at {:#x} references non-executable section '{}'",
+                                object.name,
+                                initial_location - 8,
+                                objects[target_object].sections[target_section].name
+                            ));
+                        }
+                        force_all || analysis.live_sections[target_object][target_section]
+                    } else {
+                        force_all
+                    };
+                    if !keep {
+                        continue;
+                    }
+
+                    analysis.live_sections[oi][section_index] = true;
+                    let plan = analysis.eh_frames[oi][section_index]
+                        .as_mut()
+                        .expect("ELF unwind plan checked above");
+                    if !plan.keep[record_index] {
+                        plan.keep[record_index] = true;
+                        new_eh_records.push((oi, section_index, record_index));
+                    }
+                    if let Some(cie) = cie {
+                        if !plan.keep[cie] {
+                            plan.keep[cie] = true;
+                            new_eh_records.push((oi, section_index, cie));
+                        }
+                    }
+                }
+            }
+        }
+
+        if new_eh_records.is_empty() {
+            break;
+        }
+        for (oi, section_index, record_index) in new_eh_records {
+            let record = &analysis.eh_frames[oi][section_index]
+                .as_ref()
+                .expect("ELF unwind plan checked above")
+                .records[record_index];
+            let relocations: Vec<Rela> = objects[oi].sections[section_index]
+                .relas
+                .iter()
+                .filter(|relocation| {
+                    (record.start as u64..record.end as u64).contains(&relocation.offset)
+                })
+                .cloned()
+                .collect();
+            for relocation in &relocations {
+                follow_gc_relocation(
+                    objects,
+                    &globals,
+                    &mut analysis,
+                    &mut pending,
+                    oi,
+                    relocation,
+                )?;
+            }
+        }
+    }
+
+    Ok(analysis)
+}
+
+fn prune_eh_frame(section: &mut Section, plan: &EhFrameGc, object: &str) -> Result<(), ElfError> {
+    let mut new_offsets = vec![None; plan.records.len()];
+    let mut data = Vec::new();
+    for (record_index, record) in plan.records.iter().enumerate() {
+        if !plan.keep[record_index] {
+            continue;
+        }
+        new_offsets[record_index] = Some(data.len());
+        data.extend_from_slice(&section.data[record.start..record.end]);
+    }
+    for (record_index, record) in plan.records.iter().enumerate() {
+        let (Some(cie), Some(new_start)) = (record.cie, new_offsets[record_index]) else {
+            continue;
+        };
+        let new_cie = new_offsets[cie].ok_or_else(|| {
+            ElfError(format!(
+                "{}: retained .eh_frame FDE lost its CIE during GC",
+                object
+            ))
+        })?;
+        let pointer_field = new_start + 4;
+        let cie_pointer = u32::try_from(pointer_field - new_cie).map_err(|_| {
+            ElfError(format!(
+                "{}: retained .eh_frame CIE pointer exceeds 32 bits",
+                object
+            ))
+        })?;
+        data[pointer_field..pointer_field + 4].copy_from_slice(&cie_pointer.to_le_bytes());
+    }
+
+    let mut relas = Vec::new();
+    for mut relocation in std::mem::take(&mut section.relas) {
+        let record_index = plan
+            .records
+            .iter()
+            .position(|record| {
+                (record.start as u64..record.end as u64).contains(&relocation.offset)
+            })
+            .ok_or_else(|| {
+                ElfError(format!(
+                    "{}: .eh_frame relocation offset {:#x} is outside a record",
+                    object, relocation.offset
+                ))
+            })?;
+        let Some(new_start) = new_offsets[record_index] else {
+            continue;
+        };
+        let old_start = plan.records[record_index].start as u64;
+        relocation.offset = new_start as u64 + (relocation.offset - old_start);
+        relas.push(relocation);
+    }
+    section.data = data;
+    section.relas = relas;
+    Ok(())
+}
+
+fn apply_gc_sections(objects: &mut [ElfObject], analysis: &GcAnalysis) -> Result<(), ElfError> {
+    for (oi, object) in objects.iter_mut().enumerate() {
+        for (section_index, section) in object.sections.iter_mut().enumerate() {
+            if analysis.live_sections[oi][section_index] {
+                if let Some(plan) = &analysis.eh_frames[oi][section_index] {
+                    prune_eh_frame(section, plan, &object.name)?;
+                }
+            }
+        }
+        let old_sections = std::mem::take(&mut object.sections);
+        let mut remap = vec![None; old_sections.len()];
+        object.sections.reserve(old_sections.len());
+        for (si, section) in old_sections.into_iter().enumerate() {
+            if analysis.live_sections[oi][si] {
+                remap[si] = Some(object.sections.len());
+                object.sections.push(section);
+            }
+        }
+        for (si, symbol) in object.symbols.iter_mut().enumerate() {
+            if let Some(section) = symbol.section {
+                symbol.section = remap[section];
+            }
+            if symbol.shndx == SHN_UNDEF && !analysis.referenced_symbols[oi][si] {
+                symbol.name.clear();
+            }
+        }
+    }
+    Ok(())
+}
+
 fn static_state(input: LinkInput) -> StaticInput {
     match input {
         LinkInput::Object(obj) => StaticInput::Object(Some(obj)),
@@ -1464,11 +2075,25 @@ pub fn link_static(
     entry: &str,
     eh_frame_hdr: bool,
 ) -> Result<Vec<u8>, ElfError> {
+    link_static_with_gc(inputs, entry, eh_frame_hdr, false)
+}
+
+#[doc(hidden)]
+pub fn link_static_with_gc(
+    inputs: Vec<LinkInput>,
+    entry: &str,
+    eh_frame_hdr: bool,
+    gc_sections: bool,
+) -> Result<Vec<u8>, ElfError> {
     let mut inputs: Vec<StaticInput> = inputs.into_iter().map(static_state).collect();
     let mut objects = Vec::new();
     let mut defined = HashSet::new();
     let end = inputs.len();
     process_static_range(&mut inputs, 0, end, &mut objects, &mut defined)?;
+    if gc_sections {
+        let analysis = analyze_gc_sections(&objects, entry, &[])?;
+        apply_gc_sections(&mut objects, &analysis)?;
+    }
 
     link_static_exec(&objects, entry, eh_frame_hdr)
 }
@@ -2513,6 +3138,7 @@ fn process_dynamic_range(
                     state.selected_sonames.insert(selected.soname.clone());
                     state.shared.push(selected);
                     state.shared_metadata.push(selected_metadata);
+                    state.shared_as_needed.push(*as_needed);
                     changed = true;
                 }
                 state
@@ -2525,6 +3151,93 @@ fn process_dynamic_range(
         i += 1;
     }
     Ok(changed)
+}
+
+fn gc_dynamic_sections(state: &mut DynamicResolution, entry: &str) -> Result<(), ElfError> {
+    debug_assert_eq!(state.shared.len(), state.shared_metadata.len());
+    debug_assert_eq!(state.shared.len(), state.shared_as_needed.len());
+
+    let object_globals = resolve_globals(&state.objects)?;
+    let mut retained: Vec<bool> = state
+        .shared_as_needed
+        .iter()
+        .map(|as_needed| !as_needed)
+        .collect();
+    let analysis = loop {
+        let export_roots: Vec<String> = state
+            .shared
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| retained[*index])
+            .flat_map(|(_, library)| library.undefs.iter().cloned())
+            .collect();
+        let analysis = analyze_gc_sections(&state.objects, entry, &export_roots)?;
+        let mut changed = false;
+        let mut provided = HashSet::new();
+        for candidate_index in 0..state.shared.len() {
+            let candidate = &state.shared[candidate_index];
+            if retained[candidate_index] {
+                provided.extend(candidate.exports.keys().cloned());
+                continue;
+            }
+            let object_needs_candidate = analysis
+                .live_undefined
+                .iter()
+                .any(|name| !provided.contains(name) && candidate.exports.contains_key(name));
+            let retained_library_needs_candidate =
+                state
+                    .shared_metadata
+                    .iter()
+                    .enumerate()
+                    .any(|(library_index, details)| {
+                        retained[library_index]
+                            && details.complete
+                            && !details.needed.contains(&candidate.soname)
+                            && details.strong_undefs.iter().any(|name| {
+                                !object_globals.contains_key(name)
+                                    && !provided.contains(name)
+                                    && candidate.exports.contains_key(name)
+                            })
+                    });
+            if object_needs_candidate || retained_library_needs_candidate {
+                retained[candidate_index] = true;
+                provided.extend(candidate.exports.keys().cloned());
+                changed = true;
+            }
+        }
+        if !changed {
+            break analysis;
+        }
+    };
+
+    apply_gc_sections(&mut state.objects, &analysis)?;
+
+    let old_shared = std::mem::take(&mut state.shared);
+    let old_metadata = std::mem::take(&mut state.shared_metadata);
+    let old_as_needed = std::mem::take(&mut state.shared_as_needed);
+    state.selected_sonames.clear();
+    for (index, ((library, metadata), as_needed)) in old_shared
+        .into_iter()
+        .zip(old_metadata)
+        .zip(old_as_needed)
+        .enumerate()
+    {
+        if retained[index] {
+            state.selected_sonames.insert(library.soname.clone());
+            state.shared.push(library);
+            state.shared_metadata.push(metadata);
+            state.shared_as_needed.push(as_needed);
+        }
+    }
+
+    state.defined.clear();
+    for object in &state.objects {
+        defined_names(object, &mut state.defined);
+    }
+    for library in &state.shared {
+        state.defined.extend(library.exports.keys().cloned());
+    }
+    Ok(())
 }
 
 /// Link ordered inputs into a dynamically-linked ET_EXEC that runs under
@@ -2554,6 +3267,17 @@ pub fn link_dynamic_with_as_needed(
     interp: &str,
     eh_frame_hdr: bool,
 ) -> Result<Vec<u8>, ElfError> {
+    link_dynamic_with_as_needed_and_gc(inputs, entry, interp, eh_frame_hdr, false)
+}
+
+#[doc(hidden)]
+pub fn link_dynamic_with_as_needed_and_gc(
+    inputs: Vec<(DynamicLinkInput, bool, Option<SharedLinkMetadata>)>,
+    entry: &str,
+    interp: &str,
+    eh_frame_hdr: bool,
+    gc_sections: bool,
+) -> Result<Vec<u8>, ElfError> {
     let mut inputs: Vec<DynamicInput> = inputs
         .into_iter()
         .map(|(input, as_needed, metadata)| dynamic_state(input, as_needed, metadata))
@@ -2561,6 +3285,9 @@ pub fn link_dynamic_with_as_needed(
     let mut state = DynamicResolution::default();
     let end = inputs.len();
     process_dynamic_range(&mut inputs, 0, end, &mut state)?;
+    if gc_sections {
+        gc_dynamic_sections(&mut state, entry)?;
+    }
 
     if let Some((lib, name)) =
         state
@@ -4514,6 +5241,79 @@ mod eh_frame_hdr_tests {
         eh.extend_from_slice(&fde(at, 0x1200, 0x2000));
         eh.extend_from_slice(&0u32.to_le_bytes());
         assert!(parse_eh_frame_fdes(&eh, 0x2000).is_err());
+    }
+
+    #[test]
+    fn gc_compaction_strips_contribution_local_terminators() {
+        let mut data = CIE.to_vec();
+        let at = data.len();
+        data.extend_from_slice(&fde(at, 0x1200, 0x2000));
+        data.extend_from_slice(&0u32.to_le_bytes());
+        let mut section = Section {
+            name: ".eh_frame".to_string(),
+            sh_type: SHT_PROGBITS,
+            sh_flags: SHF_ALLOC,
+            sh_addralign: 8,
+            data,
+            nobits_size: 0,
+            relas: vec![Rela {
+                offset: (at + 8) as u64,
+                sym: 0,
+                r_type: R_X86_64_PC32,
+                addend: 0,
+            }],
+        };
+        let mut plan = parse_eh_frame_gc(&section, "one.o").unwrap();
+        plan.keep.fill(true);
+        prune_eh_frame(&mut section, &plan, "one.o").unwrap();
+        assert_eq!(section.data.len(), CIE.len() + 32);
+
+        let mut merged = section.data.clone();
+        merged.extend_from_slice(&section.data);
+        assert_eq!(parse_eh_frame_fdes(&merged, 0x2000).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn gc_rejects_fde_without_initial_location_relocation() {
+        let mut eh_frame = CIE.to_vec();
+        let at = eh_frame.len();
+        eh_frame.extend_from_slice(&fde(at, 0x1200, 0x2000));
+        let object = ElfObject {
+            name: "missing-fde-relocation.o".to_string(),
+            sections: vec![
+                Section {
+                    name: ".text._start".to_string(),
+                    sh_type: SHT_PROGBITS,
+                    sh_flags: SHF_ALLOC | SHF_EXECINSTR,
+                    sh_addralign: 1,
+                    data: vec![0xc3],
+                    nobits_size: 0,
+                    relas: Vec::new(),
+                },
+                Section {
+                    name: ".eh_frame".to_string(),
+                    sh_type: SHT_PROGBITS,
+                    sh_flags: SHF_ALLOC,
+                    sh_addralign: 8,
+                    data: eh_frame,
+                    nobits_size: 0,
+                    relas: Vec::new(),
+                },
+            ],
+            symbols: vec![Symbol {
+                name: "_start".to_string(),
+                bind: STB_GLOBAL,
+                typ: STT_FUNC,
+                shndx: 1,
+                section: Some(0),
+                value: 0,
+                size: 1,
+            }],
+        };
+        let error = analyze_gc_sections(&[object], "_start", &[])
+            .err()
+            .expect("missing FDE relocation must fail GC");
+        assert!(error.to_string().contains("no initial_location relocation"));
     }
 
     #[test]

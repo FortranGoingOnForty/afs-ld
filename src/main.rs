@@ -39,6 +39,8 @@ Options:
   -no_loh                         Accepted for compatibility (currently warns; no effect)
   -thunks=<none|safe|all>         Configure branch thunks
   -dead_strip                     Dead-strip unreferenced code/data
+  --gc-sections                   Discard unreachable ELF input sections
+  --no-gc-sections                Keep all ELF input sections
   -icf=safe | -icf=none | -icf=all
                                   Configure identical code folding (`all` currently errors)
   -fixup_chains | -no_fixup_chains
@@ -175,6 +177,7 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
     let mut unsupported: Vec<String> = Vec::new();
     let mut dynamic_linker: Option<String> = None;
     let mut eh_frame_hdr = false;
+    let mut gc_sections = false;
     let mut as_needed = false;
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
@@ -200,13 +203,15 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
             // PT_GNU_EH_FRAME (GNU semantics: emitted only when asked).
             "--eh-frame-hdr" => eh_frame_hdr = true,
             "--no-eh-frame-hdr" => eh_frame_hdr = false,
+            "--gc-sections" => gc_sections = true,
+            "--no-gc-sections" => gc_sections = false,
             "--start-group" | "-(" => link_inputs.push(LinkInput::GroupStart),
             "--end-group" | "-)" => link_inputs.push(LinkInput::GroupEnd),
             // Flags we honor or safely ignore. -static and a target
             // emulation are the expected mode.
             "--as-needed" => as_needed = true,
             "--no-as-needed" => as_needed = false,
-            "-static" | "-Bstatic" | "-Bdynamic" | "-melf_x86_64" | "-znow" | "--gc-sections" => {}
+            "-static" | "-Bstatic" | "-Bdynamic" | "-melf_x86_64" | "-znow" => {}
             "-m" => {
                 it.next();
             }
@@ -258,12 +263,25 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
     };
 
     let image = if let Some(interp) = dynamic_linker {
-        match link_dynamic(&link_inputs, &lib_dirs, &interp, eh_frame_hdr, read_bytes) {
+        match link_dynamic(
+            &link_inputs,
+            &lib_dirs,
+            &interp,
+            eh_frame_hdr,
+            gc_sections,
+            read_bytes,
+        ) {
             Ok(img) => img,
             Err(code) => return Some(code),
         }
     } else {
-        match link_static(&link_inputs, &lib_dirs, eh_frame_hdr, read_bytes) {
+        match link_static(
+            &link_inputs,
+            &lib_dirs,
+            eh_frame_hdr,
+            gc_sections,
+            read_bytes,
+        ) {
             Ok(img) => img,
             Err(code) => return Some(code),
         }
@@ -493,6 +511,7 @@ fn link_static(
     link_inputs: &[LinkInput],
     lib_dirs: &[std::path::PathBuf],
     eh_frame_hdr: bool,
+    gc_sections: bool,
     read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
 ) -> Result<Vec<u8>, ExitCode> {
     let mut inputs = Vec::new();
@@ -526,7 +545,7 @@ fn link_static(
             inputs.push(elf::LinkInput::Object(parse_object(&p, &bytes)?));
         }
     }
-    elf::link_static(inputs, "_start", eh_frame_hdr).map_err(|e| {
+    elf::link_static_with_gc(inputs, "_start", eh_frame_hdr, gc_sections).map_err(|e| {
         diag::error(&e.to_string());
         ExitCode::from(1)
     })
@@ -541,16 +560,18 @@ fn link_dynamic(
     lib_dirs: &[std::path::PathBuf],
     interp: &str,
     eh_frame_hdr: bool,
+    gc_sections: bool,
     read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
 ) -> Result<Vec<u8>, ExitCode> {
     let mut inputs = Vec::new();
     for input in link_inputs {
         push_dynamic_input(input, lib_dirs, &read_bytes, &mut inputs)?;
     }
-    elf::link_dynamic_with_as_needed(inputs, "_start", interp, eh_frame_hdr).map_err(|e| {
-        diag::error(&e.to_string());
-        ExitCode::from(1)
-    })
+    elf::link_dynamic_with_as_needed_and_gc(inputs, "_start", interp, eh_frame_hdr, gc_sections)
+        .map_err(|e| {
+            diag::error(&e.to_string());
+            ExitCode::from(1)
+        })
 }
 
 fn resolve_dynamic_lib(name: &str, lib_dirs: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {

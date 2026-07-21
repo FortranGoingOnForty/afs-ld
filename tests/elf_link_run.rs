@@ -1699,6 +1699,230 @@ fn versioned_dynamic_import_declares_and_binds_default_version() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An explicit non-default reference must select that exact DSO version,
+/// describe it through VERSYM/VERNEED, and bind it at load time instead of
+/// silently falling back to the default definition.
+#[test]
+fn versioned_dynamic_import_binds_explicit_non_default_version() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=versioned_dynamic_import_binds_explicit_non_default_version count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let Some(ld) = system_ld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=versioned_dynamic_import_binds_explicit_non_default_version count=1 reason=\"no system ld to build the reference .so\"");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=versioned_dynamic_import_binds_explicit_non_default_version count=1 reason=\"no standard dynamic loader on this host\"");
+        return;
+    };
+    let dir =
+        std::env::temp_dir().join(format!("afs_ld_elf_ver_nondefault_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    let lib_obj = dir.join("lib.o");
+    assemble(
+        &gas,
+        ".text\n.globl answer_v2\n.type answer_v2,@function\nanswer_v2:\n    movl $42, %eax\n    ret\n.globl answer_v1\n.type answer_v1,@function\nanswer_v1:\n    movl $7, %eax\n    ret\n.symver answer_v2, answer@@VERS_2.0\n.symver answer_v1, answer@VERS_1.0\n",
+        &dir.join("lib.s"),
+        &lib_obj,
+    );
+    let vmap = dir.join("ver.map");
+    std::fs::write(
+        &vmap,
+        "VERS_1.0 { global: answer; };\nVERS_2.0 { global: answer; } VERS_1.0;\n",
+    )
+    .unwrap();
+    let so = dir.join("libver.so.1");
+    let r = Command::new(&ld)
+        .args(["-shared", "-soname", "libver.so.1", "--version-script"])
+        .arg(&vmap)
+        .arg("-o")
+        .arg(&so)
+        .arg(&lib_obj)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "ld -shared --version-script: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(
+            ".symver answer_v1, answer@VERS_1.0\n.text\n.globl _start\n_start:\n    call answer_v1@PLT\n    movl %eax, %edi\n    movl ${exit_nr}, %eax\n    syscall\n"
+        ),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+
+    let gnu_out = dir.join("gnu_nondefault");
+    let r = Command::new(&ld)
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&gnu_out)
+        .arg(&main_obj)
+        .arg(&so)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "reference ld explicit version: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let run = Command::new(&gnu_out)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(7),
+        "reference linker must bind answer@VERS_1.0: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let out = dir.join("ver_nondefault");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&out)
+        .arg(&main_obj)
+        .arg(&so)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld explicit version: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let bytes = std::fs::read(&out).unwrap();
+    assert!(
+        bytes.windows(8).any(|w| w == b"VERS_1.0"),
+        "exe must declare the explicit VERS_1.0 requirement"
+    );
+    let dynstr = section_bytes(&bytes, ".dynstr").expect("dynamic string table");
+    assert!(
+        dynstr.split(|&b| b == 0).any(|name| name == b"answer"),
+        "dynsym must store the undecorated base name"
+    );
+    assert!(
+        !dynstr
+            .split(|&b| b == 0)
+            .any(|name| name == b"answer@VERS_1.0"),
+        "the version suffix belongs in VERSYM/VERNEED, not st_name"
+    );
+    let run = Command::new(&out)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(7),
+        "explicit version must bind answer@VERS_1.0: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // Plain and explicit-default references describe the same import. Keep
+    // that identity canonical while retaining the separately versioned V1
+    // import through section collection and as-needed DSO selection.
+    let mixed_obj = dir.join("mixed.o");
+    assemble(
+        &gas,
+        &format!(
+            ".symver answer_v1_ref, answer@VERS_1.0\n.symver answer_v2_ref, answer@VERS_2.0\n.text\n.globl _start\n_start:\n    call answer_v1_ref@PLT\n    movl %eax, %ebx\n    call answer_v2_ref@PLT\n    addl %eax, %ebx\n    call answer@PLT\n    addl %ebx, %eax\n    movl %eax, %edi\n    movl ${exit_nr}, %eax\n    syscall\n"
+        ),
+        &dir.join("mixed.s"),
+        &mixed_obj,
+    );
+    let mixed_out = dir.join("ver_mixed");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--gc-sections", "--dynamic-linker", interp, "-o"])
+        .arg(&mixed_out)
+        .arg(&mixed_obj)
+        .arg("--as-needed")
+        .arg(&so)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld mixed explicit versions: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let mixed = std::fs::read(&mixed_out).unwrap();
+    assert_eq!(needed_libraries(&mixed), ["libver.so.1"]);
+    let mixed_dynstr = section_bytes(&mixed, ".dynstr").expect("dynamic string table");
+    assert!(mixed_dynstr
+        .split(|&b| b == 0)
+        .any(|name| name == b"VERS_1.0"));
+    assert!(mixed_dynstr
+        .split(|&b| b == 0)
+        .any(|name| name == b"VERS_2.0"));
+    let mixed_dynsym = section_bytes(&mixed, ".dynsym").expect("dynamic symbol table");
+    let mixed_versym = section_bytes(&mixed, ".gnu.version").expect("version symbol table");
+    assert_eq!(mixed_versym.len(), mixed_dynsym.len() / 12);
+    let mut imported_versions = Vec::new();
+    for (index, symbol) in mixed_dynsym.chunks_exact(24).enumerate() {
+        let name_offset = u32::from_le_bytes(symbol[0..4].try_into().unwrap()) as usize;
+        let section_index = u16::from_le_bytes(symbol[6..8].try_into().unwrap());
+        if name_offset == 0 || section_index != 0 {
+            continue;
+        }
+        let name_end = mixed_dynstr[name_offset..]
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap();
+        assert_eq!(
+            &mixed_dynstr[name_offset..name_offset + name_end],
+            b"answer"
+        );
+        imported_versions.push(u16::from_le_bytes(
+            mixed_versym[index * 2..index * 2 + 2].try_into().unwrap(),
+        ));
+    }
+    assert_eq!(
+        imported_versions.len(),
+        2,
+        "plain and explicit-default references must share one dynsym"
+    );
+    imported_versions.sort_unstable();
+    imported_versions.dedup();
+    assert_eq!(
+        imported_versions.len(),
+        2,
+        "V1 and V2 imports must use distinct VERSYM indices"
+    );
+    assert!(imported_versions.iter().all(|&index| index >= 2));
+    let run = Command::new(&mixed_out)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(91),
+        "mixed imports must bind V1 once and V2 twice: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let out2 = dir.join("ver_nondefault2");
+    assert!(Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&out2)
+        .arg(&main_obj)
+        .arg(&so)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        std::fs::read(&out2).unwrap(),
+        "explicit-version link must be deterministic"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// System `ld`, if present, for building the reference shared object.
 /// Probes the usual FHS spots and then bare `ld` on PATH (NixOS keeps it
 /// in the current-system profile, not /usr/bin).

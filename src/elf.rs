@@ -578,7 +578,7 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
 /// One symbol a shared object exports.
 #[derive(Debug, Clone)]
 pub struct Export {
-    /// Symbol version (`""` when unversioned). Populated in a later rung.
+    /// Symbol version (`""` when unversioned).
     pub version: String,
     /// STT_FUNC (PLT-callable) vs a data object (GLOB_DAT).
     pub func: bool,
@@ -590,6 +590,9 @@ pub struct Export {
 #[derive(Debug)]
 pub struct SharedLib {
     pub soname: String,
+    /// Export lookup by plain dynamic-symbol name and, for versioned
+    /// definitions, by synthetic `name@version` aliases. A plain name selects
+    /// the default definition when the shared object provides one.
     pub exports: HashMap<String, Export>,
     /// Undefined dynamic-symbol names, in dynsym order (deterministic).
     pub undefs: Vec<String>,
@@ -645,8 +648,9 @@ pub fn parse_shared_with_metadata(
     let sh = |i: usize| -> &[u8] { &bytes[shoff + i * shentsize..shoff + (i + 1) * shentsize] };
 
     // Locate .dynsym (with its linked string table), .dynamic, and the
-    // version sections (.gnu.version / .gnu.version_d) so exported
-    // symbols carry their default version.
+    // version sections (.gnu.version / .gnu.version_d) so every exported
+    // symbol version remains addressable while the plain name selects the
+    // default definition.
     let mut dynsym: Option<(usize, usize, usize, usize)> = None; // off,size,link,entsize
     let mut dynamic: Option<(usize, usize)> = None; // off,size
     let mut versym_off: Option<usize> = None;
@@ -780,20 +784,27 @@ pub fn parse_shared_with_metadata(
             }
             _ => (String::new(), true),
         };
-        // Prefer the default-versioned definition when a name repeats:
-        // replace only when the new def is default and the stored isn't.
+        let export = Export {
+            version: version.clone(),
+            func: typ == STT_FUNC || typ == STT_GNU_IFUNC,
+        };
+        // A relocation names an explicit version as `name@version`, while
+        // the DSO dynsym stores only `name` and identifies the version via
+        // `.gnu.version`. Preserve that exact lookup identity for every
+        // versioned definition.
+        if !version.is_empty() {
+            exports
+                .entry(format!("{nm}@{version}"))
+                .or_insert_with(|| export.clone());
+        }
+        // The plain name keeps the existing compatibility rule: prefer the
+        // default-versioned definition when a name repeats.
         let prev_default = is_default_export.get(&nm).copied().unwrap_or(false);
         if exports.contains_key(&nm) && (prev_default || !default) {
             continue;
         }
         is_default_export.insert(nm.clone(), default);
-        exports.insert(
-            nm,
-            Export {
-                version,
-                func: typ == STT_FUNC || typ == STT_GNU_IFUNC,
-            },
-        );
+        exports.insert(nm, export);
     }
     Ok((
         SharedLib {
@@ -3699,12 +3710,15 @@ pub fn link_dynamic_exec(
     // ---- Imports: undefined strong globals a shared library exports.
     // Function imports get a PLT slot (JUMP_SLOT); data imports get a
     // GOT slot (GLOB_DAT). Each import records its owning library and the
-    // default version the library binds it to (empty when unversioned).
+    // selected version (empty when unversioned). Exact object spellings stay
+    // in `import_index`; `imports` holds the base dynsym spelling because ELF
+    // records the requested version through VERSYM/VERNEED.
     let mut imports: Vec<String> = Vec::new();
     let mut import_lib: Vec<usize> = Vec::new();
     let mut import_ver: Vec<String> = Vec::new();
     let mut import_is_func: Vec<bool> = Vec::new();
     let mut import_index: HashMap<String, usize> = HashMap::new();
+    let mut import_identity: HashMap<(usize, String, String), usize> = HashMap::new();
     for obj in objects {
         for sym in &obj.symbols {
             if sym.shndx != SHN_UNDEF
@@ -3727,11 +3741,23 @@ pub fn link_dynamic_exec(
                 ));
             };
             let export = &shared[li].exports[&sym.name];
-            import_index.insert(sym.name.clone(), imports.len());
+            let dynamic_name = if export.version.is_empty() {
+                sym.name.clone()
+            } else {
+                version_base(&sym.name).unwrap_or(&sym.name).to_string()
+            };
+            let identity = (li, dynamic_name.clone(), export.version.clone());
+            if let Some(&ii) = import_identity.get(&identity) {
+                import_index.insert(sym.name.clone(), ii);
+                continue;
+            }
+            let ii = imports.len();
+            import_index.insert(sym.name.clone(), ii);
+            import_identity.insert(identity, ii);
             import_lib.push(li);
             import_ver.push(export.version.clone());
             import_is_func.push(export.func);
-            imports.push(sym.name.clone());
+            imports.push(dynamic_name);
         }
     }
     let n_imp = imports.len();

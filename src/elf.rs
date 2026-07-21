@@ -1987,6 +1987,7 @@ fn scan_archive(
     objects: &mut Vec<ElfObject>,
     defined: &mut HashSet<String>,
     additional_demand: &[String],
+    required_demand: &[String],
     mode: &str,
 ) -> Result<bool, ElfError> {
     use crate::archive::Archive as ArContainer;
@@ -1995,7 +1996,12 @@ fn scan_archive(
         .map_err(|e| ElfError(format!("{}: {}", input.lib.name, e)))?;
     let mut pulled_any = false;
     loop {
-        let demand = undefined_demand(objects, additional_demand, defined);
+        let mut demand = undefined_demand(objects, additional_demand, defined);
+        for name in required_demand {
+            if !name.is_empty() && !demand.contains(name) {
+                demand.push(name.clone());
+            }
+        }
         let mut changed = false;
         for name in &demand {
             let Some(off) = armap_offset(&archive, name) else {
@@ -2051,6 +2057,7 @@ fn process_static_range(
     end: usize,
     objects: &mut Vec<ElfObject>,
     defined: &mut HashSet<String>,
+    entry: &str,
 ) -> Result<bool, ElfError> {
     let mut changed = false;
     let mut i = start;
@@ -2059,7 +2066,7 @@ fn process_static_range(
             let group_end = find_static_group_end(inputs, i + 1, end)?;
             loop {
                 let pass_changed =
-                    process_static_range(inputs, i + 1, group_end, objects, defined)?;
+                    process_static_range(inputs, i + 1, group_end, objects, defined, entry)?;
                 if !pass_changed {
                     break;
                 }
@@ -2079,7 +2086,11 @@ fn process_static_range(
                 }
             }
             StaticInput::Archive(archive) => {
-                changed |= scan_archive(archive, objects, defined, &[], "static")?;
+                let required_entry = (!defined.contains(entry))
+                    .then(|| entry.to_string())
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                changed |= scan_archive(archive, objects, defined, &[], &required_entry, "static")?;
             }
             StaticInput::GroupStart | StaticInput::GroupEnd => unreachable!(),
         }
@@ -2111,7 +2122,7 @@ pub fn link_static_with_gc(
     let mut objects = Vec::new();
     let mut defined = HashSet::new();
     let end = inputs.len();
-    process_static_range(&mut inputs, 0, end, &mut objects, &mut defined)?;
+    process_static_range(&mut inputs, 0, end, &mut objects, &mut defined, entry)?;
     if gc_sections {
         let analysis = analyze_gc_sections(&objects, entry, &[])?;
         apply_gc_sections(&mut objects, &analysis)?;
@@ -3089,6 +3100,7 @@ fn process_dynamic_range(
     start: usize,
     end: usize,
     state: &mut DynamicResolution,
+    entry: &str,
 ) -> Result<bool, ElfError> {
     let mut changed = false;
     let mut i = start;
@@ -3096,7 +3108,7 @@ fn process_dynamic_range(
         if matches!(inputs[i], DynamicInput::GroupStart) {
             let group_end = find_dynamic_group_end(inputs, i + 1, end)?;
             loop {
-                let pass_changed = process_dynamic_range(inputs, i + 1, group_end, state)?;
+                let pass_changed = process_dynamic_range(inputs, i + 1, group_end, state, entry)?;
                 if !pass_changed {
                     break;
                 }
@@ -3121,11 +3133,20 @@ fn process_dynamic_range(
                     &state.defined,
                     &state.dependency_exports,
                 );
+                let mut object_definitions = HashSet::new();
+                for object in &state.objects {
+                    defined_names(object, &mut object_definitions);
+                }
+                let required_entry = (!object_definitions.contains(entry))
+                    .then(|| entry.to_string())
+                    .into_iter()
+                    .collect::<Vec<_>>();
                 changed |= scan_archive(
                     archive,
                     &mut state.objects,
                     &mut state.defined,
                     &additional_demand,
+                    &required_entry,
                     "dynamic",
                 )?;
             }
@@ -3310,7 +3331,7 @@ pub fn link_dynamic_with_as_needed_and_gc(
         .collect();
     let mut state = DynamicResolution::default();
     let end = inputs.len();
-    process_dynamic_range(&mut inputs, 0, end, &mut state)?;
+    process_dynamic_range(&mut inputs, 0, end, &mut state, entry)?;
     if gc_sections {
         gc_dynamic_sections(&mut state, entry)?;
     }

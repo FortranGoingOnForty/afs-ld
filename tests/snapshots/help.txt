@@ -5,6 +5,7 @@ Options:
   -dylib                          Emit a dylib instead of an executable
   -e <symbol>                     Set the entry symbol
   -arch arm64                     Select the arm64 target
+  -melf_x86_64 / -m elf_x86_64   Select the x86_64 ELF target
   -map <path>                     Emit text link map
   -why_live <symbol>              Print a reachability chain for <symbol>
   -l<name> / -l <name>            Search for library

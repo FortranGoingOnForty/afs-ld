@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::process::ExitCode;
 
 use afs_ld::{archive, args, diag, dump, elf, LinkError, Linker};
@@ -11,6 +12,7 @@ Options:
   -dylib                          Emit a dylib instead of an executable
   -e <symbol>                     Set the entry symbol
   -arch arm64                     Select the arm64 target
+  -melf_x86_64 / -m elf_x86_64   Select the x86_64 ELF target
   -map <path>                     Emit text link map
   -why_live <symbol>              Print a reachability chain for <symbol>
   -l<name> / -l <name>            Search for library
@@ -62,10 +64,8 @@ Options:
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
 
-    // x16: ELF mode. If any input file carries ELF magic, route to
-    // the ELF linker before the Mach-O argument surface sees it.
-    // Rung-1 flag set: `-o <out> <objects...>`; anything else is a
-    // loud not-yet, never a silent ignore.
+    // Route explicit x86_64 ELF emulation and direct or indirect ELF
+    // inputs before the Mach-O argument surface sees them.
     if let Some(code) = elf_mode(&argv[1..]) {
         return code;
     }
@@ -165,8 +165,8 @@ enum LinkInput {
     GroupEnd,
 }
 
-/// Detect and run the ELF link path. Returns None when no input is
-/// an ELF object (Mach-O flow continues unchanged).
+/// Detect and run the ELF link path. Returns None when neither an explicit
+/// ELF emulation nor a direct or indirect ELF input selects it.
 fn elf_mode(args: &[String]) -> Option<ExitCode> {
     let mut output: Option<std::path::PathBuf> = None;
     // Inputs in command-line order, positional files and `-l` requests
@@ -179,6 +179,8 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
     let mut eh_frame_hdr = false;
     let mut gc_sections = false;
     let mut as_needed = false;
+    let mut elf_emulation = false;
+    let mut entry = "_start".to_string();
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -199,6 +201,13 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
             "--dynamic-linker" | "-dynamic-linker" => {
                 dynamic_linker = it.next().cloned();
             }
+            "-e" => {
+                if let Some(symbol) = it.next() {
+                    entry = symbol.clone();
+                } else {
+                    unsupported.push("-e (missing symbol)".to_string());
+                }
+            }
             // `--eh-frame-hdr` requests the `.eh_frame_hdr` unwind index +
             // PT_GNU_EH_FRAME (GNU semantics: emitted only when asked).
             "--eh-frame-hdr" => eh_frame_hdr = true,
@@ -211,10 +220,13 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
             // emulation are the expected mode.
             "--as-needed" => as_needed = true,
             "--no-as-needed" => as_needed = false,
-            "-static" | "-Bstatic" | "-Bdynamic" | "-melf_x86_64" | "-znow" => {}
-            "-m" => {
-                it.next();
-            }
+            "-melf_x86_64" => elf_emulation = true,
+            "-static" | "-Bstatic" | "-Bdynamic" | "-znow" => {}
+            "-m" => match it.next() {
+                Some(emulation) if emulation == "elf_x86_64" => elf_emulation = true,
+                Some(emulation) => unsupported.push(format!("-m {emulation}")),
+                None => unsupported.push("-m (missing emulation)".to_string()),
+            },
             "-z" => {
                 it.next();
             }
@@ -232,15 +244,8 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
             }),
         }
     }
-    let is_elf = |p: &std::path::Path| {
-        std::fs::read(p)
-            .map(|b| b.len() >= 4 && &b[0..4] == b"\x7fELF")
-            .unwrap_or(false)
-    };
-    if !link_inputs
-        .iter()
-        .any(|li| matches!(li, LinkInput::File { path, .. } if is_elf(path)))
-    {
+    let dynamic = dynamic_linker.is_some();
+    if !elf_emulation && !link_inputs_select_elf(&link_inputs, &lib_dirs, dynamic) {
         return None;
     }
     if !unsupported.is_empty() {
@@ -266,6 +271,7 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
         match link_dynamic(
             &link_inputs,
             &lib_dirs,
+            &entry,
             &interp,
             eh_frame_hdr,
             gc_sections,
@@ -278,6 +284,7 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
         match link_static(
             &link_inputs,
             &lib_dirs,
+            &entry,
             eh_frame_hdr,
             gc_sections,
             read_bytes,
@@ -502,6 +509,77 @@ fn linker_script_inputs(
     (!out.is_empty()).then_some(out)
 }
 
+fn link_inputs_select_elf(
+    link_inputs: &[LinkInput],
+    lib_dirs: &[std::path::PathBuf],
+    dynamic: bool,
+) -> bool {
+    let mut script_stack = HashSet::new();
+    link_inputs
+        .iter()
+        .any(|input| link_input_selects_elf(input, lib_dirs, dynamic, &mut script_stack))
+}
+
+fn link_input_selects_elf(
+    input: &LinkInput,
+    lib_dirs: &[std::path::PathBuf],
+    dynamic: bool,
+    script_stack: &mut HashSet<std::path::PathBuf>,
+) -> bool {
+    let path = match input {
+        LinkInput::File { path, .. } => path.clone(),
+        LinkInput::Lib { name, .. } => {
+            let resolved = if dynamic {
+                resolve_dynamic_lib(name, lib_dirs)
+            } else {
+                resolve_lib(name, "a", lib_dirs)
+            };
+            let Some(path) = resolved else {
+                return false;
+            };
+            path
+        }
+        LinkInput::GroupStart | LinkInput::GroupEnd => return false,
+    };
+    path_selects_elf(&path, lib_dirs, dynamic, script_stack)
+}
+
+fn path_selects_elf(
+    path: &std::path::Path,
+    lib_dirs: &[std::path::PathBuf],
+    dynamic: bool,
+    script_stack: &mut HashSet<std::path::PathBuf>,
+) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    if bytes.starts_with(b"\x7fELF") {
+        return true;
+    }
+    if bytes.starts_with(archive::AR_MAGIC) || bytes.starts_with(archive::AR_MAGIC_THIN) {
+        let Ok(container) = archive::Archive::open(path, &bytes) else {
+            return false;
+        };
+        return container.object_members().any(|member| {
+            container
+                .member_bytes(member)
+                .is_ok_and(|member_bytes| member_bytes.starts_with(b"\x7fELF"))
+        });
+    }
+    let Some(script_inputs) = linker_script_inputs(path, &bytes, lib_dirs, false) else {
+        return false;
+    };
+    let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !script_stack.insert(identity.clone()) {
+        return false;
+    }
+    let selects_elf = script_inputs
+        .iter()
+        .any(|input| link_input_selects_elf(input, lib_dirs, dynamic, script_stack));
+    script_stack.remove(&identity);
+    selects_elf
+}
+
 /// Static link: objects load eagerly, `ar` archives feed lazy member
 /// selection. `-lfoo` resolves to `libfoo.a`. Inputs are consumed in
 /// command-line order so archive symbol resolution matches GNU ld
@@ -510,45 +588,84 @@ fn linker_script_inputs(
 fn link_static(
     link_inputs: &[LinkInput],
     lib_dirs: &[std::path::PathBuf],
+    entry: &str,
     eh_frame_hdr: bool,
     gc_sections: bool,
     read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
 ) -> Result<Vec<u8>, ExitCode> {
     let mut inputs = Vec::new();
+    let mut script_stack = HashSet::new();
     for input in link_inputs {
-        let p = match input {
-            LinkInput::File { path, .. } => path.clone(),
-            LinkInput::Lib { name, .. } => match resolve_lib(name, "a", lib_dirs) {
-                Some(p) => p,
-                None => {
-                    diag::error(&format!("unable to find library -l{name}"));
-                    return Err(ExitCode::from(1));
-                }
-            },
-            LinkInput::GroupStart => {
-                inputs.push(elf::LinkInput::GroupStart);
-                continue;
-            }
-            LinkInput::GroupEnd => {
-                inputs.push(elf::LinkInput::GroupEnd);
-                continue;
-            }
-        };
-        let bytes = read_bytes(&p)?;
-        if bytes.starts_with(archive::AR_MAGIC) || bytes.starts_with(archive::AR_MAGIC_THIN) {
-            inputs.push(elf::LinkInput::Archive(elf::Library {
-                name: p.display().to_string(),
-                path: p,
-                bytes,
-            }));
-        } else {
-            inputs.push(elf::LinkInput::Object(parse_object(&p, &bytes)?));
-        }
+        push_static_input(input, lib_dirs, &read_bytes, &mut script_stack, &mut inputs)?;
     }
-    elf::link_static_with_gc(inputs, "_start", eh_frame_hdr, gc_sections).map_err(|e| {
+    elf::link_static_with_gc(inputs, entry, eh_frame_hdr, gc_sections).map_err(|e| {
         diag::error(&e.to_string());
         ExitCode::from(1)
     })
+}
+
+fn push_static_input(
+    input: &LinkInput,
+    lib_dirs: &[std::path::PathBuf],
+    read_bytes: &impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
+    script_stack: &mut HashSet<std::path::PathBuf>,
+    inputs: &mut Vec<elf::LinkInput>,
+) -> Result<(), ExitCode> {
+    let path = match input {
+        LinkInput::File { path, .. } => path.clone(),
+        LinkInput::Lib { name, .. } => match resolve_lib(name, "a", lib_dirs) {
+            Some(path) => path,
+            None => {
+                diag::error(&format!("unable to find library -l{name}"));
+                return Err(ExitCode::from(1));
+            }
+        },
+        LinkInput::GroupStart => {
+            inputs.push(elf::LinkInput::GroupStart);
+            return Ok(());
+        }
+        LinkInput::GroupEnd => {
+            inputs.push(elf::LinkInput::GroupEnd);
+            return Ok(());
+        }
+    };
+    push_static_path(&path, lib_dirs, read_bytes, script_stack, inputs)
+}
+
+fn push_static_path(
+    path: &std::path::Path,
+    lib_dirs: &[std::path::PathBuf],
+    read_bytes: &impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
+    script_stack: &mut HashSet<std::path::PathBuf>,
+    inputs: &mut Vec<elf::LinkInput>,
+) -> Result<(), ExitCode> {
+    let bytes = read_bytes(path)?;
+    if bytes.starts_with(archive::AR_MAGIC) || bytes.starts_with(archive::AR_MAGIC_THIN) {
+        inputs.push(elf::LinkInput::Archive(elf::Library {
+            name: path.display().to_string(),
+            path: path.to_path_buf(),
+            bytes,
+        }));
+        return Ok(());
+    }
+    if bytes.starts_with(b"\x7fELF") {
+        inputs.push(elf::LinkInput::Object(parse_object(path, &bytes)?));
+        return Ok(());
+    }
+    if let Some(script_inputs) = linker_script_inputs(path, &bytes, lib_dirs, false) {
+        let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if !script_stack.insert(identity.clone()) {
+            diag::error(&format!("linker script cycle involving {}", path.display()));
+            return Err(ExitCode::from(1));
+        }
+        let result = script_inputs.iter().try_for_each(|input| {
+            push_static_input(input, lib_dirs, read_bytes, script_stack, inputs)
+        });
+        script_stack.remove(&identity);
+        return result;
+    }
+    inputs.push(elf::LinkInput::Object(parse_object(path, &bytes)?));
+    Ok(())
 }
 
 /// Dynamic link: objects load eagerly; `.a` inputs feed lazy member
@@ -558,16 +675,18 @@ fn link_static(
 fn link_dynamic(
     link_inputs: &[LinkInput],
     lib_dirs: &[std::path::PathBuf],
+    entry: &str,
     interp: &str,
     eh_frame_hdr: bool,
     gc_sections: bool,
     read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
 ) -> Result<Vec<u8>, ExitCode> {
     let mut inputs = Vec::new();
+    let mut script_stack = HashSet::new();
     for input in link_inputs {
-        push_dynamic_input(input, lib_dirs, &read_bytes, &mut inputs)?;
+        push_dynamic_input(input, lib_dirs, &read_bytes, &mut script_stack, &mut inputs)?;
     }
-    elf::link_dynamic_with_as_needed_and_gc(inputs, "_start", interp, eh_frame_hdr, gc_sections)
+    elf::link_dynamic_with_as_needed_and_gc(inputs, entry, interp, eh_frame_hdr, gc_sections)
         .map_err(|e| {
             diag::error(&e.to_string());
             ExitCode::from(1)
@@ -582,6 +701,7 @@ fn push_dynamic_input(
     input: &LinkInput,
     lib_dirs: &[std::path::PathBuf],
     read_bytes: &impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
+    script_stack: &mut HashSet<std::path::PathBuf>,
     inputs: &mut Vec<(elf::DynamicLinkInput, bool, Option<elf::SharedLinkMetadata>)>,
 ) -> Result<(), ExitCode> {
     let (p, as_needed) = match input {
@@ -602,7 +722,7 @@ fn push_dynamic_input(
             return Ok(());
         }
     };
-    push_dynamic_path(&p, lib_dirs, as_needed, read_bytes, inputs)
+    push_dynamic_path(&p, lib_dirs, as_needed, read_bytes, script_stack, inputs)
 }
 
 fn push_dynamic_path(
@@ -610,6 +730,7 @@ fn push_dynamic_path(
     lib_dirs: &[std::path::PathBuf],
     as_needed: bool,
     read_bytes: &impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
+    script_stack: &mut HashSet<std::path::PathBuf>,
     inputs: &mut Vec<(elf::DynamicLinkInput, bool, Option<elf::SharedLinkMetadata>)>,
 ) -> Result<(), ExitCode> {
     let bytes = read_bytes(p)?;
@@ -644,10 +765,16 @@ fn push_dynamic_path(
         return Ok(());
     }
     if let Some(script_inputs) = linker_script_inputs(p, &bytes, lib_dirs, as_needed) {
-        for input in script_inputs {
-            push_dynamic_input(&input, lib_dirs, read_bytes, inputs)?;
+        let identity = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        if !script_stack.insert(identity.clone()) {
+            diag::error(&format!("linker script cycle involving {}", p.display()));
+            return Err(ExitCode::from(1));
         }
-        return Ok(());
+        let result = script_inputs.iter().try_for_each(|input| {
+            push_dynamic_input(input, lib_dirs, read_bytes, script_stack, inputs)
+        });
+        script_stack.remove(&identity);
+        return result;
     }
     inputs.push((
         elf::DynamicLinkInput::Object(parse_object(p, &bytes)?),

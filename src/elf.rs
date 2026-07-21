@@ -428,24 +428,39 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
     let symtab = raws.iter().position(|r| r.sh_type == SHT_SYMTAB);
     if let Some(si) = symtab {
         let r = &raws[si];
-        if r.entsize == 0 {
-            return err(format!("{}: .symtab has zero entry size", name));
+        if r.entsize < 24 {
+            return err(format!(
+                "{}: {} entry size {} invalid (need >= 24)",
+                name, r.name, r.entsize
+            ));
+        }
+        if !r.size.is_multiple_of(r.entsize) {
+            return err(format!(
+                "{}: {} size {} is not a multiple of entry size {}",
+                name, r.name, r.size, r.entsize
+            ));
         }
         let Some(strtab) = raws.get(r.link) else {
             return err(format!(
-                "{}: .symtab links to a nonexistent string table",
-                name
+                "{}: {} string table index {} out of range",
+                name, r.name, r.link
             ));
         };
-        let strdat = subslice(bytes, strtab.off, strtab.size, name, ".strtab")?;
+        if strtab.sh_type != SHT_STRTAB {
+            return err(format!(
+                "{}: {} links to section '{}' at index {}, not a string table",
+                name, r.name, strtab.name, r.link
+            ));
+        }
+        let strdat = subslice(bytes, strtab.off, strtab.size, name, &strtab.name)?;
+        let symdat = subslice(bytes, r.off, r.size, name, &r.name)?;
         let n = r.size / r.entsize;
-        // The whole symbol table must fit; each entry is 24 bytes.
-        subslice(bytes, r.off, n.saturating_mul(24), name, ".symtab")?;
         for k in 0..n {
-            let e = &bytes[r.off + k * 24..r.off + (k + 1) * 24];
+            let start = k * r.entsize;
+            let e = &symdat[start..start + 24];
             let shndx = ru16(e, 6);
             symbols.push(Symbol {
-                name: cstr(strdat, ru32(e, 0) as usize, name, ".strtab")?,
+                name: cstr(strdat, ru32(e, 0) as usize, name, &strtab.name)?,
                 bind: e[4] >> 4,
                 typ: e[4] & 0xf,
                 shndx,
@@ -458,32 +473,90 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
 
     // RELA tables onto their targets.
     for r in raws.iter().filter(|r| r.sh_type == SHT_RELA) {
-        let Some(&target) = remap.get(&r.info) else {
-            continue; // relocations for a dropped section (.eh_frame etc.)
-        };
-        if r.entsize == 0 {
+        let Some(target_raw) = raws.get(r.info) else {
             return err(format!(
-                "{}: RELA section '{}' has zero entry size",
-                name, r.name
+                "{}: RELA section '{}' target index {} out of range (section count {})",
+                name,
+                r.name,
+                r.info,
+                raws.len()
+            ));
+        };
+        let Some(symtab_index) = symtab else {
+            return err(format!(
+                "{}: RELA section '{}' links to symbol table index {}, but the object has no SHT_SYMTAB",
+                name, r.name, r.link
+            ));
+        };
+        if r.link != symtab_index {
+            return err(format!(
+                "{}: RELA section '{}' symbol table index {} does not match .symtab index {}",
+                name, r.name, r.link, symtab_index
             ));
         }
-        let n = r.size / r.entsize;
-        subslice(
+        if r.entsize < 24 {
+            return err(format!(
+                "{}: RELA section '{}' entry size {} invalid (need >= 24)",
+                name, r.name, r.entsize
+            ));
+        }
+        if !r.size.is_multiple_of(r.entsize) {
+            return err(format!(
+                "{}: RELA section '{}' size {} is not a multiple of entry size {}",
+                name, r.name, r.size, r.entsize
+            ));
+        }
+        let reladat = subslice(
             bytes,
             r.off,
-            n.saturating_mul(24),
+            r.size,
             name,
-            &format!("RELA '{}'", r.name),
+            &format!("RELA section '{}'", r.name),
         )?;
+        let n = r.size / r.entsize;
         for k in 0..n {
-            let e = &bytes[r.off + k * 24..r.off + (k + 1) * 24];
+            let start = k * r.entsize;
+            let e = &reladat[start..start + 24];
+            let offset = ru64(e, 0);
             let info = ru64(e, 8);
-            sections[target].relas.push(Rela {
-                offset: ru64(e, 0),
-                sym: (info >> 32) as u32,
-                r_type: (info & 0xffff_ffff) as u32,
+            let sym = (info >> 32) as u32;
+            let r_type = (info & 0xffff_ffff) as u32;
+            if sym as usize >= symbols.len() {
+                return err(format!(
+                    "{}: section '{}' relocation {} has invalid r_sym {} (symbol count {})",
+                    name,
+                    target_raw.name,
+                    k,
+                    sym,
+                    symbols.len()
+                ));
+            }
+            let width = input_relocation_width(r_type).unwrap_or(1);
+            let offset_usize = usize::try_from(offset).map_err(|_| {
+                ElfError(format!(
+                    "{}: section '{}' relocation {} has invalid r_offset {:#x} (does not fit usize)",
+                    name, target_raw.name, k, offset
+                ))
+            })?;
+            match offset_usize.checked_add(width) {
+                Some(end) if end <= target_raw.size => {}
+                _ => {
+                    return err(format!(
+                        "{}: section '{}' relocation {} has invalid r_offset {:#x}: {}-byte write exceeds section size {:#x}",
+                        name, target_raw.name, k, offset, width, target_raw.size
+                    ));
+                }
+            }
+
+            let rela = Rela {
+                offset,
+                sym,
+                r_type,
                 addend: ru64(e, 16) as i64,
-            });
+            };
+            if let Some(&target) = remap.get(&r.info) {
+                sections[target].relas.push(rela);
+            }
         }
     }
 
@@ -1409,6 +1482,64 @@ fn input_relocation_width(r_type: u32) -> Option<usize> {
     }
 }
 
+fn validate_object_relocations(objects: &[ElfObject]) -> Result<(), ElfError> {
+    for object in objects {
+        for (symbol_index, symbol) in object.symbols.iter().enumerate() {
+            let Some(section_index) = symbol.section else {
+                continue;
+            };
+            if section_index >= object.sections.len() {
+                return err(format!(
+                    "{}: symbol {} ('{}') has invalid section index {} (section count {})",
+                    object.name,
+                    symbol_index,
+                    symbol.name,
+                    section_index,
+                    object.sections.len()
+                ));
+            }
+        }
+
+        for section in &object.sections {
+            for (relocation_index, relocation) in section.relas.iter().enumerate() {
+                if relocation.sym as usize >= object.symbols.len() {
+                    return err(format!(
+                        "{}: section '{}' relocation {} has invalid r_sym {} (symbol count {})",
+                        object.name,
+                        section.name,
+                        relocation_index,
+                        relocation.sym,
+                        object.symbols.len()
+                    ));
+                }
+
+                let width = input_relocation_width(relocation.r_type).unwrap_or(1);
+                let offset = usize::try_from(relocation.offset).map_err(|_| {
+                    ElfError(format!(
+                        "{}: section '{}' relocation {} has invalid r_offset {:#x} (does not fit usize)",
+                        object.name, section.name, relocation_index, relocation.offset
+                    ))
+                })?;
+                match offset.checked_add(width) {
+                    Some(end) if end <= section.data.len() => {}
+                    _ => {
+                        return err(format!(
+                            "{}: section '{}' relocation {} has invalid r_offset {:#x}: {}-byte write exceeds section size {:#x}",
+                            object.name,
+                            section.name,
+                            relocation_index,
+                            relocation.offset,
+                            width,
+                            section.data.len()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_eh_frame_gc(section: &Section, object: &str) -> Result<EhFrameGc, ElfError> {
     let mut records: Vec<EhFrameRecord> = Vec::new();
     let mut cie_by_offset: HashMap<usize, usize> = HashMap::new();
@@ -1656,6 +1787,7 @@ fn analyze_gc_sections(
     entry: &str,
     export_roots: &[String],
 ) -> Result<GcAnalysis, ElfError> {
+    validate_object_relocations(objects)?;
     let globals = resolve_globals(objects)?;
     let mut eh_frames = Vec::with_capacity(objects.len());
     for object in objects {
@@ -2142,6 +2274,8 @@ pub fn link_static_exec(
     entry: &str,
     eh_frame_hdr: bool,
 ) -> Result<Vec<u8>, ElfError> {
+    validate_object_relocations(objects)?;
+
     // ---- Merge input sections by (name, flags) in first-seen order,
     // ranked text / rodata / data / bss for segment assignment.
     let mut outs: Vec<OutSec> = Vec::new();
@@ -3371,6 +3505,8 @@ pub fn link_dynamic_exec(
     interp: &str,
     eh_frame_hdr: bool,
 ) -> Result<Vec<u8>, ElfError> {
+    validate_object_relocations(objects)?;
+
     const DBASE: u64 = 0x20_0000;
 
     // ---- Merge input sections (text/rodata/data/bss). Init/fini arrays

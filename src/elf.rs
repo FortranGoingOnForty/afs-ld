@@ -1091,6 +1091,12 @@ fn cie_fde_encoding(eh: &[u8], content: usize, rec_end: usize) -> Result<u8, Elf
                     return err(".eh_frame: CIE personality pointer is truncated");
                 }
             }
+            // 'S' marks a signal frame (gas `.cfi_signal_frame`); it
+            // carries NO augmentation data and does not affect the FDE
+            // encoding. glibc's static libc.a ships exactly one "zRS"
+            // CIE (the signal restorer), so a static link against it
+            // dies here without this arm.
+            b'S' => {}
             _ => return err(".eh_frame: unsupported CIE augmentation char"),
         }
     }

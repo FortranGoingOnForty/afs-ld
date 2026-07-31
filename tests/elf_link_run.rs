@@ -3324,3 +3324,41 @@ fn eh_frame_hdr_emitted_only_when_requested() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A signal-frame CIE (gas `.cfi_signal_frame` -> augmentation "zRS")
+/// must parse: 'S' carries no augmentation data. glibc's static libc.a
+/// ships exactly one such CIE (the signal restorer), so before this
+/// arm every static link against system glibc died at the merge.
+#[test]
+fn eh_frame_signal_frame_cie_links() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=eh_frame_signal_frame_cie_links count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_sigframe_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let asm = format!(
+        ".text\n.globl _start\n.type _start,@function\n_start:\n    .cfi_startproc\n    .cfi_signal_frame\n    movl $42, %edi\n    movl ${exit_nr}, %eax\n    syscall\n    .cfi_endproc\n.size _start,.-_start\n"
+    );
+    let s = dir.join("sig.s");
+    let obj = dir.join("sig.o");
+    assemble(&gas, &asm, &s, &obj);
+
+    let out = dir.join("sig");
+    let res = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("--eh-frame-hdr")
+        .arg("-o")
+        .arg(&out)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "signal-frame CIE must link: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

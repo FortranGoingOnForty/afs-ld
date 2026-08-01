@@ -4,7 +4,9 @@
 //! and errors on anything else with a precise diagnostic. Sprint 19 grows this
 //! into the full `ld`-compatible surface described in `.docs/sprints/sprint19.md`.
 
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::resolve::{levenshtein, UndefinedTreatment};
 use crate::{
@@ -64,6 +66,8 @@ const KNOWN_FLAGS: &[&str] = &[
     "--dump-tbd",
 ];
 
+const RESPONSE_FILE_DEPTH_LIMIT: usize = 8;
+
 #[derive(Debug)]
 pub enum ArgsError {
     /// A flag that takes an argument was supplied without one.
@@ -78,6 +82,30 @@ pub enum ArgsError {
     UnknownFlag {
         flag: String,
         suggestion: Option<String>,
+    },
+    /// A response file could not be read as UTF-8 text.
+    ResponseFileRead {
+        path: PathBuf,
+        referenced_at: Option<(PathBuf, usize, usize)>,
+        source: io::Error,
+    },
+    /// A response file contains malformed quoting.
+    ResponseFileSyntax {
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        message: String,
+    },
+    /// A response file includes itself, directly or indirectly.
+    ResponseFileCycle {
+        path: PathBuf,
+        referenced_at: Option<(PathBuf, usize, usize)>,
+    },
+    /// Nested response files exceeded the defensive recursion bound.
+    ResponseFileDepth {
+        path: PathBuf,
+        referenced_at: Option<(PathBuf, usize, usize)>,
+        limit: usize,
     },
 }
 
@@ -110,8 +138,63 @@ impl std::fmt::Display for ArgsError {
                 }
                 write!(f, " (Sprint 19 adds the full `ld` surface)")
             }
+            ArgsError::ResponseFileRead {
+                path,
+                referenced_at,
+                source,
+            } => {
+                write!(
+                    f,
+                    "cannot read response file `{}`: {source}",
+                    path.display()
+                )?;
+                write_response_reference(f, referenced_at.as_ref())
+            }
+            ArgsError::ResponseFileSyntax {
+                path,
+                line,
+                column,
+                message,
+            } => write!(
+                f,
+                "cannot parse response file `{}` at {line}:{column}: {message}",
+                path.display()
+            ),
+            ArgsError::ResponseFileCycle {
+                path,
+                referenced_at,
+            } => {
+                write!(
+                    f,
+                    "circular response file inclusion of `{}`",
+                    path.display()
+                )?;
+                write_response_reference(f, referenced_at.as_ref())
+            }
+            ArgsError::ResponseFileDepth {
+                path,
+                referenced_at,
+                limit,
+            } => {
+                write!(
+                    f,
+                    "response file nesting exceeds limit of {limit} at `{}`",
+                    path.display()
+                )?;
+                write_response_reference(f, referenced_at.as_ref())
+            }
         }
     }
+}
+
+fn write_response_reference(
+    f: &mut std::fmt::Formatter<'_>,
+    referenced_at: Option<&(PathBuf, usize, usize)>,
+) -> std::fmt::Result {
+    if let Some((path, line, column)) = referenced_at {
+        write!(f, " (referenced at `{}`:{line}:{column})", path.display())?;
+    }
+    Ok(())
 }
 
 fn unknown_flag(flag: &str) -> ArgsError {
@@ -168,6 +251,193 @@ fn parse_jobs(value: &str) -> Result<usize, ArgsError> {
     Ok(jobs)
 }
 
+#[derive(Debug)]
+struct ResponseToken {
+    value: String,
+    line: usize,
+    column: usize,
+}
+
+/// Expand GNU-style `@file` arguments in place before target-format routing.
+///
+/// Nested response paths are resolved relative to the file containing them.
+/// `@@path` escapes a literal `@path`, and Darwin loader paths are never
+/// interpreted as response files.
+#[doc(hidden)]
+pub fn expand_response_files(argv: &[String]) -> Result<Vec<String>, ArgsError> {
+    let mut expanded = Vec::with_capacity(argv.len());
+    let mut stack = Vec::new();
+    for arg in argv {
+        expand_response_arg(arg, None, None, 0, &mut stack, &mut expanded)?;
+    }
+    Ok(expanded)
+}
+
+fn expand_response_arg(
+    arg: &str,
+    base_dir: Option<&Path>,
+    referenced_at: Option<(PathBuf, usize, usize)>,
+    depth: usize,
+    stack: &mut Vec<PathBuf>,
+    expanded: &mut Vec<String>,
+) -> Result<(), ArgsError> {
+    if let Some(literal) = arg.strip_prefix("@@") {
+        expanded.push(format!("@{literal}"));
+        return Ok(());
+    }
+    if is_darwin_loader_path(arg) {
+        expanded.push(arg.to_string());
+        return Ok(());
+    }
+    let Some(path) = arg.strip_prefix('@') else {
+        expanded.push(arg.to_string());
+        return Ok(());
+    };
+
+    let resolved = resolve_response_path(path, base_dir);
+    if depth >= RESPONSE_FILE_DEPTH_LIMIT {
+        return Err(ArgsError::ResponseFileDepth {
+            path: resolved,
+            referenced_at,
+            limit: RESPONSE_FILE_DEPTH_LIMIT,
+        });
+    }
+
+    let canonical = fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+    if stack.contains(&canonical) {
+        return Err(ArgsError::ResponseFileCycle {
+            path: resolved,
+            referenced_at,
+        });
+    }
+
+    let body = fs::read_to_string(&resolved).map_err(|source| ArgsError::ResponseFileRead {
+        path: resolved.clone(),
+        referenced_at: referenced_at.clone(),
+        source,
+    })?;
+    let tokens = parse_response_tokens(&body, &resolved)?;
+    let next_base = resolved.parent();
+
+    stack.push(canonical);
+    let result = tokens.into_iter().try_for_each(|token| {
+        expand_response_arg(
+            &token.value,
+            next_base,
+            Some((resolved.clone(), token.line, token.column)),
+            depth + 1,
+            stack,
+            expanded,
+        )
+    });
+    stack.pop();
+    result
+}
+
+fn is_darwin_loader_path(arg: &str) -> bool {
+    arg.starts_with("@rpath/")
+        || arg.starts_with("@loader_path/")
+        || arg.starts_with("@executable_path/")
+}
+
+fn resolve_response_path(path: &str, base_dir: Option<&Path>) -> PathBuf {
+    let candidate = PathBuf::from(path);
+    if candidate.is_absolute() {
+        candidate
+    } else if let Some(base_dir) = base_dir {
+        base_dir.join(candidate)
+    } else {
+        candidate
+    }
+}
+
+fn parse_response_tokens(body: &str, path: &Path) -> Result<Vec<ResponseToken>, ArgsError> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = body.chars().peekable();
+    let mut line = 1usize;
+    let mut column = 1usize;
+    let mut token_start = None;
+    let mut quote = None;
+
+    while let Some(ch) = chars.next() {
+        let ch_line = line;
+        let ch_column = column;
+        advance_response_position(ch, &mut line, &mut column);
+
+        if let Some((delimiter, _, _)) = quote {
+            match ch {
+                '\\' => {
+                    if let Some(escaped) = chars.next() {
+                        advance_response_position(escaped, &mut line, &mut column);
+                        current.push(escaped);
+                    } else {
+                        current.push('\\');
+                    }
+                }
+                value if value == delimiter => quote = None,
+                _ => current.push(ch),
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => {
+                token_start.get_or_insert((ch_line, ch_column));
+                quote = Some((ch, ch_line, ch_column));
+            }
+            '\\' => {
+                token_start.get_or_insert((ch_line, ch_column));
+                if let Some(escaped) = chars.next() {
+                    advance_response_position(escaped, &mut line, &mut column);
+                    current.push(escaped);
+                } else {
+                    current.push('\\');
+                }
+            }
+            whitespace if whitespace.is_whitespace() => {
+                if let Some((start_line, start_column)) = token_start.take() {
+                    tokens.push(ResponseToken {
+                        value: std::mem::take(&mut current),
+                        line: start_line,
+                        column: start_column,
+                    });
+                }
+            }
+            _ => {
+                token_start.get_or_insert((ch_line, ch_column));
+                current.push(ch);
+            }
+        }
+    }
+
+    if let Some((delimiter, quote_line, quote_column)) = quote {
+        return Err(ArgsError::ResponseFileSyntax {
+            path: path.to_path_buf(),
+            line: quote_line,
+            column: quote_column,
+            message: format!("unterminated {delimiter} quote"),
+        });
+    }
+    if let Some((start_line, start_column)) = token_start {
+        tokens.push(ResponseToken {
+            value: current,
+            line: start_line,
+            column: start_column,
+        });
+    }
+    Ok(tokens)
+}
+
+fn advance_response_position(ch: char, line: &mut usize, column: &mut usize) {
+    if ch == '\n' {
+        *line += 1;
+        *column = 1;
+    } else {
+        *column += 1;
+    }
+}
+
 #[deprecated(
     since = "0.1.0",
     note = "grouped LinkOptions cannot preserve mixed input order; use parse_ordered"
@@ -182,6 +452,17 @@ pub fn parse_ordered(argv: &[String]) -> Result<ParsedArgs, ArgsError> {
 
 #[doc(hidden)]
 pub fn parse_ordered_with_force_loads(
+    argv: &[String],
+) -> Result<(ParsedArgs, Vec<usize>), ArgsError> {
+    let expanded = expand_response_files(argv)?;
+    parse_response_expanded_with_force_loads(&expanded)
+}
+
+/// Parse arguments that have already passed through [`expand_response_files`].
+/// The binary uses this entry point to avoid reading response files twice after
+/// it performs target-format routing.
+#[doc(hidden)]
+pub fn parse_response_expanded_with_force_loads(
     argv: &[String],
 ) -> Result<(ParsedArgs, Vec<usize>), ArgsError> {
     let normalized = normalize_wl(argv);
@@ -518,6 +799,38 @@ fn normalize_wl(argv: &[String]) -> Vec<String> {
 #[allow(deprecated)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_RESPONSE_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    struct ResponseTestDir {
+        path: PathBuf,
+    }
+
+    impl ResponseTestDir {
+        fn new() -> Self {
+            let id = NEXT_RESPONSE_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "afs_ld_response_test_{}_{}",
+                std::process::id(),
+                id
+            ));
+            fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+
+        fn write(&self, name: &str, contents: &str) -> PathBuf {
+            let path = self.path.join(name);
+            fs::write(&path, contents).unwrap();
+            path
+        }
+    }
+
+    impl Drop for ResponseTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
@@ -831,6 +1144,176 @@ mod tests {
         let opts = parse(&argv(&["-Wl,-map,link.map", "main.o"])).unwrap();
         assert_eq!(opts.map.as_deref(), Some(std::path::Path::new("link.map")));
         assert_eq!(opts.inputs, vec![PathBuf::from("main.o")]);
+    }
+
+    #[test]
+    fn response_files_expand_in_place_with_quotes_escapes_and_nesting() {
+        let dir = ResponseTestDir::new();
+        dir.write(
+            "inner.rsp",
+            "\"middle object.o\" escaped\\ object.o -lSystem\n",
+        );
+        let outer = dir.write(
+            "outer.rsp",
+            "-force_load \"forced archive.a\"\n@inner.rsp\n",
+        );
+
+        let (parsed, force_load_positions) = parse_ordered_with_force_loads(&[
+            "before.o".into(),
+            format!("@{}", outer.display()),
+            "after.o".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.input_specs,
+            vec![
+                InputSpec::Path(PathBuf::from("before.o")),
+                InputSpec::Path(PathBuf::from("forced archive.a")),
+                InputSpec::Path(PathBuf::from("middle object.o")),
+                InputSpec::Path(PathBuf::from("escaped object.o")),
+                InputSpec::Library("System".into()),
+                InputSpec::Path(PathBuf::from("after.o")),
+            ]
+        );
+        assert_eq!(force_load_positions, vec![1]);
+    }
+
+    #[test]
+    fn empty_response_file_contributes_no_arguments() {
+        let dir = ResponseTestDir::new();
+        let response = dir.write("empty.rsp", " \n\t");
+        let opts = parse(&[
+            "before.o".into(),
+            format!("@{}", response.display()),
+            "after.o".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            opts.inputs,
+            vec![PathBuf::from("before.o"), PathBuf::from("after.o")]
+        );
+    }
+
+    #[test]
+    fn escaped_at_and_darwin_loader_paths_remain_literal() {
+        let parsed = parse_ordered(&argv(&[
+            "@@response.o",
+            "@rpath/libdependency.dylib",
+            "@loader_path/libdependency.dylib",
+            "@executable_path/libdependency.dylib",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.options.inputs,
+            vec![
+                PathBuf::from("@response.o"),
+                PathBuf::from("@rpath/libdependency.dylib"),
+                PathBuf::from("@loader_path/libdependency.dylib"),
+                PathBuf::from("@executable_path/libdependency.dylib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unreadable_response_file_is_a_hard_parse_error() {
+        let dir = ResponseTestDir::new();
+        let missing = dir.path.join("missing.rsp");
+        let err = parse(&[format!("@{}", missing.display())]).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::ResponseFileRead { ref path, .. } if path == &missing
+        ));
+        assert!(err.to_string().contains("cannot read response file"));
+    }
+
+    #[test]
+    fn response_file_syntax_errors_name_the_exact_location() {
+        let dir = ResponseTestDir::new();
+        let response = dir.write("malformed.rsp", "before.o\n\"unterminated\n");
+        let err = parse(&[format!("@{}", response.display())]).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::ResponseFileSyntax {
+                ref path,
+                line: 2,
+                column: 1,
+                ..
+            } if path == &response
+        ));
+        assert!(err.to_string().contains("at 2:1: unterminated \" quote"));
+    }
+
+    #[test]
+    fn response_file_cycles_are_rejected() {
+        let dir = ResponseTestDir::new();
+        let first = dir.write("first.rsp", "@second.rsp\n");
+        let second = dir.write("second.rsp", "@first.rsp\n");
+        let err = parse(&[format!("@{}", first.display())]).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::ResponseFileCycle {
+                ref path,
+                referenced_at: Some((ref source, 1, 1)),
+            } if path == &first && source == &second
+        ));
+    }
+
+    #[test]
+    fn response_file_nesting_is_bounded() {
+        let dir = ResponseTestDir::new();
+        let files = (0..=RESPONSE_FILE_DEPTH_LIMIT)
+            .map(|index| dir.path.join(format!("{index}.rsp")))
+            .collect::<Vec<_>>();
+        for (index, file) in files.iter().take(RESPONSE_FILE_DEPTH_LIMIT).enumerate() {
+            fs::write(file, format!("@{}.rsp\n", index + 1)).unwrap();
+        }
+        fs::write(&files[RESPONSE_FILE_DEPTH_LIMIT], "main.o\n").unwrap();
+
+        let err = parse(&[format!("@{}", files[0].display())]).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::ResponseFileDepth {
+                ref path,
+                limit: RESPONSE_FILE_DEPTH_LIMIT,
+                ..
+            } if path == &files[RESPONSE_FILE_DEPTH_LIMIT]
+        ));
+    }
+
+    #[test]
+    fn quoted_empty_response_arguments_are_preserved() {
+        let tokens = parse_response_tokens("\"\" '' value", Path::new("inline.rsp")).unwrap();
+        assert_eq!(
+            tokens
+                .into_iter()
+                .map(|token| token.value)
+                .collect::<Vec<_>>(),
+            vec!["", "", "value"]
+        );
+    }
+
+    #[test]
+    fn large_response_file_preserves_every_input_in_order() {
+        const INPUT_COUNT: usize = 16_384;
+
+        let dir = ResponseTestDir::new();
+        let contents = (0..INPUT_COUNT)
+            .map(|index| format!("object_{index:05}.o"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let response = dir.write("large.rsp", &contents);
+        let parsed = parse_ordered(&[format!("@{}", response.display())]).unwrap();
+
+        assert_eq!(parsed.input_specs.len(), INPUT_COUNT);
+        assert_eq!(
+            parsed.input_specs.first(),
+            Some(&InputSpec::Path(PathBuf::from("object_00000.o")))
+        );
+        assert_eq!(
+            parsed.input_specs.last(),
+            Some(&InputSpec::Path(PathBuf::from("object_16383.o")))
+        );
     }
 
     #[test]

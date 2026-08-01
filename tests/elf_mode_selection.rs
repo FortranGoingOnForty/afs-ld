@@ -337,6 +337,36 @@ fn explicit_emulation_and_entry_select_elf() {
 }
 
 #[test]
+fn response_file_selects_elf_before_format_routing() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=response_file_selects_elf_before_format_routing count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = scratch("response_file");
+    std::fs::create_dir_all(&dir).unwrap();
+    let object = assemble(&gas, &dir, "entry", &exit_asm("_start", 47));
+    let executable = dir.join("linked");
+    let response = dir.join("link.rsp");
+    std::fs::write(
+        &response,
+        format!(
+            "-melf_x86_64\n-o\n{}\n{}\n",
+            executable.display(),
+            object.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg(format!("@{}", response.display()))
+        .output()
+        .unwrap();
+    assert_linked(&output, &executable, 47);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn dynamic_archive_only_invocation_extracts_entry() {
     let (Some(gas), Some(ar), Some(loader)) = (gas(), ar(), dynamic_loader()) else {
         eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=dynamic_archive_only_invocation_extracts_entry count=1 reason=\"no GNU assembler, ar, or standard dynamic loader on this host\"");

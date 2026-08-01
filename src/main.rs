@@ -50,6 +50,8 @@ Options:
   -all_load                       Force-load every archive member
   -force_load <archive>           Force-load one archive
   -j <jobs>                       Limit parallel worker jobs (`1` disables parallelism)
+  @<file>                         Read additional arguments from <file>
+  @@<path>                        Treat @<path> as a literal input path
   -Wl,<arg,arg,...>               Normalize comma-separated driver flags
   --dump <path>                   Dump a Mach-O file summary
   --dump-archive <path>           Dump an archive summary
@@ -63,20 +65,28 @@ Options:
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
-
-    // Route explicit x86_64 ELF emulation and direct or indirect ELF
-    // inputs before the Mach-O argument surface sees them.
-    if let Some(code) = elf_mode(&argv[1..]) {
-        return code;
-    }
-
-    let (parsed, force_load_positions) = match args::parse_ordered_with_force_loads(&argv[1..]) {
-        Ok(parsed) => parsed,
+    let expanded = match args::expand_response_files(&argv[1..]) {
+        Ok(expanded) => expanded,
         Err(e) => {
             diag::error(&e.to_string());
             return ExitCode::from(2);
         }
     };
+
+    // Route explicit x86_64 ELF emulation and direct or indirect ELF
+    // inputs before the Mach-O argument surface sees them.
+    if let Some(code) = elf_mode(&expanded) {
+        return code;
+    }
+
+    let (parsed, force_load_positions) =
+        match args::parse_response_expanded_with_force_loads(&expanded) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                diag::error(&e.to_string());
+                return ExitCode::from(2);
+            }
+        };
     let opts = parsed.options;
 
     if opts.show_help {

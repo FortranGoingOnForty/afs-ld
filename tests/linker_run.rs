@@ -1,5 +1,9 @@
 //! End-to-end `Linker::run` coverage for Sprint 10's newly wired pipeline.
 
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -3150,15 +3154,15 @@ fn sign_extend_26(value: i64) -> i64 {
 #[test]
 fn linker_run_emits_non_empty_executable_from_real_object() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun as or codesign unavailable");
+        harness_skip!("xcrun as or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -3173,10 +3177,7 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -3264,15 +3265,15 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
 #[test]
 fn linker_run_loh_executable_surfaces_match_apple_ld() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -3345,13 +3346,7 @@ fn linker_run_loh_executable_surfaces_match_apple_ld() {
         let obj = scratch(&format!("{name}.o"));
         let our_out = scratch(&format!("{name}-ours.out"));
         let apple_out = scratch(&format!("{name}-apple.out"));
-        if let Err(e) = assemble(src, &obj) {
-            eprintln!("skipping: assemble failed: {e}");
-            let _ = fs::remove_file(obj);
-            let _ = fs::remove_file(our_out);
-            let _ = fs::remove_file(apple_out);
-            return;
-        }
+        require_fixture!("assembly fixture", assemble(src, &obj));
 
         let opts = LinkOptions {
             inputs: vec![obj.clone()],
@@ -3474,15 +3469,15 @@ fn linker_run_loh_executable_surfaces_match_apple_ld() {
 #[test]
 fn linker_run_loh_dylib_surfaces_match_apple_ld() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -3505,10 +3500,7 @@ fn linker_run_loh_dylib_surfaces_match_apple_ld() {
         .loh AdrpAdd Lloh0, Lloh1
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -3562,7 +3554,7 @@ fn linker_run_loh_dylib_surfaces_match_apple_ld() {
 #[test]
 fn linker_run_emits_minimal_dylib_from_real_object() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -3575,10 +3567,7 @@ fn linker_run_emits_minimal_dylib_from_real_object() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -3621,7 +3610,7 @@ fn linker_run_emits_minimal_dylib_from_real_object() {
 #[test]
 fn linker_run_uses_dylib_identity_flags() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -3634,10 +3623,7 @@ fn linker_run_uses_dylib_identity_flags() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -3677,7 +3663,7 @@ fn linker_run_uses_dylib_identity_flags() {
 #[test]
 fn linker_run_honors_exported_symbol_filters_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -3698,10 +3684,7 @@ fn linker_run_honors_exported_symbol_filters_like_ld() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
     fs::write(&list_path, "_bet?\n").unwrap();
 
     let opts = LinkOptions {
@@ -3764,7 +3747,7 @@ fn linker_run_honors_exported_symbol_filters_like_ld() {
 #[test]
 fn linker_run_honors_unexported_symbol_filters_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -3785,10 +3768,7 @@ fn linker_run_honors_unexported_symbol_filters_like_ld() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
     fs::write(&list_path, "_bet?\n").unwrap();
 
     let opts = LinkOptions {
@@ -3855,7 +3835,7 @@ fn linker_run_honors_unexported_symbol_filters_like_ld() {
 #[test]
 fn linker_run_loads_minimal_dylib_via_dlopen() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang/as or codesign unavailable");
+        harness_skip!("xcrun clang/as or codesign unavailable");
         return;
     }
 
@@ -3871,10 +3851,7 @@ fn linker_run_loads_minimal_dylib_via_dlopen() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -3939,15 +3916,15 @@ fn linker_run_loads_minimal_dylib_via_dlopen() {
 #[test]
 fn dylib_export_surfaces_match_apple_ld() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -3967,15 +3944,15 @@ fn dylib_export_surfaces_match_apple_ld() {
 #[test]
 fn dylib_export_surfaces_match_apple_ld_with_shared_prefixes() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -4001,15 +3978,15 @@ fn dylib_export_surfaces_match_apple_ld_with_shared_prefixes() {
 #[test]
 fn dylib_export_surfaces_match_apple_ld_across_fixture_matrix() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -4130,7 +4107,7 @@ fn dylib_export_surfaces_match_apple_ld_across_fixture_matrix() {
 #[test]
 fn linker_run_reports_unresolved_symbol() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -4143,10 +4120,7 @@ fn linker_run_reports_unresolved_symbol() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -4168,7 +4142,7 @@ fn linker_run_reports_unresolved_symbol() {
 #[test]
 fn linker_run_promotes_unresolved_symbol_to_dynamic_lookup() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -4187,10 +4161,7 @@ fn linker_run_promotes_unresolved_symbol_to_dynamic_lookup() {
             .quad _missing
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -4932,7 +4903,7 @@ fn linker_run_reports_alias_definition_provenance_in_input_order() {
 #[test]
 fn linker_run_reports_duplicate_from_fetched_archive_member() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -4963,10 +4934,7 @@ fn linker_run_reports_duplicate_from_fetched_archive_member() {
     "#;
 
     for (src, out) in [(&main_src, &main_obj), (&dup_src, &dup_obj)] {
-        if let Err(e) = assemble(src, out) {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
+        require_fixture!("assembly fixture", assemble(src, out));
     }
 
     let ar = Command::new("ar")
@@ -4975,13 +4943,11 @@ fn linker_run_reports_duplicate_from_fetched_archive_member() {
         .arg(&dup_obj)
         .output()
         .unwrap();
-    if !ar.status.success() {
-        eprintln!(
-            "skipping: ar failed: {}",
-            String::from_utf8_lossy(&ar.stderr)
-        );
-        return;
-    }
+    assert!(
+        ar.status.success(),
+        "archive fixture failed: {}",
+        String::from_utf8_lossy(&ar.stderr)
+    );
 
     let opts = LinkOptions {
         inputs: vec![main_obj.clone(), archive.clone()],
@@ -5005,7 +4971,7 @@ fn linker_run_reports_duplicate_from_fetched_archive_member() {
 #[test]
 fn fetched_archive_member_undefined_reports_member_referrer() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5031,10 +4997,7 @@ fn fetched_archive_member_undefined_reports_member_referrer() {
     "#;
 
     for (src, out) in [(&main_src, &main_obj), (&member_src, &member_obj)] {
-        if let Err(e) = assemble(src, out) {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
+        require_fixture!("assembly fixture", assemble(src, out));
     }
 
     let ar = Command::new("ar")
@@ -5043,13 +5006,11 @@ fn fetched_archive_member_undefined_reports_member_referrer() {
         .arg(&member_obj)
         .output()
         .unwrap();
-    if !ar.status.success() {
-        eprintln!(
-            "skipping: ar failed: {}",
-            String::from_utf8_lossy(&ar.stderr)
-        );
-        return;
-    }
+    assert!(
+        ar.status.success(),
+        "archive fixture failed: {}",
+        String::from_utf8_lossy(&ar.stderr)
+    );
 
     let opts = LinkOptions {
         inputs: vec![main_obj.clone(), archive.clone()],
@@ -5080,16 +5041,16 @@ fn fetched_archive_member_undefined_reports_member_referrer() {
 #[test]
 fn linker_run_all_load_pulls_entry_from_archive() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun as or codesign unavailable");
+        harness_skip!("xcrun as or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: no macOS SDK path");
+        harness_skip!("no macOS SDK path");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -5104,23 +5065,18 @@ fn linker_run_all_load_pulls_entry_from_archive() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &member_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &member_obj));
     let ar = Command::new("ar")
         .arg("rcs")
         .arg(&archive)
         .arg(&member_obj)
         .output()
         .unwrap();
-    if !ar.status.success() {
-        eprintln!(
-            "skipping: ar failed: {}",
-            String::from_utf8_lossy(&ar.stderr)
-        );
-        return;
-    }
+    assert!(
+        ar.status.success(),
+        "archive fixture failed: {}",
+        String::from_utf8_lossy(&ar.stderr)
+    );
 
     let opts = LinkOptions {
         inputs: vec![archive.clone(), tbd],
@@ -5156,16 +5112,16 @@ fn linker_run_all_load_pulls_entry_from_archive() {
 #[test]
 fn linker_run_force_load_pulls_entry_from_archive() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun as or codesign unavailable");
+        harness_skip!("xcrun as or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: no macOS SDK path");
+        harness_skip!("no macOS SDK path");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -5180,23 +5136,18 @@ fn linker_run_force_load_pulls_entry_from_archive() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &member_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &member_obj));
     let ar = Command::new("ar")
         .arg("rcs")
         .arg(&archive)
         .arg(&member_obj)
         .output()
         .unwrap();
-    if !ar.status.success() {
-        eprintln!(
-            "skipping: ar failed: {}",
-            String::from_utf8_lossy(&ar.stderr)
-        );
-        return;
-    }
+    assert!(
+        ar.status.success(),
+        "archive fixture failed: {}",
+        String::from_utf8_lossy(&ar.stderr)
+    );
 
     let opts = LinkOptions {
         inputs: vec![archive.clone(), tbd],
@@ -5232,11 +5183,11 @@ fn linker_run_force_load_pulls_entry_from_archive() {
 #[test]
 fn linker_run_resolves_lsystem_via_syslibroot() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun as or codesign unavailable");
+        harness_skip!("xcrun as or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: no macOS SDK path");
+        harness_skip!("no macOS SDK path");
         return;
     };
 
@@ -5250,10 +5201,7 @@ fn linker_run_resolves_lsystem_via_syslibroot() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5297,18 +5245,18 @@ fn linker_run_resolves_lsystem_via_syslibroot() {
 #[test]
 fn linker_run_resolves_framework_via_syslibroot() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let metal = PathBuf::from(format!(
         "{sdk}/System/Library/Frameworks/Metal.framework/Metal.tbd"
     ));
     if !metal.exists() {
-        eprintln!("skipping: no Metal.tbd at {}", metal.display());
+        harness_skip!("no Metal.tbd at {}", metal.display());
         return;
     }
 
@@ -5322,10 +5270,7 @@ fn linker_run_resolves_framework_via_syslibroot() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5357,18 +5302,18 @@ fn linker_run_resolves_framework_via_syslibroot() {
 #[test]
 fn linker_run_resolves_weak_framework_via_syslibroot() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let metal = PathBuf::from(format!(
         "{sdk}/System/Library/Frameworks/Metal.framework/Metal.tbd"
     ));
     if !metal.exists() {
-        eprintln!("skipping: no Metal.tbd at {}", metal.display());
+        harness_skip!("no Metal.tbd at {}", metal.display());
         return;
     }
 
@@ -5382,10 +5327,7 @@ fn linker_run_resolves_weak_framework_via_syslibroot() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5417,7 +5359,7 @@ fn linker_run_resolves_weak_framework_via_syslibroot() {
 #[test]
 fn linker_run_uses_platform_version_for_build_command() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5431,10 +5373,7 @@ fn linker_run_uses_platform_version_for_build_command() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5468,7 +5407,7 @@ fn linker_run_uses_platform_version_for_build_command() {
 #[test]
 fn linker_run_emits_rpath_command() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5482,10 +5421,7 @@ fn linker_run_emits_rpath_command() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5515,7 +5451,7 @@ fn linker_run_emits_rpath_command() {
 #[test]
 fn linker_run_emits_map_file() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5530,10 +5466,7 @@ fn linker_run_emits_map_file() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5564,7 +5497,7 @@ fn linker_run_emits_map_file() {
 #[test]
 fn linker_run_map_lists_dead_stripped_symbols() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5596,21 +5529,9 @@ fn linker_run_map_lists_dead_stripped_symbols() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(main_src, &main_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-    if let Err(e) = assemble(helper_src, &helper_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        return;
-    }
-    if let Err(e) = assemble(unused_src, &unused_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        let _ = fs::remove_file(helper_obj);
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(main_src, &main_obj));
+    require_fixture!("assembly fixture", assemble(helper_src, &helper_obj));
+    require_fixture!("assembly fixture", assemble(unused_src, &unused_obj));
 
     let opts = LinkOptions {
         inputs: vec![main_obj.clone(), helper_obj.clone(), unused_obj.clone()],
@@ -5638,7 +5559,7 @@ fn linker_run_map_lists_dead_stripped_symbols() {
 #[test]
 fn linker_run_map_lists_folded_symbols_under_icf_safe() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5665,10 +5586,7 @@ fn linker_run_map_lists_folded_symbols_under_icf_safe() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5693,16 +5611,16 @@ fn linker_run_map_lists_folded_symbols_under_icf_safe() {
 #[test]
 fn linker_run_carries_tbd_inputs_into_load_commands() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -5716,10 +5634,7 @@ fn linker_run_carries_tbd_inputs_into_load_commands() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone()],
@@ -5747,7 +5662,7 @@ fn linker_run_carries_tbd_inputs_into_load_commands() {
 #[test]
 fn linker_run_handles_non_standard_segment_without_panicking() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5766,10 +5681,7 @@ fn linker_run_handles_non_standard_segment_without_panicking() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5873,20 +5785,20 @@ fn linker_run_omits_debug_section_rebases() {
 #[test]
 fn linker_run_rebases_custom_segment_pointers_like_apple_ld() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -5916,10 +5828,7 @@ fn linker_run_rebases_custom_segment_pointers_like_apple_ld() {
             cset w0, ne
             ret
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -5993,7 +5902,7 @@ fn linker_run_rebases_custom_segment_pointers_like_apple_ld() {
 #[test]
 fn linker_run_uses_requested_entry_symbol() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -6010,10 +5919,7 @@ fn linker_run_uses_requested_entry_symbol() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6082,20 +5988,20 @@ fn linker_run_dead_strip_keeps_same_address_entry_alias_bytes() {
 #[test]
 fn linker_run_dead_strip_keeps_same_address_entry_alias() {
     if !have_xcrun_tool("ld") || !have_tool("codesign") {
-        eprintln!("skipping: xcrun ld or codesign unavailable");
+        harness_skip!("xcrun ld or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -6156,7 +6062,7 @@ fn linker_run_dead_strip_keeps_same_address_entry_alias() {
 #[test]
 fn linker_run_defaults_entry_to_main_symbol() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -6174,10 +6080,7 @@ fn linker_run_defaults_entry_to_main_symbol() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6201,7 +6104,7 @@ fn linker_run_defaults_entry_to_main_symbol() {
 #[test]
 fn linker_run_applies_core_arm64_relocations() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -6230,10 +6133,7 @@ fn linker_run_applies_core_arm64_relocations() {
             .quad _helper - _main
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6292,7 +6192,7 @@ fn sign_extend_21(value: i64) -> i64 {
 #[test]
 fn linker_run_applies_scaled_pageoff12_for_ldr_x() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -6314,10 +6214,7 @@ fn linker_run_applies_scaled_pageoff12_for_ldr_x() {
             .quad 0x1122334455667788
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6356,15 +6253,15 @@ fn linker_run_applies_scaled_pageoff12_for_ldr_x() {
 #[test]
 fn relocated_sections_match_apple_ld_across_fixture_matrix() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     const TEXT: SectionCase = SectionCase {
@@ -6633,7 +6530,7 @@ fn relocated_sections_match_apple_ld_across_fixture_matrix() {
 #[test]
 fn linker_run_thunks_none_rejects_out_of_range_branch26() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -6657,10 +6554,7 @@ fn linker_run_thunks_none_rejects_out_of_range_branch26() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6686,7 +6580,7 @@ fn linker_run_thunks_none_rejects_out_of_range_branch26() {
 #[test]
 fn linker_run_inserts_thunk_for_out_of_range_branch26() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
 
@@ -6711,10 +6605,7 @@ fn linker_run_inserts_thunk_for_out_of_range_branch26() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6761,7 +6652,7 @@ fn linker_run_inserts_thunk_for_out_of_range_branch26() {
 #[test]
 fn linker_run_safe_thunks_do_not_grow_small_programs() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -6779,10 +6670,7 @@ fn linker_run_safe_thunks_do_not_grow_small_programs() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6804,7 +6692,7 @@ fn linker_run_safe_thunks_do_not_grow_small_programs() {
 #[test]
 fn linker_run_thunks_all_forces_shared_thunk_for_in_range_calls() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
 
@@ -6826,10 +6714,7 @@ fn linker_run_thunks_all_forces_shared_thunk_for_in_range_calls() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6973,7 +6858,7 @@ fn linker_run_thunks_preserve_branch_addends_and_identity() {
 #[test]
 fn linker_run_places_thunks_in_caller_segment() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
 
@@ -6998,10 +6883,7 @@ fn linker_run_places_thunks_in_caller_segment() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -7043,7 +6925,7 @@ fn linker_run_places_thunks_in_caller_segment() {
 #[test]
 fn linker_run_replans_thunks_until_layout_converges() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -7072,10 +6954,7 @@ fn linker_run_replans_thunks_until_layout_converges() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -7111,7 +6990,7 @@ fn linker_run_replans_thunks_until_layout_converges() {
 #[test]
 fn linker_run_emits_multiple_thunk_islands_within_text_segment() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
 
@@ -7140,10 +7019,7 @@ fn linker_run_emits_multiple_thunk_islands_within_text_segment() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -7198,16 +7074,16 @@ fn linker_run_emits_multiple_thunk_islands_within_text_segment() {
 #[test]
 fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7223,10 +7099,7 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone()],
@@ -7366,20 +7239,20 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
 #[test]
 fn linker_run_applies_pcrel_pointer_to_got_like_apple_ld() {
     if !have_xcrun() || !have_xcrun_tool("ld") || !have_tool("codesign") {
-        eprintln!("skipping: xcrun as/ld or codesign unavailable");
+        harness_skip!("xcrun as/ld or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7464,20 +7337,20 @@ fn linker_run_applies_pcrel_pointer_to_got_like_apple_ld() {
 #[test]
 fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7494,10 +7367,7 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -7583,15 +7453,15 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
 #[test]
 fn classic_lazy_surfaces_match_apple_ld_across_fixture_matrix() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -7677,20 +7547,20 @@ fn classic_lazy_surfaces_match_apple_ld_across_fixture_matrix() {
 #[test]
 fn linker_run_binds_direct_dylib_import_pointers() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang or codesign unavailable");
+        harness_skip!("xcrun clang or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7714,20 +7584,17 @@ fn linker_run_binds_direct_dylib_import_pointers() {
     let obj = scratch("direct-data.o");
     let our_out = scratch("direct-data-ours.out");
 
-    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
-        eprintln!("skipping: dylib compile failed: {e}");
-        return;
-    }
+    require_fixture!(
+        "dylib fixture compilation",
+        compile_dylib_c(dylib_src, &dylib)
+    );
 
     let main_src = r#"
         extern int ext_data;
         int *p = &ext_data;
         int main(void) { return *p == 5 ? 0 : 1; }
     "#;
-    if let Err(e) = compile_c(main_src, &obj) {
-        eprintln!("skipping: compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(main_src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone(), dylib.clone()],
@@ -7772,15 +7639,15 @@ fn linker_run_binds_direct_dylib_import_pointers() {
 #[test]
 fn direct_bind_surfaces_match_apple_ld_across_fixture_matrix() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang or codesign unavailable");
+        harness_skip!("xcrun clang or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -7855,20 +7722,20 @@ fn direct_bind_surfaces_match_apple_ld_across_fixture_matrix() {
 #[test]
 fn linker_run_rebases_local_absolute_pointers_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7880,10 +7747,7 @@ fn linker_run_rebases_local_absolute_pointers_like_ld() {
         int *p = &ext;
         int main(void) { return *p == 7 ? 0 : 1; }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: clang compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -7921,20 +7785,20 @@ fn linker_run_rebases_local_absolute_pointers_like_ld() {
 #[test]
 fn linker_run_routes_local_got_loads_through_rebased_slots() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7957,10 +7821,7 @@ fn linker_run_routes_local_got_loads_through_rebased_slots() {
             .long 7
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone()],
@@ -8012,20 +7873,20 @@ fn linker_run_routes_local_got_loads_through_rebased_slots() {
 #[test]
 fn linker_run_dead_strip_prunes_synthetic_import_sections() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -8046,10 +7907,7 @@ fn linker_run_dead_strip_prunes_synthetic_import_sections() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone()],
@@ -8113,20 +7971,20 @@ fn linker_run_dead_strip_prunes_synthetic_import_sections() {
 #[test]
 fn linker_run_dead_strip_keeps_and_runs_initializers() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -8210,16 +8068,16 @@ fn linker_run_dead_strip_keeps_and_runs_initializers() {
 #[test]
 fn linker_run_preserves_initialized_same_name_section_data() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -8318,20 +8176,20 @@ fn linker_run_preserves_initialized_same_name_section_data() {
 #[test]
 fn linker_run_relaxes_hidden_got_loads_like_apple_ld() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -8354,10 +8212,7 @@ fn linker_run_relaxes_hidden_got_loads_like_apple_ld() {
             .long 7
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone()],
@@ -8410,7 +8265,7 @@ fn linker_run_relaxes_hidden_got_loads_like_apple_ld() {
 #[test]
 fn linker_run_partitions_symtab_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
 
@@ -8422,10 +8277,10 @@ fn linker_run_partitions_symtab_like_ld() {
     let dylib_src = r#"
         int ext_data = 5;
     "#;
-    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
-        eprintln!("skipping: dylib compile failed: {e}");
-        return;
-    }
+    require_fixture!(
+        "dylib fixture compilation",
+        compile_dylib_c(dylib_src, &dylib)
+    );
 
     let asm = r#"
         .text
@@ -8446,10 +8301,7 @@ fn linker_run_partitions_symtab_like_ld() {
         .quad _ext_data
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), dylib.clone()],
@@ -8507,7 +8359,7 @@ fn linker_run_partitions_symtab_like_ld() {
 #[test]
 fn linker_run_strips_locals_with_x_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
 
@@ -8519,10 +8371,10 @@ fn linker_run_strips_locals_with_x_like_ld() {
     let dylib_src = r#"
         int ext_data = 5;
     "#;
-    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
-        eprintln!("skipping: dylib compile failed: {e}");
-        return;
-    }
+    require_fixture!(
+        "dylib fixture compilation",
+        compile_dylib_c(dylib_src, &dylib)
+    );
 
     let asm = r#"
         .text
@@ -8543,10 +8395,7 @@ fn linker_run_strips_locals_with_x_like_ld() {
         .quad _ext_data
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), dylib.clone()],
@@ -8608,15 +8457,15 @@ fn linker_run_strips_locals_with_x_like_ld() {
 #[test]
 fn linker_run_emits_leaf_unwind_info_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -8628,10 +8477,7 @@ fn linker_run_emits_leaf_unwind_info_like_ld() {
             return 0;
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: clang compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -8658,15 +8504,15 @@ fn linker_run_emits_leaf_unwind_info_like_ld() {
 #[test]
 fn linker_run_emits_multi_function_unwind_info_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -8682,10 +8528,7 @@ fn linker_run_emits_multi_function_unwind_info_like_ld() {
             return helper();
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: clang compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -8712,15 +8555,15 @@ fn linker_run_emits_multi_function_unwind_info_like_ld() {
 #[test]
 fn linker_run_dead_strip_prunes_unused_unwind_records_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -8740,10 +8583,7 @@ fn linker_run_dead_strip_prunes_unused_unwind_records_like_ld() {
             return helper();
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: clang compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -8785,7 +8625,7 @@ fn linker_run_dead_strip_prunes_unused_unwind_records_like_ld() {
 #[test]
 fn linker_run_handles_large_unwind_function_gaps() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
 
@@ -8809,10 +8649,7 @@ fn linker_run_handles_large_unwind_function_gaps() {
         .cfi_endproc
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -8840,15 +8677,15 @@ fn linker_run_handles_large_unwind_function_gaps() {
 #[test]
 fn linker_run_preserves_eh_frame_like_ld() {
     if !have_xcrun() || !have_xcrun_tool("dwarfdump") {
-        eprintln!("skipping: xcrun dwarfdump unavailable");
+        harness_skip!("xcrun dwarfdump unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -8879,10 +8716,7 @@ fn linker_run_preserves_eh_frame_like_ld() {
         .cfi_endproc
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -8926,15 +8760,15 @@ fn linker_run_preserves_eh_frame_like_ld() {
 #[test]
 fn linker_run_dead_strip_preserves_pruned_eh_frame_like_ld() {
     if !have_xcrun() || !have_xcrun_tool("dwarfdump") {
-        eprintln!("skipping: xcrun dwarfdump unavailable");
+        harness_skip!("xcrun dwarfdump unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -8984,10 +8818,7 @@ fn linker_run_dead_strip_preserves_pruned_eh_frame_like_ld() {
         .cfi_endproc
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -9032,20 +8863,20 @@ fn linker_run_dead_strip_preserves_pruned_eh_frame_like_ld() {
 #[test]
 fn linker_run_emits_backtrace_metadata_like_apple_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9072,10 +8903,7 @@ fn linker_run_emits_backtrace_metadata_like_apple_ld() {
             return helper() > 1 ? 0 : 1;
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: clang compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -9105,22 +8933,22 @@ fn linker_run_emits_backtrace_metadata_like_apple_ld() {
 #[test]
 fn linker_run_preserves_exception_unwind_metadata_like_apple_ld() {
     if !have_xcrun() || !have_xcrun_tool("clang++") || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang++ or codesign unavailable");
+        harness_skip!("xcrun clang++ or codesign unavailable");
         return;
     }
 
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let libsystem = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     let libcxx = PathBuf::from(format!("{sdk}/usr/lib/libc++.tbd"));
     if !libsystem.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", libsystem.display());
+        harness_skip!("no libSystem.tbd at {}", libsystem.display());
         return;
     }
     if !libcxx.exists() {
-        eprintln!("skipping: no libc++.tbd at {}", libcxx.display());
+        harness_skip!("no libc++.tbd at {}", libcxx.display());
         return;
     }
 
@@ -9134,10 +8962,7 @@ fn linker_run_preserves_exception_unwind_metadata_like_apple_ld() {
             catch (...) { return 42; }
         }
     "#;
-    if let Err(e) = compile_cxx(src, &obj) {
-        eprintln!("skipping: clang++ compile failed: {e}");
-        return;
-    }
+    require_fixture!("C++ fixture compilation", compile_cxx(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), libcxx.clone(), libsystem.clone()],
@@ -9181,20 +9006,20 @@ fn linker_run_preserves_exception_unwind_metadata_like_apple_ld() {
 #[test]
 fn linker_run_resolves_backtrace_symbols_at_runtime() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9227,10 +9052,7 @@ fn linker_run_resolves_backtrace_symbols_at_runtime() {
             return helper();
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: clang compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -9273,20 +9095,20 @@ fn linker_run_resolves_backtrace_symbols_at_runtime() {
 #[test]
 fn linker_run_emits_function_starts_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9304,10 +9126,7 @@ fn linker_run_emits_function_starts_like_ld() {
         ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -9357,15 +9176,15 @@ fn linker_run_emits_function_starts_like_ld() {
 #[test]
 fn linker_run_emits_function_starts_for_other_text_sections_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -9386,10 +9205,7 @@ fn linker_run_emits_function_starts_for_other_text_sections_like_ld() {
         ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -9426,20 +9242,20 @@ fn linker_run_emits_function_starts_for_other_text_sections_like_ld() {
 #[test]
 fn linker_run_omits_data_in_code_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9471,10 +9287,7 @@ fn linker_run_omits_data_in_code_like_ld() {
         ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -9510,20 +9323,20 @@ fn linker_run_omits_data_in_code_like_ld() {
 #[test]
 fn linker_run_omits_data_in_code_in_later_text_section_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9556,10 +9369,7 @@ fn linker_run_omits_data_in_code_in_later_text_section_like_ld() {
         ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -9591,20 +9401,20 @@ fn linker_run_omits_data_in_code_in_later_text_section_like_ld() {
 #[test]
 fn linker_run_omits_data_in_code_after_large_first_text_section_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9641,10 +9451,7 @@ fn linker_run_omits_data_in_code_after_large_first_text_section_like_ld() {
         ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -9676,20 +9483,20 @@ fn linker_run_omits_data_in_code_after_large_first_text_section_like_ld() {
 #[test]
 fn linker_run_dedups_output_strtab_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9711,10 +9518,7 @@ fn linker_run_dedups_output_strtab_like_ld() {
     }
     asm.push_str("    _main:\n        bl _afs_array_sum\n        ret\n");
     asm.push_str("        .subsections_via_symbols\n");
-    if let Err(e) = assemble(&asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(&asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -9752,16 +9556,16 @@ fn linker_run_dedups_output_strtab_like_ld() {
 #[test]
 fn linker_run_launches_with_classic_lazy_dylib_import() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang or codesign unavailable");
+        harness_skip!("xcrun clang or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9772,19 +9576,16 @@ fn linker_run_launches_with_classic_lazy_dylib_import() {
     let dylib_src = r#"
         int ext_fn(void) { return 7; }
     "#;
-    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
-        eprintln!("skipping: dylib compile failed: {e}");
-        return;
-    }
+    require_fixture!(
+        "dylib fixture compilation",
+        compile_dylib_c(dylib_src, &dylib)
+    );
 
     let main_src = r#"
         int ext_fn(void);
         int main(void) { return ext_fn() == 7 ? 0 : 1; }
     "#;
-    if let Err(e) = compile_c(main_src, &obj) {
-        eprintln!("skipping: compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(main_src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd, dylib.clone()],
@@ -9819,16 +9620,16 @@ fn linker_run_launches_with_classic_lazy_dylib_import() {
 #[test]
 fn linker_run_handles_local_tlv_descriptors() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang or codesign unavailable");
+        harness_skip!("xcrun clang or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9846,10 +9647,7 @@ fn linker_run_handles_local_tlv_descriptors() {
             return tls_sum() == 7 ? 0 : 1;
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -9921,20 +9719,20 @@ fn linker_run_handles_local_tlv_descriptors() {
 #[test]
 fn linker_run_routes_imported_tlv_through_thread_pointers() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang or codesign unavailable");
+        harness_skip!("xcrun clang or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9947,19 +9745,16 @@ fn linker_run_routes_imported_tlv_through_thread_pointers() {
         __thread long ext_tls = 5;
         long read_lib_tls(void) { return ext_tls; }
     "#;
-    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
-        eprintln!("skipping: dylib compile failed: {e}");
-        return;
-    }
+    require_fixture!(
+        "dylib fixture compilation",
+        compile_dylib_c(dylib_src, &dylib)
+    );
 
     let main_src = r#"
         extern __thread long ext_tls;
         int main(void) { return ext_tls == 5 ? 0 : 1; }
     "#;
-    if let Err(e) = compile_c(main_src, &obj) {
-        eprintln!("skipping: compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(main_src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone(), dylib.clone()],
@@ -10062,24 +9857,24 @@ fn linker_run_routes_imported_tlv_through_thread_pointers() {
 #[test]
 fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(runtime) = workspace_artifact("libarmfortas_rt.a") else {
-        eprintln!("skipping: libarmfortas_rt.a not built");
+        harness_skip!("libarmfortas_rt.a not built");
         return;
     };
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: no macOS SDK path");
+        harness_skip!("no macOS SDK path");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: no macOS SDK version");
+        harness_skip!("no macOS SDK version");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -10100,10 +9895,7 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
             return 0;
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), runtime.clone(), tbd],
@@ -10247,24 +10039,24 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
 #[test]
 fn linker_run_rebases_runtime_init_metadata_like_apple_ld() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(runtime) = workspace_artifact("libarmfortas_rt.a") else {
-        eprintln!("skipping: libarmfortas_rt.a not built");
+        harness_skip!("libarmfortas_rt.a not built");
         return;
     };
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: no macOS SDK path");
+        harness_skip!("no macOS SDK path");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: no macOS SDK version");
+        harness_skip!("no macOS SDK version");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -10279,10 +10071,7 @@ fn linker_run_rebases_runtime_init_metadata_like_apple_ld() {
             return 0;
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), runtime.clone(), tbd],
@@ -10472,20 +10261,20 @@ fn linker_run_icf_safe_folds_const_sections_mapped_to_same_output_domain() {
 #[test]
 fn linker_run_icf_safe_keeps_cross_object_section_targets_distinct() {
     if !have_xcrun() || !have_xcrun_tool("ld") || !have_tool("codesign") {
-        eprintln!("skipping: xcrun as/ld or codesign unavailable");
+        harness_skip!("xcrun as/ld or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -10627,7 +10416,7 @@ fn linker_run_icf_safe_keeps_cross_object_section_targets_distinct() {
 #[test]
 fn linker_run_icf_safe_folds_identical_private_text() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10656,10 +10445,7 @@ fn linker_run_icf_safe_folds_identical_private_text() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -10715,7 +10501,7 @@ fn linker_run_icf_safe_folds_identical_private_text() {
 #[test]
 fn linker_run_icf_safe_keeps_address_taken_functions_distinct() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10750,10 +10536,7 @@ fn linker_run_icf_safe_keeps_address_taken_functions_distinct() {
             .quad _helper2
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -10810,7 +10593,7 @@ fn linker_run_icf_safe_keeps_address_taken_functions_distinct() {
 #[test]
 fn linker_run_icf_safe_keeps_adrp_add_address_taken_functions_distinct() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10848,10 +10631,7 @@ fn linker_run_icf_safe_keeps_adrp_add_address_taken_functions_distinct() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -10908,7 +10688,7 @@ fn linker_run_icf_safe_keeps_adrp_add_address_taken_functions_distinct() {
 #[test]
 fn linker_run_icf_safe_folds_matching_branch_relocs() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10943,10 +10723,7 @@ fn linker_run_icf_safe_folds_matching_branch_relocs() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -11002,7 +10779,7 @@ fn linker_run_icf_safe_folds_matching_branch_relocs() {
 #[test]
 fn linker_run_icf_safe_keeps_distinct_branch_targets_unfolded() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -11042,10 +10819,7 @@ fn linker_run_icf_safe_keeps_distinct_branch_targets_unfolded() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -11102,7 +10876,7 @@ fn linker_run_icf_safe_keeps_distinct_branch_targets_unfolded() {
 #[test]
 fn linker_run_icf_safe_folds_identical_private_const_data() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -11127,10 +10901,7 @@ fn linker_run_icf_safe_folds_identical_private_const_data() {
             .quad 0x1122334455667788
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -11181,7 +10952,7 @@ fn linker_run_icf_safe_folds_identical_private_const_data() {
 #[test]
 fn linker_run_icf_safe_folds_identical_private_cstrings() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -11204,10 +10975,7 @@ fn linker_run_icf_safe_folds_identical_private_cstrings() {
             .asciz "fold me"
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -11258,7 +11026,7 @@ fn linker_run_icf_safe_folds_identical_private_cstrings() {
 #[test]
 fn linker_run_icf_safe_folds_identical_private_literal16() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -11283,10 +11051,7 @@ fn linker_run_icf_safe_folds_identical_private_literal16() {
             .quad 0x99aabbccddeeff00
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -11339,7 +11104,7 @@ fn linker_run_icf_safe_folds_identical_private_literal16() {
 #[test]
 fn linker_run_icf_safe_folds_identical_private_data_const_atoms() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -11364,10 +11129,7 @@ fn linker_run_icf_safe_folds_identical_private_data_const_atoms() {
             .quad 0x0123456789abcdef
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -11420,7 +11182,7 @@ fn linker_run_icf_safe_folds_identical_private_data_const_atoms() {
 #[test]
 fn linker_run_icf_safe_reaches_fixed_point_through_folded_targets() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -11460,10 +11222,7 @@ fn linker_run_icf_safe_reaches_fixed_point_through_folded_targets() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -11529,7 +11288,7 @@ fn linker_run_icf_safe_reaches_fixed_point_through_folded_targets() {
 #[test]
 fn linker_run_icf_safe_prefers_earlier_input_order_winner() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -11571,21 +11330,9 @@ fn linker_run_icf_safe_prefers_earlier_input_order_winner() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(main_src, &main_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-    if let Err(e) = assemble(helper_a_src, &first_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        return;
-    }
-    if let Err(e) = assemble(helper_b_src, &second_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        let _ = fs::remove_file(first_obj);
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(main_src, &main_obj));
+    require_fixture!("assembly fixture", assemble(helper_a_src, &first_obj));
+    require_fixture!("assembly fixture", assemble(helper_b_src, &second_obj));
 
     let opts = LinkOptions {
         inputs: vec![main_obj.clone(), first_obj.clone(), second_obj.clone()],

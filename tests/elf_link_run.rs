@@ -2,6 +2,10 @@
 //! runs with the same exit code as system-linker builds, and afs-ld's
 //! output is byte-deterministic across runs.
 
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -121,7 +125,7 @@ fn freestanding_exit42_matches_system_linkers() {
         let run = Command::new(&ours3).output().unwrap();
         assert_eq!(run.status.code(), Some(42), "all-bespoke binary exit code");
     } else {
-        eprintln!("skipping: afs-as sibling binary not built (all-bespoke leg)");
+        harness_skip!("afs-as sibling binary not built (all-bespoke leg)");
     }
 
     // Behavioral parity with every available system linker.

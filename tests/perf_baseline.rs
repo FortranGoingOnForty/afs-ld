@@ -1,4 +1,8 @@
 use std::fs;
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -22,22 +26,11 @@ fn performance_prerequisites_available() -> bool {
     if std::env::var_os("AFS_LD_REQUIRE_PERF_PREREQUISITES").is_some() {
         panic!("required performance-test prerequisites are unavailable");
     }
-    eprintln!("skipping: xcrun as/ld unavailable");
+    harness_skip!("xcrun as/ld unavailable");
     false
 }
 
-fn runtime_archive_fixture() -> Result<PathBuf, String> {
-    if let Some(runtime) = workspace_artifact("libarmfortas_rt.a") {
-        return Ok(runtime);
-    }
-    build_synthetic_runtime_archive()
-}
-
 fn build_synthetic_runtime_archive() -> Result<PathBuf, String> {
-    if !have_tool("libtool") {
-        return Err("libtool unavailable".into());
-    }
-
     let members = [
         ("init", "_afs_program_init"),
         ("finalize", "_afs_program_finalize"),
@@ -286,12 +279,16 @@ fn bench_runtime_link_profile_reports_baseline_timings() {
     if !performance_prerequisites_available() {
         return;
     }
-    let runtime = match runtime_archive_fixture() {
-        Ok(runtime) => runtime,
-        Err(reason) => {
-            eprintln!("skipping: {reason}");
+    let runtime = match workspace_artifact("libarmfortas_rt.a") {
+        Some(runtime) => runtime,
+        None if !have_tool("libtool") => {
+            harness_skip!("libtool unavailable");
             return;
         }
+        None => require_fixture!(
+            "synthetic runtime archive",
+            build_synthetic_runtime_archive()
+        ),
     };
 
     let obj = scratch("perf-runtime.o");

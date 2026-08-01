@@ -9,6 +9,10 @@
 #[path = "common/artifacts.rs"]
 mod artifacts;
 
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use afs_ld::archive::{Archive, FetchError, SymbolIndex};
 use afs_ld::symbol::SymKind;
 use artifacts::workspace_artifact;
@@ -16,7 +20,7 @@ use artifacts::workspace_artifact;
 #[test]
 fn libarmfortas_rt_archive_walks_cleanly() {
     let Some(path) = workspace_artifact("libarmfortas_rt.a") else {
-        eprintln!("skipping: libarmfortas_rt.a not built; run `cargo build -p armfortas-rt` first");
+        harness_skip!("libarmfortas_rt.a not built; run `cargo build -p armfortas-rt` first");
         return;
     };
 
@@ -42,7 +46,7 @@ fn libarmfortas_rt_archive_walks_cleanly() {
         })
         .unwrap_or(false);
     if !is_macho {
-        eprintln!("skipping: runtime archive members are not Mach-O on this host (ELF); Mach-O ObjectFile walk not applicable");
+        harness_skip!("runtime archive members are not Mach-O on this host (ELF); Mach-O ObjectFile walk not applicable");
         return;
     }
 

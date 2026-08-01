@@ -1,4 +1,8 @@
 use std::fs;
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -430,17 +434,14 @@ fn assemble_minimal_main(name: &str) -> Result<PathBuf, String> {
 
 fn assert_flag_errors(flag: &str, expected: &str, name: &str) {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
     let exe = env!("CARGO_BIN_EXE_afs-ld");
-    let obj = match assemble_minimal_main(&format!("{name}.o")) {
-        Ok(obj) => obj,
-        Err(e) => {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
-    };
+    let obj = require_fixture!(
+        "assembly fixture",
+        assemble_minimal_main(&format!("{name}.o"))
+    );
     let out_path = scratch(&format!("{name}.out"));
     let out = Command::new(exe)
         .arg(flag)
@@ -531,18 +532,12 @@ fn version_flag_prints_version_and_exits_successfully() {
 #[test]
 fn no_uuid_flag_omits_uuid_load_command() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let exe = env!("CARGO_BIN_EXE_afs-ld");
-    let obj = match assemble_minimal_main("no-uuid-main.o") {
-        Ok(obj) => obj,
-        Err(e) => {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
-    };
+    let obj = require_fixture!("assembly fixture", assemble_minimal_main("no-uuid-main.o"));
     let out_path = scratch("no-uuid.out");
     let out = Command::new(exe)
         .arg("-no_uuid")
@@ -575,18 +570,12 @@ fn no_uuid_flag_omits_uuid_load_command() {
 #[test]
 fn no_loh_flag_warns_but_links_successfully() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let exe = env!("CARGO_BIN_EXE_afs-ld");
-    let obj = match assemble_minimal_main("no-loh-main.o") {
-        Ok(obj) => obj,
-        Err(e) => {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
-    };
+    let obj = require_fixture!("assembly fixture", assemble_minimal_main("no-loh-main.o"));
     let out_path = scratch("no-loh.out");
     let out = Command::new(exe)
         .arg("-no_loh")
@@ -618,18 +607,15 @@ fn no_loh_flag_warns_but_links_successfully() {
 #[test]
 fn strip_debug_flag_warns_but_links_successfully() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let exe = env!("CARGO_BIN_EXE_afs-ld");
-    let obj = match assemble_minimal_main("strip-debug-main.o") {
-        Ok(obj) => obj,
-        Err(e) => {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
-    };
+    let obj = require_fixture!(
+        "assembly fixture",
+        assemble_minimal_main("strip-debug-main.o")
+    );
     let out_path = scratch("strip-debug.out");
     let out = Command::new(exe)
         .arg("-S")
@@ -656,18 +642,12 @@ fn strip_debug_flag_warns_but_links_successfully() {
 #[test]
 fn objc_flag_warns_but_links_successfully() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let exe = env!("CARGO_BIN_EXE_afs-ld");
-    let obj = match assemble_minimal_main("objc-main.o") {
-        Ok(obj) => obj,
-        Err(e) => {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
-    };
+    let obj = require_fixture!("assembly fixture", assemble_minimal_main("objc-main.o"));
     let out_path = scratch("objc.out");
     let out = Command::new(exe)
         .arg("-ObjC")
@@ -878,7 +858,7 @@ fn bundle_flag_errors_loudly() {
 #[test]
 fn dead_strip_removes_unreferenced_symbols_and_reports_why_live() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -910,21 +890,9 @@ fn dead_strip_removes_unreferenced_symbols_and_reports_why_live() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(main_src, &main_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-    if let Err(e) = assemble(helper_src, &helper_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        return;
-    }
-    if let Err(e) = assemble(unused_src, &unused_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        let _ = fs::remove_file(helper_obj);
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(main_src, &main_obj));
+    require_fixture!("assembly fixture", assemble(helper_src, &helper_obj));
+    require_fixture!("assembly fixture", assemble(unused_src, &unused_obj));
 
     let out = Command::new(exe)
         .arg("-dead_strip")
@@ -973,7 +941,7 @@ fn dead_strip_removes_unreferenced_symbols_and_reports_why_live() {
 #[test]
 fn dead_strip_keeps_no_dead_strip_roots() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -997,10 +965,7 @@ fn dead_strip_keeps_no_dead_strip_roots() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let out = Command::new(exe)
         .arg("-dead_strip")
@@ -1044,18 +1009,12 @@ fn dead_strip_keeps_no_dead_strip_roots() {
 #[test]
 fn icf_safe_flag_links_successfully() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let exe = env!("CARGO_BIN_EXE_afs-ld");
-    let obj = match assemble_minimal_main("icf-safe-main.o") {
-        Ok(obj) => obj,
-        Err(e) => {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
-    };
+    let obj = require_fixture!("assembly fixture", assemble_minimal_main("icf-safe-main.o"));
     let out_path = scratch("icf-safe.out");
     let out = Command::new(exe)
         .arg("-icf=safe")
@@ -1100,7 +1059,7 @@ fn fixup_chains_flag_errors_loudly() {
 #[test]
 fn undefined_symbol_diagnostic_is_not_double_prefixed() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -1114,10 +1073,7 @@ fn undefined_symbol_diagnostic_is_not_double_prefixed() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let out = Command::new(exe)
         .arg("-o")
@@ -1141,11 +1097,11 @@ fn undefined_symbol_diagnostic_is_not_double_prefixed() {
 #[test]
 fn undefined_warning_mode_links_and_warns_once() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
 
@@ -1159,10 +1115,7 @@ fn undefined_warning_mode_links_and_warns_once() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let out_path = scratch("missing-warning.out");
     let out = Command::new(exe)
@@ -1199,11 +1152,11 @@ fn undefined_warning_mode_links_and_warns_once() {
 #[test]
 fn undefined_suppress_mode_links_silently() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
 
@@ -1217,10 +1170,7 @@ fn undefined_suppress_mode_links_silently() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let out_path = scratch("missing-suppress.out");
     let out = Command::new(exe)
@@ -1253,7 +1203,7 @@ fn undefined_suppress_mode_links_silently() {
 #[test]
 fn trace_flag_prints_loaded_inputs_and_archive_members() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -1286,27 +1236,10 @@ fn trace_flag_prints_loaded_inputs_and_archive_members() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(main_src, &main_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-    if let Err(e) = assemble(helper_src, &helper_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-    if let Err(e) = assemble(tail_src, &tail_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        let _ = fs::remove_file(helper_obj);
-        return;
-    }
-    if let Err(e) = archive(&[&helper_obj], &archive_path) {
-        eprintln!("skipping: archive failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        let _ = fs::remove_file(helper_obj);
-        let _ = fs::remove_file(tail_obj);
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(main_src, &main_obj));
+    require_fixture!("assembly fixture", assemble(helper_src, &helper_obj));
+    require_fixture!("assembly fixture", assemble(tail_src, &tail_obj));
+    require_fixture!("archive fixture", archive(&[&helper_obj], &archive_path));
 
     let out = Command::new(exe)
         .arg("-t")
@@ -1347,11 +1280,11 @@ fn trace_flag_prints_loaded_inputs_and_archive_members() {
 #[test]
 fn mixed_library_and_positional_inputs_follow_command_line_order() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
 
@@ -1392,22 +1325,10 @@ fn mixed_library_and_positional_inputs_follow_command_line_order() {
     "#;
 
     for (src, object) in [(main_src, &main_obj), (a_src, &a_obj), (b_src, &b_obj)] {
-        if let Err(e) = assemble(src, object) {
-            eprintln!("skipping: assemble failed: {e}");
-            let _ = fs::remove_dir_all(root);
-            return;
-        }
+        require_fixture!("assembly fixture", assemble(src, object));
     }
-    if let Err(e) = archive(&[&a_obj], &lib_a) {
-        eprintln!("skipping: archive failed: {e}");
-        let _ = fs::remove_dir_all(root);
-        return;
-    }
-    if let Err(e) = archive(&[&b_obj], &lib_b) {
-        eprintln!("skipping: archive failed: {e}");
-        let _ = fs::remove_dir_all(root);
-        return;
-    }
+    require_fixture!("archive fixture", archive(&[&a_obj], &lib_a));
+    require_fixture!("archive fixture", archive(&[&b_obj], &lib_b));
 
     let link = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
         .arg("-arch")
@@ -2411,7 +2332,7 @@ fn ordered_api_applies_configured_force_load_archives() {
 #[test]
 fn why_live_reports_root_entry_symbol() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -2426,10 +2347,7 @@ fn why_live_reports_root_entry_symbol() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &main_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &main_obj));
 
     let out = Command::new(exe)
         .arg("-why_live")
@@ -2456,7 +2374,7 @@ fn why_live_reports_root_entry_symbol() {
 #[test]
 fn why_live_reports_transitive_symbol_chain() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -2489,21 +2407,9 @@ fn why_live_reports_transitive_symbol_chain() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(main_src, &main_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-    if let Err(e) = assemble(helper_src, &helper_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        return;
-    }
-    if let Err(e) = assemble(leaf_src, &leaf_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        let _ = fs::remove_file(helper_obj);
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(main_src, &main_obj));
+    require_fixture!("assembly fixture", assemble(helper_src, &helper_obj));
+    require_fixture!("assembly fixture", assemble(leaf_src, &leaf_obj));
 
     let out = Command::new(exe)
         .arg("-why_live")
@@ -2536,7 +2442,7 @@ fn why_live_reports_transitive_symbol_chain() {
 #[test]
 fn why_live_reports_folded_symbol_winner_chain() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -2566,10 +2472,7 @@ fn why_live_reports_folded_symbol_winner_chain() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let out = Command::new(exe)
         .arg("-icf=safe")

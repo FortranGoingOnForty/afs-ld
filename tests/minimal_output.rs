@@ -1,6 +1,10 @@
 //! Sprint 10 integration gate: minimal executable/dylib outputs are accepted
 //! by the platform inspection tools.
 
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -44,7 +48,7 @@ fn write_image(path: &Path, kind: OutputKind) {
 #[test]
 fn minimal_outputs_pass_otool_and_file() {
     if !have_xcrun_tool("otool") || !have_file() {
-        eprintln!("skipping: xcrun otool or file unavailable");
+        harness_skip!("xcrun otool or file unavailable");
         return;
     }
 

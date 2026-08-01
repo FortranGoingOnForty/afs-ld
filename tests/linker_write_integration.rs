@@ -1,4 +1,8 @@
 use std::fs;
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -156,16 +160,13 @@ fn fixture_source() -> &'static str {
 #[test]
 fn linker_writes_executable_with_real_section_bytes() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let obj = scratch("fixture.o");
     let out = scratch("linked-exec");
-    if let Err(e) = assemble(fixture_source(), &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(fixture_source(), &obj));
     link_with_afs_ld(&[obj.to_str().unwrap(), "-o", out.to_str().unwrap()])
         .expect("link executable");
 
@@ -206,16 +207,13 @@ fn linker_writes_executable_with_real_section_bytes() {
 #[test]
 fn linker_writes_dylib_with_real_text_section() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let obj = scratch("fixture-dylib.o");
     let out = scratch("libfixture.dylib");
-    if let Err(e) = assemble(fixture_source(), &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(fixture_source(), &obj));
     link_with_afs_ld(&["-dylib", obj.to_str().unwrap(), "-o", out.to_str().unwrap()])
         .expect("link dylib");
 
@@ -237,33 +235,33 @@ fn linker_writes_dylib_with_real_text_section() {
 #[test]
 fn linker_emits_load_dylib_for_direct_dependency_input() {
     if !have_xcrun() || !have_clang() {
-        eprintln!("skipping: xcrun as / clang unavailable");
+        harness_skip!("xcrun as / clang unavailable");
         return;
     }
 
     let obj = scratch("dep-main.o");
     let dep = scratch("libdep.dylib");
     let out = scratch("dep-linked");
-    if let Err(e) = assemble(
-        r#"
+    require_fixture!(
+        "assembly fixture",
+        assemble(
+            r#"
             .section __TEXT,__text,regular,pure_instructions
             .globl _main
             _main:
                 ret
         "#,
-        &obj,
-    ) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-    if let Err(e) = build_test_dylib(
-        "int afsld_dep(void) { return 7; }\n",
-        &dep,
-        "@rpath/libafslddep.dylib",
-    ) {
-        eprintln!("skipping: clang failed: {e}");
-        return;
-    }
+            &obj,
+        )
+    );
+    require_fixture!(
+        "test dylib compilation",
+        build_test_dylib(
+            "int afsld_dep(void) { return 7; }\n",
+            &dep,
+            "@rpath/libafslddep.dylib",
+        )
+    );
 
     link_with_afs_ld(&[
         obj.to_str().unwrap(),
@@ -292,24 +290,24 @@ fn linker_emits_load_dylib_for_direct_dependency_input() {
 #[test]
 fn linker_emits_rpath_load_command() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let obj = scratch("rpath-main.o");
     let out = scratch("rpath-linked");
-    if let Err(e) = assemble(
-        r#"
+    require_fixture!(
+        "assembly fixture",
+        assemble(
+            r#"
             .section __TEXT,__text,regular,pure_instructions
             .globl _main
             _main:
                 ret
         "#,
-        &obj,
-    ) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+            &obj,
+        )
+    );
 
     link_with_afs_ld(&[
         obj.to_str().unwrap(),
@@ -337,24 +335,24 @@ fn linker_emits_rpath_load_command() {
 #[test]
 fn linker_emits_uuid_and_source_version_commands() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let obj = scratch("uuid-main.o");
     let out = scratch("uuid-linked");
-    if let Err(e) = assemble(
-        r#"
+    require_fixture!(
+        "assembly fixture",
+        assemble(
+            r#"
             .section __TEXT,__text,regular,pure_instructions
             .globl _main
             _main:
                 ret
         "#,
-        &obj,
-    ) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+            &obj,
+        )
+    );
 
     link_with_afs_ld(&[obj.to_str().unwrap(), "-o", out.to_str().unwrap()])
         .expect("link executable with metadata");

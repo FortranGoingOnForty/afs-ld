@@ -18,6 +18,10 @@
 //!
 //! Skipped if `xcrun` or `ar` aren't available on PATH.
 
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -97,7 +101,7 @@ fn scratch(name: &str) -> PathBuf {
 #[test]
 fn resolve_pipeline_pulls_archive_member_and_flags_missing() {
     if !have_xcrun() || !have_ar() {
-        eprintln!("skipping: xcrun as / ar unavailable");
+        harness_skip!("xcrun as / ar unavailable");
         return;
     }
 
@@ -133,15 +137,9 @@ fn resolve_pipeline_pulls_archive_member_and_flags_missing() {
     let libtest = scratch("libtest.a");
 
     for (src, out) in [(a_src, &a_o), (b_src, &b_o), (c_src, &c_o)] {
-        if let Err(e) = assemble(src, out) {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
+        require_fixture!("assembly fixture", assemble(src, out));
     }
-    if let Err(e) = pack_archive(&[&c_o], &libtest) {
-        eprintln!("skipping: archive build failed: {e}");
-        return;
-    }
+    require_fixture!("archive fixture", pack_archive(&[&c_o], &libtest));
 
     // Register the inputs with the resolver.
     let mut inputs = Inputs::new();

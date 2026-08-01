@@ -8,6 +8,10 @@
 //! Section bodies, symbols, strings, and relocations are still untouched by
 //! Sprint 1; we only round-trip the header + `sizeofcmds` region.
 
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -52,8 +56,8 @@ fn assemble(src: &Path, obj: &Path) -> Result<(), String> {
 fn every_afs_as_corpus_s_round_trips() {
     let corpus = corpus_dir();
     if !corpus.is_dir() {
-        eprintln!(
-            "skipping: corpus not found at {} (run from the armfortas workspace)",
+        harness_skip!(
+            "corpus not found at {} (run from the armfortas workspace)",
             corpus.display()
         );
         return;
@@ -61,7 +65,7 @@ fn every_afs_as_corpus_s_round_trips() {
 
     let which = Command::new("xcrun").arg("-f").arg("as").output();
     if !matches!(which, Ok(o) if o.status.success()) {
-        eprintln!("skipping: xcrun as not available");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -149,12 +153,12 @@ fn every_afs_as_corpus_s_round_trips() {
 fn every_afs_as_corpus_object_parses_fully() {
     let corpus = corpus_dir();
     if !corpus.is_dir() {
-        eprintln!("skipping: corpus not found at {}", corpus.display());
+        harness_skip!("corpus not found at {}", corpus.display());
         return;
     }
     let which = Command::new("xcrun").arg("-f").arg("as").output();
     if !matches!(which, Ok(o) if o.status.success()) {
-        eprintln!("skipping: xcrun as not available");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -276,12 +280,12 @@ fn every_afs_as_corpus_object_parses_fully() {
 fn every_afs_as_corpus_section_relocs_round_trip() {
     let corpus = corpus_dir();
     if !corpus.is_dir() {
-        eprintln!("skipping: corpus not found at {}", corpus.display());
+        harness_skip!("corpus not found at {}", corpus.display());
         return;
     }
     let which = Command::new("xcrun").arg("-f").arg("as").output();
     if !matches!(which, Ok(o) if o.status.success()) {
-        eprintln!("skipping: xcrun as not available");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 

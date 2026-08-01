@@ -568,7 +568,7 @@ fn build_reverse_edges(
     atom_table: &AtomTable,
     resolved_by_name: &HashMap<String, SymbolId>,
 ) -> HashMap<SymbolId, Vec<SymbolId>> {
-    let atoms_by_input_section = atom_table.by_input_section();
+    let atom_index = AtomOffsetIndex::new(atom_table);
     let atom_symbols = atom_symbol_sets(atom_table);
     let mut edge_set = HashSet::<(SymbolId, SymbolId)>::new();
 
@@ -585,13 +585,8 @@ fn build_reverse_edges(
             };
             let input_section = (section_idx_zero + 1) as u8;
             for reloc in relocs {
-                let Some(source_atom) = find_atom_for_offset(
-                    atom_table,
-                    &atoms_by_input_section,
-                    input.id,
-                    input_section,
-                    reloc.offset,
-                ) else {
+                let Some(source_atom) = atom_index.find(input.id, input_section, reloc.offset)
+                else {
                     continue;
                 };
                 let Some(source_symbols) = atom_symbols.get(&source_atom) else {
@@ -629,7 +624,7 @@ fn build_forward_edges(
     sym_table: &SymbolTable,
     resolved_by_name: &HashMap<String, SymbolId>,
 ) -> HashMap<AtomId, Vec<AtomId>> {
-    let atoms_by_input_section = atom_table.by_input_section();
+    let atom_index = AtomOffsetIndex::new(atom_table);
     let mut edge_set = HashSet::<(AtomId, AtomId)>::new();
 
     for input in layout_inputs {
@@ -645,13 +640,8 @@ fn build_forward_edges(
             };
             let input_section = (section_idx_zero + 1) as u8;
             for reloc in relocs {
-                let Some(source_atom) = find_atom_for_offset(
-                    atom_table,
-                    &atoms_by_input_section,
-                    input.id,
-                    input_section,
-                    reloc.offset,
-                ) else {
+                let Some(source_atom) = atom_index.find(input.id, input_section, reloc.offset)
+                else {
                     continue;
                 };
                 for target_atom in target_atoms_for_reloc(
@@ -661,10 +651,9 @@ fn build_forward_edges(
                     reloc,
                     reloc.referent,
                     reloc.subtrahend,
-                    atom_table,
                     sym_table,
                     resolved_by_name,
-                    &atoms_by_input_section,
+                    &atom_index,
                 ) {
                     if source_atom != target_atom {
                         edge_set.insert((source_atom, target_atom));
@@ -678,7 +667,7 @@ fn build_forward_edges(
         if atom.section != AtomSection::EhFrame {
             continue;
         }
-        let Some(cie_atom) = eh_frame_cie_atom(atom_table, &atoms_by_input_section, atom) else {
+        let Some(cie_atom) = eh_frame_cie_atom(&atom_index, atom) else {
             continue;
         };
         if atom_id != cie_atom {
@@ -755,31 +744,120 @@ fn atom_symbol_sets(atom_table: &AtomTable) -> HashMap<crate::resolve::AtomId, V
     out
 }
 
-fn find_atom_for_offset(
-    atom_table: &AtomTable,
-    atoms_by_input_section: &HashMap<(InputId, u8), Vec<AtomId>>,
-    input_id: InputId,
-    input_section: u8,
-    offset: u32,
-) -> Option<AtomId> {
-    atoms_by_input_section
-        .get(&(input_id, input_section))
-        .and_then(|ids| {
-            ids.iter()
-                .find_map(|atom_id| {
-                    let atom = atom_table.get(*atom_id);
-                    let start = atom.input_offset;
-                    let end = atom.input_offset.saturating_add(atom.size);
-                    (start <= offset && offset < end).then_some(*atom_id)
+#[derive(Debug, Clone, Copy)]
+struct IndexedAtom {
+    id: AtomId,
+    start: u32,
+    end: u32,
+}
+
+impl IndexedAtom {
+    fn contains(self, offset: u32) -> bool {
+        self.start <= offset && offset < self.end
+    }
+}
+
+#[derive(Debug, Default)]
+struct InputSectionAtomIndex {
+    atoms: Vec<IndexedAtom>,
+    ordered_non_overlapping: bool,
+}
+
+/// Relocation-to-atom lookup for why-live and dead-strip graph construction.
+///
+/// Normal atomization emits each input section in non-overlapping offset
+/// order, so a relocation lookup is a binary search. Keep the original scan
+/// as a defensive fallback for synthetic or malformed internal atom tables;
+/// correctness must not depend on that construction invariant.
+#[derive(Debug, Default)]
+struct AtomOffsetIndex {
+    sections: HashMap<(InputId, u8), InputSectionAtomIndex>,
+}
+
+impl AtomOffsetIndex {
+    fn new(atom_table: &AtomTable) -> Self {
+        let mut sections = HashMap::<(InputId, u8), InputSectionAtomIndex>::new();
+        for (id, atom) in atom_table.iter() {
+            let section = sections
+                .entry((atom.origin, atom.input_section))
+                .or_default();
+            let end = atom.input_offset.saturating_add(atom.size);
+            section.atoms.push(IndexedAtom {
+                id,
+                start: atom.input_offset,
+                end,
+            });
+        }
+        for section in sections.values_mut() {
+            section.ordered_non_overlapping = section
+                .atoms
+                .windows(2)
+                .all(|pair| pair[0].start <= pair[1].start && pair[0].end <= pair[1].start);
+        }
+        Self { sections }
+    }
+
+    fn find(&self, input_id: InputId, input_section: u8, offset: u32) -> Option<AtomId> {
+        self.find_with_probe(input_id, input_section, offset, || {})
+    }
+
+    fn find_with_probe(
+        &self,
+        input_id: InputId,
+        input_section: u8,
+        offset: u32,
+        mut probe: impl FnMut(),
+    ) -> Option<AtomId> {
+        let section = self.sections.get(&(input_id, input_section))?;
+        if !section.ordered_non_overlapping {
+            return section
+                .atoms
+                .iter()
+                .find_map(|atom| {
+                    probe();
+                    atom.contains(offset).then_some(atom.id)
                 })
                 .or_else(|| {
-                    ids.iter().find_map(|atom_id| {
-                        let atom = atom_table.get(*atom_id);
-                        let end = atom.input_offset.saturating_add(atom.size);
-                        (offset == end).then_some(*atom_id)
+                    section.atoms.iter().find_map(|atom| {
+                        probe();
+                        (atom.end == offset).then_some(atom.id)
                     })
-                })
-        })
+                });
+        }
+
+        let candidate = section.atoms.partition_point(|atom| {
+            probe();
+            atom.start <= offset
+        });
+        if let Some(atom) = candidate
+            .checked_sub(1)
+            .and_then(|index| section.atoms.get(index))
+        {
+            probe();
+            if atom.contains(offset) {
+                return Some(atom.id);
+            }
+        }
+
+        // Ends are nondecreasing under the section invariant. This second
+        // binary search preserves the legacy rule that an otherwise
+        // unmatched end boundary belongs to the first atom ending there.
+        let boundary = section.atoms.partition_point(|atom| {
+            probe();
+            atom.end < offset
+        });
+        section
+            .atoms
+            .get(boundary)
+            .and_then(|atom| (atom.end == offset).then_some(atom.id))
+    }
+
+    fn atom_ids(&self, input_id: InputId, input_section: u8) -> Vec<AtomId> {
+        self.sections
+            .get(&(input_id, input_section))
+            .map(|section| section.atoms.iter().map(|atom| atom.id).collect())
+            .unwrap_or_default()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -790,10 +868,9 @@ fn target_atoms_for_reloc(
     reloc: crate::reloc::Reloc,
     referent: Referent,
     subtrahend: Option<Referent>,
-    atom_table: &AtomTable,
     sym_table: &SymbolTable,
     resolved_by_name: &HashMap<String, SymbolId>,
-    atoms_by_input_section: &HashMap<(InputId, u8), Vec<AtomId>>,
+    atom_index: &AtomOffsetIndex,
 ) -> Vec<AtomId> {
     let mut out = referent_atoms(
         input_id,
@@ -801,10 +878,9 @@ fn target_atoms_for_reloc(
         source_atom,
         reloc,
         referent,
-        atom_table,
         sym_table,
         resolved_by_name,
-        atoms_by_input_section,
+        atom_index,
     );
     if let Some(subtrahend) = subtrahend {
         out.extend(referent_atoms(
@@ -813,10 +889,9 @@ fn target_atoms_for_reloc(
             source_atom,
             reloc,
             subtrahend,
-            atom_table,
             sym_table,
             resolved_by_name,
-            atoms_by_input_section,
+            atom_index,
         ));
     }
     out.sort_by_key(|aid| aid.0);
@@ -831,10 +906,9 @@ fn referent_atoms(
     source_atom: &Atom,
     reloc: crate::reloc::Reloc,
     referent: Referent,
-    atom_table: &AtomTable,
     sym_table: &SymbolTable,
     resolved_by_name: &HashMap<String, SymbolId>,
-    atoms_by_input_section: &HashMap<(InputId, u8), Vec<AtomId>>,
+    atom_index: &AtomOffsetIndex,
 ) -> Vec<AtomId> {
     match referent {
         Referent::Symbol(symbol_index) => {
@@ -851,15 +925,10 @@ fn referent_atoms(
                 let Ok(section_offset) = u32::try_from(section_offset) else {
                     return Vec::new();
                 };
-                return find_atom_for_offset(
-                    atom_table,
-                    atoms_by_input_section,
-                    input_id,
-                    input_sym.sect_idx(),
-                    section_offset,
-                )
-                .into_iter()
-                .collect();
+                return atom_index
+                    .find(input_id, input_sym.sect_idx(), section_offset)
+                    .into_iter()
+                    .collect();
             }
             let Some(name) = object.symbol_name(input_sym).ok() else {
                 return Vec::new();
@@ -873,20 +942,12 @@ fn referent_atoms(
             }
         }
         Referent::Section(section_index) => {
-            if let Some(atom_id) = section_referent_atom(
-                input_id,
-                source_atom,
-                reloc,
-                section_index,
-                atom_table,
-                atoms_by_input_section,
-            ) {
+            if let Some(atom_id) =
+                section_referent_atom(input_id, source_atom, reloc, section_index, atom_index)
+            {
                 vec![atom_id]
             } else {
-                atoms_by_input_section
-                    .get(&(input_id, section_index))
-                    .cloned()
-                    .unwrap_or_default()
+                atom_index.atom_ids(input_id, section_index)
             }
         }
     }
@@ -897,8 +958,7 @@ fn section_referent_atom(
     source_atom: &Atom,
     reloc: crate::reloc::Reloc,
     section_index: u8,
-    atom_table: &AtomTable,
-    atoms_by_input_section: &HashMap<(InputId, u8), Vec<AtomId>>,
+    atom_index: &AtomOffsetIndex,
 ) -> Option<AtomId> {
     if source_atom.section == AtomSection::CompactUnwind
         && reloc.offset == source_atom.input_offset
@@ -907,22 +967,12 @@ fn section_referent_atom(
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&source_atom.data[..8]);
         let target_offset = u64::from_le_bytes(buf) as u32;
-        return find_atom_for_offset(
-            atom_table,
-            atoms_by_input_section,
-            input_id,
-            section_index,
-            target_offset,
-        );
+        return atom_index.find(input_id, section_index, target_offset);
     }
     None
 }
 
-fn eh_frame_cie_atom(
-    atom_table: &AtomTable,
-    atoms_by_input_section: &HashMap<(InputId, u8), Vec<AtomId>>,
-    atom: &Atom,
-) -> Option<AtomId> {
+fn eh_frame_cie_atom(atom_index: &AtomOffsetIndex, atom: &Atom) -> Option<AtomId> {
     if atom.section != AtomSection::EhFrame || atom.data.len() < 8 {
         return None;
     }
@@ -933,13 +983,7 @@ fn eh_frame_cie_atom(
         return None;
     }
     let cie_offset = atom.input_offset.checked_add(4)?.checked_sub(cie_delta)?;
-    find_atom_for_offset(
-        atom_table,
-        atoms_by_input_section,
-        atom.origin,
-        atom.input_section,
-        cie_offset,
-    )
+    atom_index.find(atom.origin, atom.input_section, cie_offset)
 }
 
 fn target_symbols_for_reloc(
@@ -993,6 +1037,85 @@ mod tests {
             flags: AtomFlags::NONE,
             parent_of: None,
         }
+    }
+
+    fn test_offset_atom(input: InputId, section: u8, offset: u32, size: u32) -> Atom {
+        Atom {
+            origin: input,
+            input_section: section,
+            input_offset: offset,
+            size,
+            data: vec![0; size.min(8) as usize],
+            ..bare_test_atom()
+        }
+    }
+
+    #[test]
+    fn atom_offset_lookup_preserves_containment_and_end_boundary_rules() {
+        let mut atoms = AtomTable::new();
+        let first = atoms.push(test_offset_atom(InputId(7), 2, 0, 4));
+        let second = atoms.push(test_offset_atom(InputId(7), 2, 4, 4));
+        let after_gap = atoms.push(test_offset_atom(InputId(7), 2, 12, 4));
+        atoms.push(test_offset_atom(InputId(7), 2, 16, 0));
+        let zero_sized = atoms.push(test_offset_atom(InputId(7), 3, 20, 0));
+        let saturated = atoms.push(test_offset_atom(InputId(8), 1, u32::MAX - 2, 8));
+        let index = AtomOffsetIndex::new(&atoms);
+
+        let find = |input, section, offset| index.find(input, section, offset);
+        assert_eq!(find(InputId(7), 2, 0), Some(first));
+        assert_eq!(find(InputId(7), 2, 3), Some(first));
+        assert_eq!(find(InputId(7), 2, 4), Some(second));
+        assert_eq!(find(InputId(7), 2, 8), Some(second));
+        assert_eq!(find(InputId(7), 2, 9), None);
+        assert_eq!(find(InputId(7), 2, 12), Some(after_gap));
+        assert_eq!(find(InputId(7), 2, 16), Some(after_gap));
+        assert_eq!(find(InputId(7), 3, 20), Some(zero_sized));
+        assert_eq!(find(InputId(8), 1, u32::MAX - 1), Some(saturated));
+        assert_eq!(find(InputId(8), 1, u32::MAX), Some(saturated));
+        assert_eq!(find(InputId(99), 1, 0), None);
+    }
+
+    #[test]
+    fn atom_offset_lookup_preserves_legacy_order_for_noncanonical_overlaps() {
+        let mut atoms = AtomTable::new();
+        let first = atoms.push(test_offset_atom(InputId(9), 1, 4, 8));
+        atoms.push(test_offset_atom(InputId(9), 1, 0, 8));
+        let index = AtomOffsetIndex::new(&atoms);
+
+        assert_eq!(index.find(InputId(9), 1, 6), Some(first));
+    }
+
+    #[test]
+    fn atom_offset_lookup_uses_logarithmic_probes() {
+        const ATOM_COUNT: u32 = 16_384;
+        let mut atoms = AtomTable::new();
+        let mut expected = AtomId(0);
+        for index in 0..ATOM_COUNT {
+            expected = atoms.push(test_offset_atom(InputId(11), 4, index * 4, 4));
+        }
+        let index = AtomOffsetIndex::new(&atoms);
+
+        let mut interior_probes = 0;
+        let found = index.find_with_probe(InputId(11), 4, (ATOM_COUNT - 1) * 4 + 2, || {
+            interior_probes += 1;
+        });
+
+        assert_eq!(found, Some(expected));
+        assert!(
+            interior_probes <= 32,
+            "indexed interior lookup should inspect at most 32 atoms, inspected {interior_probes}"
+        );
+
+        let mut boundary_probes = 0;
+        let found = index.find_with_probe(InputId(11), 4, ATOM_COUNT * 4, || {
+            boundary_probes += 1;
+        });
+
+        assert_eq!(found, Some(expected));
+        assert!(
+            boundary_probes <= 32,
+            "indexed end-boundary lookup should inspect at most 32 atoms, inspected {boundary_probes}"
+        );
     }
 
     fn alias_roots_private_target(private_alias: bool) -> (bool, bool) {

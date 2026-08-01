@@ -17,13 +17,14 @@ use common::harness::{
 
 const WARM_SAMPLES: usize = 11;
 const REQUIRED_BUDGET_PASSES: usize = 9;
+const REQUIRE_PERF_PREREQUISITES_ENV: &str = "AFS_LD_REQUIRE_PERF_PREREQUISITES";
 
 fn performance_prerequisites_available() -> bool {
     if have_xcrun() && have_xcrun_tool("ld") {
         return true;
     }
 
-    if std::env::var_os("AFS_LD_REQUIRE_PERF_PREREQUISITES").is_some() {
+    if std::env::var_os(REQUIRE_PERF_PREREQUISITES_ENV).is_some() {
         panic!("required performance-test prerequisites are unavailable");
     }
     harness_skip!("xcrun as/ld unavailable");
@@ -205,10 +206,27 @@ fn budget_pass_count(samples: &[Duration], limit: Duration) -> usize {
 }
 
 fn assert_warm_budget(name: &str, env_name: &str, inputs: &[PathBuf], output_stem: &str) {
-    let Ok(limit_ms) = std::env::var(env_name) else {
-        return;
+    let limit_ms = match std::env::var(env_name) {
+        Ok(limit_ms) => limit_ms,
+        Err(std::env::VarError::NotPresent)
+            if std::env::var_os(REQUIRE_PERF_PREREQUISITES_ENV).is_none() =>
+        {
+            return;
+        }
+        Err(std::env::VarError::NotPresent) => {
+            panic!(
+                "{env_name} must be set when {REQUIRE_PERF_PREREQUISITES_ENV} enables the performance gate"
+            );
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("{env_name} must contain a UTF-8 millisecond budget");
+        }
     };
-    let limit = Duration::from_millis(limit_ms.parse().expect("parse performance budget"));
+    let limit_ms: u64 = limit_ms
+        .parse()
+        .unwrap_or_else(|_| panic!("{env_name} must contain an integer millisecond budget"));
+    assert!(limit_ms > 0, "{env_name} must be greater than zero");
+    let limit = Duration::from_millis(limit_ms);
     let mut profiles = Vec::with_capacity(WARM_SAMPLES);
     for sample in 1..=WARM_SAMPLES {
         let label = format!("{name} warm sample {sample}");
@@ -333,5 +351,38 @@ fn warm_budget_tolerates_at_most_two_slow_samples() {
     assert_eq!(
         budget_pass_count(&samples, limit),
         REQUIRED_BUDGET_PASSES - 1
+    );
+}
+
+#[test]
+fn required_performance_gate_rejects_missing_budget_configuration() {
+    const CHILD_MARKER: &str = "AFS_LD_MISSING_BUDGET_TEST_CHILD";
+    const MISSING_BUDGET: &str = "AFS_LD_TEST_MISSING_BUDGET_MS";
+
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        assert_warm_budget("required gate", MISSING_BUDGET, &[], "unused");
+        return;
+    }
+
+    let output = Command::new(std::env::current_exe().expect("resolve performance test binary"))
+        .arg("required_performance_gate_rejects_missing_budget_configuration")
+        .arg("--exact")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env(CHILD_MARKER, "1")
+        .env(REQUIRE_PERF_PREREQUISITES_ENV, "1")
+        .env_remove(MISSING_BUDGET)
+        .output()
+        .expect("run isolated missing-budget probe");
+
+    assert!(
+        !output.status.success(),
+        "required performance gate accepted a missing budget:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(MISSING_BUDGET),
+        "missing-budget diagnostic did not name {MISSING_BUDGET}:\n{stderr}"
     );
 }

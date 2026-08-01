@@ -1959,6 +1959,9 @@ fn linkedit_payload(bytes: &[u8], cmd: u32) -> Result<Vec<u8>, String> {
 
 fn decode_function_starts(bytes: &[u8]) -> Result<Vec<u64>, String> {
     let payload = linkedit_payload(bytes, LC_FUNCTION_STARTS)?;
+    if payload.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut offsets = Vec::new();
     let mut cursor = 0usize;
     let mut current = 0u64;
@@ -1966,12 +1969,17 @@ fn decode_function_starts(bytes: &[u8]) -> Result<Vec<u64>, String> {
         let (delta, used) = read_uleb(&payload[cursor..]).map_err(|e| e.to_string())?;
         cursor += used;
         if delta == 0 {
-            break;
+            if payload[cursor..].iter().any(|byte| *byte != 0) {
+                return Err(
+                    "LC_FUNCTION_STARTS contains non-zero padding after its terminator".into(),
+                );
+            }
+            return Ok(offsets);
         }
         current += delta;
         offsets.push(current);
     }
-    Ok(offsets)
+    Err("LC_FUNCTION_STARTS is missing its zero ULEB terminator".into())
 }
 
 fn normalize_function_start_offsets(starts: &[u64]) -> Vec<u64> {

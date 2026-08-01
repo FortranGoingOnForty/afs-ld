@@ -2,15 +2,17 @@
 
 mod common;
 
-use afs_ld::macho::constants::{CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_EXECUTE, MH_MAGIC_64};
+use afs_ld::macho::constants::{
+    CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_FUNCTION_STARTS, MH_EXECUTE, MH_MAGIC_64,
+};
 use afs_ld::macho::exports::ExportKind;
 use afs_ld::macho::reader::{
     write_commands, write_header, DyldInfoCmd, LinkEditDataCmd, LoadCommand, MachHeader64,
     HEADER_SIZE,
 };
 use common::harness::{
-    apply_section_tolerances, diff_macho, macho_exports, parse_case_tolerances,
-    string_table_within_five_percent,
+    apply_section_tolerances, compare_command_details, diff_macho, macho_exports,
+    parse_case_tolerances, string_table_within_five_percent, CommandCheck,
 };
 
 const SINGLE_EXPORT_TRIE: &[u8] = &[0, 1, b'_', b'x', 0, 6, 2, 0, 7, 0];
@@ -33,6 +35,21 @@ fn executable_with_commands(commands: &[LoadCommand], payload: &[u8]) -> Vec<u8>
     write_commands(commands, &mut bytes);
     bytes.extend_from_slice(payload);
     bytes
+}
+
+fn executable_with_function_starts(payload: &[u8]) -> Vec<u8> {
+    let dataoff = HEADER_SIZE as u32 + LinkEditDataCmd::WIRE_SIZE;
+    let mut data = Vec::with_capacity(8);
+    data.extend_from_slice(&dataoff.to_le_bytes());
+    data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    executable_with_commands(
+        &[LoadCommand::Raw {
+            cmd: LC_FUNCTION_STARTS,
+            cmdsize: LinkEditDataCmd::WIRE_SIZE,
+            data,
+        }],
+        payload,
+    )
 }
 
 fn assert_single_regular_export(bytes: &[u8]) {
@@ -160,4 +177,66 @@ fn string_table_near_parity_rejects_large_suffix_dedup_drift() {
         !string_table_within_five_percent(120, 100),
         "20% string-table drift should fail the Sprint 27 allowance"
     );
+}
+
+#[test]
+fn function_starts_parity_rejects_missing_terminator() {
+    let unterminated = executable_with_function_starts(&[0x04, 0x08]);
+    let terminated = executable_with_function_starts(&[0x04, 0x08, 0x00]);
+
+    for check in [
+        CommandCheck::FunctionStarts,
+        CommandCheck::NormalizedFunctionStarts,
+    ] {
+        let error = compare_command_details(&unterminated, &terminated, &[check])
+            .expect_err("reject unterminated function-start metadata");
+        assert!(error.contains("terminator"), "unexpected error: {error}");
+    }
+}
+
+#[test]
+fn function_starts_parity_rejects_records_after_terminator() {
+    let trailing_record =
+        executable_with_function_starts(&[0x04, 0x08, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00]);
+    let padded = executable_with_function_starts(&[0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+    for check in [
+        CommandCheck::FunctionStarts,
+        CommandCheck::NormalizedFunctionStarts,
+    ] {
+        let error = compare_command_details(&trailing_record, &padded, &[check])
+            .expect_err("reject records after the function-start terminator");
+        assert!(error.contains("padding"), "unexpected error: {error}");
+    }
+}
+
+#[test]
+fn function_starts_parity_accepts_zero_padding_after_terminator() {
+    let compact = executable_with_function_starts(&[0x04, 0x08, 0x00]);
+    let padded = executable_with_function_starts(&[0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+    compare_command_details(
+        &compact,
+        &padded,
+        &[
+            CommandCheck::FunctionStarts,
+            CommandCheck::NormalizedFunctionStarts,
+        ],
+    )
+    .expect("zero alignment padding is valid function-start metadata");
+}
+
+#[test]
+fn function_starts_parity_accepts_empty_metadata() {
+    let empty = executable_with_function_starts(&[]);
+
+    compare_command_details(
+        &empty,
+        &empty,
+        &[
+            CommandCheck::FunctionStarts,
+            CommandCheck::NormalizedFunctionStarts,
+        ],
+    )
+    .expect("an empty function-start payload represents no functions");
 }

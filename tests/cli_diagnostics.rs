@@ -7,15 +7,17 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use afs_ld::macho::constants::{
-    CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_ID_DYLIB, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_MAIN,
-    LC_UUID, MH_BUNDLE, MH_DYLIB, MH_DYLINKER, MH_EXECUTE, MH_MAGIC_64, MH_OBJECT, N_ABS, N_EXT,
-    N_NO_DEAD_STRIP, N_PEXT, N_SECT, N_UNDF, SECTION_TYPE_MASK, S_REGULAR, S_ZEROFILL,
+    ARM64_RELOC_ADDEND, CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_ID_DYLIB, LC_LOAD_DYLIB,
+    LC_LOAD_WEAK_DYLIB, LC_MAIN, LC_UUID, MH_BUNDLE, MH_DYLIB, MH_DYLINKER, MH_EXECUTE,
+    MH_MAGIC_64, MH_OBJECT, N_ABS, N_EXT, N_NO_DEAD_STRIP, N_PEXT, N_SECT, N_UNDF,
+    SECTION_TYPE_MASK, S_REGULAR, S_ZEROFILL,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::reader::{
     parse_commands, parse_header, write_header, DylibCmd, LoadCommand, MachHeader64,
     Section64Header, Segment64, SymtabCmd,
 };
+use afs_ld::reloc::{write_raw_relocs, RawRelocation};
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, RawNlist, SymKind, NLIST_SIZE};
 use afs_ld::{InputSpec, LinkError, LinkOptions, Linker, OutputKind};
@@ -140,7 +142,16 @@ fn synthetic_symbol_object_with_desc(symbols: &[(&str, u8, u16, u64)]) -> Vec<u8
 }
 
 fn synthetic_text_object(symbol_name: &str) -> Vec<u8> {
+    synthetic_text_object_with_relocations(symbol_name, &[])
+}
+
+fn synthetic_text_object_with_relocations(
+    symbol_name: &str,
+    relocations: &[RawRelocation],
+) -> Vec<u8> {
     let text = [0xc0, 0x03, 0x5f, 0xd6]; // ret
+    let mut relocation_bytes = Vec::new();
+    write_raw_relocs(relocations, &mut relocation_bytes);
     let mut strings = vec![0];
     let strx = strings.len() as u32;
     strings.extend_from_slice(symbol_name.as_bytes());
@@ -180,7 +191,9 @@ fn synthetic_text_object(symbol_name: &str) -> Vec<u8> {
     let data_offset = afs_ld::macho::reader::HEADER_SIZE as u32 + sizeofcmds;
     segment.fileoff = data_offset as u64;
     segment.sections[0].offset = data_offset;
-    let symoff = data_offset + text.len() as u32;
+    segment.sections[0].reloff = data_offset + text.len() as u32;
+    segment.sections[0].nreloc = relocations.len() as u32;
+    let symoff = segment.sections[0].reloff + relocation_bytes.len() as u32;
     let stroff = symoff + NLIST_SIZE as u32;
 
     let mut bytes = Vec::new();
@@ -206,8 +219,25 @@ fn synthetic_text_object(symbol_name: &str) -> Vec<u8> {
     }
     .write(&mut bytes);
     bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&relocation_bytes);
     symbol.write(&mut bytes);
     bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_text_object_with_invalid_symbol_name() -> Vec<u8> {
+    let mut bytes = synthetic_text_object("_main");
+    let header = parse_header(&bytes).unwrap();
+    let symtab = parse_commands(&header, &bytes)
+        .unwrap()
+        .into_iter()
+        .find_map(|command| match command {
+            LoadCommand::Symtab(symtab) => Some(symtab),
+            _ => None,
+        })
+        .unwrap();
+    bytes[symtab.symoff as usize..symtab.symoff as usize + 4]
+        .copy_from_slice(&symtab.strsize.to_le_bytes());
     bytes
 }
 
@@ -1648,6 +1678,68 @@ fn dump_still_inspects_final_macho_images() {
     assert!(String::from_utf8_lossy(&result.stdout).contains("MH_EXECUTE"));
 
     let _ = fs::remove_file(input);
+}
+
+fn assert_dump_rejects(
+    name: &str,
+    bytes: Vec<u8>,
+    expected_error: &str,
+    forbidden_placeholder: &str,
+) {
+    let input = scratch(name);
+    fs::write(&input, bytes).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("--dump")
+        .arg(&input)
+        .output()
+        .expect("afs-ld should run");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success(),
+        "dump accepted malformed input {name}:\n{stdout}"
+    );
+    assert!(
+        stderr.contains(expected_error),
+        "dump diagnostic for {name} omitted {expected_error:?}:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains(forbidden_placeholder),
+        "dump reduced malformed input {name} to placeholder output:\n{stdout}"
+    );
+
+    let _ = fs::remove_file(input);
+}
+
+#[test]
+fn dump_rejects_malformed_relocations() {
+    assert_dump_rejects(
+        "dump-malformed-relocation.o",
+        synthetic_text_object_with_relocations(
+            "_main",
+            &[RawRelocation {
+                r_address: 0,
+                r_symbolnum: 1,
+                r_pcrel: false,
+                r_length: 2,
+                r_extern: false,
+                r_type: ARM64_RELOC_ADDEND,
+            }],
+        ),
+        "trailing ARM64_RELOC_ADDEND with no following primary",
+        "<parse error:",
+    );
+}
+
+#[test]
+fn dump_rejects_invalid_symbol_names() {
+    assert_dump_rejects(
+        "dump-malformed-symbol.o",
+        synthetic_text_object_with_invalid_symbol_name(),
+        "strx out of bounds",
+        "<unresolved>",
+    );
 }
 
 #[test]

@@ -351,14 +351,19 @@ fn write_sections(w: &mut impl Write, secs: &[InputSection]) -> io::Result<()> {
         }
         if s.nreloc > 0 {
             writeln!(w, "      relocs ({}):", s.nreloc)?;
-            match parse_raw_relocs(&s.raw_relocs, 0, s.nreloc).and_then(|raws| parse_relocs(&raws))
-            {
-                Ok(fused) => {
-                    for (ri, r) in fused.iter().enumerate() {
-                        writeln!(w, "        [{ri}] {}", describe_reloc(r))?;
-                    }
-                }
-                Err(e) => writeln!(w, "        <parse error: {e}>")?,
+            let fused = parse_raw_relocs(&s.raw_relocs, 0, s.nreloc)
+                .and_then(|raws| parse_relocs(&raws))
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "section {i} ({},{}): invalid relocation table: {error}",
+                            s.segname, s.sectname
+                        ),
+                    )
+                })?;
+            for (ri, r) in fused.iter().enumerate() {
+                writeln!(w, "        [{ri}] {}", describe_reloc(r))?;
             }
         }
     }
@@ -371,7 +376,12 @@ fn write_symbols(w: &mut impl Write, obj: &ObjectFile) -> io::Result<()> {
     }
     writeln!(w, "Symbols ({}):", obj.symbols.len())?;
     for (i, sym) in obj.symbols.iter().enumerate() {
-        let name = obj.symbol_name(sym).unwrap_or("<unresolved>");
+        let name = obj.symbol_name(sym).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("symbol {i} has invalid name offset {}: {error}", sym.strx()),
+            )
+        })?;
         writeln!(w, "  [{i}] {:<32} {}", name, describe_symbol(sym))?;
     }
     Ok(())

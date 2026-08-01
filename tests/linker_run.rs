@@ -1072,6 +1072,100 @@ fn synthetic_atomless_object(strings: Vec<u8>, symbols: &[RawNlist]) -> Vec<u8> 
     bytes
 }
 
+fn synthetic_aligned_subsections_object() -> Vec<u8> {
+    const RET: [u8; 4] = [0xc0, 0x03, 0x5f, 0xd6];
+    const ASSEMBLER_RESOLVED_DELTA: u64 = 4;
+
+    let mut text = Vec::with_capacity(16);
+    text.extend_from_slice(&RET);
+    text.extend_from_slice(&RET);
+    text.extend_from_slice(&ASSEMBLER_RESOLVED_DELTA.to_le_bytes());
+
+    let mut strings = vec![0];
+    let mut add_string = |name: &str| {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        strx
+    };
+    let symbols = [
+        RawNlist {
+            strx: add_string("_a"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: add_string("_b"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: RET.len() as u64,
+        },
+    ];
+
+    let mut segment = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: 0,
+        vmsize: text.len() as u64,
+        fileoff: 0,
+        filesize: text.len() as u64,
+        maxprot: 5,
+        initprot: 5,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: 0,
+            size: text.len() as u64,
+            offset: 0,
+            align: 4,
+            reloff: 0,
+            nreloc: 0,
+            flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = u64::from(data_offset);
+    segment.sections[0].offset = data_offset;
+    let symoff = data_offset + text.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
 fn output_section(bytes: &[u8], segname: &str, sectname: &str) -> Option<(u64, Vec<u8>)> {
     let header = parse_header(bytes).ok()?;
     let commands = parse_commands(&header, bytes).ok()?;
@@ -4031,6 +4125,40 @@ fn linker_run_mixed_undefined_references_are_required_in_both_orders() {
         let _ = fs::remove_file(second);
         let _ = fs::remove_file(out);
     }
+}
+
+#[test]
+fn linker_run_preserves_assembler_resolved_deltas_between_subsections() {
+    let object = scratch("aligned-subsections.o");
+    let output = scratch("aligned-subsections.dylib");
+    fs::write(&object, synthetic_aligned_subsections_object()).unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let symbols = symbol_values(&bytes);
+    let linked_delta = symbols["_b"] - symbols["_a"];
+    let embedded_delta = u64::from_le_bytes(text[text.len() - 8..].try_into().unwrap());
+
+    assert_eq!(text_addr % 16, 0, "section-level alignment was lost");
+    assert_eq!(
+        linked_delta, embedded_delta,
+        "atom layout disagrees with the assembler-resolved _b-_a value"
+    );
+    assert_eq!(
+        text,
+        [0xc0, 0x03, 0x5f, 0xd6, 0xc0, 0x03, 0x5f, 0xd6, 4, 0, 0, 0, 0, 0, 0, 0,]
+    );
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(output);
 }
 
 #[test]

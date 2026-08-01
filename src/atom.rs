@@ -165,7 +165,7 @@ pub struct Atom {
     pub input_offset: u32,
     /// Byte size. For zerofill atoms, this is virtual; `data` is empty.
     pub size: u32,
-    /// log2 of required alignment. Inherited from the containing section.
+    /// log2 of required alignment at this atom's original section offset.
     pub align_pow2: u8,
     /// Primary defining symbol, if any. Locals that split a section at
     /// `MH_SUBSECTIONS_VIA_SYMBOLS` boundaries but have no matching
@@ -800,7 +800,7 @@ fn atomize_cstring(
             section: atom_section,
             input_offset: offset as u32,
             size,
-            align_pow2: sect.align_pow2 as u8,
+            align_pow2: atom_alignment_pow2(sect.align_pow2, offset as u32),
             owner: None,
             alt_entries: Vec::new(),
             data,
@@ -854,7 +854,7 @@ fn atomize_fixed_literal(
             section: atom_section,
             input_offset: offset as u32,
             size,
-            align_pow2: sect.align_pow2 as u8,
+            align_pow2: atom_alignment_pow2(sect.align_pow2, offset as u32),
             owner: None,
             alt_entries: Vec::new(),
             data,
@@ -902,7 +902,7 @@ fn atomize_compact_unwind(
             section: atom_section,
             input_offset: offset as u32,
             size,
-            align_pow2: sect.align_pow2 as u8,
+            align_pow2: atom_alignment_pow2(sect.align_pow2, offset as u32),
             owner: None,
             alt_entries: Vec::new(),
             data,
@@ -945,7 +945,7 @@ fn atomize_eh_frame(
             section: atom_section,
             input_offset: offset as u32,
             size: (end - offset) as u32,
-            align_pow2: (sect.align_pow2 as u8).min(2),
+            align_pow2: atom_alignment_pow2(sect.align_pow2.min(2), offset as u32),
             owner: None,
             alt_entries: Vec::new(),
             data: sect.data[offset..end].to_vec(),
@@ -1096,7 +1096,7 @@ fn atomize_zerofill(
             section: atom_section,
             input_offset: start,
             size,
-            align_pow2: sect.align_pow2 as u8,
+            align_pow2: atom_alignment_pow2(sect.align_pow2, start),
             owner: Some(SymbolId(*sym_idx as u32)),
             alt_entries: Vec::new(),
             data: Vec::new(), // zerofill
@@ -1128,7 +1128,7 @@ fn build_section_atom(
         section: atom_section,
         input_offset: 0,
         size: sect.size as u32,
-        align_pow2: sect.align_pow2 as u8,
+        align_pow2: atom_alignment_pow2(sect.align_pow2, 0),
         owner: None,
         alt_entries: Vec::new(),
         data,
@@ -1169,7 +1169,7 @@ fn build_slice_atom(
         section: atom_section,
         input_offset: offset,
         size,
-        align_pow2: sect.align_pow2 as u8,
+        align_pow2: atom_alignment_pow2(sect.align_pow2, offset),
         // owner is wired at back-patch time via `backpatch_symbol_atoms`;
         // atomization doesn't know the resolver-side SymbolId yet.
         owner: None,
@@ -1178,6 +1178,17 @@ fn build_slice_atom(
         flags,
         parent_of: None,
     }
+}
+
+fn atom_alignment_pow2(section_alignment_pow2: u32, input_offset: u32) -> u8 {
+    let offset_alignment_pow2 = if input_offset == 0 {
+        u32::MAX
+    } else {
+        input_offset.trailing_zeros()
+    };
+    section_alignment_pow2
+        .min(offset_alignment_pow2)
+        .min(u8::MAX as u32) as u8
 }
 
 fn section_atom_flags(sect: &InputSection) -> AtomFlags {
@@ -1276,6 +1287,16 @@ mod tests {
             flags: AtomFlags::default().with(AtomFlags::PURE_INSTRUCTIONS),
             parent_of: None,
         }
+    }
+
+    #[test]
+    fn split_atom_alignment_is_derived_from_its_section_offset() {
+        assert_eq!(atom_alignment_pow2(4, 0), 4);
+        assert_eq!(atom_alignment_pow2(4, 1), 0);
+        assert_eq!(atom_alignment_pow2(4, 4), 2);
+        assert_eq!(atom_alignment_pow2(4, 8), 3);
+        assert_eq!(atom_alignment_pow2(4, 16), 4);
+        assert_eq!(atom_alignment_pow2(2, 16), 2);
     }
 
     #[test]

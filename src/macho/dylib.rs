@@ -83,11 +83,9 @@ impl DylibFile {
         let path = path.into();
         let header = parse_header(file_bytes)?;
         if header.filetype != MH_DYLIB {
-            return Err(ReadError::BadCmdsize {
-                cmd: 0,
-                cmdsize: header.filetype,
-                at_offset: 0,
-                reason: "DylibFile::parse expects MH_DYLIB filetype",
+            return Err(ReadError::UnexpectedFiletype {
+                got: header.filetype,
+                expected: MH_DYLIB,
             });
         }
         let commands = parse_commands(&header, file_bytes)?;
@@ -548,6 +546,12 @@ mod tests {
         let mut image = Vec::new();
         write_header(&hdr, &mut image);
         let err = DylibFile::parse("/tmp/obj.o", &image).unwrap_err();
-        assert!(matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("MH_DYLIB")));
+        assert!(matches!(
+            err,
+            ReadError::UnexpectedFiletype {
+                got: MH_OBJECT,
+                expected: MH_DYLIB
+            }
+        ));
     }
 }

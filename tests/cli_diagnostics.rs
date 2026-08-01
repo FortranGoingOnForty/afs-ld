@@ -4,8 +4,8 @@ use std::process::Command;
 
 use afs_ld::macho::constants::{
     CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_ID_DYLIB, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_MAIN,
-    LC_UUID, MH_DYLIB, MH_EXECUTE, MH_MAGIC_64, MH_OBJECT, N_ABS, N_EXT, N_NO_DEAD_STRIP, N_PEXT,
-    N_SECT, N_UNDF, SECTION_TYPE_MASK, S_REGULAR, S_ZEROFILL,
+    LC_UUID, MH_BUNDLE, MH_DYLIB, MH_DYLINKER, MH_EXECUTE, MH_MAGIC_64, MH_OBJECT, N_ABS, N_EXT,
+    N_NO_DEAD_STRIP, N_PEXT, N_SECT, N_UNDF, SECTION_TYPE_MASK, S_REGULAR, S_ZEROFILL,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::reader::{
@@ -322,6 +322,12 @@ fn synthetic_macho_with_truncated_commands(filetype: u32) -> Vec<u8> {
         },
         &mut bytes,
     );
+    bytes
+}
+
+fn synthetic_text_macho_with_filetype(symbol: &str, filetype: u32) -> Vec<u8> {
+    let mut bytes = synthetic_text_object(symbol);
+    bytes[12..16].copy_from_slice(&filetype.to_le_bytes());
     bytes
 }
 
@@ -1597,6 +1603,130 @@ fn macho_parse_diagnostics_include_input_paths() {
     }
 
     let _ = fs::remove_file(valid);
+}
+
+#[test]
+fn linker_rejects_non_linkable_macho_filetypes() {
+    for (stem, filetype, filetype_name) in [
+        ("execute", MH_EXECUTE, "MH_EXECUTE"),
+        ("dylinker", MH_DYLINKER, "MH_DYLINKER"),
+        ("bundle", MH_BUNDLE, "MH_BUNDLE"),
+    ] {
+        let input = scratch(&format!("non-linkable-{stem}"));
+        fs::write(
+            &input,
+            synthetic_text_macho_with_filetype("_not_an_object", filetype),
+        )
+        .unwrap();
+
+        for jobs in [1, 4] {
+            let output = scratch(&format!("non-linkable-{stem}-{jobs}.dylib"));
+            let _ = fs::remove_file(&output);
+            let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+                .arg("-dylib")
+                .arg("-j")
+                .arg(jobs.to_string())
+                .arg("-o")
+                .arg(&output)
+                .arg(&input)
+                .output()
+                .expect("afs-ld should run");
+            let stderr = String::from_utf8_lossy(&result.stderr);
+
+            assert!(
+                !result.status.success(),
+                "{filetype_name} input was accepted with -j{jobs}"
+            );
+            assert!(
+                stderr.contains(&input.display().to_string()),
+                "missing input path with -j{jobs}:\n{stderr}"
+            );
+            assert!(
+                stderr.contains(filetype_name) && stderr.contains("expected MH_OBJECT or MH_DYLIB"),
+                "unexpected {filetype_name} diagnostic with -j{jobs}:\n{stderr}"
+            );
+            assert!(
+                !output.exists(),
+                "rejected {filetype_name} input left an output with -j{jobs}"
+            );
+        }
+
+        let _ = fs::remove_file(input);
+    }
+}
+
+#[test]
+fn archive_members_must_be_relocatable_macho_objects() {
+    let archive = scratch("non-object-member.a");
+    let member_name = "final-image.o/";
+    fs::write(
+        &archive,
+        synthetic_indexed_archive(
+            "_final_image",
+            member_name,
+            &synthetic_text_macho_with_filetype("_final_image", MH_EXECUTE),
+        ),
+    )
+    .unwrap();
+
+    for jobs in [1, 4] {
+        let output = scratch(&format!("non-object-member-{jobs}.dylib"));
+        let _ = fs::remove_file(&output);
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
+            .arg("-all_load")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg("-o")
+            .arg(&output)
+            .arg(&archive)
+            .output()
+            .expect("afs-ld should run");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+
+        assert!(
+            !result.status.success(),
+            "MH_EXECUTE archive member was accepted with -j{jobs}"
+        );
+        assert!(
+            stderr.contains(&archive.display().to_string()) && stderr.contains("final-image.o"),
+            "missing archive-member path with -j{jobs}:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("MH_EXECUTE") && stderr.contains("expected MH_OBJECT"),
+            "unexpected archive-member diagnostic with -j{jobs}:\n{stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "rejected archive member left an output with -j{jobs}"
+        );
+    }
+
+    let _ = fs::remove_file(archive);
+}
+
+#[test]
+fn dump_still_inspects_final_macho_images() {
+    let input = scratch("dump-final-image");
+    fs::write(
+        &input,
+        synthetic_text_macho_with_filetype("_main", MH_EXECUTE),
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("--dump")
+        .arg(&input)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        result.status.success(),
+        "dump rejected a final Mach-O image:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("MH_EXECUTE"));
+
+    let _ = fs::remove_file(input);
 }
 
 #[test]

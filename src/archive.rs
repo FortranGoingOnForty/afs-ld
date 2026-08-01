@@ -491,7 +491,9 @@ impl<'a> Archive<'a> {
     /// demand.
     pub fn parse_member_object(&self, member: &Member<'a>) -> Result<ObjectFile, FetchError> {
         let loaded = self.load_member(member).map_err(FetchError::Load)?;
-        ObjectFile::parse(loaded.logical_path, loaded.bytes.as_ref()).map_err(FetchError::Read)
+        let path = loaded.logical_path;
+        ObjectFile::parse(&path, loaded.bytes.as_ref())
+            .map_err(|source| FetchError::MachOParse { path, source })
     }
 
     /// Resolve `name` to its defining member, then parse that member as an
@@ -579,14 +581,16 @@ fn load_thin_member<'a>(
 #[derive(Debug)]
 pub enum FetchError {
     Load(MemberLoadError),
-    Read(ReadError),
+    MachOParse { path: PathBuf, source: ReadError },
 }
 
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FetchError::Load(e) => write!(f, "{e}"),
-            FetchError::Read(e) => write!(f, "{e}"),
+            FetchError::MachOParse { path, source } => {
+                write!(f, "{}: {source}", path.display())
+            }
         }
     }
 }
@@ -595,7 +599,7 @@ impl std::error::Error for FetchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             FetchError::Load(error) => Some(error),
-            FetchError::Read(error) => Some(error),
+            FetchError::MachOParse { source, .. } => Some(source),
         }
     }
 }
@@ -1753,7 +1757,7 @@ mod tests {
 
         let ar = Archive::open("/tmp/bad_body.a", &buf).unwrap();
         let result = ar.fetch_object_defining("_bogus").expect("found");
-        assert!(matches!(result, Err(FetchError::Read(_))));
+        assert!(matches!(result, Err(FetchError::MachOParse { .. })));
     }
 
     #[test]

@@ -63,8 +63,8 @@ fn libarmfortas_rt_archive_walks_cleanly() {
     // defined, external, section symbol.
     let obj = match ar.fetch_object_defining(target) {
         Some(Ok(o)) => o,
-        Some(Err(FetchError::Read(e))) => {
-            panic!("parse error on {}: {e}", mem.name.display())
+        Some(Err(FetchError::MachOParse { path, source })) => {
+            panic!("parse error on {}: {source}", path.display())
         }
         Some(Err(FetchError::Load(e))) => {
             panic!("member load error on {}: {e}", mem.name.display())

@@ -26,6 +26,8 @@ pub enum ReadError {
     BadMagic { got: u32 },
     /// CPU type is not `CPU_TYPE_ARM64`.
     UnsupportedCpu { got: u32 },
+    /// A parser was given a different kind of Mach-O image than it accepts.
+    UnexpectedFiletype { got: u32, expected: u32 },
     /// A load command's `cmdsize` field is malformed.
     BadCmdsize {
         cmd: u32,
@@ -54,6 +56,12 @@ impl fmt::Display for ReadError {
             ReadError::UnsupportedCpu { got } => write!(
                 f,
                 "unsupported cpu type 0x{got:08x} (afs-ld requires arm64 / 0x{CPU_TYPE_ARM64:08x})"
+            ),
+            ReadError::UnexpectedFiletype { got, expected } => write!(
+                f,
+                "unexpected Mach-O filetype {} (0x{got:08x}); expected {} (0x{expected:08x})",
+                macho_filetype_name(*got).unwrap_or("unknown"),
+                macho_filetype_name(*expected).unwrap_or("unknown")
             ),
             ReadError::BadCmdsize { cmd, cmdsize, at_offset, reason } => write!(
                 f,

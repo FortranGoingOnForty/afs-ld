@@ -1478,6 +1478,10 @@ pub(crate) fn resolve_inputs_in_order(
 #[derive(Debug)]
 pub enum FetchError {
     Read(ReadError),
+    MachOParse {
+        path: PathBuf,
+        source: ReadError,
+    },
     Archive(ArchiveError),
     MemberLoad(MemberLoadError),
     MemberNotFound {
@@ -1490,6 +1494,9 @@ impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FetchError::Read(e) => write!(f, "{e}"),
+            FetchError::MachOParse { path, source } => {
+                write!(f, "{}: {source}", path.display())
+            }
             FetchError::Archive(e) => write!(f, "{e}"),
             FetchError::MemberLoad(e) => write!(f, "{e}"),
             FetchError::MemberNotFound { archive, member } => write!(
@@ -1505,6 +1512,7 @@ impl std::error::Error for FetchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             FetchError::Read(error) => Some(error),
+            FetchError::MachOParse { source, .. } => Some(source),
             FetchError::Archive(error) => Some(error),
             FetchError::MemberLoad(error) => Some(error),
             FetchError::MemberNotFound { .. } => None,
@@ -1663,7 +1671,11 @@ fn load_archive_member_job(
                 .load_member(job.archive_path, job.archive_bytes, member)?;
         let logical_path = loaded.logical_path;
         let bytes = loaded.bytes.into_owned();
-        let parsed = ObjectFile::parse(&logical_path, &bytes)?;
+        let parsed =
+            ObjectFile::parse(&logical_path, &bytes).map_err(|source| FetchError::MachOParse {
+                path: logical_path.clone(),
+                source,
+            })?;
         Ok(LoadedArchiveMember {
             key: job.key,
             archive_load_order: job.archive_load_order,
@@ -2699,7 +2711,7 @@ mod tests {
             let mut table = SymbolTable::new();
             let error =
                 resolve_inputs_in_order(&mut inputs, &order, &mut table, jobs, false).unwrap_err();
-            assert!(matches!(error.error, FetchError::Read(_)));
+            assert!(matches!(error.error, FetchError::MachOParse { .. }));
             assert_eq!(
                 error.report.loaded_paths,
                 vec![PathBuf::from("main.o"), PathBuf::from("libMalformed.a")]

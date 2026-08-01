@@ -40,7 +40,7 @@ use atom::{
 use icf::IcfError;
 use input::ObjectFile;
 use layout::{ExtraLayoutSections, Layout, LayoutInput};
-use macho::constants::{MH_DYLIB, SECTION_TYPE_MASK, S_ZEROFILL};
+use macho::constants::{macho_filetype_name, MH_DYLIB, MH_OBJECT, SECTION_TYPE_MASK, S_ZEROFILL};
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
 use macho::reader::{parse_header, ReadError};
 use macho::tbd::{
@@ -222,6 +222,10 @@ pub enum LinkError {
         path: PathBuf,
         source: ReadError,
     },
+    UnsupportedMachOInput {
+        path: PathBuf,
+        filetype: u32,
+    },
     Input(InputAddError),
     Seed(resolve::SeedError),
     Fetch(resolve::FetchError),
@@ -340,6 +344,12 @@ impl std::fmt::Display for LinkError {
             LinkError::MachOParse { path, source } => {
                 write!(f, "{}: {source}", path.display())
             }
+            LinkError::UnsupportedMachOInput { path, filetype } => write!(
+                f,
+                "{}: unsupported Mach-O input filetype {} (0x{filetype:08x}); expected MH_OBJECT or MH_DYLIB",
+                path.display(),
+                macho_filetype_name(*filetype).unwrap_or("unknown")
+            ),
             LinkError::Input(e) => write!(f, "{e}"),
             LinkError::Seed(e) => write!(f, "{e}"),
             LinkError::Fetch(e) => write!(f, "{e}"),
@@ -1366,31 +1376,38 @@ fn load_macho_input(
         load_order,
         error: LinkError::macho_parse(&path, error),
     })?;
-    if filetype.filetype == MH_DYLIB {
-        let parsed = DylibFile::parse(&path, &bytes).map_err(|error| InitialLoadError {
+    match filetype.filetype {
+        MH_DYLIB => {
+            let parsed = DylibFile::parse(&path, &bytes).map_err(|error| InitialLoadError {
+                load_order,
+                error: LinkError::macho_parse(&path, error),
+            })?;
+            timings.dylib_parse = phase_started.elapsed();
+            Ok(LoadedInitialInput::Dylib(Box::new(LoadedDylibInput {
+                path,
+                load_order,
+                parsed,
+                timings,
+            })))
+        }
+        MH_OBJECT => {
+            let parsed = ObjectFile::parse(&path, &bytes).map_err(|error| InitialLoadError {
+                load_order,
+                error: LinkError::macho_parse(&path, error),
+            })?;
+            timings.object_parse = phase_started.elapsed();
+            Ok(LoadedInitialInput::Object(Box::new(LoadedObjectInput {
+                path,
+                load_order,
+                bytes,
+                parsed,
+                timings,
+            })))
+        }
+        filetype => Err(InitialLoadError {
             load_order,
-            error: LinkError::macho_parse(&path, error),
-        })?;
-        timings.dylib_parse = phase_started.elapsed();
-        Ok(LoadedInitialInput::Dylib(Box::new(LoadedDylibInput {
-            path,
-            load_order,
-            parsed,
-            timings,
-        })))
-    } else {
-        let parsed = ObjectFile::parse(&path, &bytes).map_err(|error| InitialLoadError {
-            load_order,
-            error: LinkError::macho_parse(&path, error),
-        })?;
-        timings.object_parse = phase_started.elapsed();
-        Ok(LoadedInitialInput::Object(Box::new(LoadedObjectInput {
-            path,
-            load_order,
-            bytes,
-            parsed,
-            timings,
-        })))
+            error: LinkError::UnsupportedMachOInput { path, filetype },
+        }),
     }
 }
 

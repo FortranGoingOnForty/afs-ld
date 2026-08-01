@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use crate::loh::{parse_loh_blob, LohEntry};
-use crate::macho::constants::LC_DATA_IN_CODE;
+use crate::macho::constants::{LC_DATA_IN_CODE, MH_OBJECT};
 use crate::macho::reader::{
     parse_commands, parse_header, DysymtabCmd, LinkEditDataCmd, LoadCommand, MachHeader64,
     ReadError, SymtabCmd, HEADER_SIZE,
@@ -58,9 +58,34 @@ impl DataInCodeEntry {
 }
 
 impl ObjectFile {
+    /// Parse a relocatable Mach-O object suitable for linking.
     pub fn parse(path: impl Into<PathBuf>, file_bytes: &[u8]) -> Result<Self, ReadError> {
         let path = path.into();
         let header = parse_header(file_bytes)?;
+        if header.filetype != MH_OBJECT {
+            return Err(ReadError::UnexpectedFiletype {
+                got: header.filetype,
+                expected: MH_OBJECT,
+            });
+        }
+        Self::parse_with_header(path, file_bytes, header)
+    }
+
+    /// Parse any Mach-O image for the read-only `--dump` inspection path.
+    pub(crate) fn parse_for_inspection(
+        path: impl Into<PathBuf>,
+        file_bytes: &[u8],
+    ) -> Result<Self, ReadError> {
+        let path = path.into();
+        let header = parse_header(file_bytes)?;
+        Self::parse_with_header(path, file_bytes, header)
+    }
+
+    fn parse_with_header(
+        path: PathBuf,
+        file_bytes: &[u8],
+        header: MachHeader64,
+    ) -> Result<Self, ReadError> {
         let commands = parse_commands(&header, file_bytes)?;
 
         // Collect sections from every LC_SEGMENT_64 (MH_OBJECT usually has
@@ -95,7 +120,7 @@ impl ObjectFile {
         let loh = parse_loh(&commands, file_bytes)?;
         let data_in_code = parse_data_in_code(&commands, file_bytes)?;
 
-        Ok(ObjectFile {
+        Ok(Self {
             path,
             header,
             commands,
@@ -533,6 +558,26 @@ mod tests {
         assert!(sym.is_ext());
         let sect = obj.section_for_symbol(sym).expect("n_sect=1 resolves");
         assert_eq!(sect.sectname, "__text");
+    }
+
+    #[test]
+    fn parse_rejects_non_object_macho_filetypes() {
+        for (filetype, name) in [
+            (MH_EXECUTE, "MH_EXECUTE"),
+            (MH_DYLINKER, "MH_DYLINKER"),
+            (MH_BUNDLE, "MH_BUNDLE"),
+        ] {
+            let mut image = synth_image();
+            image[12..16].copy_from_slice(&filetype.to_le_bytes());
+
+            let error = ObjectFile::parse(format!("/tmp/{name}"), &image)
+                .expect_err("final Mach-O images must not parse as relocatable objects");
+            let diagnostic = error.to_string();
+            assert!(
+                diagnostic.contains(name) && diagnostic.contains("MH_OBJECT"),
+                "unexpected diagnostic for {name}: {diagnostic}"
+            );
+        }
     }
 
     #[test]

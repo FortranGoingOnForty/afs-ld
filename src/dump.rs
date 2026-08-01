@@ -173,7 +173,7 @@ pub fn dump_dylib_file(path: &Path) -> io::Result<()> {
 
 pub fn dump_file(path: &Path) -> io::Result<()> {
     let bytes = std::fs::read(path)?;
-    let obj = ObjectFile::parse(path, &bytes)
+    let obj = ObjectFile::parse_for_inspection(path, &bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let out = io::stdout();
     let mut h = out.lock();
@@ -486,12 +486,7 @@ fn cpu_name(ct: u32) -> &'static str {
 }
 
 fn filetype_name(ft: u32) -> &'static str {
-    match ft {
-        MH_OBJECT => "MH_OBJECT",
-        MH_EXECUTE => "MH_EXECUTE",
-        MH_DYLIB => "MH_DYLIB",
-        _ => "??",
-    }
+    macho_filetype_name(ft).unwrap_or("??")
 }
 
 fn cmd_name(cmd: u32) -> String {

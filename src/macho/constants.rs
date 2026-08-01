@@ -13,7 +13,35 @@ pub const CPU_SUBTYPE_ARM64_ALL: u32 = 0;
 
 pub const MH_OBJECT: u32 = 1;
 pub const MH_EXECUTE: u32 = 2;
+pub const MH_FVMLIB: u32 = 3;
+pub const MH_CORE: u32 = 4;
+pub const MH_PRELOAD: u32 = 5;
 pub const MH_DYLIB: u32 = 6;
+pub const MH_DYLINKER: u32 = 7;
+pub const MH_BUNDLE: u32 = 8;
+pub const MH_DYLIB_STUB: u32 = 9;
+pub const MH_DSYM: u32 = 10;
+pub const MH_KEXT_BUNDLE: u32 = 11;
+pub const MH_FILESET: u32 = 12;
+
+/// Return the loader.h spelling for a known Mach-O file type.
+pub fn macho_filetype_name(filetype: u32) -> Option<&'static str> {
+    match filetype {
+        MH_OBJECT => Some("MH_OBJECT"),
+        MH_EXECUTE => Some("MH_EXECUTE"),
+        MH_FVMLIB => Some("MH_FVMLIB"),
+        MH_CORE => Some("MH_CORE"),
+        MH_PRELOAD => Some("MH_PRELOAD"),
+        MH_DYLIB => Some("MH_DYLIB"),
+        MH_DYLINKER => Some("MH_DYLINKER"),
+        MH_BUNDLE => Some("MH_BUNDLE"),
+        MH_DYLIB_STUB => Some("MH_DYLIB_STUB"),
+        MH_DSYM => Some("MH_DSYM"),
+        MH_KEXT_BUNDLE => Some("MH_KEXT_BUNDLE"),
+        MH_FILESET => Some("MH_FILESET"),
+        _ => None,
+    }
+}
 
 // Mach header flags
 pub const MH_NOUNDEFS: u32 = 0x1;

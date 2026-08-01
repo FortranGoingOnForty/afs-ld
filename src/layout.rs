@@ -45,8 +45,9 @@ pub struct Layout {
     pub sections: Vec<OutputSection>,
 }
 
+/// Canonical identity for inputs that may share one output section.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct SectionKey {
+pub(crate) struct SectionKey {
     segment: String,
     name: String,
     flags: u32,
@@ -71,7 +72,7 @@ pub struct ExtraLayoutSections<'a> {
     pub split_after_atoms: &'a [AtomId],
 }
 
-fn output_section_key(input_section: &InputSection) -> SectionKey {
+pub(crate) fn output_section_key(input_section: &InputSection) -> SectionKey {
     let (segment, name) = match (
         input_section.segname.as_str(),
         input_section.sectname.as_str(),

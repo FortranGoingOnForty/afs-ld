@@ -725,6 +725,110 @@ fn synthetic_icf_section_reference_object(symbol: &str, data_value: u64) -> Vec<
     bytes
 }
 
+fn synthetic_icf_const_domains_object(first_segment: &str, second_segment: &str) -> Vec<u8> {
+    let value = 0x1122_3344_5566_7788u64.to_le_bytes();
+
+    let mut strings = vec![0];
+    let first_strx = strings.len() as u32;
+    strings.extend_from_slice(b"_first_const\0");
+    let second_strx = strings.len() as u32;
+    strings.extend_from_slice(b"_second_const\0");
+    let symbols = [
+        RawNlist {
+            strx: first_strx,
+            n_type: N_SECT | N_EXT | N_PEXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: second_strx,
+            n_type: N_SECT | N_EXT | N_PEXT,
+            n_sect: 2,
+            n_desc: 0,
+            n_value: value.len() as u64,
+        },
+    ];
+
+    let mut segment = Segment64 {
+        segname: [0; 16],
+        vmaddr: 0,
+        vmsize: (value.len() * 2) as u64,
+        fileoff: 0,
+        filesize: (value.len() * 2) as u64,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections: vec![
+            Section64Header {
+                sectname: name16("__const"),
+                segname: name16(first_segment),
+                addr: 0,
+                size: value.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+            Section64Header {
+                sectname: name16("__const"),
+                segname: name16(second_segment),
+                addr: value.len() as u64,
+                size: value.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+        ],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    segment.sections[1].offset = data_offset + value.len() as u32;
+    let symoff = data_offset + (value.len() * 2) as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&value);
+    bytes.extend_from_slice(&value);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
 #[derive(Clone, Copy)]
 enum SyntheticAliasEncoding {
     Indirect,
@@ -10272,6 +10376,97 @@ fn synthetic_icf_fixture_uses_section_relocation() {
             && reloc.kind == RelocKind::PageOff12
             && reloc.referent == Referent::Section(2)
     }));
+}
+
+#[test]
+fn linker_run_icf_safe_preserves_const_output_protection_domains() {
+    let object = scratch("icf-protection-domains.o");
+    let output = scratch("icf-protection-domains.dylib");
+    fs::write(
+        &object,
+        synthetic_icf_const_domains_object("__TEXT", "__DATA"),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        icf_mode: afs_ld::IcfMode::Safe,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    assert_eq!(
+        output_section(&bytes, "__TEXT", "__const")
+            .expect("safe ICF erased __TEXT,__const")
+            .1
+            .len(),
+        8
+    );
+    assert_eq!(
+        output_section(&bytes, "__DATA_CONST", "__const")
+            .expect("safe ICF erased __DATA_CONST,__const")
+            .1
+            .len(),
+        8
+    );
+    assert_ne!(
+        segment_protections(&bytes, "__TEXT"),
+        segment_protections(&bytes, "__DATA_CONST"),
+        "fixture must exercise distinct output protection domains"
+    );
+    let symbols = canonical_symbol_record_map(&bytes);
+    assert_ne!(
+        symbols["_first_const"].n_sect, symbols["_second_const"].n_sect,
+        "safe ICF rebound symbols across output sections"
+    );
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn linker_run_icf_safe_folds_const_sections_mapped_to_same_output_domain() {
+    let object = scratch("icf-mapped-domain.o");
+    let output = scratch("icf-mapped-domain.dylib");
+    fs::write(
+        &object,
+        synthetic_icf_const_domains_object("__DATA", "__DATA_CONST"),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        icf_mode: afs_ld::IcfMode::Safe,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    assert_eq!(
+        output_section(&bytes, "__DATA_CONST", "__const")
+            .expect("mapped const output section")
+            .1
+            .len(),
+        8,
+        "same-domain constants should still fold"
+    );
+    let symbols = canonical_symbol_record_map(&bytes);
+    assert_eq!(
+        symbols["_first_const"].n_sect, symbols["_second_const"].n_sect,
+        "same-domain folded symbols should share one output section"
+    );
+    assert_eq!(
+        symbols["_first_const"].value, symbols["_second_const"].value,
+        "same-domain folded symbols should share one output address"
+    );
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(output);
 }
 
 #[test]

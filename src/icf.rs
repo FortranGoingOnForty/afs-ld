@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::atom::{Atom, AtomFlags, AtomSection, AtomTable};
-use crate::layout::LayoutInput;
+use crate::layout::{output_section_key, LayoutInput, SectionKey};
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
 use crate::resolve::{AtomId, InputId, Symbol, SymbolId, SymbolTable};
 
@@ -93,6 +93,7 @@ pub fn fold_safe(
 ) -> Result<IcfPlan, IcfError> {
     let resolved_by_name = resolved_symbol_map(sym_table);
     let reloc_cache = reloc_cache(layout_inputs)?;
+    let output_sections = output_section_cache(layout_inputs);
 
     mark_address_taken(
         layout_inputs,
@@ -138,8 +139,17 @@ pub fn fold_safe(
             ) else {
                 continue;
             };
+            let output_section = output_sections
+                .get(&(atom.origin, atom.input_section))
+                .cloned()
+                .ok_or_else(|| {
+                    IcfError(format!(
+                        "atom {atom_id:?} references missing input {:?} section {}",
+                        atom.origin, atom.input_section
+                    ))
+                })?;
             buckets
-                .entry(FoldKey::from_atom(atom, reloc_sig))
+                .entry(FoldKey::from_atom(atom, output_section, reloc_sig))
                 .or_default()
                 .push(atom_id);
         }
@@ -181,6 +191,7 @@ pub fn fold_safe(
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FoldKey {
+    output_section: SectionKey,
     section: AtomSection,
     size: u32,
     align_pow2: u8,
@@ -190,8 +201,9 @@ struct FoldKey {
 }
 
 impl FoldKey {
-    fn from_atom(atom: &Atom, relocs: Vec<FoldReloc>) -> Self {
+    fn from_atom(atom: &Atom, output_section: SectionKey, relocs: Vec<FoldReloc>) -> Self {
         Self {
+            output_section,
             section: atom.section,
             size: atom.size,
             align_pow2: atom.align_pow2,
@@ -200,6 +212,19 @@ impl FoldKey {
             relocs,
         }
     }
+}
+
+fn output_section_cache(layout_inputs: &[LayoutInput<'_>]) -> HashMap<(InputId, u8), SectionKey> {
+    let mut out = HashMap::new();
+    for input in layout_inputs {
+        for (section_idx_zero, section) in input.object.sections.iter().enumerate() {
+            out.insert(
+                (input.id, (section_idx_zero + 1) as u8),
+                output_section_key(section),
+            );
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -523,14 +548,16 @@ mod tests {
     use super::*;
     use crate::atom::AltEntry;
     use crate::input::ObjectFile;
+    use crate::layout::Layout;
     use crate::macho::constants::{
         CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, S_ATTR_PURE_INSTRUCTIONS,
-        S_ATTR_SOME_INSTRUCTIONS, S_REGULAR,
+        S_ATTR_SOME_INSTRUCTIONS, S_ATTR_STRIP_STATIC_SYMS, S_REGULAR,
     };
     use crate::macho::reader::MachHeader64;
     use crate::reloc::{write_raw_relocs, write_relocs};
     use crate::section::{InputSection, SectionKind};
     use crate::string_table::StringTable;
+    use crate::OutputKind;
 
     fn section_reloc_object(
         path: &str,
@@ -612,6 +639,39 @@ mod tests {
             alt_entries: Vec::new(),
             data: vec![0; 8],
             flags: AtomFlags::default().with(AtomFlags::PURE_INSTRUCTIONS),
+            parent_of: None,
+        }
+    }
+
+    fn const_sections_object(path: &str, sections: &[(&str, u32)]) -> ObjectFile {
+        assert_eq!(sections.len(), 2);
+        let mut object = section_reloc_object(path, 8, &[], 0x1122_3344_5566_7788);
+        for (index, (section, (segment, flags))) in
+            object.sections.iter_mut().zip(sections.iter()).enumerate()
+        {
+            section.segname = (*segment).into();
+            section.sectname = "__const".into();
+            section.kind = SectionKind::ConstData;
+            section.addr = (index * 8) as u64;
+            section.flags = *flags;
+            section.data = 0x1122_3344_5566_7788u64.to_le_bytes().to_vec();
+        }
+        object
+    }
+
+    fn foldable_const_atom(origin: InputId, input_section: u8) -> Atom {
+        Atom {
+            id: AtomId(0),
+            origin,
+            input_section,
+            section: AtomSection::ConstData,
+            input_offset: 0,
+            size: 8,
+            align_pow2: 3,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: 0x1122_3344_5566_7788u64.to_le_bytes().to_vec(),
+            flags: AtomFlags::default(),
             parent_of: None,
         }
     }
@@ -699,6 +759,97 @@ mod tests {
 
         assert_eq!(plan.redirects().len(), 1);
         assert_eq!(plan.kept_atoms().len(), 1);
+    }
+
+    #[test]
+    fn safe_icf_keeps_identical_constants_in_distinct_output_protection_domains() {
+        let object = const_sections_object(
+            "protection-domains.o",
+            &[("__TEXT", S_REGULAR), ("__DATA", S_REGULAR)],
+        );
+        let inputs = [LayoutInput {
+            id: InputId(0),
+            object: &object,
+            load_order: 0,
+            archive_member_offset: None,
+        }];
+        let mut atoms = AtomTable::new();
+        let text = atoms.push(foldable_const_atom(InputId(0), 1));
+        let data = atoms.push(foldable_const_atom(InputId(0), 2));
+        let mut symbols = SymbolTable::new();
+
+        let plan = fold_safe(&inputs, &mut atoms, &mut symbols, None).unwrap();
+
+        assert!(plan.kept_atoms().contains(&text));
+        assert!(plan.kept_atoms().contains(&data));
+        assert!(plan.redirects().is_empty());
+
+        let layout = Layout::build_with_synthetics_filtered(
+            OutputKind::Dylib,
+            &inputs,
+            &atoms,
+            0,
+            None,
+            Some(plan.kept_atoms()),
+        );
+        assert!(layout
+            .sections
+            .iter()
+            .any(|section| { section.segment == "__TEXT" && section.name == "__const" }));
+        assert!(layout
+            .sections
+            .iter()
+            .any(|section| { section.segment == "__DATA_CONST" && section.name == "__const" }));
+    }
+
+    #[test]
+    fn safe_icf_folds_identical_constants_with_same_effective_output_section() {
+        let object = const_sections_object(
+            "mapped-domain.o",
+            &[("__DATA", S_REGULAR), ("__DATA_CONST", S_REGULAR)],
+        );
+        let inputs = [LayoutInput {
+            id: InputId(0),
+            object: &object,
+            load_order: 0,
+            archive_member_offset: None,
+        }];
+        let mut atoms = AtomTable::new();
+        atoms.push(foldable_const_atom(InputId(0), 1));
+        atoms.push(foldable_const_atom(InputId(0), 2));
+        let mut symbols = SymbolTable::new();
+
+        let plan = fold_safe(&inputs, &mut atoms, &mut symbols, None).unwrap();
+
+        assert_eq!(plan.redirects().len(), 1);
+        assert_eq!(plan.kept_atoms().len(), 1);
+    }
+
+    #[test]
+    fn safe_icf_keeps_identical_constants_with_incompatible_section_attributes() {
+        let object = const_sections_object(
+            "section-attributes.o",
+            &[
+                ("__TEXT", S_REGULAR),
+                ("__TEXT", S_REGULAR | S_ATTR_STRIP_STATIC_SYMS),
+            ],
+        );
+        let inputs = [LayoutInput {
+            id: InputId(0),
+            object: &object,
+            load_order: 0,
+            archive_member_offset: None,
+        }];
+        let mut atoms = AtomTable::new();
+        let plain = atoms.push(foldable_const_atom(InputId(0), 1));
+        let strip_static = atoms.push(foldable_const_atom(InputId(0), 2));
+        let mut symbols = SymbolTable::new();
+
+        let plan = fold_safe(&inputs, &mut atoms, &mut symbols, None).unwrap();
+
+        assert!(plan.kept_atoms().contains(&plain));
+        assert!(plan.kept_atoms().contains(&strip_static));
+        assert!(plan.redirects().is_empty());
     }
 
     #[test]

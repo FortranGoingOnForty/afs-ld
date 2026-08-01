@@ -258,39 +258,53 @@ struct ResponseToken {
     column: usize,
 }
 
-/// Expand GNU-style `@file` arguments in place before target-format routing.
+/// Normalize driver-wrapped flags and expand GNU-style `@file` arguments in
+/// place before target-format routing.
 ///
 /// Nested response paths are resolved relative to the file containing them.
 /// `@@path` escapes a literal `@path`, and Darwin loader paths are never
 /// interpreted as response files.
 #[doc(hidden)]
-pub fn expand_response_files(argv: &[String]) -> Result<Vec<String>, ArgsError> {
-    let mut expanded = Vec::with_capacity(argv.len());
+pub fn preprocess_args(argv: &[String]) -> Result<Vec<String>, ArgsError> {
+    let mut preprocessed = Vec::with_capacity(argv.len());
     let mut stack = Vec::new();
     for arg in argv {
-        expand_response_arg(arg, None, None, 0, &mut stack, &mut expanded)?;
+        preprocess_arg(arg, None, None, 0, &mut stack, &mut preprocessed)?;
     }
-    Ok(expanded)
+    Ok(preprocessed)
 }
 
-fn expand_response_arg(
+fn preprocess_arg(
     arg: &str,
     base_dir: Option<&Path>,
     referenced_at: Option<(PathBuf, usize, usize)>,
     depth: usize,
     stack: &mut Vec<PathBuf>,
-    expanded: &mut Vec<String>,
+    preprocessed: &mut Vec<String>,
 ) -> Result<(), ArgsError> {
+    if let Some(wrapped) = arg.strip_prefix("-Wl,") {
+        for piece in wrapped.split(',').filter(|piece| !piece.is_empty()) {
+            preprocess_arg(
+                piece,
+                base_dir,
+                referenced_at.clone(),
+                depth,
+                stack,
+                preprocessed,
+            )?;
+        }
+        return Ok(());
+    }
     if let Some(literal) = arg.strip_prefix("@@") {
-        expanded.push(format!("@{literal}"));
+        preprocessed.push(format!("@{literal}"));
         return Ok(());
     }
     if is_darwin_loader_path(arg) {
-        expanded.push(arg.to_string());
+        preprocessed.push(arg.to_string());
         return Ok(());
     }
     let Some(path) = arg.strip_prefix('@') else {
-        expanded.push(arg.to_string());
+        preprocessed.push(arg.to_string());
         return Ok(());
     };
 
@@ -321,13 +335,13 @@ fn expand_response_arg(
 
     stack.push(canonical);
     let result = tokens.into_iter().try_for_each(|token| {
-        expand_response_arg(
+        preprocess_arg(
             &token.value,
             next_base,
             Some((resolved.clone(), token.line, token.column)),
             depth + 1,
             stack,
-            expanded,
+            preprocessed,
         )
     });
     stack.pop();
@@ -454,22 +468,21 @@ pub fn parse_ordered(argv: &[String]) -> Result<ParsedArgs, ArgsError> {
 pub fn parse_ordered_with_force_loads(
     argv: &[String],
 ) -> Result<(ParsedArgs, Vec<usize>), ArgsError> {
-    let expanded = expand_response_files(argv)?;
-    parse_response_expanded_with_force_loads(&expanded)
+    let preprocessed = preprocess_args(argv)?;
+    parse_preprocessed_with_force_loads(&preprocessed)
 }
 
-/// Parse arguments that have already passed through [`expand_response_files`].
-/// The binary uses this entry point to avoid reading response files twice after
-/// it performs target-format routing.
+/// Parse arguments that have already passed through [`preprocess_args`]. The
+/// binary uses this entry point to avoid reading response files twice after it
+/// performs target-format routing.
 #[doc(hidden)]
-pub fn parse_response_expanded_with_force_loads(
+pub fn parse_preprocessed_with_force_loads(
     argv: &[String],
 ) -> Result<(ParsedArgs, Vec<usize>), ArgsError> {
-    let normalized = normalize_wl(argv);
     let mut opts = LinkOptions::default();
     let mut input_specs = Vec::new();
     let mut force_load_positions = Vec::new();
-    let mut it = normalized.iter();
+    let mut it = argv.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-o" => {
@@ -777,22 +790,6 @@ pub fn parse_response_expanded_with_force_loads(
         },
         force_load_positions,
     ))
-}
-
-fn normalize_wl(argv: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(argv.len());
-    for arg in argv {
-        if let Some(rest) = arg.strip_prefix("-Wl,") {
-            out.extend(
-                rest.split(',')
-                    .filter(|piece| !piece.is_empty())
-                    .map(ToString::to_string),
-            );
-        } else {
-            out.push(arg.clone());
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1144,6 +1141,58 @@ mod tests {
         let opts = parse(&argv(&["-Wl,-map,link.map", "main.o"])).unwrap();
         assert_eq!(opts.map.as_deref(), Some(std::path::Path::new("link.map")));
         assert_eq!(opts.inputs, vec![PathBuf::from("main.o")]);
+    }
+
+    #[test]
+    fn wl_and_response_preprocessing_compose_recursively_in_place() {
+        let dir = ResponseTestDir::new();
+        dir.write("inner.rsp", "-Wl,middle.o,-lSystem\n");
+        let outer = dir.write("outer.rsp", "-Wl,@inner.rsp\n");
+
+        let parsed = parse_ordered(&[
+            "before.o".into(),
+            format!("-Wl,@{}", outer.display()),
+            "after.o".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.input_specs,
+            vec![
+                InputSpec::Path(PathBuf::from("before.o")),
+                InputSpec::Path(PathBuf::from("middle.o")),
+                InputSpec::Library("System".into()),
+                InputSpec::Path(PathBuf::from("after.o")),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_wl_fields_do_not_disturb_input_order() {
+        let parsed =
+            parse_ordered(&argv(&["before.o", "-Wl,,middle.o,,-lSystem,,", "after.o"])).unwrap();
+        assert_eq!(
+            parsed.input_specs,
+            vec![
+                InputSpec::Path(PathBuf::from("before.o")),
+                InputSpec::Path(PathBuf::from("middle.o")),
+                InputSpec::Library("System".into()),
+                InputSpec::Path(PathBuf::from("after.o")),
+            ]
+        );
+    }
+
+    #[test]
+    fn wl_wrapping_preserves_escaped_at_and_darwin_loader_paths() {
+        let parsed =
+            parse_ordered(&argv(&["-Wl,@@response.o,@rpath/libdependency.dylib"])).unwrap();
+        assert_eq!(
+            parsed.options.inputs,
+            vec![
+                PathBuf::from("@response.o"),
+                PathBuf::from("@rpath/libdependency.dylib"),
+            ]
+        );
     }
 
     #[test]

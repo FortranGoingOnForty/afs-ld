@@ -367,6 +367,36 @@ fn response_file_selects_elf_before_format_routing() {
 }
 
 #[test]
+fn wl_wrapped_emulation_selects_elf_before_format_routing() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=wl_wrapped_emulation_selects_elf_before_format_routing count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = scratch("wl_wrapped");
+    std::fs::create_dir_all(&dir).unwrap();
+    let object = assemble(&gas, &dir, "entry", &exit_asm("_start", 49));
+    let direct = dir.join("direct");
+    let wrapped = dir.join("wrapped");
+
+    let direct_output = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["-melf_x86_64", "-o"])
+        .arg(&direct)
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert_linked(&direct_output, &direct, 49);
+
+    let wrapped_output = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg(format!("-Wl,-melf_x86_64,-o,{}", wrapped.display()))
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert_linked(&wrapped_output, &wrapped, 49);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn dynamic_archive_only_invocation_extracts_entry() {
     let (Some(gas), Some(ar), Some(loader)) = (gas(), ar(), dynamic_loader()) else {
         eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=dynamic_archive_only_invocation_extracts_entry count=1 reason=\"no GNU assembler, ar, or standard dynamic loader on this host\"");

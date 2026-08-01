@@ -65,8 +65,8 @@ Options:
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
-    let expanded = match args::expand_response_files(&argv[1..]) {
-        Ok(expanded) => expanded,
+    let preprocessed = match args::preprocess_args(&argv[1..]) {
+        Ok(preprocessed) => preprocessed,
         Err(e) => {
             diag::error(&e.to_string());
             return ExitCode::from(2);
@@ -75,12 +75,12 @@ fn main() -> ExitCode {
 
     // Route explicit x86_64 ELF emulation and direct or indirect ELF
     // inputs before the Mach-O argument surface sees them.
-    if let Some(code) = elf_mode(&expanded) {
+    if let Some(code) = elf_mode(&preprocessed) {
         return code;
     }
 
     let (parsed, force_load_positions) =
-        match args::parse_response_expanded_with_force_loads(&expanded) {
+        match args::parse_preprocessed_with_force_loads(&preprocessed) {
             Ok(parsed) => parsed,
             Err(e) => {
                 diag::error(&e.to_string());

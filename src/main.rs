@@ -185,6 +185,7 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
     let mut link_inputs: Vec<LinkInput> = Vec::new();
     let mut lib_dirs: Vec<std::path::PathBuf> = Vec::new();
     let mut unsupported: Vec<String> = Vec::new();
+    let mut argument_error: Option<args::ArgsError> = None;
     let mut dynamic_linker: Option<String> = None;
     let mut eh_frame_hdr = false;
     let mut gc_sections = false;
@@ -209,7 +210,11 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
                 }
             }
             "--dynamic-linker" | "-dynamic-linker" => {
-                dynamic_linker = it.next().cloned();
+                if let Some(path) = it.next() {
+                    dynamic_linker = Some(path.clone());
+                } else {
+                    argument_error = Some(args::ArgsError::MissingValue(a.clone()));
+                }
             }
             "-e" => {
                 if let Some(symbol) = it.next() {
@@ -255,6 +260,10 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
         }
     }
     let dynamic = dynamic_linker.is_some();
+    if let Some(error) = argument_error {
+        diag::error(&error.to_string());
+        return Some(ExitCode::from(2));
+    }
     if !elf_emulation && !link_inputs_select_elf(&link_inputs, &lib_dirs, dynamic) {
         return None;
     }

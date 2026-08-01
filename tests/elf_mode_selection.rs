@@ -421,6 +421,49 @@ fn dynamic_archive_only_invocation_extracts_entry() {
 }
 
 #[test]
+fn missing_dynamic_linker_operand_never_falls_back_to_static_output() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=missing_dynamic_linker_operand_never_falls_back_to_static_output count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = scratch("missing_dynamic_linker");
+    std::fs::create_dir_all(&dir).unwrap();
+    let object = assemble(&gas, &dir, "entry", &exit_asm("_start", 50));
+
+    for (index, flag) in ["--dynamic-linker", "-dynamic-linker"]
+        .into_iter()
+        .enumerate()
+    {
+        let executable = dir.join(format!("missing-{index}"));
+        let output = link(
+            &executable,
+            &[
+                OsStr::new("-melf_x86_64"),
+                object.as_os_str(),
+                OsStr::new(flag),
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{flag} stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("flag `{flag}` requires a value")),
+            "{flag} stderr:\n{stderr}"
+        );
+        assert!(
+            !executable.exists(),
+            "{flag} must not publish a static fallback"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn non_elf_archive_does_not_select_elf() {
     let Some(ar) = ar() else {
         eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=non_elf_archive_does_not_select_elf count=1 reason=\"no ar on this host\"");

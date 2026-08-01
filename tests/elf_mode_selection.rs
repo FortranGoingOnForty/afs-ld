@@ -97,6 +97,22 @@ fn link(output: &Path, args: &[&OsStr]) -> Output {
         .unwrap()
 }
 
+#[cfg(unix)]
+fn link_with_small_file_limit(output: &Path, args: &[&OsStr]) -> Output {
+    Command::new("/bin/sh")
+        .args([
+            "-c",
+            "trap '' 25; ulimit -f 1; exec \"$@\"",
+            "afs-ld-file-limit",
+        ])
+        .arg(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(output)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
 fn run(path: &Path) -> i32 {
     Command::new(path).status().unwrap().code().unwrap()
 }
@@ -332,6 +348,44 @@ fn explicit_emulation_and_entry_select_elf() {
     assert!(!separated.status.success());
     let stderr = String::from_utf8_lossy(&separated.stderr);
     assert!(!stderr.contains("unknown flag `-m`"), "{stderr}");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn primary_elf_output_preserves_previous_file_after_write_failure() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=primary_elf_output_preserves_previous_file_after_write_failure count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    const SENTINEL: &[u8] = b"previous complete ELF output";
+
+    let dir = scratch("atomic_primary_output");
+    std::fs::create_dir_all(&dir).unwrap();
+    let object = assemble(&gas, &dir, "entry", &exit_asm("_start", 42));
+    let executable = dir.join("linked");
+    std::fs::write(&executable, SENTINEL).unwrap();
+
+    let result = link_with_small_file_limit(
+        &executable,
+        &[OsStr::new("-melf_x86_64"), object.as_os_str()],
+    );
+
+    assert!(!result.status.success(), "file-limited link must fail");
+    assert_eq!(
+        std::fs::read(&executable).unwrap(),
+        SENTINEL,
+        "failed ELF publication replaced the previous complete output"
+    );
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("afs-ld-tmp")),
+        "failed ELF publication leaked a temporary output"
+    );
 
     let _ = std::fs::remove_dir_all(dir);
 }

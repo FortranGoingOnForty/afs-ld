@@ -17,6 +17,7 @@ pub mod leb;
 pub mod link_map;
 pub mod loh;
 pub mod macho;
+pub mod output;
 pub mod reloc;
 pub mod resolve;
 pub mod section;
@@ -25,7 +26,6 @@ pub mod symbol;
 pub mod synth;
 pub mod why_live;
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -1051,7 +1051,14 @@ impl Linker {
             &mut image,
         )?;
         let output = default_output_path(opts);
-        fs::write(&output, image)?;
+        let permission_mode = if opts.kind == OutputKind::Executable {
+            output::PermissionMode::AddExecute
+        } else {
+            output::PermissionMode::Preserve
+        };
+        output::write_atomic(&output, &image, permission_mode).map_err(|error| {
+            io::Error::new(error.kind(), format!("{}: {error}", output.display()))
+        })?;
         if let Some(map_path) = &opts.map {
             let dead_stripped = dead_strip
                 .as_ref()
@@ -1068,12 +1075,6 @@ impl Linker {
                 &folded_symbols,
                 &dead_stripped,
             )?;
-        }
-        if opts.kind == OutputKind::Executable {
-            let mut perms = fs::metadata(&output)?.permissions();
-            let mode = perms.mode();
-            perms.set_mode(mode | ((mode & 0o444) >> 2));
-            fs::set_permissions(&output, perms)?;
         }
         phases.write_output = phase_started.elapsed();
         Ok(LinkProfile {

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::process::ExitCode;
 
-use afs_ld::{archive, args, diag, dump, elf, LinkError, Linker};
+use afs_ld::{archive, args, diag, dump, elf, output, LinkError, Linker};
 
 fn usage() -> &'static str {
     "\
@@ -313,14 +313,9 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
         }
     };
 
-    if let Err(e) = std::fs::write(&output, &image) {
+    if let Err(e) = output::write_atomic(&output, &image, output::PermissionMode::Exact(0o755)) {
         diag::error(&format!("{}: {}", output.display(), e));
         return Some(ExitCode::from(1));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o755));
     }
     Some(ExitCode::SUCCESS)
 }

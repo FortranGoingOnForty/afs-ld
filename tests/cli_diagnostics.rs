@@ -3,6 +3,8 @@ use std::fs;
 #[path = "common/skip.rs"]
 mod test_skip;
 
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -81,6 +83,20 @@ fn assemble(src: &str, out: &PathBuf) -> Result<(), String> {
 
 fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-cli-diag-{}-{name}", std::process::id()))
+}
+
+#[cfg(unix)]
+fn link_with_small_file_limit(args: &[&OsStr]) -> std::process::Output {
+    Command::new("/bin/sh")
+        .args([
+            "-c",
+            "trap '' 25; ulimit -f 1; exec \"$@\"",
+            "afs-ld-file-limit",
+        ])
+        .arg(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(args)
+        .output()
+        .expect("run afs-ld with a small file-size limit")
 }
 
 fn synthetic_undefined_object(name: &str) -> Vec<u8> {
@@ -802,6 +818,40 @@ fn executable_accepts_default_and_explicit_entries() {
         let _ = fs::remove_file(object);
         let _ = fs::remove_file(output);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn primary_macho_output_preserves_previous_file_after_write_failure() {
+    const SENTINEL: &[u8] = b"previous complete Mach-O output";
+
+    let dir = scratch("atomic-primary-output");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let object = dir.join("main.o");
+    let output = dir.join("linked");
+    fs::write(&object, synthetic_text_object("_main")).unwrap();
+    fs::write(&output, SENTINEL).unwrap();
+
+    let result =
+        link_with_small_file_limit(&[OsStr::new("-o"), output.as_os_str(), object.as_os_str()]);
+
+    assert!(!result.status.success(), "file-limited link must fail");
+    assert_eq!(
+        fs::read(&output).unwrap(),
+        SENTINEL,
+        "failed Mach-O publication replaced the previous complete output"
+    );
+    assert!(
+        fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("afs-ld-tmp")),
+        "failed Mach-O publication leaked a temporary output"
+    );
+
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]

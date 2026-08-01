@@ -10,10 +10,16 @@ use afs_ld::macho::reader::{
     write_commands, write_header, DyldInfoCmd, LinkEditDataCmd, LoadCommand, MachHeader64,
     HEADER_SIZE,
 };
+#[cfg(unix)]
+use common::harness::run_program_with_timeout;
 use common::harness::{
     apply_section_tolerances, compare_command_details, diff_macho, macho_exports,
     parse_case_tolerances, string_table_within_five_percent, CommandCheck,
 };
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
+use std::time::Duration;
 
 const SINGLE_EXPORT_TRIE: &[u8] = &[0, 1, b'_', b'x', 0, 6, 2, 0, 7, 0];
 
@@ -239,4 +245,29 @@ fn function_starts_parity_accepts_empty_metadata() {
         ],
     )
     .expect("an empty function-start payload represents no functions");
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_capture_drains_stdout_and_stderr_while_child_runs() {
+    const CHUNK_LEN: usize = 1024;
+    const ITERATIONS: usize = 2048;
+
+    let stdout_chunk = "o".repeat(CHUNK_LEN);
+    let stderr_chunk = "e".repeat(CHUNK_LEN);
+    let script = format!(
+        "i=0; while [ \"$i\" -lt {ITERATIONS} ]; do printf '%s' '{stdout_chunk}'; printf '%s' '{stderr_chunk}' >&2; i=$((i + 1)); done"
+    );
+    let output = run_program_with_timeout(
+        Path::new("/bin/sh"),
+        &["-c".to_string(), script],
+        Duration::from_secs(5),
+    )
+    .expect("capture finite output larger than both child pipes");
+
+    assert_eq!(output.exit_code, Some(0));
+    assert_eq!(output.stdout.len(), CHUNK_LEN * ITERATIONS);
+    assert_eq!(output.stderr.len(), CHUNK_LEN * ITERATIONS);
+    assert!(output.stdout.iter().all(|byte| *byte == b'o'));
+    assert!(output.stderr.iter().all(|byte| *byte == b'e'));
 }

@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -968,46 +969,95 @@ fn resolve_page_ref_expectation(
 }
 
 pub fn run_program(path: &Path, args: &[String]) -> Result<ProgramOutput, String> {
-    let runtime_timeout = runtime_timeout();
+    run_program_with_timeout(path, args, runtime_timeout())
+}
 
+pub(crate) fn run_program_with_timeout(
+    path: &Path,
+    args: &[String],
+    runtime_timeout: Duration,
+) -> Result<ProgramOutput, String> {
     let mut child = Command::new(path)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("run {}: {e}", path.display()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .expect("stdout is available after configuring a piped child stream");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("stderr is available after configuring a piped child stream");
+    let stdout_reader = thread::spawn(move || read_to_end(stdout));
+    let stderr_reader = thread::spawn(move || read_to_end(stderr));
+
     let started = Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .map_err(|e| format!("wait for {}: {e}", path.display()))?
-            .is_some()
-        {
-            let output = child
-                .wait_with_output()
-                .map_err(|e| format!("collect output from {}: {e}", path.display()))?;
-            return Ok(ProgramOutput {
-                exit_code: output.status.code(),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            });
+    let wait_result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok((status, false)),
+            Ok(None) if started.elapsed() >= runtime_timeout => {
+                let _ = child.kill();
+                break child
+                    .wait()
+                    .map(|status| (status, true))
+                    .map_err(|e| format!("wait for timed-out {}: {e}", path.display()));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(5)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("wait for {}: {error}", path.display()));
+            }
         }
-        if started.elapsed() >= runtime_timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .map_err(|e| format!("collect timed-out output from {}: {e}", path.display()))?;
-            return Err(format!(
-                "run {} timed out after {:?}: exit={:?} stdout={:?} stderr={:?}",
-                path.display(),
-                runtime_timeout,
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        thread::sleep(Duration::from_millis(5));
+    };
+
+    let stdout = join_output_reader(stdout_reader, "stdout", path);
+    let stderr = join_output_reader(stderr_reader, "stderr", path);
+    let (status, timed_out) = wait_result?;
+    let stdout = stdout?;
+    let stderr = stderr?;
+
+    if timed_out {
+        return Err(format!(
+            "run {} timed out after {:?}: exit={:?} stdout={:?} stderr={:?}",
+            path.display(),
+            runtime_timeout,
+            status.code(),
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        ));
     }
+
+    Ok(ProgramOutput {
+        exit_code: status.code(),
+        stdout,
+        stderr,
+    })
+}
+
+fn read_to_end(mut stream: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn join_output_reader(
+    reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stream_name: &str,
+    path: &Path,
+) -> Result<Vec<u8>, String> {
+    reader
+        .join()
+        .map_err(|_| {
+            format!(
+                "collect {stream_name} from {}: reader panicked",
+                path.display()
+            )
+        })?
+        .map_err(|error| format!("collect {stream_name} from {}: {error}", path.display()))
 }
 
 pub fn compare_runtime(our_path: &Path, their_path: &Path, args: &[String]) -> Result<(), String> {

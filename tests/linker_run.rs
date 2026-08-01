@@ -1166,6 +1166,140 @@ fn synthetic_aligned_subsections_object() -> Vec<u8> {
     bytes
 }
 
+fn synthetic_branch_addend_object() -> Vec<u8> {
+    const BL: [u8; 4] = 0x9400_0000u32.to_le_bytes();
+    const RET: [u8; 4] = 0xd65f_03c0u32.to_le_bytes();
+
+    let mut text = Vec::with_capacity(28);
+    text.extend_from_slice(&BL);
+    text.extend_from_slice(&BL);
+    text.extend_from_slice(&BL);
+    text.extend_from_slice(&RET);
+    text.extend_from_slice(&RET);
+    let target_offset = text.len() as u64;
+    text.extend_from_slice(&RET);
+    text.extend_from_slice(&RET);
+
+    let relocs = [
+        Reloc {
+            offset: 0,
+            kind: RelocKind::Branch26,
+            length: RelocLength::Word,
+            pcrel: true,
+            referent: Referent::Symbol(1),
+            addend: 4,
+            subtrahend: None,
+        },
+        Reloc {
+            offset: 4,
+            kind: RelocKind::Branch26,
+            length: RelocLength::Word,
+            pcrel: true,
+            referent: Referent::Symbol(1),
+            addend: -4,
+            subtrahend: None,
+        },
+        Reloc {
+            offset: 8,
+            kind: RelocKind::Branch26,
+            length: RelocLength::Word,
+            pcrel: true,
+            referent: Referent::Symbol(1),
+            addend: 4,
+            subtrahend: None,
+        },
+    ];
+    let raw_relocs = write_relocs(&relocs).unwrap();
+    let mut reloc_bytes = Vec::new();
+    write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+
+    let mut strings = vec![0];
+    let mut add_string = |name: &str| {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        strx
+    };
+    let symbols = [
+        RawNlist {
+            strx: add_string("_main"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: add_string("_target"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: target_offset,
+        },
+    ];
+
+    let mut segment = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: 0,
+        vmsize: text.len() as u64,
+        fileoff: 0,
+        filesize: text.len() as u64,
+        maxprot: 5,
+        initprot: 5,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: 0,
+            size: text.len() as u64,
+            offset: 0,
+            align: 2,
+            reloff: 0,
+            nreloc: raw_relocs.len() as u32,
+            flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = u64::from(data_offset);
+    segment.sections[0].offset = data_offset;
+    segment.sections[0].reloff = data_offset + text.len() as u32;
+    let symoff = segment.sections[0].reloff + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: 0,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
 fn output_section(bytes: &[u8], segname: &str, sectname: &str) -> Option<(u64, Vec<u8>)> {
     let header = parse_header(bytes).ok()?;
     let commands = parse_commands(&header, bytes).ok()?;
@@ -6639,6 +6773,96 @@ fn linker_run_thunks_all_forces_shared_thunk_for_in_range_calls() {
     );
 
     let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_thunks_preserve_branch_addends_and_identity() {
+    let obj = scratch("branch26-thunk-addends.o");
+    let direct_out = scratch("branch26-direct-addends.dylib");
+    let out = scratch("branch26-thunk-addends.dylib");
+    fs::write(&obj, synthetic_branch_addend_object()).unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(direct_out.clone()),
+        kind: OutputKind::Dylib,
+        thunks: afs_ld::ThunkMode::None,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+    let direct_bytes = fs::read(&direct_out).unwrap();
+    let direct_symbols = symbol_values(&direct_bytes);
+    let (direct_text_addr, direct_text) =
+        output_section(&direct_bytes, "__TEXT", "__text").unwrap();
+    assert_eq!(
+        [
+            decode_branch_target(&direct_text, direct_text_addr, 0).unwrap(),
+            decode_branch_target(&direct_text, direct_text_addr, 4).unwrap(),
+            decode_branch_target(&direct_text, direct_text_addr, 8).unwrap(),
+        ],
+        [
+            direct_symbols["_target"] + 4,
+            direct_symbols["_target"] - 4,
+            direct_symbols["_target"] + 4,
+        ],
+        "direct branches must retain their relocation addends"
+    );
+
+    Linker::run(&LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Dylib,
+        thunks: afs_ld::ThunkMode::All,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let symbols = symbol_values(&bytes);
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let (thunks_addr, thunks) = output_section(&bytes, "__TEXT", "__thunks").unwrap();
+    assert_eq!(
+        thunks.len(),
+        24,
+        "distinct relocation addends require distinct thunks"
+    );
+
+    let positive = decode_branch_target(&text, text_addr, 0).unwrap();
+    let negative = decode_branch_target(&text, text_addr, 4).unwrap();
+    let repeated_positive = decode_branch_target(&text, text_addr, 8).unwrap();
+    assert_eq!(
+        positive, repeated_positive,
+        "equal addends should share a thunk"
+    );
+    assert_ne!(
+        positive, negative,
+        "distinct addends must not share a thunk"
+    );
+
+    let thunk_starts = [thunks_addr, thunks_addr + 12];
+    for (caller_target, effective_target) in [
+        (positive, symbols["_target"] + 4),
+        (negative, symbols["_target"] - 4),
+    ] {
+        assert!(
+            thunk_starts.contains(&caller_target),
+            "caller landed inside a thunk instead of at its first instruction"
+        );
+        let thunk_offset = caller_target - thunks_addr;
+        assert_eq!(
+            decode_page_reference(&thunks, thunks_addr, thunk_offset, &PageRefKind::Add).unwrap(),
+            effective_target,
+            "thunk materialized the bare symbol instead of the addend-adjusted target"
+        );
+        assert_eq!(
+            read_insn(&thunks, thunk_offset as usize + 8).unwrap(),
+            0xd61f_0200
+        );
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(direct_out);
     let _ = fs::remove_file(out);
 }
 

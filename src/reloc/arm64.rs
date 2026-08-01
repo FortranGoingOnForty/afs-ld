@@ -110,10 +110,16 @@ enum BranchTargetKey {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ThunkTarget {
+    key: BranchTargetKey,
+    addend: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ThunkBucketKey {
     island: usize,
-    target: BranchTargetKey,
+    target: ThunkTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +132,7 @@ struct ThunkIsland {
 struct ThunkEntry {
     island: usize,
     slot_in_island: usize,
-    target: BranchTargetKey,
+    target: ThunkTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -578,7 +584,12 @@ pub fn plan_thunks(
         parsed_relocs,
     } = ctx;
 
-    if opts.thunks == ThunkMode::Safe && layout_fits_branch26_span(layout) {
+    let has_branch26_addends = parsed_relocs
+        .values()
+        .flatten()
+        .any(|reloc| reloc.kind == RelocKind::Branch26 && reloc.addend != 0);
+    if opts.thunks == ThunkMode::Safe && !has_branch26_addends && layout_fits_branch26_span(layout)
+    {
         return Ok(None);
     }
 
@@ -635,10 +646,16 @@ pub fn plan_thunks(
             };
             let place = place + local_offset as u64;
             let target_key = resolve_branch_target_key(obj, atom, reloc, &resolve)?;
-            let target = resolve_branch_target_from_key(obj, atom, reloc, target_key, &resolve)?;
+            let target = ThunkTarget {
+                key: target_key,
+                addend: reloc.addend,
+            };
+            let effective_target =
+                resolve_branch_target_from_key(obj, atom, reloc, target.key, &resolve)?
+                    .wrapping_add_signed(target.addend);
             let needs_thunk = match opts.thunks {
                 ThunkMode::None => false,
-                ThunkMode::Safe => !branch26_in_range(place, target),
+                ThunkMode::Safe => !branch26_in_range(place, effective_target),
                 ThunkMode::All => true,
             };
             if !needs_thunk {
@@ -655,10 +672,7 @@ pub fn plan_thunks(
                 island_index.insert(atom_id, next);
                 next
             };
-            let bucket_key = ThunkBucketKey {
-                island,
-                target: target_key,
-            };
+            let bucket_key = ThunkBucketKey { island, target };
             let thunk_index = if let Some(&existing) = index.get(&bucket_key) {
                 existing
             } else {
@@ -670,7 +684,7 @@ pub fn plan_thunks(
                 entries.push(ThunkEntry {
                     island,
                     slot_in_island,
-                    target: target_key,
+                    target,
                 });
                 index.insert(bucket_key, next);
                 next
@@ -772,9 +786,10 @@ fn apply_one(
                         })?
                 } else {
                     resolve_branch_target(obj, atom, reloc, resolve)?
+                        .wrapping_add_signed(reloc.addend)
                 }
             } else {
-                resolve_branch_target(obj, atom, reloc, resolve)?
+                resolve_branch_target(obj, atom, reloc, resolve)?.wrapping_add_signed(reloc.addend)
             };
             patch_branch26(bytes, atom, obj, local_offset, reloc, place, target)
         }
@@ -1074,7 +1089,7 @@ fn synthesize_thunk_section(
         })?;
         let section = &mut layout.sections[section_idx];
         let thunk_addr = section.addr + (entry.slot_in_island as u64) * THUNK_SIZE;
-        let target = match entry.target {
+        let target = match entry.target.key {
             BranchTargetKey::Symbol(symbol_id) => match resolve.sym_table.get(symbol_id) {
                 Symbol::Defined { atom, value, .. } => resolve
                     .atom_addrs
@@ -1098,7 +1113,18 @@ fn synthesize_thunk_section(
             kind: RelocKind::Branch26,
             referent: "thunk target".to_string(),
             detail: "missing final target address".to_string(),
-        })?;
+        })?
+        .wrapping_add_signed(entry.target.addend);
+        if target & 0b11 != 0 {
+            return Err(RelocError {
+                input: PathBuf::from("<synthetic thunks>"),
+                atom: crate::resolve::AtomId(0),
+                atom_offset: (idx as u32) * THUNK_SIZE as u32,
+                kind: RelocKind::Branch26,
+                referent: "thunk target".to_string(),
+                detail: format!("branch target address 0x{target:x} is not 4-byte aligned"),
+            });
+        }
         let adrp = encode_adrp_reg(16, thunk_addr, target, "thunk target")?;
         let add = encode_add_x_reg_pageoff(16, target, "thunk target")?;
         let start = entry.slot_in_island * THUNK_SIZE as usize;
@@ -1735,7 +1761,7 @@ fn patch_branch26(
     place: u64,
     target: u64,
 ) -> Result<(), RelocError> {
-    let delta = target.wrapping_add_signed(reloc.addend).wrapping_sub(place) as i64;
+    let delta = target.wrapping_sub(place) as i64;
     if delta & 0b11 != 0 {
         return Err(reloc_error(
             atom,
@@ -3159,17 +3185,115 @@ mod tests {
         );
     }
 
+    #[test]
+    fn safe_thunk_planning_accounts_for_addends_at_range_boundaries() {
+        let cases = [
+            ("forward", 0, BRANCH26_MAX_FORWARD_DELTA_BYTES - 4, 8),
+            ("backward", BRANCH26_MAX_FORWARD_DELTA_BYTES - 4, 0, -12),
+        ];
+
+        for (name, caller_offset, target_offset, addend) in cases {
+            let raw_relocs = branch26_raw_relocs_with_addends(&[(0, addend)]);
+            let object = thunk_test_object(raw_relocs, 4, 8);
+
+            let mut atoms = AtomTable::new();
+            let caller = atoms.push(test_atom(0, 4));
+            let target = atoms.push(test_atom(4, 4));
+
+            let mut sym_table = SymbolTable::new();
+            let target_name = sym_table.intern("_target");
+            sym_table
+                .insert(Symbol::Defined {
+                    name: target_name,
+                    origin: InputId(0),
+                    atom: target,
+                    value: 0,
+                    weak: false,
+                    private_extern: false,
+                    no_dead_strip: false,
+                })
+                .unwrap();
+
+            let inputs = [LayoutInput {
+                id: InputId(0),
+                object: &object,
+                load_order: 0,
+                archive_member_offset: None,
+            }];
+            let mut section = output_section(
+                "__TEXT",
+                "__text",
+                0x1_0000_0000,
+                BRANCH26_MAX_FORWARD_DELTA_BYTES,
+            );
+            let mut output_atoms = vec![
+                crate::section::OutputAtom {
+                    atom: caller,
+                    offset: caller_offset,
+                    size: 4,
+                    data: Vec::new(),
+                },
+                crate::section::OutputAtom {
+                    atom: target,
+                    offset: target_offset,
+                    size: 4,
+                    data: Vec::new(),
+                },
+            ];
+            output_atoms.sort_by_key(|atom| atom.offset);
+            section.atoms = output_atoms;
+            let layout = Layout {
+                kind: OutputKind::Executable,
+                segments: Vec::new(),
+                sections: vec![section],
+            };
+            assert!(layout_fits_branch26_span(&layout));
+            let parsed_relocs = crate::macho::writer::build_parsed_reloc_cache(&inputs).unwrap();
+            let opts = LinkOptions {
+                kind: OutputKind::Executable,
+                thunks: ThunkMode::Safe,
+                ..LinkOptions::default()
+            };
+
+            let plan = plan_thunks(
+                &opts,
+                ThunkPlanningContext {
+                    layout: &layout,
+                    inputs: &inputs,
+                    atoms: &atoms,
+                    sym_table: &sym_table,
+                    synthetic_plan: None,
+                    icf_redirects: None,
+                    parsed_relocs: &parsed_relocs,
+                },
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name} addend overflow was skipped by the safe fast path"));
+
+            assert_eq!(
+                plan.redirect_for(caller, 0),
+                Some(0),
+                "{name} addend overflow should be redirected through a thunk"
+            );
+        }
+    }
+
     fn branch26_raw_relocs(offsets: &[u32]) -> Vec<u8> {
-        let relocs: Vec<_> = offsets
+        let relocs: Vec<_> = offsets.iter().copied().map(|offset| (offset, 0)).collect();
+        branch26_raw_relocs_with_addends(&relocs)
+    }
+
+    fn branch26_raw_relocs_with_addends(relocs: &[(u32, i64)]) -> Vec<u8> {
+        let relocs: Vec<_> = relocs
             .iter()
             .copied()
-            .map(|offset| crate::reloc::Reloc {
+            .map(|(offset, addend)| crate::reloc::Reloc {
                 offset,
                 kind: RelocKind::Branch26,
                 length: RelocLength::Word,
                 pcrel: true,
                 referent: Referent::Symbol(0),
-                addend: 0,
+                addend,
                 subtrahend: None,
             })
             .collect();

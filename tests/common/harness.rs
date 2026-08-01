@@ -26,7 +26,7 @@ use afs_ld::macho::constants::{
     LC_BUILD_VERSION, LC_CODE_SIGNATURE, LC_DATA_IN_CODE, LC_DYLD_CHAINED_FIXUPS,
     LC_DYLD_EXPORTS_TRIE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS, LC_ID_DYLIB,
     LC_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_SEGMENT_64,
-    LC_SYMTAB, LC_UUID, N_TYPE, N_UNDF,
+    LC_SYMTAB, LC_UUID, N_ABS, N_SECT, N_TYPE, N_UNDF,
 };
 use afs_ld::macho::exports::{ExportKind, Exports};
 use afs_ld::macho::reader::{
@@ -1742,19 +1742,19 @@ struct CanonicalSymbolRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum CanonicalExportKind {
-    Regular(u64),
-    ThreadLocal(u64),
+pub(crate) enum CanonicalExportKind {
+    Regular(CanonicalSectionLocation),
+    ThreadLocal(CanonicalSectionLocation),
     Absolute(u64),
     Reexport { ordinal: u32, imported_name: String },
     StubAndResolver { stub: u64, resolver: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CanonicalExportRecord {
-    name: String,
-    flags: u64,
-    kind: CanonicalExportKind,
+pub(crate) struct CanonicalExportRecord {
+    pub(crate) name: String,
+    pub(crate) flags: u64,
+    pub(crate) kind: CanonicalExportKind,
 }
 
 fn canonical_symbol_record_map(
@@ -1808,27 +1808,25 @@ fn is_optional_dyld_stub_binder_record(record: &CanonicalSymbolRecord) -> bool {
         && record.section.is_none()
 }
 
-fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExportRecord>, String> {
+pub(crate) fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExportRecord>, String> {
     let exports = macho_exports(bytes)?;
-    let symbol_values: BTreeMap<String, u64> = canonical_symbol_records(bytes)?
+    let symbol_records: BTreeMap<String, CanonicalSymbolRecord> = canonical_symbol_records(bytes)?
         .into_iter()
-        .map(|record| (record.name, record.value))
+        .map(|record| (record.name.clone(), record))
         .collect();
     let mut out = exports
         .entries()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|entry| {
+        .map(|entry| -> Result<CanonicalExportRecord, String> {
             let kind = match entry.kind {
-                ExportKind::Regular { .. } => {
-                    CanonicalExportKind::Regular(*symbol_values.get(&entry.name).unwrap())
-                }
-                ExportKind::ThreadLocal { .. } => {
-                    CanonicalExportKind::ThreadLocal(*symbol_values.get(&entry.name).unwrap())
-                }
-                ExportKind::Absolute { .. } => {
-                    CanonicalExportKind::Absolute(*symbol_values.get(&entry.name).unwrap())
-                }
+                ExportKind::Regular { address } => CanonicalExportKind::Regular(
+                    canonical_export_location(bytes, &entry.name, "regular", address)?,
+                ),
+                ExportKind::ThreadLocal { address } => CanonicalExportKind::ThreadLocal(
+                    canonical_export_location(bytes, &entry.name, "thread-local", address)?,
+                ),
+                ExportKind::Absolute { address } => CanonicalExportKind::Absolute(address),
                 ExportKind::Reexport {
                     ordinal,
                     imported_name,
@@ -1840,15 +1838,65 @@ fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExportRecord>, 
                     CanonicalExportKind::StubAndResolver { stub, resolver }
                 }
             };
-            CanonicalExportRecord {
+            validate_export_symbol(&entry.name, &kind, &symbol_records)?;
+            Ok(CanonicalExportRecord {
                 name: entry.name,
                 flags: entry.flags,
                 kind,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     out.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
     Ok(out)
+}
+
+fn canonical_export_location(
+    bytes: &[u8],
+    name: &str,
+    kind: &str,
+    image_offset: u64,
+) -> Result<CanonicalSectionLocation, String> {
+    let text_base = segment_regions(bytes)?
+        .into_iter()
+        .find(|segment| segment.segname == "__TEXT")
+        .map(|segment| segment.vmaddr)
+        .ok_or_else(|| format!("{kind} export `{name}` has no __TEXT image base"))?;
+    let address = text_base.checked_add(image_offset).ok_or_else(|| {
+        format!("{kind} export `{name}` address overflows the Mach-O image address space")
+    })?;
+    canonical_section_location(bytes, address).map_err(|error| {
+        format!("{kind} export `{name}` trie address 0x{image_offset:x} is invalid: {error}")
+    })
+}
+
+fn validate_export_symbol(
+    name: &str,
+    export_kind: &CanonicalExportKind,
+    symbol_records: &BTreeMap<String, CanonicalSymbolRecord>,
+) -> Result<(), String> {
+    let Some(symbol) = symbol_records.get(name) else {
+        return Err(format!("export `{name}` has no LC_SYMTAB record"));
+    };
+    let agrees = match export_kind {
+        CanonicalExportKind::Regular(location) | CanonicalExportKind::ThreadLocal(location) => {
+            (symbol.n_type & N_TYPE) == N_SECT
+                && symbol.section.as_ref()
+                    == Some(&(location.segname.clone(), location.sectname.clone()))
+                && symbol.value == location.offset
+        }
+        CanonicalExportKind::Absolute(address) => {
+            (symbol.n_type & N_TYPE) == N_ABS
+                && symbol.section.is_none()
+                && symbol.value == *address
+        }
+        CanonicalExportKind::Reexport { .. } | CanonicalExportKind::StubAndResolver { .. } => true,
+    };
+    if !agrees {
+        return Err(format!(
+            "export `{name}` trie record {export_kind:?} disagrees with LC_SYMTAB record {symbol:?}"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn macho_exports(bytes: &[u8]) -> Result<Exports, String> {
@@ -2360,7 +2408,7 @@ struct SectionRegion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct CanonicalSectionLocation {
+pub(crate) struct CanonicalSectionLocation {
     segname: String,
     sectname: String,
     offset: u64,

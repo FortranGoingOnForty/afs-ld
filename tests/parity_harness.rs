@@ -3,13 +3,17 @@
 mod common;
 
 use afs_ld::macho::constants::{
-    CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_FUNCTION_STARTS, MH_EXECUTE, MH_MAGIC_64,
+    CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE,
+    EXPORT_SYMBOL_FLAGS_KIND_REGULAR, EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL, LC_FUNCTION_STARTS,
+    MH_EXECUTE, MH_MAGIC_64, N_ABS, N_EXT, N_SECT, S_REGULAR, S_THREAD_LOCAL_VARIABLES,
 };
-use afs_ld::macho::exports::ExportKind;
+use afs_ld::macho::exports::{ExportEntry, ExportKind};
 use afs_ld::macho::reader::{
-    write_commands, write_header, DyldInfoCmd, LinkEditDataCmd, LoadCommand, MachHeader64,
-    HEADER_SIZE,
+    write_commands, write_header, DyldInfoCmd, DysymtabCmd, LinkEditDataCmd, LoadCommand,
+    MachHeader64, Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
 };
+use afs_ld::symbol::RawNlist;
+use afs_ld::synth::dyld_info::build_export_trie;
 #[cfg(unix)]
 use common::harness::run_program_with_timeout;
 use common::harness::{
@@ -55,6 +59,163 @@ fn executable_with_function_starts(payload: &[u8]) -> Vec<u8> {
             data,
         }],
         payload,
+    )
+}
+
+fn executable_with_export(trie: &[u8], segments: Vec<Segment64>, symbol: RawNlist) -> Vec<u8> {
+    let command_size = segments.iter().map(Segment64::wire_size).sum::<u32>()
+        + LinkEditDataCmd::WIRE_SIZE
+        + SymtabCmd::WIRE_SIZE
+        + DysymtabCmd::WIRE_SIZE;
+    let trie_offset = HEADER_SIZE as u32 + command_size;
+    let symbol_offset = trie_offset + trie.len() as u32;
+    let string_offset = symbol_offset + 16;
+    let mut commands = segments
+        .into_iter()
+        .map(LoadCommand::Segment64)
+        .collect::<Vec<_>>();
+    commands.extend([
+        LoadCommand::DyldExportsTrie(LinkEditDataCmd {
+            dataoff: trie_offset,
+            datasize: trie.len() as u32,
+        }),
+        LoadCommand::Symtab(SymtabCmd {
+            symoff: symbol_offset,
+            nsyms: 1,
+            stroff: string_offset,
+            strsize: 4,
+        }),
+        LoadCommand::Dysymtab(DysymtabCmd {
+            iextdefsym: 0,
+            nextdefsym: 1,
+            ..DysymtabCmd::default()
+        }),
+    ]);
+    let mut bytes = executable_with_commands(&commands, trie);
+    symbol.write(&mut bytes);
+    bytes.extend_from_slice(b"\0_x\0");
+    bytes
+}
+
+fn executable_with_absolute_export(trie_address: u64, symbol_value: u64) -> Vec<u8> {
+    let trie = build_export_trie(&[ExportEntry {
+        name: "_x".to_string(),
+        flags: EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE,
+        kind: ExportKind::Absolute {
+            address: trie_address,
+        },
+    }]);
+    executable_with_export(
+        &trie,
+        Vec::new(),
+        RawNlist {
+            strx: 1,
+            n_type: N_ABS | N_EXT,
+            n_sect: 0,
+            n_desc: 0,
+            n_value: symbol_value,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum SyntheticSectionExportKind {
+    Regular,
+    ThreadLocal,
+}
+
+fn name16(name: &str) -> [u8; 16] {
+    let mut out = [0; 16];
+    out[..name.len()].copy_from_slice(name.as_bytes());
+    out
+}
+
+fn executable_with_section_export(
+    kind: SyntheticSectionExportKind,
+    section_image_offset: u64,
+    trie_section_offset: u64,
+    symbol_section_offset: u64,
+) -> Vec<u8> {
+    const IMAGE_BASE: u64 = 0x1000;
+
+    let (segment_name, section_name, section_flags, export_flags, export_kind) = match kind {
+        SyntheticSectionExportKind::Regular => (
+            "__TEXT",
+            "__text",
+            S_REGULAR,
+            EXPORT_SYMBOL_FLAGS_KIND_REGULAR,
+            ExportKind::Regular {
+                address: section_image_offset + trie_section_offset,
+            },
+        ),
+        SyntheticSectionExportKind::ThreadLocal => (
+            "__DATA",
+            "__thread_vars",
+            S_THREAD_LOCAL_VARIABLES,
+            EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL,
+            ExportKind::ThreadLocal {
+                address: section_image_offset + trie_section_offset,
+            },
+        ),
+    };
+    let trie = build_export_trie(&[ExportEntry {
+        name: "_x".to_string(),
+        flags: export_flags,
+        kind: export_kind,
+    }]);
+    let section = Section64Header {
+        sectname: name16(section_name),
+        segname: name16(segment_name),
+        addr: IMAGE_BASE + section_image_offset,
+        size: 0x100,
+        offset: 0,
+        align: 0,
+        reloff: 0,
+        nreloc: 0,
+        flags: section_flags,
+        reserved1: 0,
+        reserved2: 0,
+        reserved3: 0,
+    };
+    let text = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: IMAGE_BASE,
+        vmsize: 0x1000,
+        fileoff: 0,
+        filesize: 0,
+        maxprot: 0,
+        initprot: 0,
+        flags: 0,
+        sections: if matches!(kind, SyntheticSectionExportKind::Regular) {
+            vec![section.clone()]
+        } else {
+            Vec::new()
+        },
+    };
+    let mut segments = vec![text];
+    if matches!(kind, SyntheticSectionExportKind::ThreadLocal) {
+        segments.push(Segment64 {
+            segname: name16("__DATA"),
+            vmaddr: IMAGE_BASE + 0x1000,
+            vmsize: 0x1000,
+            fileoff: 0,
+            filesize: 0,
+            maxprot: 0,
+            initprot: 0,
+            flags: 0,
+            sections: vec![section],
+        });
+    }
+    executable_with_export(
+        &trie,
+        segments,
+        RawNlist {
+            strx: 1,
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: IMAGE_BASE + section_image_offset + symbol_section_offset,
+        },
     )
 }
 
@@ -123,6 +284,60 @@ fn export_trie_reader_rejects_out_of_bounds_ranges() {
             error.contains("exceeds file size"),
             "unexpected error: {error}"
         );
+    }
+}
+
+#[test]
+fn export_record_parity_compares_decoded_absolute_addresses() {
+    let matching = executable_with_absolute_export(7, 7);
+    let divergent = executable_with_absolute_export(99, 7);
+
+    let error = compare_command_details(&matching, &divergent, &[CommandCheck::ExportRecords])
+        .expect_err("different export-trie addresses must fail parity");
+    assert!(
+        error.contains("export"),
+        "unexpected parity diagnostic: {error}"
+    );
+}
+
+#[test]
+fn export_record_parity_rejects_trie_and_symbol_address_disagreement() {
+    let inconsistent = executable_with_absolute_export(99, 7);
+
+    let error =
+        compare_command_details(&inconsistent, &inconsistent, &[CommandCheck::ExportRecords])
+            .expect_err("an export trie must agree with its symbol-table record");
+    assert!(
+        error.contains("export"),
+        "unexpected consistency diagnostic: {error}"
+    );
+}
+
+#[test]
+fn export_record_parity_compares_decoded_section_addresses() {
+    for (kind, section_image_offset) in [
+        (SyntheticSectionExportKind::Regular, 0x20),
+        (SyntheticSectionExportKind::ThreadLocal, 0x1020),
+    ] {
+        let matching = executable_with_section_export(kind, section_image_offset, 7, 7);
+        let divergent = executable_with_section_export(kind, section_image_offset, 9, 7);
+
+        compare_command_details(&matching, &divergent, &[CommandCheck::ExportRecords])
+            .expect_err("different section-relative trie addresses must fail parity");
+    }
+}
+
+#[test]
+fn export_record_parity_normalizes_section_layout_drift() {
+    for (kind, first_section_offset, second_section_offset) in [
+        (SyntheticSectionExportKind::Regular, 0x20, 0x40),
+        (SyntheticSectionExportKind::ThreadLocal, 0x1020, 0x1040),
+    ] {
+        let first = executable_with_section_export(kind, first_section_offset, 7, 7);
+        let second = executable_with_section_export(kind, second_section_offset, 7, 7);
+
+        compare_command_details(&first, &second, &[CommandCheck::ExportRecords])
+            .expect("matching section-relative export locations should compare equal");
     }
 }
 

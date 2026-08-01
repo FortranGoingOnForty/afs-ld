@@ -35,7 +35,7 @@ use afs_ld::macho::constants::{
     S_ATTR_SOME_INSTRUCTIONS, S_REGULAR, S_ZEROFILL,
 };
 use afs_ld::macho::dylib::DylibFile;
-use afs_ld::macho::exports::{ExportKind, Exports};
+use afs_ld::macho::exports::Exports;
 use afs_ld::macho::reader::{
     parse_commands, parse_header, u32_le, write_header, LoadCommand, MachHeader64, Section64Header,
     Segment64, SymtabCmd, HEADER_SIZE,
@@ -49,7 +49,9 @@ use afs_ld::symbol::{parse_nlist_table, RawNlist, SymKind, NLIST_SIZE};
 use afs_ld::synth::unwind::decode_unwind_info;
 use afs_ld::{FrameworkSpec, LinkError, LinkOptions, Linker, OutputKind};
 use common::artifacts::workspace_artifact;
-use common::harness::{compare_sections, diff_macho};
+use common::harness::{
+    canonical_export_records, compare_sections, diff_macho, CanonicalExportKind,
+};
 
 fn have_xcrun() -> bool {
     Command::new("xcrun")
@@ -1660,66 +1662,6 @@ fn assert_same_address_entry_alias_output(bytes: &[u8]) {
     assert_eq!(entryoff, u64::from(text.offset));
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CanonicalExportKind {
-    Regular(u64),
-    ThreadLocal(u64),
-    Absolute(u64),
-    Reexport { ordinal: u32, imported_name: String },
-    StubAndResolver { stub: u64, resolver: u64 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CanonicalExportRecord {
-    name: String,
-    flags: u64,
-    kind: CanonicalExportKind,
-}
-
-fn canonical_export_records(bytes: &[u8]) -> Vec<CanonicalExportRecord> {
-    let dylib = DylibFile::parse("/tmp/canonical.dylib", bytes).unwrap();
-    let symbol_values: HashMap<String, u64> = canonical_symbol_records(bytes)
-        .into_iter()
-        .map(|record| (record.name, record.value))
-        .collect();
-    let mut out = dylib
-        .exports
-        .entries()
-        .unwrap()
-        .into_iter()
-        .map(|entry| {
-            let kind = match entry.kind {
-                ExportKind::Regular { .. } => {
-                    CanonicalExportKind::Regular(*symbol_values.get(&entry.name).unwrap())
-                }
-                ExportKind::ThreadLocal { .. } => {
-                    CanonicalExportKind::ThreadLocal(*symbol_values.get(&entry.name).unwrap())
-                }
-                ExportKind::Absolute { .. } => {
-                    CanonicalExportKind::Absolute(*symbol_values.get(&entry.name).unwrap())
-                }
-                ExportKind::Reexport {
-                    ordinal,
-                    imported_name,
-                } => CanonicalExportKind::Reexport {
-                    ordinal,
-                    imported_name,
-                },
-                ExportKind::StubAndResolver { stub, resolver } => {
-                    CanonicalExportKind::StubAndResolver { stub, resolver }
-                }
-            };
-            CanonicalExportRecord {
-                name: entry.name,
-                flags: entry.flags,
-                kind,
-            }
-        })
-        .collect::<Vec<_>>();
-    out.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
-    out
-}
-
 fn dyld_info_export_names(bytes: &[u8]) -> Result<Vec<String>, String> {
     let trie = dyld_info_stream(bytes, DyldInfoStreamKind::Export)?;
     if trie.is_empty() {
@@ -2780,12 +2722,14 @@ fn assert_dylib_export_case_matches_apple_ld(
 
     let our_bytes = fs::read(&our_out).map_err(|e| format!("read our output: {e}"))?;
     let apple_bytes = fs::read(&apple_out).map_err(|e| format!("read apple output: {e}"))?;
-    if canonical_export_records(&our_bytes) != canonical_export_records(&apple_bytes) {
+    let our_exports = canonical_export_records(&our_bytes)
+        .map_err(|error| format!("{}: invalid afs-ld exports: {error}", case.name))?;
+    let apple_exports = canonical_export_records(&apple_bytes)
+        .map_err(|error| format!("{}: invalid Apple ld exports: {error}", case.name))?;
+    if our_exports != apple_exports {
         return Err(format!(
             "{}: canonical export records diverged:\nours={:#?}\napple={:#?}",
-            case.name,
-            canonical_export_records(&our_bytes),
-            canonical_export_records(&apple_bytes)
+            case.name, our_exports, apple_exports
         ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind)
@@ -3718,8 +3662,8 @@ fn linker_run_honors_exported_symbol_filters_like_ld() {
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
     assert_eq!(
-        canonical_export_records(&our_bytes),
-        canonical_export_records(&apple_bytes)
+        canonical_export_records(&our_bytes).unwrap(),
+        canonical_export_records(&apple_bytes).unwrap()
     );
     assert_eq!(
         dyld_info_export_names(&our_bytes).unwrap(),
@@ -3802,8 +3746,8 @@ fn linker_run_honors_unexported_symbol_filters_like_ld() {
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
     assert_eq!(
-        canonical_export_records(&our_bytes),
-        canonical_export_records(&apple_bytes)
+        canonical_export_records(&our_bytes).unwrap(),
+        canonical_export_records(&apple_bytes).unwrap()
     );
     assert_eq!(
         dyld_info_export_names(&our_bytes).unwrap(),
@@ -4692,7 +4636,7 @@ fn linker_run_emits_aliases_to_absolute_symbols() {
         assert_eq!(record.n_desc, 0);
         assert_eq!(record.value, ABSOLUTE_VALUE);
     }
-    let exports = canonical_export_records(&bytes);
+    let exports = canonical_export_records(&bytes).unwrap();
     for name in ["_absolute", "_absolute_alias"] {
         let export = exports.iter().find(|entry| entry.name == name).unwrap();
         assert!(matches!(
@@ -4792,7 +4736,7 @@ exports:
 
         let records = canonical_symbol_record_map(&bytes);
         let (locals, external_defineds, _) = symbol_partition_names(&bytes);
-        let exports = canonical_export_records(&bytes);
+        let exports = canonical_export_records(&bytes).unwrap();
         let alias_export = exports.iter().find(|entry| entry.name == "_alias");
         if private_alias {
             assert!(!records.contains_key("_alias"));

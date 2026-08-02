@@ -1569,37 +1569,60 @@ fn patch_unsigned(
         reloc.kind,
         reloc.referent,
     )?;
-    let value = target
-        .wrapping_add_signed(reloc.addend)
-        .wrapping_add_signed(implicit_addend);
+    let referent = describe_referent(obj, reloc.referent);
     match reloc.length {
-        RelocLength::Word => write_u32(
-            bytes,
-            local_offset,
-            value as u32,
-            atom,
-            obj,
-            reloc.kind,
-            &describe_referent(obj, reloc.referent),
-        ),
+        RelocLength::Word => {
+            let value = i128::from(target) + i128::from(reloc.addend) + i128::from(implicit_addend);
+            let encoded = encode_unsigned_word_value(value).ok_or_else(|| {
+                reloc_error(
+                    atom,
+                    &obj.path,
+                    local_offset,
+                    reloc.kind,
+                    &referent,
+                    format!(
+                        "32-bit UNSIGNED relocation value is out of range ({value:#x}); expected -0x80000000..=0xffffffff"
+                    ),
+                )
+            })?;
+            write_u32(
+                bytes,
+                local_offset,
+                encoded,
+                atom,
+                obj,
+                reloc.kind,
+                &referent,
+            )
+        }
         RelocLength::Quad => write_u64(
             bytes,
             local_offset,
-            value,
+            target
+                .wrapping_add_signed(reloc.addend)
+                .wrapping_add_signed(implicit_addend),
             atom,
             obj,
             reloc.kind,
-            &describe_referent(obj, reloc.referent),
+            &referent,
         ),
         other => Err(reloc_error(
             atom,
             &obj.path,
             local_offset,
             reloc.kind,
-            &describe_referent(obj, reloc.referent),
+            &referent,
             format!("unsupported UNSIGNED width {:?}", other),
         )),
     }
+}
+
+fn encode_unsigned_word_value(value: i128) -> Option<u32> {
+    u32::try_from(value).ok().or_else(|| {
+        i32::try_from(value)
+            .ok()
+            .map(|signed| u32::from_ne_bytes(signed.to_ne_bytes()))
+    })
 }
 
 fn patch_pointer_to_got(
@@ -2771,6 +2794,34 @@ mod tests {
     use crate::symbol::{InputSymbol, RawNlist};
     use crate::OutputKind;
 
+    fn apply_unsigned_word_fixture(
+        target: u64,
+        explicit_addend: i64,
+        implicit_addend: i32,
+    ) -> Result<Vec<u8>, RelocError> {
+        let object = thunk_test_object(Vec::new(), 0, 4);
+        let atom = test_atom(0, 4);
+        let mut bytes = implicit_addend.to_le_bytes().to_vec();
+
+        patch_unsigned(
+            &mut bytes,
+            &atom,
+            &object,
+            0,
+            Reloc {
+                offset: 0,
+                kind: RelocKind::Unsigned,
+                length: RelocLength::Word,
+                pcrel: false,
+                referent: Referent::Section(0),
+                addend: explicit_addend,
+                subtrahend: None,
+            },
+            target,
+        )?;
+        Ok(bytes)
+    }
+
     fn apply_pointer_to_got_fixture(
         place: u64,
         got: u64,
@@ -2920,6 +2971,35 @@ mod tests {
             apply_pointer_to_got_fixture(place, got, RelocLength::Word, true, 12, -4).unwrap();
 
         assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), -0x3ff8);
+    }
+
+    #[test]
+    fn unsigned_word_accepts_signed_and_unsigned_32_bit_values() {
+        for (target, explicit_addend, implicit_addend, expected) in [
+            (u32::MAX as u64, 0, 0, u32::MAX),
+            (0, 0, -1, u32::MAX),
+            (0, 0, i32::MIN, 0x8000_0000),
+        ] {
+            let bytes =
+                apply_unsigned_word_fixture(target, explicit_addend, implicit_addend).unwrap();
+
+            assert_eq!(u32::from_le_bytes(bytes.try_into().unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn unsigned_word_rejects_values_that_require_truncation_or_wrapping() {
+        for (target, explicit_addend, implicit_addend) in [
+            (u32::MAX as u64 + 1, 0, 0),
+            (u64::MAX, 1, 0),
+            (0, i64::MIN, -1),
+        ] {
+            let error =
+                apply_unsigned_word_fixture(target, explicit_addend, implicit_addend).unwrap_err();
+
+            assert!(error.detail.contains("32-bit"), "{error}");
+            assert!(error.detail.contains("out of range"), "{error}");
+        }
     }
 
     #[test]

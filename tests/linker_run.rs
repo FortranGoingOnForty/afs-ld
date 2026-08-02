@@ -362,6 +362,10 @@ fn synthetic_absolute_reference_object(entry: &str, target: &str) -> Vec<u8> {
     synthetic_data_reference_object(entry, target, RelocKind::Unsigned, RelocLength::Quad, false)
 }
 
+fn synthetic_unsigned_word_reference_object(entry: &str, target: &str) -> Vec<u8> {
+    synthetic_data_reference_object(entry, target, RelocKind::Unsigned, RelocLength::Word, false)
+}
+
 fn synthetic_pointer_to_got_reference_object(
     entry: &str,
     target: &str,
@@ -4924,6 +4928,86 @@ fn linker_run_resolves_external_absolute_symbols_without_atoms() {
     let _ = fs::remove_file(definition);
     let _ = fs::remove_file(out);
     let _ = fs::remove_file(map);
+}
+
+#[test]
+fn linker_run_preserves_maximum_unsigned_word_relocation() {
+    const ABSOLUTE_VALUE: u64 = u32::MAX as u64;
+
+    let reference = scratch("unsigned-word-max-reference.o");
+    let definition = scratch("unsigned-word-max-definition.o");
+    let out = scratch("unsigned-word-max.out");
+    fs::write(
+        &reference,
+        synthetic_unsigned_word_reference_object("_main", "_absolute"),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        synthetic_absolute_object("_absolute", ABSOLUTE_VALUE),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![reference.clone(), definition.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (_, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    assert_eq!(u32::from_le_bytes(text[..4].try_into().unwrap()), u32::MAX);
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_rejects_overflowing_unsigned_word_without_publishing_output() {
+    const OVERFLOWING_VALUE: u64 = u32::MAX as u64 + 1;
+    const SENTINEL: &[u8] = b"AFSLD-050 existing output";
+
+    let reference = scratch("unsigned-word-overflow-reference.o");
+    let definition = scratch("unsigned-word-overflow-definition.o");
+    let out = scratch("unsigned-word-overflow.out");
+    fs::write(
+        &reference,
+        synthetic_unsigned_word_reference_object("_main", "_absolute"),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        synthetic_absolute_object("_absolute", OVERFLOWING_VALUE),
+    )
+    .unwrap();
+    fs::write(&out, SENTINEL).unwrap();
+
+    let error = Linker::run(&LinkOptions {
+        inputs: vec![reference.clone(), definition.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap_err();
+
+    match error {
+        LinkError::Reloc(error) => {
+            assert_eq!(error.kind, RelocKind::Unsigned);
+            assert_eq!(error.referent, "_absolute");
+            assert!(error.detail.contains("32-bit"), "{error}");
+            assert!(error.detail.contains("0x100000000"), "{error}");
+            assert!(error.detail.contains("out of range"), "{error}");
+        }
+        other => panic!("expected Reloc error, got {other:?}"),
+    }
+    assert_eq!(fs::read(&out).unwrap(), SENTINEL);
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
 }
 
 #[test]

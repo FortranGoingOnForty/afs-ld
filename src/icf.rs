@@ -375,16 +375,15 @@ fn mark_address_taken(
                 if !marks_address_taken(reloc.kind) {
                     continue;
                 }
-                for target_atom in target_atoms_for_reloc(
-                    input.object,
-                    reloc.referent,
-                    sym_table,
-                    resolved_by_name,
-                ) {
-                    atom_table
-                        .get_mut(target_atom)
-                        .flags
-                        .set(AtomFlags::ADDRESS_TAKEN);
+                for referent in std::iter::once(reloc.referent).chain(reloc.subtrahend) {
+                    for target_atom in
+                        target_atoms_for_reloc(input.object, referent, sym_table, resolved_by_name)
+                    {
+                        atom_table
+                            .get_mut(target_atom)
+                            .flags
+                            .set(AtomFlags::ADDRESS_TAKEN);
+                    }
                 }
             }
         }
@@ -395,6 +394,7 @@ fn marks_address_taken(kind: RelocKind) -> bool {
     matches!(
         kind,
         RelocKind::Unsigned
+            | RelocKind::Subtractor
             | RelocKind::Page21
             | RelocKind::PageOff12
             | RelocKind::PointerToGot
@@ -550,13 +550,14 @@ mod tests {
     use crate::input::ObjectFile;
     use crate::layout::Layout;
     use crate::macho::constants::{
-        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, S_ATTR_PURE_INSTRUCTIONS,
-        S_ATTR_SOME_INSTRUCTIONS, S_ATTR_STRIP_STATIC_SYMS, S_REGULAR,
+        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, N_EXT, N_UNDF,
+        S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_ATTR_STRIP_STATIC_SYMS, S_REGULAR,
     };
     use crate::macho::reader::MachHeader64;
     use crate::reloc::{write_raw_relocs, write_relocs};
     use crate::section::{InputSection, SectionKind};
     use crate::string_table::StringTable;
+    use crate::symbol::{InputSymbol, RawNlist};
     use crate::OutputKind;
 
     fn section_reloc_object(
@@ -707,6 +708,95 @@ mod tests {
             addend: 0,
             subtrahend: None,
         }
+    }
+
+    fn subtractor_reference_object(path: &str, minuend: &str, subtrahend: &str) -> ObjectFile {
+        let reloc = Reloc {
+            offset: 0,
+            kind: RelocKind::Subtractor,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(0),
+            addend: 0,
+            subtrahend: Some(Referent::Symbol(1)),
+        };
+        let mut object = section_reloc_object(path, 8, &[reloc], 0);
+        let mut strings = vec![0];
+        object.symbols = [minuend, subtrahend]
+            .into_iter()
+            .map(|name| {
+                let strx = strings.len() as u32;
+                strings.extend_from_slice(name.as_bytes());
+                strings.push(0);
+                InputSymbol::from_raw(RawNlist {
+                    strx,
+                    n_type: N_UNDF | N_EXT,
+                    n_sect: 0,
+                    n_desc: 0,
+                    n_value: 0,
+                })
+            })
+            .collect();
+        object.strings = StringTable::from_bytes(strings);
+        object
+    }
+
+    #[test]
+    fn safe_icf_keeps_both_cross_object_subtractor_operands_distinct() {
+        let objects = [
+            section_reloc_object("minuend.o", 8, &[], 0),
+            section_reloc_object("subtrahend.o", 8, &[], 0),
+            subtractor_reference_object("difference.o", "_minuend", "_subtrahend"),
+        ];
+        let inputs = [
+            LayoutInput {
+                id: InputId(0),
+                object: &objects[0],
+                load_order: 0,
+                archive_member_offset: None,
+            },
+            LayoutInput {
+                id: InputId(1),
+                object: &objects[1],
+                load_order: 1,
+                archive_member_offset: None,
+            },
+            LayoutInput {
+                id: InputId(2),
+                object: &objects[2],
+                load_order: 2,
+                archive_member_offset: None,
+            },
+        ];
+        let mut atoms = AtomTable::new();
+        let minuend = atoms.push(foldable_atom(InputId(0), 0));
+        let subtrahend = atoms.push(foldable_atom(InputId(1), 0));
+        let mut symbols = SymbolTable::new();
+        for (name, origin, atom) in [
+            ("_minuend", InputId(0), minuend),
+            ("_subtrahend", InputId(1), subtrahend),
+        ] {
+            let name = symbols.intern(name);
+            symbols
+                .insert(Symbol::Defined {
+                    name,
+                    origin,
+                    atom,
+                    value: 0,
+                    weak: false,
+                    private_extern: true,
+                    no_dead_strip: false,
+                })
+                .unwrap();
+        }
+
+        let plan = fold_safe(&inputs, &mut atoms, &mut symbols, None).unwrap();
+
+        assert!(atoms.get(minuend).flags.has(AtomFlags::ADDRESS_TAKEN));
+        assert!(atoms.get(subtrahend).flags.has(AtomFlags::ADDRESS_TAKEN));
+        assert!(plan.redirects().is_empty());
+        assert!(plan.kept_atoms().contains(&minuend));
+        assert!(plan.kept_atoms().contains(&subtrahend));
     }
 
     #[test]

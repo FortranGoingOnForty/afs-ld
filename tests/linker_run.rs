@@ -241,6 +241,132 @@ fn name16(name: &str) -> [u8; 16] {
     out
 }
 
+fn synthetic_single_section_object(
+    segment_name: &str,
+    section_name: &str,
+    section_flags: u32,
+    data: &[u8],
+    relocs: &[Reloc],
+    symbols: &[(&str, u8, u8, u16, u64)],
+) -> Vec<u8> {
+    let raw_relocs = write_relocs(relocs).unwrap();
+    let mut reloc_bytes = Vec::new();
+    write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+
+    let mut strings = vec![0];
+    let symbols: Vec<RawNlist> = symbols
+        .iter()
+        .map(|&(name, n_type, n_sect, n_desc, n_value)| {
+            let strx = strings.len() as u32;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            RawNlist {
+                strx,
+                n_type,
+                n_sect,
+                n_desc,
+                n_value,
+            }
+        })
+        .collect();
+
+    let mut segment = Segment64 {
+        segname: [0; 16],
+        vmaddr: 0,
+        vmsize: data.len() as u64,
+        fileoff: 0,
+        filesize: data.len() as u64,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16(section_name),
+            segname: name16(segment_name),
+            addr: 0,
+            size: data.len() as u64,
+            offset: 0,
+            align: 3,
+            reloff: 0,
+            nreloc: raw_relocs.len() as u32,
+            flags: section_flags,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    segment.sections[0].reloff = data_offset + data.len() as u32;
+    let symoff = segment.sections[0].reloff + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(data);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_icf_const_object(symbol: &str) -> Vec<u8> {
+    synthetic_single_section_object(
+        "__TEXT",
+        "__const",
+        S_REGULAR,
+        &0x1122_3344_5566_7788u64.to_le_bytes(),
+        &[],
+        &[(symbol, N_SECT | N_EXT | N_PEXT, 1, 0, 0)],
+    )
+}
+
+fn synthetic_subtractor_difference_object(minuend: &str, subtrahend: &str) -> Vec<u8> {
+    synthetic_single_section_object(
+        "__DATA",
+        "__data",
+        S_REGULAR,
+        &[0; 8],
+        &[Reloc {
+            offset: 0,
+            kind: RelocKind::Subtractor,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(2),
+            addend: 0,
+            subtrahend: Some(Referent::Symbol(1)),
+        }],
+        &[
+            ("_difference", N_SECT | N_EXT, 1, 0, 0),
+            (subtrahend, N_UNDF | N_EXT, 0, 0, 0),
+            (minuend, N_UNDF | N_EXT, 0, 0, 0),
+        ],
+    )
+}
+
 fn synthetic_got_reference_object(entry: &str, target: &str, weak_ref: bool) -> Vec<u8> {
     let text = [
         0x00, 0x00, 0x00, 0x90, // adrp x0, target@GOTPAGE
@@ -11606,6 +11732,69 @@ fn linker_run_icf_safe_folds_const_sections_mapped_to_same_output_domain() {
 
     let _ = fs::remove_file(object);
     let _ = fs::remove_file(output);
+}
+
+#[test]
+fn linker_run_icf_safe_preserves_cross_object_subtractor_difference() {
+    let first = scratch("AFSLD-065-subtractor-first.o");
+    let second = scratch("AFSLD-065-subtractor-second.o");
+    let difference = scratch("AFSLD-065-subtractor-difference.o");
+    let baseline_output = scratch("AFSLD-065-subtractor-baseline.dylib");
+    let icf_output = scratch("AFSLD-065-subtractor-icf.dylib");
+    fs::write(&first, synthetic_icf_const_object("_first")).unwrap();
+    fs::write(&second, synthetic_icf_const_object("_second")).unwrap();
+    fs::write(
+        &difference,
+        synthetic_subtractor_difference_object("_second", "_first"),
+    )
+    .unwrap();
+
+    let inputs = vec![first.clone(), second.clone(), difference.clone()];
+    Linker::run(&LinkOptions {
+        inputs: inputs.clone(),
+        output: Some(baseline_output.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+    Linker::run(&LinkOptions {
+        inputs,
+        output: Some(icf_output.clone()),
+        kind: OutputKind::Dylib,
+        icf_mode: IcfMode::Safe,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let difference_value = |path: &PathBuf| {
+        let bytes = fs::read(path).unwrap();
+        let data = output_section(&bytes, "__DATA", "__data")
+            .expect("SUBTRACTOR fixture must retain __DATA,__data")
+            .1;
+        u64::from_le_bytes(data[..8].try_into().unwrap())
+    };
+    assert_eq!(
+        difference_value(&baseline_output),
+        8,
+        "fixture must materialize the cross-object address difference"
+    );
+    assert_eq!(
+        difference_value(&icf_output),
+        8,
+        "safe ICF must not collapse either operand of a SUBTRACTOR relocation"
+    );
+    let icf_symbols = symbol_values(&fs::read(&icf_output).unwrap());
+    assert_ne!(
+        icf_symbols.get("_first"),
+        icf_symbols.get("_second"),
+        "safe ICF must preserve distinct addresses observed by SUBTRACTOR"
+    );
+
+    let _ = fs::remove_file(first);
+    let _ = fs::remove_file(second);
+    let _ = fs::remove_file(difference);
+    let _ = fs::remove_file(baseline_output);
+    let _ = fs::remove_file(icf_output);
 }
 
 #[test]

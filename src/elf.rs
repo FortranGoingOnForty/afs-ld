@@ -159,6 +159,15 @@ const PAGE: u64 = 0x1000;
 #[derive(Debug)]
 pub struct ElfError(pub String);
 
+/// ELF output policies selected by command-line options rather than input
+/// metadata. The defaults match GNU ld: input notes determine stack
+/// executability and dynamic function binding is lazy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ElfLinkPolicy {
+    pub executable_stack: Option<bool>,
+    pub bind_now: bool,
+}
+
 impl std::fmt::Display for ElfError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -1664,16 +1673,13 @@ fn validate_object_relocations(objects: &[ElfObject]) -> Result<(), ElfError> {
     Ok(())
 }
 
-fn gnu_stack_flags(objects: &[ElfObject]) -> u32 {
-    PF_R | PF_W
-        | if objects
+fn gnu_stack_flags(objects: &[ElfObject], executable_stack: Option<bool>) -> u32 {
+    let executable_stack = executable_stack.unwrap_or_else(|| {
+        objects
             .iter()
             .any(|object| object.requires_executable_stack)
-        {
-            PF_X
-        } else {
-            0
-        }
+    });
+    PF_R | PF_W | if executable_stack { PF_X } else { 0 }
 }
 
 fn parse_eh_frame_gc(section: &Section, object: &str) -> Result<EhFrameGc, ElfError> {
@@ -2386,6 +2392,23 @@ pub fn link_static_with_gc(
     eh_frame_hdr: bool,
     gc_sections: bool,
 ) -> Result<Vec<u8>, ElfError> {
+    link_static_with_gc_and_policy(
+        inputs,
+        entry,
+        eh_frame_hdr,
+        gc_sections,
+        ElfLinkPolicy::default(),
+    )
+}
+
+#[doc(hidden)]
+pub fn link_static_with_gc_and_policy(
+    inputs: Vec<LinkInput>,
+    entry: &str,
+    eh_frame_hdr: bool,
+    gc_sections: bool,
+    policy: ElfLinkPolicy,
+) -> Result<Vec<u8>, ElfError> {
     let mut inputs: Vec<StaticInput> = inputs.into_iter().map(static_state).collect();
     let mut objects = Vec::new();
     let mut defined = HashSet::new();
@@ -2396,7 +2419,7 @@ pub fn link_static_with_gc(
         apply_gc_sections(&mut objects, &analysis)?;
     }
 
-    link_static_exec(&objects, entry, eh_frame_hdr)
+    link_static_exec_with_policy(&objects, entry, eh_frame_hdr, policy)
 }
 
 /// Link relocatable objects into a static ET_EXEC image. Explicit
@@ -2409,6 +2432,15 @@ pub fn link_static_exec(
     objects: &[ElfObject],
     entry: &str,
     eh_frame_hdr: bool,
+) -> Result<Vec<u8>, ElfError> {
+    link_static_exec_with_policy(objects, entry, eh_frame_hdr, ElfLinkPolicy::default())
+}
+
+fn link_static_exec_with_policy(
+    objects: &[ElfObject],
+    entry: &str,
+    eh_frame_hdr: bool,
+    policy: ElfLinkPolicy,
 ) -> Result<Vec<u8>, ElfError> {
     validate_object_relocations(objects)?;
 
@@ -3264,9 +3296,17 @@ pub fn link_static_exec(
             4,
         ));
     }
-    // Missing notes keep the secure non-executable default; an executable
-    // `.note.GNU-stack` in any selected input requests PF_X.
-    ph.extend(phdr(PT_GNU_STACK, gnu_stack_flags(objects), 0, 0, 0, 0, 0));
+    // Command-line policy overrides input notes. Otherwise missing notes keep
+    // the secure non-executable default and any executable note requests PF_X.
+    ph.extend(phdr(
+        PT_GNU_STACK,
+        gnu_stack_flags(objects, policy.executable_stack),
+        0,
+        0,
+        0,
+        0,
+        0,
+    ));
     image[64..64 + ph.len()].copy_from_slice(&ph);
 
     // Section bytes.
@@ -3604,6 +3644,25 @@ pub fn link_dynamic_with_as_needed_and_gc(
     eh_frame_hdr: bool,
     gc_sections: bool,
 ) -> Result<Vec<u8>, ElfError> {
+    link_dynamic_with_as_needed_gc_and_policy(
+        inputs,
+        entry,
+        interp,
+        eh_frame_hdr,
+        gc_sections,
+        ElfLinkPolicy::default(),
+    )
+}
+
+#[doc(hidden)]
+pub fn link_dynamic_with_as_needed_gc_and_policy(
+    inputs: Vec<(DynamicLinkInput, bool, Option<SharedLinkMetadata>)>,
+    entry: &str,
+    interp: &str,
+    eh_frame_hdr: bool,
+    gc_sections: bool,
+    policy: ElfLinkPolicy,
+) -> Result<Vec<u8>, ElfError> {
     let mut inputs: Vec<DynamicInput> = inputs
         .into_iter()
         .map(|(input, as_needed, metadata)| dynamic_state(input, as_needed, metadata))
@@ -3641,7 +3700,14 @@ pub fn link_dynamic_with_as_needed_and_gc(
         ));
     }
 
-    link_dynamic_exec(&state.objects, &state.shared, entry, interp, eh_frame_hdr)
+    link_dynamic_exec_with_policy(
+        &state.objects,
+        &state.shared,
+        entry,
+        interp,
+        eh_frame_hdr,
+        policy,
+    )
 }
 
 pub fn link_dynamic_exec(
@@ -3650,6 +3716,24 @@ pub fn link_dynamic_exec(
     entry: &str,
     interp: &str,
     eh_frame_hdr: bool,
+) -> Result<Vec<u8>, ElfError> {
+    link_dynamic_exec_with_policy(
+        objects,
+        shared,
+        entry,
+        interp,
+        eh_frame_hdr,
+        ElfLinkPolicy::default(),
+    )
+}
+
+fn link_dynamic_exec_with_policy(
+    objects: &[ElfObject],
+    shared: &[SharedLib],
+    entry: &str,
+    interp: &str,
+    eh_frame_hdr: bool,
+    policy: ElfLinkPolicy,
 ) -> Result<Vec<u8>, ElfError> {
     validate_object_relocations(objects)?;
 
@@ -4245,10 +4329,11 @@ pub fn link_dynamic_exec(
     let has_init_array = outs.iter().any(|section| section.name == ".init_array");
     let has_fini_array = outs.iter().any(|section| section.name == ".fini_array");
     // .dynamic entry count: NEEDED* + base tags (HASH/STRTAB/SYMTAB/STRSZ/
-    // SYMENT/FLAGS) + PLT tags (PLTGOT/PLTRELSZ/PLTREL/JMPREL, only with a
+    // SYMENT, plus FLAGS for eager binding) + PLT tags
+    // (PLTGOT/PLTRELSZ/PLTREL/JMPREL, only with a
     // PLT) + versioning tags (VERSYM/VERNEED/VERNEEDNUM) + .rela.dyn tags
     // (RELA/RELASZ/RELAENT) + array address/size pairs + NULL.
-    let n_base_dyn = 6;
+    let n_base_dyn = 5 + usize::from(policy.bind_now);
     let n_plt_dyn = if has_plt { 4 } else { 0 };
     let n_ver_dyn = if versioned { 3 } else { 0 };
     let n_reladyn_dyn = if reladyn_size > 0 { 3 } else { 0 };
@@ -4767,7 +4852,9 @@ pub fn link_dynamic_exec(
         dyn_push(DT_PLTREL, DT_RELA as u64, &mut dynamic);
         dyn_push(DT_JMPREL, relaplt_v, &mut dynamic);
     }
-    dyn_push(DT_FLAGS, DF_BIND_NOW, &mut dynamic);
+    if policy.bind_now {
+        dyn_push(DT_FLAGS, DF_BIND_NOW, &mut dynamic);
+    }
     if reladyn_size > 0 {
         dyn_push(DT_RELA, reladyn_v, &mut dynamic);
         dyn_push(DT_RELASZ, reladyn_size, &mut dynamic);
@@ -4884,7 +4971,15 @@ pub fn link_dynamic_exec(
         let len = eh_hdr_bytes.len() as u64;
         phdr(PT_GNU_EH_FRAME, PF_R, hfo, hv, len, len, 4);
     }
-    phdr(PT_GNU_STACK, gnu_stack_flags(objects), 0, 0, 0, 0, 0);
+    phdr(
+        PT_GNU_STACK,
+        gnu_stack_flags(objects, policy.executable_stack),
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
     image[64..64 + ph.len()].copy_from_slice(&ph);
 
     // Write metadata sections.

@@ -518,6 +518,71 @@ fn missing_dynamic_linker_operand_never_falls_back_to_static_output() {
 }
 
 #[test]
+fn invalid_z_policies_preserve_existing_output() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=invalid_z_policies_preserve_existing_output count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    const SENTINEL: &[u8] = b"previous complete ELF output";
+
+    let dir = scratch("invalid_z_policy");
+    std::fs::create_dir_all(&dir).unwrap();
+    let object = assemble(&gas, &dir, "entry", &exit_asm("_start", 51));
+    let cases = [
+        (
+            "unknown_separated",
+            vec!["-z", "mystery"],
+            "flag `-z` got invalid value `mystery`",
+        ),
+        (
+            "unknown_joined",
+            vec!["-zmystery"],
+            "flag `-z` got invalid value `mystery`",
+        ),
+        ("missing", vec!["-z"], "flag `-z` requires a value"),
+    ];
+
+    for (case, policy_args, expected_diagnostic) in cases {
+        let executable = dir.join(case);
+        std::fs::write(&executable, SENTINEL).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-o")
+            .arg(&executable)
+            .arg("-melf_x86_64")
+            .arg(&object)
+            .args(&policy_args)
+            .output()
+            .expect("run afs-ld");
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{case} stderr:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected_diagnostic),
+            "{case} stderr:\n{stderr}"
+        );
+        assert_eq!(
+            std::fs::read(&executable).unwrap(),
+            SENTINEL,
+            "{case} replaced the previous output"
+        );
+    }
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("afs-ld-tmp")),
+        "rejected -z policy leaked a temporary output"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn non_elf_archive_does_not_select_elf() {
     let Some(ar) = ar() else {
         eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=non_elf_archive_does_not_select_elf count=1 reason=\"no ar on this host\"");

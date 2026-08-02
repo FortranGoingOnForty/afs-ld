@@ -43,6 +43,8 @@ Options:
   -dead_strip                     Dead-strip unreferenced code/data
   --gc-sections                   Discard unreachable ELF input sections
   --no-gc-sections                Keep all ELF input sections
+  -z execstack | -z noexecstack   Override ELF stack executability
+  -z lazy | -z now                Select lazy or eager ELF symbol binding
   -icf=safe | -icf=none | -icf=all
                                   Configure identical code folding (`all` currently errors)
   -fixup_chains | -no_fixup_chains
@@ -175,6 +177,33 @@ enum LinkInput {
     GroupEnd,
 }
 
+#[derive(Clone, Copy, Default)]
+struct ElfModeOptions {
+    eh_frame_hdr: bool,
+    gc_sections: bool,
+    policy: elf::ElfLinkPolicy,
+}
+
+fn apply_elf_z_policy(
+    keyword: &str,
+    policy: &mut elf::ElfLinkPolicy,
+) -> Result<(), args::ArgsError> {
+    match keyword {
+        "execstack" => policy.executable_stack = Some(true),
+        "noexecstack" => policy.executable_stack = Some(false),
+        "lazy" => policy.bind_now = false,
+        "now" => policy.bind_now = true,
+        _ => {
+            return Err(args::ArgsError::InvalidValue {
+                flag: "-z".to_string(),
+                value: keyword.to_string(),
+                expected: "`execstack`, `noexecstack`, `lazy`, or `now`".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Detect and run the ELF link path. Returns None when neither an explicit
 /// ELF emulation nor a direct or indirect ELF input selects it.
 fn elf_mode(args: &[String]) -> Option<ExitCode> {
@@ -187,8 +216,7 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
     let mut unsupported: Vec<String> = Vec::new();
     let mut argument_error: Option<args::ArgsError> = None;
     let mut dynamic_linker: Option<String> = None;
-    let mut eh_frame_hdr = false;
-    let mut gc_sections = false;
+    let mut options = ElfModeOptions::default();
     let mut as_needed = false;
     let mut elf_emulation = false;
     let mut entry = "_start".to_string();
@@ -225,10 +253,10 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
             }
             // `--eh-frame-hdr` requests the `.eh_frame_hdr` unwind index +
             // PT_GNU_EH_FRAME (GNU semantics: emitted only when asked).
-            "--eh-frame-hdr" => eh_frame_hdr = true,
-            "--no-eh-frame-hdr" => eh_frame_hdr = false,
-            "--gc-sections" => gc_sections = true,
-            "--no-gc-sections" => gc_sections = false,
+            "--eh-frame-hdr" => options.eh_frame_hdr = true,
+            "--no-eh-frame-hdr" => options.eh_frame_hdr = false,
+            "--gc-sections" => options.gc_sections = true,
+            "--no-gc-sections" => options.gc_sections = false,
             "--start-group" | "-(" => link_inputs.push(LinkInput::GroupStart),
             "--end-group" | "-)" => link_inputs.push(LinkInput::GroupEnd),
             // Flags we honor or safely ignore. -static and a target
@@ -236,15 +264,22 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
             "--as-needed" => as_needed = true,
             "--no-as-needed" => as_needed = false,
             "-melf_x86_64" => elf_emulation = true,
-            "-static" | "-Bstatic" | "-Bdynamic" | "-znow" => {}
+            "-static" | "-Bstatic" | "-Bdynamic" => {}
             "-m" => match it.next() {
                 Some(emulation) if emulation == "elf_x86_64" => elf_emulation = true,
                 Some(emulation) => unsupported.push(format!("-m {emulation}")),
                 None => unsupported.push("-m (missing emulation)".to_string()),
             },
-            "-z" => {
-                it.next();
-            }
+            "-z" => match it.next() {
+                Some(keyword) => {
+                    if let Err(error) = apply_elf_z_policy(keyword, &mut options.policy) {
+                        argument_error.get_or_insert(error);
+                    }
+                }
+                None => {
+                    argument_error.get_or_insert_with(|| args::ArgsError::MissingValue(a.clone()));
+                }
+            },
             // PIE and shared-object output are later rungs.
             "-pie" | "--pie" | "-shared" | "-Bshareable" => unsupported.push(a.to_string()),
             s if s.starts_with("-L") => lib_dirs.push(std::path::PathBuf::from(&s[2..])),
@@ -252,6 +287,11 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
                 name: s[2..].to_string(),
                 as_needed,
             }),
+            s if s.starts_with("-z") => {
+                if let Err(error) = apply_elf_z_policy(&s[2..], &mut options.policy) {
+                    argument_error.get_or_insert(error);
+                }
+            }
             s if s.starts_with('-') => unsupported.push(s.to_string()),
             _ => link_inputs.push(LinkInput::File {
                 path: std::path::PathBuf::from(a),
@@ -292,22 +332,14 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
             &lib_dirs,
             &entry,
             &interp,
-            eh_frame_hdr,
-            gc_sections,
+            options,
             read_bytes,
         ) {
             Ok(img) => img,
             Err(code) => return Some(code),
         }
     } else {
-        match link_static(
-            &link_inputs,
-            &lib_dirs,
-            &entry,
-            eh_frame_hdr,
-            gc_sections,
-            read_bytes,
-        ) {
+        match link_static(&link_inputs, &lib_dirs, &entry, options, read_bytes) {
             Ok(img) => img,
             Err(code) => return Some(code),
         }
@@ -603,8 +635,7 @@ fn link_static(
     link_inputs: &[LinkInput],
     lib_dirs: &[std::path::PathBuf],
     entry: &str,
-    eh_frame_hdr: bool,
-    gc_sections: bool,
+    options: ElfModeOptions,
     read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
 ) -> Result<Vec<u8>, ExitCode> {
     let mut inputs = Vec::new();
@@ -612,7 +643,14 @@ fn link_static(
     for input in link_inputs {
         push_static_input(input, lib_dirs, &read_bytes, &mut script_stack, &mut inputs)?;
     }
-    elf::link_static_with_gc(inputs, entry, eh_frame_hdr, gc_sections).map_err(|e| {
+    elf::link_static_with_gc_and_policy(
+        inputs,
+        entry,
+        options.eh_frame_hdr,
+        options.gc_sections,
+        options.policy,
+    )
+    .map_err(|e| {
         diag::error(&e.to_string());
         ExitCode::from(1)
     })
@@ -691,8 +729,7 @@ fn link_dynamic(
     lib_dirs: &[std::path::PathBuf],
     entry: &str,
     interp: &str,
-    eh_frame_hdr: bool,
-    gc_sections: bool,
+    options: ElfModeOptions,
     read_bytes: impl Fn(&std::path::Path) -> Result<Vec<u8>, ExitCode>,
 ) -> Result<Vec<u8>, ExitCode> {
     let mut inputs = Vec::new();
@@ -700,11 +737,18 @@ fn link_dynamic(
     for input in link_inputs {
         push_dynamic_input(input, lib_dirs, &read_bytes, &mut script_stack, &mut inputs)?;
     }
-    elf::link_dynamic_with_as_needed_and_gc(inputs, entry, interp, eh_frame_hdr, gc_sections)
-        .map_err(|e| {
-            diag::error(&e.to_string());
-            ExitCode::from(1)
-        })
+    elf::link_dynamic_with_as_needed_gc_and_policy(
+        inputs,
+        entry,
+        interp,
+        options.eh_frame_hdr,
+        options.gc_sections,
+        options.policy,
+    )
+    .map_err(|e| {
+        diag::error(&e.to_string());
+        ExitCode::from(1)
+    })
 }
 
 fn resolve_dynamic_lib(name: &str, lib_dirs: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {

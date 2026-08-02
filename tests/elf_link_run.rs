@@ -2273,6 +2273,32 @@ fn dynamic_executable_calls_shared_answer_through_plt() {
         String::from_utf8_lossy(&run.stderr)
     );
 
+    // Explicit eager binding must route through the same PLT correctly; this
+    // also proves that the optional DT_FLAGS entry does not disturb layout.
+    let out_now = dir.join("dyn_now");
+    let r = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-z", "now", "-o"])
+        .arg(&out_now)
+        .arg(&main_obj)
+        .arg(&so)
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "afs-ld dynamic now: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let run = Command::new(&out_now)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "eager dynamic exe exit code: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
     // Determinism: a fresh link is byte-identical.
     let out3 = dir.join("dyn_again");
     assert!(Command::new(env!("CARGO_BIN_EXE_afs-ld"))

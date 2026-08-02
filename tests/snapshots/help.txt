@@ -36,6 +36,8 @@ Options:
   -dead_strip                     Dead-strip unreferenced code/data
   --gc-sections                   Discard unreachable ELF input sections
   --no-gc-sections                Keep all ELF input sections
+  -z execstack | -z noexecstack   Override ELF stack executability
+  -z lazy | -z now                Select lazy or eager ELF symbol binding
   -icf=safe | -icf=none | -icf=all
                                   Configure identical code folding (`all` currently errors)
   -fixup_chains | -no_fixup_chains

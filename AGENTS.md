@@ -1,29 +1,35 @@
 # AFS-LD
 
-Local working guide for agents in `afs-ld`. Keep this file untracked.
-`CLAUDE.md` is the tracked, authoritative policy file; this document adds a
-reality-checked snapshot of the current implementation so we do not confuse the
-roadmap with shipped code.
+Tracked local working guide for agents in `afs-ld`. Read it together with
+`CLAUDE.md`: this file records the current implementation and repository
+workflow, while `CLAUDE.md` carries the longer-lived linker design discipline.
+Neither roadmap prose nor an old status paragraph overrides code and tests.
 
 ## Repository Context
 
-`afs-ld` is the standalone ARM64 Mach-O linker for the ARMFORTAS toolchain. It
-sits beside `afs-as` as a submodule in the `armfortas` workspace and is meant
-to replace Apple's `ld` for binaries produced by armfortas.
+`afs-ld` is the standalone final linker for the ARMFORTAS toolchain. It sits
+beside `afs-as` as a submodule in the `armfortas` workspace and ships two
+independent output paths:
+
+- ARM64 Mach-O executables and dylibs for Apple Silicon.
+- x86_64 ELF static and dynamically linked executables for Linux and FreeBSD.
 
 The project boundary is intentionally clean:
 
 - `afs-as` emits `MH_OBJECT`.
-- `afs-ld` reads `.o`, `.a`, `.dylib`, and `.tbd`.
-- armfortas should eventually hand final linking to `afs-ld` rather than to
-  the system linker.
+- The Mach-O path reads `.o`, `.a`, `.dylib`, and `.tbd` inputs.
+- The ELF path reads `ET_REL`, archives, linker scripts, and `ET_DYN`
+  dependencies.
+- armfortas invokes `afs-ld` through the CLI; the subprojects do not share Rust
+  format types.
 
-The project is Mach-O only, macOS only, arm64 only, stdlib only.
+The crate is Rust standard-library only. Mach-O is arm64-only; ELF is
+x86_64-only. COFF, PE, LTO, and bitcode are outside the current scope.
 
 ## Definition Of Done
 
-The real finish line is not "parses some objects" or "links hello world once."
-It is parity with Apple's `ld` for the binaries armfortas and fortsh need:
+The Mach-O finish line is parity with Apple's `ld` for the binaries armfortas
+and fortsh need:
 
 - arm64 Mach-O executables and dylibs
 - static archive linking
@@ -33,82 +39,73 @@ It is parity with Apple's `ld` for the binaries armfortas and fortsh need:
 - deterministic output
 - enough correctness to link fortsh without ARM-specific workarounds
 
+The shipped ELF boundary is narrower and explicit: non-PIE `ET_EXEC` output,
+both static and dynamically linked, with supported x86_64 relocations and GNU
+archive/search semantics. ELF PIE and shared-object output are not implemented.
+
 ## Current Reality
 
-This repo is ahead of Sprint 0 scaffolding, but it is not yet a full linker.
-The roadmap in `.docs/overview.md` and `.docs/sprints/` is broader than the
-code that exists today.
+This repository produces final binaries, but it is not a drop-in replacement
+for every Apple or GNU linker mode. The roadmap in `.docs/overview.md` and
+`.docs/sprints/` remains broader than the supported CLI and output matrix.
 
 What is implemented now:
 
-- hand-rolled CLI parsing for a small flag subset plus dump modes
-- Mach-O header/load-command/section/symbol/string-table reading
-- relocation parsing, fusion, validation, and round-trip support
-- archive parsing and lazy member fetch support
-- binary dylib parsing and export-trie walking
-- TAPI TBD v4 parsing, including the custom YAML subset parser
-- linker-side symbol interning, symbol table modeling, and resolution passes
-- subsections-via-symbols atomization
+- hand-rolled CLI parsing, response files, ordered input normalization, and dump
+  modes
+- Mach-O object/archive/dylib/TBD ingestion, symbol resolution, atomization,
+  layout, ARM64 relocation application, thunks, safe ICF, and dead stripping
+- Mach-O GOT/stub/TLV/unwind/dyld/symbol metadata synthesis, deterministic
+  `MH_EXECUTE` and `MH_DYLIB` writing, ad-hoc signing, link maps, and atomic
+  output publication
+- x86_64 ELF `ET_REL`, archive, linker-script, and `ET_DYN` ingestion
+- static and dynamically linked ELF `ET_EXEC` writing with ordered archive
+  scans, GOT/PLT, TLS, IFUNC/IPLT, init arrays, garbage collection, unwind
+  headers, and symbol versioning
+- structural, deterministic, differential, and runtime-oriented test suites for
+  both paths, with destination-specific execution when the host permits it
 - `--dump`, `--dump-archive`, `--dump-dylib`, and `--dump-tbd`
 
 What is not implemented yet:
 
-- real `Linker::run` output production
-- output layout and Mach-O writing
-- dyld metadata synthesis
-- code signing
-- dead-strip / ICF / thunks
-- real differential linking against Apple `ld`
-- driver integration with armfortas
-- the full `ld`-compatible CLI surface described in Sprint 19
+- the full Apple `ld` or GNU `ld` option surface
+- Mach-O relocatable and bundle output
+- ELF PIE, ELF shared-object output, and non-x86_64 ELF targets
+- modes that the CLI currently diagnoses as deferred or unsupported
 
 Important practical note:
 
-- `src/lib.rs` still returns `LinkError::NotYetImplemented` for real link runs.
-- `tests/common/harness.rs::link_both` still panics because full end-to-end
-  linker execution has not landed.
-- `README.md` still describes the crate as "Sprint 0 scaffolding only," which is
-  now too pessimistic for the read-side code but still accurate for the actual
-  link-producing path.
-
-As of 2026-04-15 in this checkout, `cargo test -p afs-ld` is green.
+- `Linker` in `src/lib.rs` owns the Mach-O final-link pipeline.
+- `src/main.rs` selects the ELF path before Mach-O argument parsing when an ELF
+  emulation or input identifies that target.
+- Unsupported output modes must fail before replacing an existing output.
 
 ## Strengths
 
-- The read-side core is already substantial and well-tested.
+- Both output paths are exercised beyond parser-only tests.
 - The project has strong bespoke discipline: no `clap`, `serde`, `object`,
   `goblin`, `byteorder`, or other format-parsing shortcuts.
 - Raw wire structures are modeled explicitly and usually paired with
   round-trip-oriented tests.
 - The type modeling is strong: opaque ids, interned strings, explicit symbol
   states, explicit atom ownership, explicit relocation referents.
-- Real-world fixtures are already in play: afs-as corpus objects,
-  `libarmfortas_rt.a`, `libSystem.tbd`, and small clang-built dylibs.
-- The codebase already separates concerns cleanly enough that writer/layout work
-  can land without tearing up the read-side foundation.
-- Dump modes make inspection easy and are useful while the full writer does not
-  exist yet.
+- Real-world fixtures include afs-as corpus objects, `libarmfortas_rt.a`,
+  `libSystem.tbd`, native archives/shared libraries, and compiler-produced
+  inputs.
+- Output publication is isolated behind atomic replacement helpers.
+- Dump modes remain useful for inspecting input and output structure.
 
 ## Weaknesses And Risk Areas
 
-- The actual link-producing pipeline does not exist yet, so the hardest parity
-  bugs are still ahead of us.
-- Some tracked docs are aspirational. `.docs/overview.md` is the intended end
-  state, not a guarantee that every listed module already exists.
-- `README.md` is stale in the opposite direction: it understates how much
-  read-side work has landed.
-- The current diagnostics surface is still minimal. `src/diag.rs` only prints
-  `afs-ld: error: ...`; the richer caret diagnostics are planned, not present.
-- The CLI surface is intentionally tiny right now. Any work that assumes
-  `ld`-compatibility must start by checking `src/args.rs`, not by trusting the
-  sprint plan.
-- Performance characteristics are mostly unknown because the writer, layout, and
-  full-link path are not in place yet.
-- The differential harness is only half-built: the diff engine exists, but the
-  "run both linkers" machinery is not wired.
-- Several future modules named in the roadmap do not exist yet:
-  `layout.rs`, `driver.rs`, `map.rs`, `gc.rs`, `icf.rs`, `synth/`,
-  `macho/writer.rs`, and the code-signing path are all still planned work.
+- Apple/GNU compatibility is intentionally incomplete; confirm each flag and
+  output kind in `src/args.rs`, `src/main.rs`, and the tests.
+- Some tracked `.docs` material describes intended end state rather than shipped
+  behavior.
+- Mach-O runtime and differential coverage depends on Apple Silicon hosts;
+  Linux-only runs cannot prove destination execution or Apple `ld` parity.
+- ELF has a deliberately different target/output matrix from Mach-O; do not
+  generalize one path's features to the other.
+- Large-link performance and native-linker parity remain continuing audit areas.
 
 ## Build And Test
 
@@ -125,18 +122,22 @@ Useful targeted commands:
 ```bash
 cargo test --lib -p afs-ld
 cargo test --test reader_corpus_round_trip -p afs-ld
-cargo test --test archive_runtime -p afs-ld
-cargo test --test dylib_integration -p afs-ld
-cargo test --test tbd_integration -p afs-ld
-cargo test --test resolve_integration -p afs-ld
-cargo test --test atom_integration -p afs-ld
+cargo test --test linker_run -p afs-ld
+cargo test --test linker_write_integration -p afs-ld
+cargo test --test parity_matrix -p afs-ld
+cargo test --test elf_link_run -p afs-ld
+cargo test --test elf_mode_selection -p afs-ld
+cargo test --test documentation_claims -p afs-ld
 cargo test -p afs-ld -- <substring>
 ```
 
 Environment assumptions:
 
-- macOS on Apple Silicon
-- Xcode command-line tools available through `xcrun`
+- Rust-only and host-independent tests run on any development host.
+- Mach-O differential/runtime tests need macOS on Apple Silicon and Xcode
+  command-line tools available through `xcrun`.
+- ELF execution/differential tests need a supported x86_64 Linux or FreeBSD host
+  and the native assembler/linker/runtime tools used by that test.
 - access to the parent workspace, especially `runtime/` and `.refs/`
 
 Integration tests already shell out to system tools in a few places. Do not
@@ -145,82 +146,51 @@ being tested.
 
 ## Project Structure
 
-Actual source tree today:
+Key source areas today:
 
 ```text
 afs-ld/
+├── AGENTS.md
 ├── CLAUDE.md
 ├── README.md
-├── .docs/
-│   ├── overview.md
-│   └── sprints/
 ├── src/
-│   ├── archive.rs
-│   ├── args.rs
-│   ├── atom.rs
-│   ├── diag.rs
-│   ├── dump.rs
-│   ├── input.rs
-│   ├── leb.rs
-│   ├── lib.rs
-│   ├── main.rs
-│   ├── resolve.rs
-│   ├── section.rs
-│   ├── string_table.rs
-│   ├── symbol.rs
-│   ├── macho/
-│   │   ├── constants.rs
-│   │   ├── dylib.rs
-│   │   ├── exports.rs
-│   │   ├── reader.rs
-│   │   ├── tbd.rs
-│   │   └── tbd_yaml.rs
-│   └── reloc/
-│       └── mod.rs
+│   ├── lib.rs / main.rs / args.rs       # Mach-O orchestration + CLI routing
+│   ├── input.rs / resolve.rs / atom.rs  # Mach-O ingestion and graph model
+│   ├── layout.rs / output.rs            # layout and atomic publication
+│   ├── macho/ / synth/ / reloc/         # Mach-O wire, metadata, relocation
+│   ├── elf.rs                           # x86_64 ELF reader/linker/writer
+│   └── icf.rs / loh.rs / link_map.rs / why_live.rs
 └── tests/
-    ├── common/harness.rs
-    ├── archive_runtime.rs
-    ├── atom_integration.rs
-    ├── diff_harness_*.rs
-    ├── dylib_integration.rs
-    ├── reader_*.rs
-    ├── resolve_integration.rs
-    ├── tbd_*.rs
-    └── reader_corpus_round_trip.rs
+    ├── linker_run.rs / linker_write_integration.rs / parity_*.rs
+    ├── elf_*.rs
+    ├── reader_*.rs / archive_runtime.rs / dylib_integration.rs
+    └── common/
 ```
 
-Planned future modules listed in the docs should be treated as design intent,
-not as present-tense implementation.
+Treat modules named only by roadmap prose as design intent until `rg --files`
+and tests confirm that they exist.
 
-## Implemented Pipeline Vs Planned Pipeline
+## Implemented Pipelines
 
-Implemented today:
+ARM64 Mach-O:
 
 ```text
-argv
-  -> args.rs
-  -> dump/read paths
-  -> archive/object/dylib/TBD ingestion
-  -> symbol/section/reloc decoding
-  -> resolve.rs
-  -> atom.rs
+argv -> args -> inputs -> resolve -> atomize -> dead-strip/ICF/thunks
+     -> layout -> apply ARM64 relocs -> synth metadata/unwind/linkedit
+     -> write Mach-O -> ad-hoc sign -> atomic publish
 ```
 
-Current real-link path:
+x86_64 ELF:
 
 ```text
-argv -> args.rs -> Linker::run -> NotYetImplemented
+argv -> ELF mode/input detection -> object/archive/script/shared ingestion
+     -> ordered resolution + optional GC -> static/dynamic layout and relocs
+     -> synth GOT/PLT/TLS/unwind/dynamic metadata -> write ET_EXEC
+     -> atomic publish
 ```
 
-Planned end-to-end pipeline from the roadmap:
-
-```text
-args -> inputs -> resolve -> atomize -> layout -> apply relocs
-     -> synth sections -> write -> sign
-```
-
-When you are planning work, always identify which of those stages is real in
-this checkout and which stage is still only described in docs.
+When planning work, identify the selected format path first. Shared concepts do
+not imply shared wire structures or identical supported flags.
 
 ## Development Guidance
 
@@ -278,7 +248,7 @@ what exists today, then decide whether the docs need to be refreshed.
 ### 7. Respect deterministic behavior
 
 - Avoid nondeterministic iteration when output order matters.
-- Avoid timestamps, random ids, or unstable hashing in any future write path.
+- Avoid timestamps, random ids, or unstable hashing in every output path.
 - When adding diagnostics, keep them stable and testable.
 
 ## Testing Practices
@@ -292,7 +262,7 @@ what exists today, then decide whether the docs need to be refreshed.
 - For reader invariants, `tests/reader_corpus_round_trip.rs` is a key guardrail.
 - For resolution and atomization, `tests/resolve_integration.rs` and
   `tests/atom_integration.rs` should move with the code.
-- If you add future write-side functionality, extend the differential harness
+- When extending output functionality, extend the differential harness
   rather than building a parallel ad hoc test path.
 
 Run focused tests first, then widen:
@@ -307,7 +277,8 @@ Run focused tests first, then widen:
 - `CLAUDE.md` is policy and development discipline.
 - `.docs/overview.md` is the intended architecture and scope.
 - `.docs/sprints/` is the staged roadmap.
-- `README.md` is user-facing and currently stale relative to the read-side code.
+- `README.md` is the user-facing summary of the currently shipped target and
+  output matrix.
 
 When a change materially shifts reality, update the tracked docs that are now
 misleading. This is especially important in this repo because the roadmap is

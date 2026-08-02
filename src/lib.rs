@@ -1,8 +1,9 @@
-//! afs-ld — standalone ARM64 Mach-O linker.
+//! afs-ld — standalone ARM64 Mach-O and x86_64 ELF linker.
 //!
-//! Sprint 0 scaffolding: public surface is declared but every link attempt
-//! returns `LinkError::NotYetImplemented`. Subsequent sprints fill in the
-//! reader, resolver, layout, reloc, synth, writer, and signing paths.
+//! [`Linker`] drives the complete Mach-O path from input ingestion through
+//! resolution, atomization, layout, relocation, metadata synthesis, writing,
+//! signing, and atomic publication. The independent [`elf`] module provides
+//! static and dynamically linked x86_64 ELF executable production.
 
 pub mod archive;
 pub mod args;
@@ -550,8 +551,9 @@ fn validate_common_sections(
     Ok(())
 }
 
-/// The linker itself. Sprint 0 only validates that inputs exist; later sprints
-/// grow this into the full pipeline described in `.docs/overview.md`.
+/// Orchestrates the ARM64 Mach-O final-link pipeline and publishes the completed
+/// image only after every resolution, layout, relocation, and writer stage
+/// succeeds.
 pub struct Linker;
 
 impl Linker {

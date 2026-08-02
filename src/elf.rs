@@ -1,12 +1,12 @@
-//! x86_64 ELF linking (x16 arc): ET_REL reader and a static ET_EXEC
-//! writer. Rung 1 scope: freestanding executables from relocatable
-//! objects — no libc, no dynamic section, no TLS. The reader/writer
-//! discipline mirrors the Mach-O side: hand-rolled wire structs,
-//! loud errors, byte-deterministic output.
+//! x86_64 ELF final linking: `ET_REL`, archive, linker-script, and `ET_DYN`
+//! readers plus writers for static and dynamically linked `ET_EXEC` images.
+//! The implemented path includes ordered archive selection, section garbage
+//! collection, GOT/PLT synthesis, TLS models and relaxation, IFUNC/IPLT,
+//! init/fini arrays, unwind headers, and symbol versioning. PIE and shared-object
+//! output remain unsupported and are rejected explicitly.
 //!
-//! Relocation set (measured against the armfortas corpus): R_X86_64_
-//! 64/32/32S/PC32/PLT32. PLT32 in a static link with the target
-//! defined resolves exactly like PC32 — there is no PLT.
+//! The reader/writer discipline mirrors the Mach-O side: hand-rolled wire
+//! structs, loud errors, and byte-deterministic output.
 
 use std::collections::{HashMap, HashSet};
 

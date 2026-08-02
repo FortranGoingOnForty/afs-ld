@@ -5,6 +5,7 @@ use crate::atom::{Atom, AtomFlags, AtomSection, AtomTable};
 use crate::layout::{output_section_key, LayoutInput, SectionKey};
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
 use crate::resolve::{AtomId, InputId, Symbol, SymbolId, SymbolTable};
+use crate::symbol::SymKind;
 
 #[derive(Debug, Clone, Default)]
 pub struct IcfPlan {
@@ -365,8 +366,10 @@ fn mark_address_taken(
     resolved_by_name: &HashMap<String, SymbolId>,
     reloc_cache: &HashMap<(InputId, u8), Vec<Reloc>>,
 ) {
+    let atom_index = IcfAtomIndex::new(atom_table);
+    let mut address_taken = HashSet::new();
     for input in layout_inputs {
-        for (section_idx_zero, _section) in input.object.sections.iter().enumerate() {
+        for (section_idx_zero, source_section) in input.object.sections.iter().enumerate() {
             let input_section = (section_idx_zero + 1) as u8;
             let Some(relocs) = reloc_cache.get(&(input.id, input_section)) else {
                 continue;
@@ -376,17 +379,25 @@ fn mark_address_taken(
                     continue;
                 }
                 for referent in std::iter::once(reloc.referent).chain(reloc.subtrahend) {
-                    for target_atom in
-                        target_atoms_for_reloc(input.object, referent, sym_table, resolved_by_name)
-                    {
-                        atom_table
-                            .get_mut(target_atom)
-                            .flags
-                            .set(AtomFlags::ADDRESS_TAKEN);
-                    }
+                    address_taken.extend(target_atoms_for_reloc(
+                        input.id,
+                        input.object,
+                        source_section,
+                        *reloc,
+                        referent,
+                        sym_table,
+                        resolved_by_name,
+                        &atom_index,
+                    ));
                 }
             }
         }
+    }
+    for target_atom in address_taken {
+        atom_table
+            .get_mut(target_atom)
+            .flags
+            .set(AtomFlags::ADDRESS_TAKEN);
     }
 }
 
@@ -515,17 +526,141 @@ fn symbol_name(sym_table: &SymbolTable, symbol_id: SymbolId) -> String {
         .to_string()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct IcfAtomRange {
+    atom: AtomId,
+    start: u32,
+    end: u32,
+}
+
+#[derive(Debug, Default)]
+struct IcfInputSectionAtoms {
+    ranges: Vec<IcfAtomRange>,
+    ordered_non_overlapping: bool,
+}
+
+#[derive(Debug, Default)]
+struct IcfAtomIndex {
+    sections: HashMap<(InputId, u8), IcfInputSectionAtoms>,
+}
+
+impl IcfAtomIndex {
+    fn new(atom_table: &AtomTable) -> Self {
+        let mut sections = HashMap::<(InputId, u8), IcfInputSectionAtoms>::new();
+        for (atom_id, atom) in atom_table.iter() {
+            sections
+                .entry((atom.origin, atom.input_section))
+                .or_default()
+                .ranges
+                .push(IcfAtomRange {
+                    atom: atom_id,
+                    start: atom.input_offset,
+                    end: atom.input_offset.saturating_add(atom.size),
+                });
+        }
+        for section in sections.values_mut() {
+            section.ranges.sort_by_key(|range| (range.start, range.end));
+            section.ordered_non_overlapping = section
+                .ranges
+                .windows(2)
+                .all(|pair| pair[0].end <= pair[1].start);
+        }
+        Self { sections }
+    }
+
+    fn target_or_all(&self, input: InputId, section: u8, offset: u32) -> Vec<AtomId> {
+        let Some(atoms) = self.sections.get(&(input, section)) else {
+            return Vec::new();
+        };
+        if !atoms.ordered_non_overlapping {
+            let mut candidates: Vec<AtomId> = atoms
+                .ranges
+                .iter()
+                .filter(|range| {
+                    (range.start <= offset && offset < range.end)
+                        || (range.start == offset && range.end == offset)
+                })
+                .map(|range| range.atom)
+                .collect();
+            if candidates.is_empty() {
+                candidates.extend(
+                    atoms
+                        .ranges
+                        .iter()
+                        .filter(|range| range.end == offset)
+                        .map(|range| range.atom),
+                );
+            }
+            return if candidates.is_empty() {
+                self.all(input, section)
+            } else {
+                candidates
+            };
+        }
+
+        let candidate = atoms.ranges.partition_point(|range| range.start <= offset);
+        if let Some(range) = candidate
+            .checked_sub(1)
+            .and_then(|index| atoms.ranges.get(index))
+        {
+            if (range.start <= offset && offset < range.end)
+                || (range.start == offset && range.end == offset)
+            {
+                return vec![range.atom];
+            }
+        }
+
+        let boundary = atoms.ranges.partition_point(|range| range.end < offset);
+        if let Some(range) = atoms
+            .ranges
+            .get(boundary)
+            .filter(|range| range.end == offset)
+        {
+            return vec![range.atom];
+        }
+        self.all(input, section)
+    }
+
+    fn all(&self, input: InputId, section: u8) -> Vec<AtomId> {
+        self.sections
+            .get(&(input, section))
+            .map(|atoms| atoms.ranges.iter().map(|range| range.atom).collect())
+            .unwrap_or_default()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn target_atoms_for_reloc(
+    input: InputId,
     object: &crate::input::ObjectFile,
+    source_section: &crate::section::InputSection,
+    reloc: Reloc,
     referent: Referent,
     sym_table: &SymbolTable,
     resolved_by_name: &HashMap<String, SymbolId>,
+    atom_index: &IcfAtomIndex,
 ) -> Vec<AtomId> {
     match referent {
         Referent::Symbol(sym_idx) => {
             let Some(input_sym) = object.symbols.get(sym_idx as usize) else {
                 return Vec::new();
             };
+            if input_sym.kind() == SymKind::Sect && !input_sym.is_ext() {
+                let Some(target_section) = object.section_for_symbol(input_sym) else {
+                    return Vec::new();
+                };
+                let Some(base_offset) = input_sym.value().checked_sub(target_section.addr) else {
+                    return atom_index.all(input, input_sym.sect_idx());
+                };
+                let target_offset = if reloc.kind == RelocKind::Subtractor {
+                    u32::try_from(base_offset).ok()
+                } else {
+                    relocation_target_offset(base_offset, source_section, reloc)
+                };
+                return target_offset
+                    .map(|offset| atom_index.target_or_all(input, input_sym.sect_idx(), offset))
+                    .unwrap_or_else(|| atom_index.all(input, input_sym.sect_idx()));
+            }
             let Some(name) = object.symbol_name(input_sym).ok() else {
                 return Vec::new();
             };
@@ -537,7 +672,45 @@ fn target_atoms_for_reloc(
                 _ => Vec::new(),
             }
         }
-        Referent::Section(_) => Vec::new(),
+        Referent::Section(section) => {
+            if reloc.kind == RelocKind::Subtractor {
+                return atom_index.all(input, section);
+            }
+            relocation_target_offset(0, source_section, reloc)
+                .map(|offset| atom_index.target_or_all(input, section, offset))
+                .unwrap_or_else(|| atom_index.all(input, section))
+        }
+    }
+}
+
+fn relocation_target_offset(
+    base_offset: u64,
+    source_section: &crate::section::InputSection,
+    reloc: Reloc,
+) -> Option<u32> {
+    let implicit_addend = match reloc.kind {
+        RelocKind::Unsigned | RelocKind::PointerToGot => {
+            read_icf_implicit_addend(source_section, reloc)?
+        }
+        _ => 0,
+    };
+    let offset = i128::from(base_offset)
+        .checked_add(i128::from(reloc.addend))?
+        .checked_add(i128::from(implicit_addend))?;
+    u32::try_from(offset).ok()
+}
+
+fn read_icf_implicit_addend(
+    source_section: &crate::section::InputSection,
+    reloc: Reloc,
+) -> Option<i64> {
+    let start = reloc.offset as usize;
+    let end = start.checked_add(reloc.length.byte_width())?;
+    let bytes = source_section.data.get(start..end)?;
+    match reloc.length {
+        RelocLength::Word => Some(i32::from_le_bytes(bytes.try_into().ok()?) as i64),
+        RelocLength::Quad => Some(i64::from_le_bytes(bytes.try_into().ok()?)),
+        RelocLength::Byte | RelocLength::Half => None,
     }
 }
 
@@ -550,8 +723,9 @@ mod tests {
     use crate::input::ObjectFile;
     use crate::layout::Layout;
     use crate::macho::constants::{
-        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, N_EXT, N_UNDF,
-        S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_ATTR_STRIP_STATIC_SYMS, S_REGULAR,
+        CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, MH_MAGIC_64, MH_OBJECT, N_EXT, N_SECT, N_UNDF,
+        S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_ATTR_STRIP_STATIC_SYMS,
+        S_CSTRING_LITERALS, S_REGULAR,
     };
     use crate::macho::reader::MachHeader64;
     use crate::reloc::{write_raw_relocs, write_relocs};
@@ -677,6 +851,95 @@ mod tests {
         }
     }
 
+    fn foldable_cstring_atom(input_offset: u32) -> Atom {
+        Atom {
+            id: AtomId(0),
+            origin: InputId(0),
+            input_section: 2,
+            section: AtomSection::CStringLiterals,
+            input_offset,
+            size: 4,
+            align_pow2: 0,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: b"dup\0".to_vec(),
+            flags: AtomFlags::default(),
+            parent_of: None,
+        }
+    }
+
+    fn local_literal_reference_object() -> ObjectFile {
+        let relocs = [
+            Reloc {
+                offset: 0,
+                kind: RelocKind::Unsigned,
+                length: RelocLength::Quad,
+                pcrel: false,
+                referent: Referent::Section(2),
+                addend: 0,
+                subtrahend: None,
+            },
+            Reloc {
+                offset: 8,
+                kind: RelocKind::Unsigned,
+                length: RelocLength::Quad,
+                pcrel: false,
+                referent: Referent::Section(2),
+                addend: 0,
+                subtrahend: None,
+            },
+        ];
+        let mut object = section_reloc_object("local-literal.o", 16, &relocs, 0);
+        object.sections[0].segname = "__DATA".into();
+        object.sections[0].sectname = "__const".into();
+        object.sections[0].kind = SectionKind::ConstData;
+        object.sections[0].flags = S_REGULAR;
+        object.sections[0].data[8..16].copy_from_slice(&4u64.to_le_bytes());
+        object.sections[1].segname = "__TEXT".into();
+        object.sections[1].sectname = "__cstring".into();
+        object.sections[1].kind = SectionKind::CStringLiterals;
+        object.sections[1].flags = S_CSTRING_LITERALS;
+        object.sections[1].data = b"dup\0dup\0".to_vec();
+        object
+    }
+
+    fn local_symbol_literal_reference_object() -> ObjectFile {
+        let relocs = [
+            Reloc {
+                offset: 0,
+                kind: RelocKind::Unsigned,
+                length: RelocLength::Quad,
+                pcrel: false,
+                referent: Referent::Symbol(0),
+                addend: 0,
+                subtrahend: None,
+            },
+            Reloc {
+                offset: 8,
+                kind: RelocKind::Unsigned,
+                length: RelocLength::Quad,
+                pcrel: false,
+                referent: Referent::Symbol(0),
+                addend: 0,
+                subtrahend: None,
+            },
+        ];
+        let raw_relocs = write_relocs(&relocs).unwrap();
+        let mut reloc_bytes = Vec::new();
+        write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+        let mut object = local_literal_reference_object();
+        object.sections[0].raw_relocs = reloc_bytes;
+        object.symbols = vec![InputSymbol::from_raw(RawNlist {
+            strx: 1,
+            n_type: N_SECT,
+            n_sect: 2,
+            n_desc: 0,
+            n_value: object.sections[1].addr,
+        })];
+        object.strings = StringTable::from_bytes(b"\0Lliteral\0".to_vec());
+        object
+    }
+
     fn defined_symbol(
         symbols: &mut SymbolTable,
         name: &str,
@@ -797,6 +1060,52 @@ mod tests {
         assert!(plan.redirects().is_empty());
         assert!(plan.kept_atoms().contains(&minuend));
         assert!(plan.kept_atoms().contains(&subtrahend));
+    }
+
+    #[test]
+    fn safe_icf_keeps_section_relative_literal_pointer_targets_distinct() {
+        let object = local_literal_reference_object();
+        let inputs = [LayoutInput {
+            id: InputId(0),
+            object: &object,
+            load_order: 0,
+            archive_member_offset: None,
+        }];
+        let mut atoms = AtomTable::new();
+        let first = atoms.push(foldable_cstring_atom(0));
+        let second = atoms.push(foldable_cstring_atom(4));
+        let mut symbols = SymbolTable::new();
+
+        let plan = fold_safe(&inputs, &mut atoms, &mut symbols, None).unwrap();
+
+        assert!(atoms.get(first).flags.has(AtomFlags::ADDRESS_TAKEN));
+        assert!(atoms.get(second).flags.has(AtomFlags::ADDRESS_TAKEN));
+        assert!(plan.redirects().is_empty());
+        assert!(plan.kept_atoms().contains(&first));
+        assert!(plan.kept_atoms().contains(&second));
+    }
+
+    #[test]
+    fn safe_icf_keeps_local_symbol_literal_pointer_targets_distinct() {
+        let object = local_symbol_literal_reference_object();
+        let inputs = [LayoutInput {
+            id: InputId(0),
+            object: &object,
+            load_order: 0,
+            archive_member_offset: None,
+        }];
+        let mut atoms = AtomTable::new();
+        let first = atoms.push(foldable_cstring_atom(0));
+        let second = atoms.push(foldable_cstring_atom(4));
+        let mut symbols = SymbolTable::new();
+
+        let plan = fold_safe(&inputs, &mut atoms, &mut symbols, None).unwrap();
+
+        assert!(atoms.get(first).flags.has(AtomFlags::ADDRESS_TAKEN));
+        assert!(atoms.get(second).flags.has(AtomFlags::ADDRESS_TAKEN));
+        assert!(plan.redirects().is_empty());
+        assert!(plan.kept_atoms().contains(&first));
+        assert!(plan.kept_atoms().contains(&second));
     }
 
     #[test]

@@ -34,7 +34,7 @@ use afs_ld::macho::constants::{
     REBASE_OPCODE_MASK, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
     REBASE_TYPE_POINTER, SECTION_TYPE_MASK, SG_READ_ONLY, S_ATTR_DEBUG, S_ATTR_LIVE_SUPPORT,
     S_ATTR_NO_TOC, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_ATTR_STRIP_STATIC_SYMS,
-    S_COALESCED, S_REGULAR, S_ZEROFILL,
+    S_COALESCED, S_CSTRING_LITERALS, S_REGULAR, S_ZEROFILL,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::Exports;
@@ -889,6 +889,123 @@ fn synthetic_icf_section_reference_object(symbol: &str, data_value: u64) -> Vec<
         symbol.write(&mut bytes);
     }
     bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_icf_local_literal_pointer_object() -> Vec<u8> {
+    let mut pointers = 0u64.to_le_bytes().to_vec();
+    pointers.extend_from_slice(&4u64.to_le_bytes());
+    let cstrings = b"dup\0dup\0";
+    let relocs = [
+        Reloc {
+            offset: 0,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Section(2),
+            addend: 0,
+            subtrahend: None,
+        },
+        Reloc {
+            offset: 8,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Section(2),
+            addend: 0,
+            subtrahend: None,
+        },
+    ];
+    let raw_relocs = write_relocs(&relocs).unwrap();
+    let mut reloc_bytes = Vec::new();
+    write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+
+    let strings = b"\0_pointers\0";
+    let symbols = [RawNlist {
+        strx: 1,
+        n_type: N_SECT | N_EXT,
+        n_sect: 1,
+        n_desc: 0,
+        n_value: 0,
+    }];
+    let mut segment = Segment64 {
+        segname: [0; 16],
+        vmaddr: 0,
+        vmsize: (pointers.len() + cstrings.len()) as u64,
+        fileoff: 0,
+        filesize: (pointers.len() + cstrings.len()) as u64,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections: vec![
+            Section64Header {
+                sectname: name16("__const"),
+                segname: name16("__DATA"),
+                addr: 0,
+                size: pointers.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: raw_relocs.len() as u32,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+            Section64Header {
+                sectname: name16("__cstring"),
+                segname: name16("__TEXT"),
+                addr: pointers.len() as u64,
+                size: cstrings.len() as u64,
+                offset: 0,
+                align: 0,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_CSTRING_LITERALS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+        ],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    segment.sections[1].offset = data_offset + pointers.len() as u32;
+    segment.sections[0].reloff = data_offset + pointers.len() as u32 + cstrings.len() as u32;
+    let symoff = segment.sections[0].reloff + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&pointers);
+    bytes.extend_from_slice(cstrings);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(strings);
     bytes
 }
 
@@ -11844,6 +11961,52 @@ fn linker_run_dead_strip_omits_private_symbols_from_removed_atoms() {
 
     let _ = fs::remove_file(object);
     let _ = fs::remove_file(output);
+}
+
+#[test]
+fn linker_run_icf_safe_preserves_section_relative_literal_pointers() {
+    let object = scratch("AFSLD-067-local-literal-pointers.o");
+    let baseline_output = scratch("AFSLD-067-local-literal-pointers-baseline.dylib");
+    let icf_output = scratch("AFSLD-067-local-literal-pointers-icf.dylib");
+    fs::write(&object, synthetic_icf_local_literal_pointer_object()).unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(baseline_output.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(icf_output.clone()),
+        kind: OutputKind::Dylib,
+        icf_mode: IcfMode::Safe,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let assert_valid_literal_pointers = |path: &PathBuf| {
+        let bytes = fs::read(path).unwrap();
+        let (cstring_addr, cstrings) = output_section(&bytes, "__TEXT", "__cstring")
+            .expect("literal pointer fixture must retain __TEXT,__cstring");
+        let (_, pointers) = output_section(&bytes, "__DATA_CONST", "__const")
+            .expect("literal pointer fixture must retain __DATA_CONST,__const");
+        assert_eq!(cstrings, b"dup\0dup\0");
+        assert_eq!(pointers.len(), 16);
+        let first = u64::from_le_bytes(pointers[..8].try_into().unwrap());
+        let second = u64::from_le_bytes(pointers[8..16].try_into().unwrap());
+        assert_eq!(first, cstring_addr);
+        assert_eq!(second, cstring_addr + 4);
+        assert!(first < cstring_addr + cstrings.len() as u64);
+        assert!(second < cstring_addr + cstrings.len() as u64);
+    };
+    assert_valid_literal_pointers(&baseline_output);
+    assert_valid_literal_pointers(&icf_output);
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(baseline_output);
+    let _ = fs::remove_file(icf_output);
 }
 
 #[test]

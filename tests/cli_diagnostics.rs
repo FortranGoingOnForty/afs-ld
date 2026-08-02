@@ -10,14 +10,14 @@ use std::process::Command;
 
 use afs_ld::macho::constants::{
     ARM64_RELOC_ADDEND, CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_ID_DYLIB, LC_LOAD_DYLIB,
-    LC_LOAD_WEAK_DYLIB, LC_MAIN, LC_UUID, MH_BUNDLE, MH_DYLIB, MH_DYLINKER, MH_EXECUTE,
-    MH_MAGIC_64, MH_OBJECT, N_ABS, N_EXT, N_NO_DEAD_STRIP, N_PEXT, N_SECT, N_UNDF,
-    SECTION_TYPE_MASK, S_REGULAR, S_ZEROFILL,
+    LC_LOAD_WEAK_DYLIB, LC_MAIN, LC_UUID, MH_BUNDLE, MH_DYLDLINK, MH_DYLIB, MH_DYLINKER,
+    MH_EXECUTE, MH_MAGIC_64, MH_OBJECT, MH_TWOLEVEL, N_ABS, N_EXT, N_NO_DEAD_STRIP, N_PEXT, N_SECT,
+    N_UNDF, SECTION_TYPE_MASK, S_REGULAR, S_ZEROFILL,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::reader::{
-    parse_commands, parse_header, write_header, DylibCmd, LoadCommand, MachHeader64,
-    Section64Header, Segment64, SymtabCmd,
+    parse_commands, parse_header, write_commands, write_header, DylibCmd, DysymtabCmd, LoadCommand,
+    MachHeader64, Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
 };
 use afs_ld::reloc::{write_raw_relocs, RawRelocation};
 use afs_ld::string_table::StringTable;
@@ -101,6 +101,63 @@ fn link_with_small_file_limit(args: &[&OsStr]) -> std::process::Output {
 
 fn synthetic_undefined_object(name: &str) -> Vec<u8> {
     synthetic_symbol_object(&[(name, N_UNDF | N_EXT, 0)])
+}
+
+fn synthetic_legacy_dylib(name: &str, install_name: &str) -> Vec<u8> {
+    let mut strings = vec![0];
+    let strx = strings.len() as u32;
+    strings.extend_from_slice(name.as_bytes());
+    strings.push(0);
+    let identity = LoadCommand::Dylib(DylibCmd {
+        cmd: LC_ID_DYLIB,
+        name: install_name.into(),
+        timestamp: 2,
+        current_version: 1 << 16,
+        compatibility_version: 1 << 16,
+    });
+    let sizeofcmds = identity.cmdsize() + SymtabCmd::WIRE_SIZE + DysymtabCmd::WIRE_SIZE;
+    let symoff = HEADER_SIZE as u32 + sizeofcmds;
+    let stroff = symoff + NLIST_SIZE as u32;
+    let commands = vec![
+        identity,
+        LoadCommand::Symtab(SymtabCmd {
+            symoff,
+            nsyms: 1,
+            stroff,
+            strsize: strings.len() as u32,
+        }),
+        LoadCommand::Dysymtab(DysymtabCmd {
+            iextdefsym: 0,
+            nextdefsym: 1,
+            iundefsym: 1,
+            ..DysymtabCmd::default()
+        }),
+    ];
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_DYLIB,
+            ncmds: commands.len() as u32,
+            sizeofcmds,
+            flags: MH_DYLDLINK | MH_TWOLEVEL,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    write_commands(&commands, &mut bytes);
+    RawNlist {
+        strx,
+        n_type: N_SECT | N_EXT,
+        n_sect: 1,
+        n_desc: 0,
+        n_value: 0x1000,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&strings);
+    bytes
 }
 
 fn synthetic_symbol_object(symbols: &[(&str, u8, u64)]) -> Vec<u8> {
@@ -1846,6 +1903,51 @@ fn double_quoted_utf8_tbd_symbol_resolves_deterministically() {
 
     let _ = fs::remove_file(object);
     let _ = fs::remove_file(tbd);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn legacy_dysymtab_dylib_symbol_resolves_deterministically() {
+    let object = scratch("legacy-dysymtab-symbol.o");
+    let dylib = scratch("legacy-dysymtab-symbol.dylib");
+    let output = scratch("legacy-dysymtab-consumer.dylib");
+    let symbol = "_legacy_export";
+    let install_name = "/usr/lib/liblegacy-dysymtab.dylib";
+    fs::write(&object, synthetic_undefined_object(symbol)).unwrap();
+    fs::write(&dylib, synthetic_legacy_dylib(symbol, install_name)).unwrap();
+
+    let mut images = Vec::new();
+    for jobs in [1, 4] {
+        let _ = fs::remove_file(&output);
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&object)
+            .arg(&dylib)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        assert!(
+            result.status.success(),
+            "legacy LC_DYSYMTAB export failed with -j{jobs}:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let image = fs::read(&output).unwrap();
+        let header = parse_header(&image).unwrap();
+        let commands = parse_commands(&header, &image).unwrap();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            LoadCommand::Dylib(dylib)
+                if dylib.cmd == LC_LOAD_DYLIB && dylib.name == install_name
+        )));
+        images.push(image);
+    }
+    assert_eq!(images[0], images[1], "-j1 and -j4 outputs differ");
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(dylib);
     let _ = fs::remove_file(output);
 }
 

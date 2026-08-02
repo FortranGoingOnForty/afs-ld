@@ -3563,6 +3563,273 @@ fn dynamic_executable_resolves_local_ifunc_without_imports() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `-Bstatic` and `-Bdynamic` are ordered search-mode switches: each `-l`
+/// request must retain the mode in force at that position.  Give both
+/// libraries an archive and a shared-object implementation with different
+/// answers so the runtime result proves which files were selected; DT_NEEDED
+/// additionally proves that only the request after `-Bdynamic` stayed shared.
+#[test]
+fn dynamic_library_search_mode_is_snapshotted_per_l_request() {
+    let Some(gas) = gas() else {
+        harness_skip!("no GNU assembler on this host");
+        return;
+    };
+    let Some(ld) = system_ld() else {
+        harness_skip!("no system ld to build the reference shared objects");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        harness_skip!("no standard dynamic loader on this host");
+        return;
+    };
+    let ar = ["/usr/bin/ar", "/usr/local/bin/ar"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|path| path.exists());
+    let Some(ar) = ar else {
+        harness_skip!("no ar on this host");
+        return;
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "afs_ld_elf_library_search_mode_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    for (library, symbol, static_answer, shared_answer) in [
+        ("first", "first_answer", 17, 3),
+        ("second", "second_answer", 23, 5),
+    ] {
+        let static_obj = dir.join(format!("{library}_static.o"));
+        assemble(
+            &gas,
+            &format!(
+                ".text\n.globl {symbol}\n.type {symbol},@function\n{symbol}:\n    movl ${static_answer}, %eax\n    ret\n"
+            ),
+            &dir.join(format!("{library}_static.s")),
+            &static_obj,
+        );
+        let archive = dir.join(format!("lib{library}.a"));
+        let archive_result = Command::new(&ar)
+            .arg("rcs")
+            .arg(&archive)
+            .arg(&static_obj)
+            .output()
+            .unwrap();
+        assert!(
+            archive_result.status.success(),
+            "ar {archive:?}: {}",
+            String::from_utf8_lossy(&archive_result.stderr)
+        );
+
+        let shared_obj = dir.join(format!("{library}_shared.o"));
+        assemble(
+            &gas,
+            &format!(
+                ".text\n.globl {symbol}\n.type {symbol},@function\n{symbol}:\n    movl ${shared_answer}, %eax\n    ret\n"
+            ),
+            &dir.join(format!("{library}_shared.s")),
+            &shared_obj,
+        );
+        let soname = format!("lib{library}.so.1");
+        let shared = dir.join(&soname);
+        let shared_result = Command::new(&ld)
+            .args(["-shared", "-soname", &soname, "-o"])
+            .arg(&shared)
+            .arg(&shared_obj)
+            .output()
+            .unwrap();
+        assert!(
+            shared_result.status.success(),
+            "ld -shared {shared:?}: {}",
+            String::from_utf8_lossy(&shared_result.stderr)
+        );
+        std::fs::copy(&shared, dir.join(format!("lib{library}.so"))).unwrap();
+    }
+
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n.globl _start\n_start:\n    call first_answer\n    movl %eax, %ebx\n    call second_answer\n    addl %ebx, %eax\n    movl %eax, %edi\n    movl ${exit_nr}, %eax\n    syscall\n"
+        ),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+
+    let link = |output: &std::path::Path, static_switch: &str, dynamic_switch: &str| {
+        Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .args(["--dynamic-linker", interp, "-o"])
+            .arg(output)
+            .arg(&main_obj)
+            .arg("-L")
+            .arg(&dir)
+            .arg(static_switch)
+            .args(["-l", "first"])
+            .arg(dynamic_switch)
+            .arg("-lsecond")
+            .output()
+            .unwrap()
+    };
+
+    let output = dir.join("mixed");
+    let result = link(&output, "-Bstatic", "-Bdynamic");
+    assert!(
+        result.status.success(),
+        "afs-ld mixed library search modes: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let image = std::fs::read(&output).unwrap();
+    assert_eq!(needed_libraries(&image), ["libsecond.so.1"]);
+    let run = Command::new(&output)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(22),
+        "17 from libfirst.a plus 5 from libsecond.so: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let reference_output = dir.join("mixed-system-ld");
+    let reference = Command::new(&ld)
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&reference_output)
+        .arg(&main_obj)
+        .arg("-L")
+        .arg(&dir)
+        .arg("-Bstatic")
+        .args(["-l", "first"])
+        .arg("-Bdynamic")
+        .arg("-lsecond")
+        .output()
+        .unwrap();
+    assert!(
+        reference.status.success(),
+        "system ld mixed library search modes: {}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    assert_eq!(
+        needed_libraries(&std::fs::read(&reference_output).unwrap()),
+        ["libsecond.so.1"]
+    );
+    assert_eq!(
+        Command::new(&reference_output)
+            .env("LD_LIBRARY_PATH", &dir)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(22)
+    );
+
+    let alias_output = dir.join("mixed-aliases");
+    let result = link(&alias_output, "-dn", "-dy");
+    assert!(
+        result.status.success(),
+        "GNU-compatible search-mode aliases: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(image, std::fs::read(&alias_output).unwrap());
+
+    let script = dir.join("first-script.ld");
+    std::fs::write(&script, "INPUT ( -lfirst )\n").unwrap();
+    let script_output = dir.join("mixed-script");
+    let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&script_output)
+        .arg(&main_obj)
+        .arg("-L")
+        .arg(&dir)
+        .arg("-Bstatic")
+        .arg(&script)
+        .arg("-Bdynamic")
+        .arg("-lsecond")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "search mode inherited by linker-script -l requests: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(image, std::fs::read(&script_output).unwrap());
+
+    std::fs::copy(dir.join("libfirst.so"), dir.join("libshared_only.so")).unwrap();
+    let rejected_output = dir.join("shared-only");
+    std::fs::write(&rejected_output, b"existing-output").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&rejected_output)
+        .arg(&main_obj)
+        .arg("-L")
+        .arg(&dir)
+        .arg("-Bstatic")
+        .arg("-lshared_only")
+        .arg("-Bdynamic")
+        .arg("-lsecond")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("unable to find library -lshared_only"),
+        "unexpected static-only search diagnostic: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(std::fs::read(&rejected_output).unwrap(), b"existing-output");
+
+    let early = dir.join("early");
+    let late = dir.join("late");
+    std::fs::create_dir_all(&early).unwrap();
+    std::fs::create_dir_all(&late).unwrap();
+    std::fs::copy(dir.join("libfirst.a"), early.join("libfirst.a")).unwrap();
+    for file in [
+        "libfirst.so",
+        "libfirst.so.1",
+        "libsecond.so",
+        "libsecond.so.1",
+    ] {
+        std::fs::copy(dir.join(file), late.join(file)).unwrap();
+    }
+    let ordered_output = dir.join("directory-order");
+    let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&ordered_output)
+        .arg(&main_obj)
+        .arg("-L")
+        .arg(&early)
+        .arg("-L")
+        .arg(&late)
+        .args(["-lfirst", "-lsecond"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "directory-first library search: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let ordered_image = std::fs::read(&ordered_output).unwrap();
+    assert_eq!(needed_libraries(&ordered_image), ["libsecond.so.1"]);
+    let run = Command::new(&ordered_output)
+        .env("LD_LIBRARY_PATH", &late)
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(22));
+
+    let output_again = dir.join("mixed-again");
+    let result = link(&output_again, "-Bstatic", "-Bdynamic");
+    assert!(
+        result.status.success(),
+        "second mixed-mode link: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(image, std::fs::read(&output_again).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Dynamic mode consumes the glibc-style inputs the driver emits:
 /// `--gc-sections`, linker-script-expanded `.so` groups, positional
 /// archive members, `-l` archive fallback, and linker-defined

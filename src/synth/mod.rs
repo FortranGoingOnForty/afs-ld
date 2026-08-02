@@ -1266,6 +1266,7 @@ mod tests {
                 exports: Exports::empty(),
             },
             ordinal: 1,
+            load_kind: crate::macho::dylib::DylibLoadKind::Normal,
         }
     }
 

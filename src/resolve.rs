@@ -23,7 +23,7 @@ use std::thread;
 use crate::archive::{Archive, ArchiveError, ArchiveMetadata, MemberLoadError};
 use crate::input::ObjectFile;
 use crate::macho::constants::MAX_LIBRARY_ORDINAL;
-use crate::macho::dylib::DylibFile;
+use crate::macho::dylib::{DylibFile, DylibLoadKind};
 use crate::macho::reader::ReadError;
 
 // ---------------------------------------------------------------------------
@@ -194,6 +194,9 @@ pub struct DylibInput {
     /// bind opcodes. Matches the output's `LC_LOAD_DYLIB` ordering, so several
     /// parsed TBD documents from one umbrella input may legitimately share it.
     pub ordinal: u16,
+    /// How the output loads this dependency. Weak loads make every import from
+    /// the dependency weak, independently of provider or consumer symbol bits.
+    pub load_kind: DylibLoadKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,6 +249,7 @@ pub struct DylibLoadMeta {
     pub current_version: u32,
     pub compatibility_version: u32,
     pub ordinal: u16,
+    pub load_kind: DylibLoadKind,
 }
 
 #[derive(Debug, Default)]
@@ -373,18 +377,17 @@ impl Inputs {
     /// Register a `.dylib`. TBD-backed dylibs go through
     /// [`Inputs::add_dylib_from_tbd`].
     pub fn add_dylib(&mut self, path: PathBuf, bytes: Vec<u8>) -> Result<DylibId, InputAddError> {
+        self.add_dylib_with_kind(path, bytes, DylibLoadKind::Normal)
+    }
+
+    pub fn add_dylib_with_kind(
+        &mut self,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        load_kind: DylibLoadKind,
+    ) -> Result<DylibId, InputAddError> {
         let file = DylibFile::parse(&path, &bytes)?;
-        let ordinal = self.next_dylib_ordinal()?;
-        let id = DylibId(self.dylibs.len() as u32);
-        self.dylibs.push(DylibInput {
-            path,
-            load_install_name: file.install_name.clone(),
-            load_current_version: file.current_version,
-            load_compatibility_version: file.compatibility_version,
-            file,
-            ordinal,
-        });
-        Ok(id)
+        self.add_dylib_from_file_with_kind(path, file, load_kind)
     }
 
     /// Register a TBD-backed dylib. The caller materializes the `DylibFile`
@@ -395,12 +398,22 @@ impl Inputs {
         path: PathBuf,
         file: DylibFile,
     ) -> Result<DylibId, InputAddError> {
+        self.add_dylib_from_file_with_kind(path, file, DylibLoadKind::Normal)
+    }
+
+    pub fn add_dylib_from_file_with_kind(
+        &mut self,
+        path: PathBuf,
+        file: DylibFile,
+        load_kind: DylibLoadKind,
+    ) -> Result<DylibId, InputAddError> {
         let ordinal = self.next_dylib_ordinal()?;
         let load = DylibLoadMeta {
             install_name: file.install_name.clone(),
             current_version: file.current_version,
             compatibility_version: file.compatibility_version,
             ordinal,
+            load_kind,
         };
         self.add_dylib_from_file_with_meta(path, file, load)
     }
@@ -422,6 +435,7 @@ impl Inputs {
             load_compatibility_version: load.compatibility_version,
             file,
             ordinal: load.ordinal,
+            load_kind: load.load_kind,
         });
         Ok(id)
     }
@@ -1365,7 +1379,7 @@ pub fn seed_dylib(
             name,
             dylib: dylib_id,
             ordinal: di.ordinal,
-            weak_import: entry.weak_def(),
+            weak_import: entry.weak_def() || di.load_kind == DylibLoadKind::Weak,
         };
         match table.insert(sym) {
             Ok(outcome) => report.record_outcome(outcome),
@@ -2558,11 +2572,42 @@ mod tests {
                     current_version: 0,
                     compatibility_version: 0,
                     ordinal: MAX_LIBRARY_ORDINAL + 1,
+                    load_kind: DylibLoadKind::Normal,
                 },
             )
             .unwrap_err();
         assert!(matches!(error, InputAddError::TooManyDylibDependencies));
         assert_eq!(inputs.dylibs.len(), accepted);
+    }
+
+    #[test]
+    fn weak_loaded_dylib_seeds_every_export_as_a_weak_import() {
+        for (load_kind, expected_weak_import) in
+            [(DylibLoadKind::Weak, true), (DylibLoadKind::Normal, false)]
+        {
+            let mut inputs = Inputs::new();
+            let dylib = inputs
+                .add_dylib_from_file_with_kind(
+                    PathBuf::from("Demo.tbd"),
+                    dylib_exporting("_optional"),
+                    load_kind,
+                )
+                .unwrap();
+            let mut table = SymbolTable::new();
+            let mut report = SeedReport::default();
+
+            seed_dylib(&inputs, dylib, &mut table, &mut report).unwrap();
+
+            let symbol = table.lookup_str("_optional").unwrap();
+            assert!(matches!(
+                table.get(symbol),
+                Symbol::DylibImport {
+                    ordinal: 1,
+                    weak_import,
+                    ..
+                } if *weak_import == expected_weak_import
+            ));
+        }
     }
 
     fn resolve_first_archive_value(first: u64, second: u64) -> u64 {
@@ -2675,6 +2720,7 @@ mod tests {
                         current_version: 0,
                         compatibility_version: 0,
                         ordinal: 1,
+                        load_kind: DylibLoadKind::Normal,
                     },
                 )
                 .unwrap();

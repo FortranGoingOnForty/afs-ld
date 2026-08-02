@@ -4899,6 +4899,106 @@ exports:
 }
 
 #[test]
+fn linker_run_weak_framework_marks_all_imports_weak() {
+    let syslibroot = scratch("weak-framework-import-root");
+    let framework_dir = syslibroot.join("System/Library/Frameworks/Demo.framework");
+    let tbd = framework_dir.join("Demo.tbd");
+    let object = scratch("weak-framework-import.o");
+    let weak_output = scratch("weak-framework-import-weak.out");
+    let strong_output = scratch("weak-framework-import-strong.out");
+    let install_name = "@rpath/Demo.framework/Demo";
+    let symbol = "_optional_from_weak_framework";
+
+    fs::create_dir_all(&framework_dir).unwrap();
+    fs::write(
+        &tbd,
+        format!(
+            r#"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '{install_name}'
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ {symbol} ]
+...
+"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &object,
+        synthetic_got_reference_object("_main", symbol, false),
+    )
+    .unwrap();
+
+    let mut weak_outputs = Vec::new();
+    let mut strong_outputs = Vec::new();
+    for jobs in [1, 4] {
+        for (weak, output, captures) in [
+            (true, &weak_output, &mut weak_outputs),
+            (false, &strong_output, &mut strong_outputs),
+        ] {
+            Linker::run(&LinkOptions {
+                inputs: vec![object.clone()],
+                frameworks: vec![FrameworkSpec {
+                    name: "Demo".into(),
+                    weak,
+                }],
+                syslibroot: Some(syslibroot.clone()),
+                output: Some(output.clone()),
+                kind: OutputKind::Executable,
+                jobs: Some(jobs),
+                ..LinkOptions::default()
+            })
+            .unwrap();
+            captures.push(fs::read(output).unwrap());
+        }
+    }
+
+    assert_eq!(
+        weak_outputs[0], weak_outputs[1],
+        "weak-framework -j1/-j4 output differs"
+    );
+    assert_eq!(
+        strong_outputs[0], strong_outputs[1],
+        "normal-framework -j1/-j4 output differs"
+    );
+    for (bytes, weak, expected_cmd) in [
+        (
+            &weak_outputs[0],
+            true,
+            afs_ld::macho::constants::LC_LOAD_WEAK_DYLIB,
+        ),
+        (
+            &strong_outputs[0],
+            false,
+            afs_ld::macho::constants::LC_LOAD_DYLIB,
+        ),
+    ] {
+        let header = parse_header(bytes).unwrap();
+        let commands = parse_commands(&header, bytes).unwrap();
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                LoadCommand::Dylib(dylib)
+                    if dylib.cmd == expected_cmd && dylib.name == install_name
+            )
+        }));
+        assert_got_import(bytes, symbol, 1, weak);
+        assert_eq!(
+            header.flags & MH_BINDS_TO_WEAK != 0,
+            weak,
+            "image weak-bind flag must follow the framework load kind"
+        );
+    }
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(weak_output);
+    let _ = fs::remove_file(strong_output);
+    let _ = fs::remove_dir_all(syslibroot);
+}
+
+#[test]
 fn linker_run_preserves_assembler_resolved_deltas_between_subsections() {
     let object = scratch("aligned-subsections.o");
     let output = scratch("aligned-subsections.dylib");

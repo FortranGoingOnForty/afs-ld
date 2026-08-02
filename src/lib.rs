@@ -52,8 +52,8 @@ use reloc::arm64::RelocError;
 use resolve::{
     classify_unresolved, find_archive_by_path, force_load_archive, format_duplicate_diagnostic,
     format_undefined_diagnostic, format_undefined_warning_diagnostic, resolve_inputs_in_order,
-    DrainReport, DylibId, DylibLoadMeta, InputAddError, InputId, Inputs, OrderedInput,
-    OrderedInputEntry, Symbol, SymbolTable, UndefinedTreatment,
+    DrainReport, DylibLoadMeta, InputAddError, InputId, Inputs, OrderedInput, OrderedInputEntry,
+    Symbol, SymbolTable, UndefinedTreatment,
 };
 use symbol::SymKind;
 
@@ -623,8 +623,6 @@ impl Linker {
 
         let (resolved_inputs, mut first_input_error) =
             resolve_input_specs(opts, input_specs, force_load_positions);
-        let mut dylib_load_kinds: std::collections::HashMap<DylibId, DylibLoadKind> =
-            std::collections::HashMap::new();
         let mut loaded_inputs = vec![false; resolved_inputs.len()];
 
         let mut inputs = Inputs::new();
@@ -654,7 +652,11 @@ impl Linker {
                 }
                 Ok(loaded) => {
                     let load_order = loaded.load_order();
-                    match register_loaded_initial_input(&mut inputs, loaded) {
+                    match register_loaded_initial_input(
+                        &mut inputs,
+                        loaded,
+                        resolved_inputs[load_order].load_kind,
+                    ) {
                         Ok(mut registered) => {
                             if resolved_inputs[load_order].force_load {
                                 let OrderedInput::Archive(id) = registered.ordered[0].input else {
@@ -682,21 +684,23 @@ impl Linker {
         let include_tbd_exports = inputs_may_need_dylib_exports(&inputs)?;
         for deferred in deferred_dylibs {
             let load_order = deferred.load_order();
+            let load_kind = resolved_inputs[load_order].load_kind;
             let result = match deferred {
-                DeferredDylibInput::Path { path, .. } => {
-                    register_input(&mut inputs, &path, load_order, include_tbd_exports)
-                }
-                DeferredDylibInput::Loaded(input) => {
-                    register_loaded_initial_input(&mut inputs, LoadedInitialInput::Dylib(input))
-                }
+                DeferredDylibInput::Path { path, .. } => register_input(
+                    &mut inputs,
+                    &path,
+                    load_order,
+                    include_tbd_exports,
+                    load_kind,
+                ),
+                DeferredDylibInput::Loaded(input) => register_loaded_initial_input(
+                    &mut inputs,
+                    LoadedInitialInput::Dylib(input),
+                    load_kind,
+                ),
             };
             match result {
                 Ok(registered) => {
-                    for entry in &registered.ordered {
-                        if let OrderedInput::Dylib(id) = entry.input {
-                            dylib_load_kinds.insert(id, resolved_inputs[load_order].load_kind);
-                        }
-                    }
                     phases.add_input_load(registered.timings);
                     input_order.extend(registered.ordered);
                     loaded_inputs[load_order] = true;
@@ -840,15 +844,12 @@ impl Linker {
             .collect();
         let mut dylib_loads = Vec::new();
         let mut seen_ordinals = std::collections::BTreeSet::new();
-        for (index, dylib) in inputs.dylibs.iter().enumerate() {
+        for dylib in &inputs.dylibs {
             if !seen_ordinals.insert(dylib.ordinal) {
                 continue;
             }
             dylib_loads.push(DylibDependency {
-                kind: dylib_load_kinds
-                    .get(&DylibId(index as u32))
-                    .copied()
-                    .unwrap_or(DylibLoadKind::Normal),
+                kind: dylib.load_kind,
                 install_name: dylib.load_install_name.clone(),
                 current_version: dylib.load_current_version,
                 compatibility_version: dylib.load_compatibility_version,
@@ -1504,6 +1505,7 @@ fn load_archive_input(
 fn register_loaded_initial_input(
     inputs: &mut Inputs,
     loaded: LoadedInitialInput,
+    load_kind: DylibLoadKind,
 ) -> Result<RegisteredInput, LinkError> {
     match loaded {
         LoadedInitialInput::Object(input) => {
@@ -1527,7 +1529,7 @@ fn register_loaded_initial_input(
             ))
         }
         LoadedInitialInput::Dylib(input) => {
-            let id = inputs.add_dylib_from_file(input.path, input.parsed)?;
+            let id = inputs.add_dylib_from_file_with_kind(input.path, input.parsed, load_kind)?;
             Ok(RegisteredInput::one(
                 input.timings,
                 OrderedInputEntry::dylib(input.load_order, id),
@@ -1541,6 +1543,7 @@ fn register_input(
     path: &std::path::Path,
     load_order: usize,
     include_tbd_exports: bool,
+    load_kind: DylibLoadKind,
 ) -> Result<RegisteredInput, LinkError> {
     let mut timings = InputLoadTimings::default();
     let mut ordered = Vec::new();
@@ -1556,7 +1559,7 @@ fn register_input(
         }
         Some("dylib") => {
             let phase_started = Instant::now();
-            let id = inputs.add_dylib(path.to_path_buf(), bytes)?;
+            let id = inputs.add_dylib_with_kind(path.to_path_buf(), bytes, load_kind)?;
             ordered.push(OrderedInputEntry::dylib(load_order, id));
             timings.dylib_parse = phase_started.elapsed();
         }
@@ -1599,6 +1602,7 @@ fn register_input(
                     .map(parse_version)
                     .unwrap_or(DEFAULT_TBD_VERSION),
                 ordinal: inputs.next_dylib_ordinal()?,
+                load_kind,
             };
             for doc in &docs {
                 let file = DylibFile::from_tbd(path, doc, &target);

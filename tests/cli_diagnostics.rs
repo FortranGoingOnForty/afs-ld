@@ -16,8 +16,8 @@ use afs_ld::macho::constants::{
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::reader::{
-    parse_commands, parse_header, write_commands, write_header, DylibCmd, DysymtabCmd, LoadCommand,
-    MachHeader64, Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
+    parse_commands, parse_header, write_commands, write_header, DyldInfoCmd, DylibCmd, DysymtabCmd,
+    LoadCommand, MachHeader64, Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
 };
 use afs_ld::reloc::{write_raw_relocs, RawRelocation};
 use afs_ld::string_table::StringTable;
@@ -157,6 +157,42 @@ fn synthetic_legacy_dylib(name: &str, install_name: &str) -> Vec<u8> {
     }
     .write(&mut bytes);
     bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_export_trie_dylib(install_name: &str, trie: &[u8]) -> Vec<u8> {
+    let identity = LoadCommand::Dylib(DylibCmd {
+        cmd: LC_ID_DYLIB,
+        name: install_name.into(),
+        timestamp: 2,
+        current_version: 1 << 16,
+        compatibility_version: 1 << 16,
+    });
+    let sizeofcmds = identity.cmdsize() + DyldInfoCmd::WIRE_SIZE;
+    let commands = vec![
+        identity,
+        LoadCommand::DyldInfoOnly(DyldInfoCmd {
+            export_off: HEADER_SIZE as u32 + sizeofcmds,
+            export_size: trie.len() as u32,
+            ..DyldInfoCmd::default()
+        }),
+    ];
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_DYLIB,
+            ncmds: commands.len() as u32,
+            sizeofcmds,
+            flags: MH_DYLDLINK | MH_TWOLEVEL,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    write_commands(&commands, &mut bytes);
+    bytes.extend_from_slice(trie);
     bytes
 }
 
@@ -1949,6 +1985,75 @@ fn legacy_dysymtab_dylib_symbol_resolves_deterministically() {
     let _ = fs::remove_file(object);
     let _ = fs::remove_file(dylib);
     let _ = fs::remove_file(output);
+}
+
+#[test]
+fn short_export_terminal_is_rejected_without_replacing_output() {
+    const SENTINEL: &[u8] = b"previous complete Mach-O output";
+
+    let dir = scratch("short-export-terminal");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let object = dir.join("consumer.o");
+    let dylib = dir.join("malformed.dylib");
+    let output = dir.join("consumer.dylib");
+    let symbol = "_forged";
+
+    // Root edge `_forged` points to a leaf whose one-byte payload contains
+    // only flags. The final zero belongs to child_count, not the address.
+    let mut trie = vec![0, 1];
+    trie.extend_from_slice(symbol.as_bytes());
+    trie.push(0);
+    let leaf_offset = trie.len() + 1;
+    assert!(leaf_offset < 0x80);
+    trie.push(leaf_offset as u8);
+    trie.extend_from_slice(&[1, 0, 0]);
+
+    fs::write(&object, synthetic_undefined_object(symbol)).unwrap();
+    fs::write(
+        &dylib,
+        synthetic_export_trie_dylib("/usr/lib/libmalformed-export.dylib", &trie),
+    )
+    .unwrap();
+
+    for jobs in [1, 4] {
+        fs::write(&output, SENTINEL).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&object)
+            .arg(&dylib)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+
+        assert!(
+            !result.status.success(),
+            "short export terminal was accepted with -j{jobs}"
+        );
+        assert!(
+            stderr.contains("truncated input while reading ULEB128 (unterminated)"),
+            "missing terminal-payload diagnostic with -j{jobs}:\n{stderr}"
+        );
+        assert_eq!(
+            fs::read(&output).unwrap(),
+            SENTINEL,
+            "rejected export terminal replaced prior output with -j{jobs}"
+        );
+        assert!(
+            fs::read_dir(&dir).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("afs-ld-tmp")),
+            "rejected export terminal leaked a temporary output with -j{jobs}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]

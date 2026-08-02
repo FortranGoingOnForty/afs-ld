@@ -53,6 +53,7 @@ pub const R_X86_64_IRELATIVE: u32 = 37;
 pub const SHF_WRITE: u64 = 0x1;
 pub const SHF_ALLOC: u64 = 0x2;
 pub const SHF_EXECINSTR: u64 = 0x4;
+pub const SHF_MERGE: u64 = 0x10;
 pub const SHF_INFO_LINK: u64 = 0x40;
 pub const SHF_TLS: u64 = 0x400;
 const SHF_GNU_RETAIN: u64 = 0x20_0000;
@@ -244,6 +245,7 @@ pub struct Section {
     pub sh_type: u32,
     pub sh_flags: u64,
     pub sh_addralign: u64,
+    pub sh_entsize: u64,
     pub data: Vec<u8>,
     pub nobits_size: u64,
     pub relas: Vec<Rela>,
@@ -419,6 +421,7 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
             sh_type: r.sh_type,
             sh_flags: r.flags,
             sh_addralign: r.align,
+            sh_entsize: r.entsize as u64,
             data: if r.sh_type == SHT_NOBITS {
                 Vec::new()
             } else {
@@ -839,6 +842,7 @@ struct OutSec {
     name: String,
     flags: u64,
     align: u64,
+    entsize: u64,
     data: Vec<u8>,
     bss_size: u64,
     vaddr: u64,
@@ -846,13 +850,19 @@ struct OutSec {
     is_bss: bool,
 }
 
-type OutputSectionIndex = HashMap<(String, u64), usize>;
+type OutputSectionIndex = HashMap<(String, u64, u64), usize>;
 
-fn validate_special_output_section_flags(
+fn validate_output_section_metadata(
     outs: &[OutSec],
     object: &str,
     section: &Section,
 ) -> Result<(), ElfError> {
+    if section.sh_flags & SHF_MERGE != 0 && section.sh_entsize == 0 {
+        return err(format!(
+            "{}: mergeable section '{}' has zero entry size",
+            object, section.name
+        ));
+    }
     if section.name != ".eh_frame" {
         return Ok(());
     }
@@ -880,10 +890,7 @@ fn output_section_type(section: &OutSec) -> u32 {
 }
 
 fn output_section_entsize(section: &OutSec) -> u64 {
-    match section.name.as_str() {
-        ".preinit_array" | ".init_array" | ".fini_array" => 8,
-        _ => 0,
-    }
+    section.entsize
 }
 
 /// (object index, section index) -> (output section, offset within it)
@@ -1420,7 +1427,7 @@ fn ensure_common_bss(
     outs: &mut Vec<OutSec>,
     out_index: &mut OutputSectionIndex,
 ) -> Result<usize, ElfError> {
-    let key = (".bss".to_string(), SHF_ALLOC | SHF_WRITE);
+    let key = (".bss".to_string(), SHF_ALLOC | SHF_WRITE, 0);
     if let Some(&idx) = out_index.get(&key) {
         if !outs[idx].is_bss {
             return err("section '.bss' is PROGBITS but COMMON allocation needs NOBITS .bss");
@@ -1431,6 +1438,7 @@ fn ensure_common_bss(
         name: ".bss".to_string(),
         flags: SHF_ALLOC | SHF_WRITE,
         align: 1,
+        entsize: 0,
         data: Vec::new(),
         bss_size: 0,
         vaddr: 0,
@@ -2422,14 +2430,15 @@ pub fn link_static_exec(
             if array_kind(&sec.name).is_some() {
                 continue;
             }
-            validate_special_output_section_flags(&outs, &obj.name, sec)?;
+            validate_output_section_metadata(&outs, &obj.name, sec)?;
             let is_bss = sec.sh_type == SHT_NOBITS;
-            let key = (sec.name.clone(), sec.sh_flags);
+            let key = (sec.name.clone(), sec.sh_flags, sec.sh_entsize);
             let idx = *out_index.entry(key).or_insert_with(|| {
                 outs.push(OutSec {
                     name: sec.name.clone(),
                     flags: sec.sh_flags,
                     align: 1,
+                    entsize: sec.sh_entsize,
                     data: Vec::new(),
                     bss_size: 0,
                     vaddr: 0,
@@ -2494,6 +2503,7 @@ pub fn link_static_exec(
             name: base.to_string(),
             flags: SHF_ALLOC | SHF_WRITE,
             align,
+            entsize: 8,
             data: Vec::new(),
             bss_size: 0,
             vaddr: 0,
@@ -2559,6 +2569,7 @@ pub fn link_static_exec(
             name: name.to_string(),
             flags: SHF_ALLOC | SHF_WRITE | SHF_TLS,
             align: tls_align,
+            entsize: 0,
             data: std::mem::take(&mut tls_data),
             bss_size: 0,
             vaddr: 0,
@@ -2660,6 +2671,7 @@ pub fn link_static_exec(
             name: ".got".to_string(),
             flags: SHF_ALLOC | SHF_WRITE,
             align: 8,
+            entsize: 0,
             data: vec![0u8; got_entries.len() * 8],
             bss_size: 0,
             vaddr: 0,
@@ -2704,6 +2716,7 @@ pub fn link_static_exec(
             name: ".iplt".to_string(),
             flags: SHF_ALLOC | SHF_EXECINSTR,
             align: 16,
+            entsize: 0,
             data: vec![0u8; n_iplt * 16],
             bss_size: 0,
             vaddr: 0,
@@ -2715,6 +2728,7 @@ pub fn link_static_exec(
             name: ".got.plt".to_string(),
             flags: SHF_ALLOC | SHF_WRITE,
             align: 8,
+            entsize: 0,
             data: vec![0u8; n_iplt * 8],
             bss_size: 0,
             vaddr: 0,
@@ -2726,6 +2740,7 @@ pub fn link_static_exec(
             name: ".rela.plt".to_string(),
             flags: SHF_ALLOC,
             align: 8,
+            entsize: 0,
             data: vec![0u8; n_iplt * 24],
             bss_size: 0,
             vaddr: 0,
@@ -2753,6 +2768,7 @@ pub fn link_static_exec(
                 name: ".eh_frame_hdr".to_string(),
                 flags: SHF_ALLOC,
                 align: 4,
+                entsize: 0,
                 data: vec![0u8; 12 + n_fde * 8],
                 bss_size: 0,
                 vaddr: 0,
@@ -3650,14 +3666,15 @@ pub fn link_dynamic_exec(
             if sec.sh_flags & SHF_TLS != 0 || array_kind(&sec.name).is_some() {
                 continue;
             }
-            validate_special_output_section_flags(&outs, &obj.name, sec)?;
+            validate_output_section_metadata(&outs, &obj.name, sec)?;
             let is_bss = sec.sh_type == SHT_NOBITS;
-            let key = (sec.name.clone(), sec.sh_flags);
+            let key = (sec.name.clone(), sec.sh_flags, sec.sh_entsize);
             let idx = *out_index.entry(key).or_insert_with(|| {
                 outs.push(OutSec {
                     name: sec.name.clone(),
                     flags: sec.sh_flags,
                     align: 1,
+                    entsize: sec.sh_entsize,
                     data: Vec::new(),
                     bss_size: 0,
                     vaddr: 0,
@@ -3719,6 +3736,7 @@ pub fn link_dynamic_exec(
             name: base.to_string(),
             flags: SHF_ALLOC | SHF_WRITE,
             align,
+            entsize: 8,
             data: Vec::new(),
             bss_size: 0,
             vaddr: 0,
@@ -3774,6 +3792,7 @@ pub fn link_dynamic_exec(
             name: name.to_string(),
             flags: SHF_ALLOC | SHF_WRITE | SHF_TLS,
             align: tls_align,
+            entsize: 0,
             data: std::mem::take(&mut tls_data),
             bss_size: tls_bss,
             vaddr: 0,
@@ -5545,6 +5564,7 @@ mod output_section_tests {
             sh_type: SHT_PROGBITS,
             sh_flags: flags,
             sh_addralign: 1,
+            sh_entsize: 0,
             data,
             nobits_size: 0,
             relas: Vec::new(),
@@ -5683,6 +5703,7 @@ mod eh_frame_hdr_tests {
             sh_type: SHT_PROGBITS,
             sh_flags: SHF_ALLOC,
             sh_addralign: 8,
+            sh_entsize: 0,
             data,
             nobits_size: 0,
             relas: vec![Rela {
@@ -5715,6 +5736,7 @@ mod eh_frame_hdr_tests {
                     sh_type: SHT_PROGBITS,
                     sh_flags: SHF_ALLOC | SHF_EXECINSTR,
                     sh_addralign: 1,
+                    sh_entsize: 0,
                     data: vec![0xc3],
                     nobits_size: 0,
                     relas: Vec::new(),
@@ -5724,6 +5746,7 @@ mod eh_frame_hdr_tests {
                     sh_type: SHT_PROGBITS,
                     sh_flags: SHF_ALLOC,
                     sh_addralign: 8,
+                    sh_entsize: 0,
                     data: eh_frame,
                     nobits_size: 0,
                     relas: Vec::new(),

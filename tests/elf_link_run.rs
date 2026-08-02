@@ -346,6 +346,152 @@ fn same_named_sections_preserve_distinct_flags_in_static_and_dynamic_links() {
 }
 
 #[test]
+fn mergeable_sections_preserve_entry_sizes_in_static_and_dynamic_links() {
+    let Some(gas) = gas() else {
+        harness_skip!("no GNU assembler on this host");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_merge_entsize_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        &format!(
+            ".text\n\
+             .globl _start\n\
+             .type _start,@function\n\
+             _start:\n\
+                 movl $42,%edi\n\
+                 movl ${exit_nr},%eax\n\
+                 syscall\n\
+             .size _start,.-_start\n"
+        ),
+        &dir.join("main.s"),
+        &main_obj,
+    );
+    let byte_obj = dir.join("byte.o");
+    assemble(
+        &gas,
+        ".section .merge.same,\"aMS\",@progbits,1\n.asciz \"byte\"\n",
+        &dir.join("byte.s"),
+        &byte_obj,
+    );
+    let word_obj = dir.join("word.o");
+    assemble(
+        &gas,
+        ".section .merge.same,\"aMS\",@progbits,4\n.long 0x00000041\n",
+        &dir.join("word.s"),
+        &word_obj,
+    );
+    let expected = [(0x32, 1), (0x32, 4)];
+
+    if let Some(ld) = system_ld() {
+        let reference = dir.join("reference");
+        let result = Command::new(ld)
+            .arg("--unique=.merge.same")
+            .arg("-o")
+            .arg(&reference)
+            .arg(&main_obj)
+            .arg(&byte_obj)
+            .arg(&word_obj)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "GNU reference link: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            section_flag_entsizes(&std::fs::read(&reference).unwrap(), ".merge.same"),
+            expected,
+            "GNU reference metadata precondition"
+        );
+        assert_eq!(
+            Command::new(reference).output().unwrap().status.code(),
+            Some(42)
+        );
+    } else {
+        harness_skip!("no system ld for the metadata differential leg");
+    }
+
+    let link = |name: &str, dynamic_linker: Option<&str>| {
+        let output = dir.join(name);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_afs-ld"));
+        if let Some(interp) = dynamic_linker {
+            command.args(["--dynamic-linker", interp]);
+        }
+        let result = command
+            .arg("-o")
+            .arg(&output)
+            .arg(&main_obj)
+            .arg(&byte_obj)
+            .arg(&word_obj)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "afs-ld {name}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        output
+    };
+    let mut modes = vec![("static", None)];
+    if let Some(interp) = rtld() {
+        modes.push(("dynamic", Some(interp)));
+    } else {
+        harness_skip!("no standard dynamic loader for the dynamic-writer leg");
+    }
+    for (name, interp) in modes {
+        let output = link(name, interp);
+        let image = std::fs::read(&output).unwrap();
+        assert_eq!(
+            section_flag_entsizes(&image, ".merge.same"),
+            expected,
+            "{name} output must retain each merge-entry size"
+        );
+        assert_eq!(
+            Command::new(&output).output().unwrap().status.code(),
+            Some(42)
+        );
+        let repeated = link(&format!("{name}-again"), interp);
+        assert_eq!(image, std::fs::read(repeated).unwrap());
+    }
+
+    let mut malformed = std::fs::read(&byte_obj).unwrap();
+    let (section_index, ..) =
+        section_header_info(&malformed, ".merge.same").expect("mergeable input section");
+    let shoff = u64::from_le_bytes(malformed[40..48].try_into().unwrap()) as usize;
+    let shentsize = u16::from_le_bytes(malformed[58..60].try_into().unwrap()) as usize;
+    let header = shoff + section_index as usize * shentsize;
+    malformed[header + 56..header + 64].fill(0);
+    let malformed_obj = dir.join("malformed.o");
+    std::fs::write(&malformed_obj, malformed).unwrap();
+    let rejected_output = dir.join("must-not-exist");
+    let rejected = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&rejected_output)
+        .arg(&main_obj)
+        .arg(&malformed_obj)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("mergeable section '.merge.same' has zero entry size"),
+        "unexpected diagnostic: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        !rejected_output.exists(),
+        "metadata rejection must not publish an executable"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn static_ehdr_start_resolves_to_image_base() {
     let Some(gas) = gas() else {
         eprintln!("\nHARNESS_SKIP suite=elf_link_run test=static_ehdr_start_resolves_to_image_base count=1 reason=\"no GNU assembler on this host\"");
@@ -3586,6 +3732,13 @@ fn section_header_info(img: &[u8], name: &str) -> Option<(u16, u32, u64, u64, u6
 }
 
 fn section_flags(img: &[u8], name: &str) -> Vec<u64> {
+    section_flag_entsizes(img, name)
+        .into_iter()
+        .map(|(flags, _)| flags)
+        .collect()
+}
+
+fn section_flag_entsizes(img: &[u8], name: &str) -> Vec<(u64, u64)> {
     let rd16 = |o: usize| u16::from_le_bytes(img[o..o + 2].try_into().unwrap());
     let rd32 = |o: usize| u32::from_le_bytes(img[o..o + 4].try_into().unwrap());
     let rd64 = |o: usize| u64::from_le_bytes(img[o..o + 8].try_into().unwrap());
@@ -3594,16 +3747,17 @@ fn section_flags(img: &[u8], name: &str) -> Vec<u64> {
     let shnum = rd16(60) as usize;
     let shstrndx = rd16(62) as usize;
     let shstr_off = rd64(shoff + shstrndx * shentsize + 24) as usize;
-    let mut flags = Vec::new();
+    let mut metadata = Vec::new();
     for i in 0..shnum {
         let sh = shoff + i * shentsize;
         let noff = shstr_off + rd32(sh) as usize;
         let end = img[noff..].iter().position(|&b| b == 0).unwrap();
         if &img[noff..noff + end] == name.as_bytes() {
-            flags.push(rd64(sh + 8));
+            metadata.push((rd64(sh + 8), rd64(sh + 56)));
         }
     }
-    flags
+    metadata.sort_unstable();
+    metadata
 }
 
 /// The `sh_addr` of a named ELF64 section, or None.

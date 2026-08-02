@@ -28,7 +28,10 @@ The full Mach-O differential and runtime suite requires macOS on Apple Silicon w
 - Reads `.o` (MH_OBJECT) Mach-O produced by `afs-as`, static archives (`.a`), binary dylibs, and TAPI TBD text stubs.
 - Emits `MH_EXECUTE` or `MH_DYLIB` PIE Mach-O files.
 - Ad-hoc code signing so binaries run directly on macOS 11+ arm64 hardware.
-- Supports both classic `LC_DYLD_INFO` opcodes and modern `LC_DYLD_CHAINED_FIXUPS`.
+- Emits classic `LC_DYLD_INFO_ONLY` rebase, bind, lazy-bind, weak-bind, and
+  export metadata. `-no_fixup_chains` explicitly selects this supported mode;
+  `-fixup_chains` is recognized for compatibility but rejected because the
+  writer does not yet produce `LC_DYLD_CHAINED_FIXUPS`.
 - Reads x86_64 ELF `ET_REL`, archives, linker scripts, and `ET_DYN` dependencies; emits static and dynamically linked `ET_EXEC` files.
 - Publishes completed outputs atomically and keeps output ordering deterministic across supported worker counts.
 

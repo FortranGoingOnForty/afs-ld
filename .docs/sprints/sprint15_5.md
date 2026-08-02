@@ -1,5 +1,9 @@
 # Sprint 15.5: Chained Fixups (LC_DYLD_CHAINED_FIXUPS)
 
+> Status: **PLANNED, NOT IMPLEMENTED.** The current writer emits classic
+> `LC_DYLD_INFO_ONLY`. `-fixup_chains` is recognized but rejected before output
+> publication; none of the deliverables below describe shipped behavior yet.
+
 ## Prerequisites
 Sprint 15 — classic dyld-info format working.
 

@@ -47,8 +47,8 @@ Options:
   -z lazy | -z now                Select lazy or eager ELF symbol binding
   -icf=safe | -icf=none | -icf=all
                                   Configure identical code folding (`all` currently errors)
-  -fixup_chains | -no_fixup_chains
-                                  Select chained fixups vs classic dyld info
+  -no_fixup_chains                Emit classic dyld info (default)
+  -fixup_chains                   Chained-fixup output is unsupported; errors
   -all_load                       Force-load every archive member
   -force_load <archive>           Force-load one archive
   -j <jobs>                       Limit parallel worker jobs (`1` disables parallelism)

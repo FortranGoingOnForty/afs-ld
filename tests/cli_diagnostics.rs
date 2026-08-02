@@ -1277,12 +1277,31 @@ fn icf_all_flag_errors_loudly() {
 }
 
 #[test]
-fn fixup_chains_flag_errors_loudly() {
-    assert_flag_errors(
-        "-fixup_chains",
-        "`-fixup_chains` is not yet supported",
-        "fixup-chains",
+fn fixup_chains_flag_errors_loudly_and_preserves_existing_output() {
+    const SENTINEL: &[u8] = b"AFSLD-075 existing output";
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let out_path = scratch("fixup-chains-existing.out");
+    fs::write(&out_path, SENTINEL).unwrap();
+    let out = Command::new(exe)
+        .arg("-fixup_chains")
+        .arg("-o")
+        .arg(&out_path)
+        .arg("missing-input.o")
+        .output()
+        .expect("afs-ld should run");
+
+    assert!(!out.status.success(), "-fixup_chains should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "`-fixup_chains` is unsupported: afs-ld emits classic `LC_DYLD_INFO_ONLY`; use `-no_fixup_chains` or omit the flag"
+        ),
+        "unexpected stderr:\n{stderr}"
     );
+    assert_eq!(fs::read(&out_path).unwrap(), SENTINEL);
+
+    let _ = fs::remove_file(out_path);
 }
 
 #[test]

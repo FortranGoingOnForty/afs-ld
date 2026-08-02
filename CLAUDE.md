@@ -122,7 +122,9 @@ format detection and output publication are routed through `src/main.rs`.
   - `arm64.rs`: relocation application against final addresses.
 - **`src/loh.rs`** — LOH preservation and relaxation.
 - **`src/elf.rs`** — x86_64 ELF readers, resolution, layout, relocations, static/dynamic `ET_EXEC` writers.
-- **`src/leb.rs`** — ULEB128/SLEB128 codec reused by export trie, function-starts deltas, dyld opcode streams, chained fixups.
+- **`src/leb.rs`** — ULEB128/SLEB128 codec used by the export trie,
+  function-starts deltas, and classic dyld opcode streams; a future chained
+  producer may reuse it for its imports table.
 - **`src/diag.rs`** — diagnostics. Path + byte offset + caret, matching `afs-as/src/diag*.rs` style. Deterministic output: no wall clock, no pid, no thread-id in error text.
 - **`src/dump.rs`** — `--dump*` inspection modes. Every time a reader decodes something new, extend the dump.
 - **`src/lib.rs`** — Mach-O pipeline orchestrator exposed through `Linker`.
@@ -255,11 +257,12 @@ a decoder or encoder:
 
 - **No LLVM, no `ld64` fork.** We own the stack. `.refs/llvm/lld/MachO/`
   is architectural inspiration; we do not link against it.
-- **Both `LC_DYLD_INFO_ONLY` (classic) and `LC_DYLD_CHAINED_FIXUPS`
-  (modern).** Classic first (Sprint 15) so hello-world works on
-  macOS 11+; chained immediately after (Sprint 15.5) so we match the
-  Apple default on macOS 12+. Gate via `-fixup_chains` /
-  `-no_fixup_chains`; default depends on `-platform_version`.
+- **Only classic dyld-info output is shipped.** The writer emits
+  `LC_DYLD_INFO_ONLY`; it does not emit `LC_DYLD_CHAINED_FIXUPS`.
+  `-no_fixup_chains` selects the classic path and is the default.
+  `-fixup_chains` remains recognized for compatibility but is rejected before
+  output publication until the planned chained-fixup producer and parity suite
+  exist.
 - **Dylib output is a first-class writer mode.** Executable and dylib output
   share layout and metadata machinery while retaining distinct load-command and
   entry-point contracts.

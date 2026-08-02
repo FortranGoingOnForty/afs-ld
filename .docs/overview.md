@@ -2,6 +2,12 @@
 
 **Bespoke ARM64 Mach-O linker for Apple Silicon, written in Rust, stdlib only.**
 
+> This is the original Mach-O design roadmap, not a complete inventory of the
+> current multi-format crate. The shipped Mach-O writer emits classic
+> `LC_DYLD_INFO_ONLY`; it does not emit `LC_DYLD_CHAINED_FIXUPS`.
+> `-fixup_chains` is reserved and fails before output publication until the
+> chained-fixup sprint is implemented and validated.
+
 ## Why
 
 armfortas already owns the compiler (`armfortas`) and the assembler (`afs-as`). Every binary the toolchain produces today is still shaped by Apple's `ld` — which puts the same class of opaque, untouchable bugs back in our path that motivated abandoning LLVM in the first place. `afs-ld` closes the loop. We own every byte from `.f90` source to the final Mach-O executable on disk.
@@ -12,7 +18,8 @@ This is **not** a toy or educational linker. The target is production parity wit
 - The fortsh milestone: ~57 KLoC Fortran 2018, 55 modules, `iso_c_binding`, allocatable strings, derived types.
 - Deterministic output: `-no_uuid` parity, reproducible byte layout across invocations.
 - All ARM64 Mach-O relocation types, static archives (`.a`), binary dylibs, and TAPI TBD v4 text stubs (libSystem ships as `.tbd` on modern SDKs).
-- Both classic `LC_DYLD_INFO` opcodes **and** modern `LC_DYLD_CHAINED_FIXUPS`.
+- Classic `LC_DYLD_INFO_ONLY` output today, with modern
+  `LC_DYLD_CHAINED_FIXUPS` retained as explicit future scope.
 - Dylib output (`-dylib`) as a first-class feature, not an afterthought.
 - Ad-hoc code signing — macOS 11+ will not execute an unsigned arm64 binary, even if every other byte is perfect.
 
@@ -109,7 +116,6 @@ afs-ld/
 │   │   ├── tlv.rs
 │   │   ├── symtab.rs
 │   │   ├── dyld_info.rs       # classic rebase/bind/lazy/weak + export trie
-│   │   ├── chained.rs         # LC_DYLD_CHAINED_FIXUPS
 │   │   ├── unwind.rs
 │   │   ├── eh_frame.rs
 │   │   ├── func_starts.rs
@@ -144,7 +150,7 @@ args → inputs → resolve → atomize → layout → apply relocs → synth se
 4. **atomize**: split input sections at symbol boundaries per `MH_SUBSECTIONS_VIA_SYMBOLS`.
 5. **layout**: assign VM addrs (`__PAGEZERO`/`__TEXT`/`__DATA_CONST`/`__DATA`/`__LINKEDIT` for executables; no `__PAGEZERO` for dylibs) and file offsets.
 6. **apply relocs**: ARM64_RELOC_* patching; GOT/stubs/lazy-pointer emission; LOH honoring.
-7. **synth sections**: `__LINKEDIT` payload — symbol table, string table, `LC_DYLD_INFO` and/or chained fixups, function starts, data-in-code, compact unwind, eh_frame passthrough.
+7. **synth sections**: `__LINKEDIT` payload — symbol table, string table, classic `LC_DYLD_INFO_ONLY`, function starts, data-in-code, compact unwind, eh_frame passthrough. Chained fixups remain a planned alternative.
 8. **write**: Mach-O header + load commands + segment data; `-no_uuid` deterministic.
 9. **sign**: ad-hoc SHA-256 page hashes in `LC_CODE_SIGNATURE` so the binary runs on bare arm64.
 
@@ -162,7 +168,7 @@ args → inputs → resolve → atomize → layout → apply relocs → synth se
 
 - **Unit**: every parser and encoder has a round-trip test — parse a fixture, re-emit, compare bytes.
 - **Corpus**: `tests/corpus/` collects `.o`, `.a`, `.dylib`, `.tbd` fixtures. Every new relocation type or section kind lands a corpus entry in the same sprint that implements it.
-- **Differential** (from Sprint 1): `tests/common/harness.rs` links the same inputs through `ld` and `afs-ld`, diffs load commands, symbol tables, bind/rebase or chained-fixup streams, and disassembly. Tolerated-diff allowlist covers UUID, timestamp, hash-backed temp names. CI gate from sprint one.
+- **Differential** (from Sprint 1): `tests/common/harness.rs` links the same inputs through `ld` and `afs-ld`, diffs load commands, symbol tables, classic bind/rebase streams, and disassembly. Chained-stream comparison belongs to the still-planned chained producer. Tolerated-diff allowlists must never hide semantic output differences.
 - **End-to-end** (from Sprint 18): hello-world executable must run; (Sprint 18.5) hello-library dylib must `dlopen`. (Sprint 21) the full armfortas integration suite must pass.
 - **fortsh link** (Sprint 29): explicit milestone. A fortsh binary linked by afs-ld must behave identically to one linked by system `ld`.
 - **Audits**: post-Sprint 18 (hello), 18.5 (dylib), 22 (first signed & running on bare arm64), 27 (parity gate), 29 (fortsh), 31 (final). Brutal honesty rules from armfortas/CLAUDE.md apply.
@@ -176,7 +182,7 @@ See `.docs/sprints/index.md` for the full list. Ten phases, 32 sprints:
 - **Phase 2 — Archives & dylibs**: Sprints 4–6 (`ar`, binary dylib, TBD).
 - **Phase 3 — Symbol resolution**: Sprints 7–9 (model, resolution pass, atomization).
 - **Phase 4 — Output construction**: Sprints 10–14 (layout, reloc application, GOT/stubs, TLV, symtab/strtab). MH_EXECUTE and MH_DYLIB both first-class.
-- **Phase 5 — Dyld metadata**: Sprints 15 (classic `LC_DYLD_INFO`), 15.5 (chained fixups), 16 (function starts/data-in-code), 17 (unwind info).
+- **Phase 5 — Dyld metadata**: Sprint 15 (classic `LC_DYLD_INFO`, shipped), Sprint 15.5 (chained fixups, still planned), Sprint 16 (function starts/data-in-code), Sprint 17 (unwind info).
 - **Phase 6 — End-to-end**: Sprint 18 (hello-world executable), 18.5 (hello-library dylib).
 - **Phase 7 — CLI & driver**: Sprints 19 (CLI + `-map`/`-why_live` diagnostics), 20 (driver swap).
 - **Phase 8 — Runtime compatibility**: Sprints 21 (runtime archive + integration tests), 22 (ad-hoc code signature).
@@ -186,6 +192,8 @@ See `.docs/sprints/index.md` for the full list. Ten phases, 32 sprints:
 ## Scope decisions (confirmed)
 
 - Dylib output is in scope from Phase 4; the writer is dylib-aware from Sprint 10. Dylib milestone at Sprint 18.5.
-- Both classic `LC_DYLD_INFO` (Sprint 15) and chained fixups (Sprint 15.5) are in scope. Chained becomes default on macOS 12+ after Sprint 27 parity gate.
+- Classic `LC_DYLD_INFO_ONLY` is shipped. Chained fixups remain in scope but
+  cannot become a default until Sprint 15.5 has a writer-side producer,
+  structural/runtime parity evidence, and an explicit policy change.
 - `.refs/` gains ld64 and mold alongside lld. lld is the architectural reference, ld64 is authoritative for Apple-parity edge cases, mold informs performance.
 - `-map` and `-why_live` land in Sprint 19 with the core CLI. They are the debugging surface during driver adoption, not a polish item.

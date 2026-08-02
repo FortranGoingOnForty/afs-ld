@@ -609,7 +609,7 @@ impl Linker {
         }
         if opts.fixup_chains {
             return Err(LinkError::UnsupportedOption(
-                "`-fixup_chains` is not yet supported".into(),
+                "`-fixup_chains` is unsupported: afs-ld emits classic `LC_DYLD_INFO_ONLY`; use `-no_fixup_chains` or omit the flag".into(),
             ));
         }
         if opts.icf_mode == IcfMode::All {

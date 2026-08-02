@@ -1,9 +1,9 @@
 //! ULEB128 / SLEB128 codec.
 //!
-//! dyld uses LEB128 pervasively: the export trie (Sprint 5), function-starts
-//! deltas (Sprint 16), rebase/bind/lazy-bind opcode streams (Sprint 15), and
-//! chained-fixups imports (Sprint 15.5) all encode variable-width integers
-//! this way. One codec, reused across all of them.
+//! dyld uses LEB128 pervasively. The shipped export trie, function-starts
+//! deltas, and classic rebase/bind/lazy-bind opcode streams all use this codec.
+//! A future chained-fixup producer can reuse it for imports-table fields where
+//! the wire format calls for ULEB128.
 
 use crate::macho::reader::ReadError;
 

@@ -4660,17 +4660,17 @@ fn linker_run_promotes_unresolved_symbol_to_dynamic_lookup() {
     let _ = fs::remove_file(out);
 }
 
-fn assert_flat_got_import(bytes: &[u8], symbol: &str, weak_import: bool) {
+fn assert_got_import(bytes: &[u8], symbol: &str, ordinal: u16, weak_import: bool) {
     let bind_records = decode_bind_records(bytes, false).unwrap();
     assert!(
         bind_records.iter().any(|record| {
             record.symbol == symbol
-                && record.ordinal == 0xFFFE
+                && record.ordinal == ordinal
                 && record.weak_import == weak_import
                 && record.segment == "__DATA_CONST"
                 && record.section == "__got"
         }),
-        "expected flat GOT bind for {symbol} with weak_import={weak_import}, got {bind_records:?}"
+        "expected GOT bind for {symbol} at ordinal {ordinal} with weak_import={weak_import}, got {bind_records:?}"
     );
     let got = output_section_header(bytes, "__DATA_CONST", "__got").unwrap();
     let got_start = got.offset as usize;
@@ -4682,6 +4682,7 @@ fn assert_flat_got_import(bytes: &[u8], symbol: &str, weak_import: bool) {
     assert_eq!(imported.n_type, N_UNDF | N_EXT);
     assert_eq!(imported.n_sect, 0);
     assert_eq!(imported.value, 0);
+    assert_eq!(imported.n_desc >> 8, ordinal & 0xff);
     assert_eq!(imported.n_desc & N_WEAK_REF != 0, weak_import);
 }
 
@@ -4739,7 +4740,7 @@ fn linker_run_emits_flat_weak_bind_for_permitted_unresolved_reference() {
     assert_eq!(outputs[0], outputs[1], "-j1 and -j4 output differs");
 
     let bytes = &outputs[0];
-    assert_flat_got_import(bytes, "_optional", true);
+    assert_got_import(bytes, "_optional", 0xFFFE, true);
     assert_ne!(
         parse_header(bytes).unwrap().flags & MH_BINDS_TO_WEAK,
         0,
@@ -4768,7 +4769,7 @@ fn linker_run_emits_required_flat_bind_for_strong_unresolved_reference() {
 
     let bytes = fs::read(&out).unwrap();
     assert_eq!(parse_header(&bytes).unwrap().flags & MH_BINDS_TO_WEAK, 0);
-    assert_flat_got_import(&bytes, target, false);
+    assert_got_import(&bytes, target, 0xFFFE, false);
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
@@ -4807,12 +4808,94 @@ fn linker_run_mixed_undefined_references_are_required_in_both_orders() {
         Linker::run(&opts).unwrap();
 
         let bytes = fs::read(&out).unwrap();
-        assert_flat_got_import(&bytes, target, false);
+        assert_got_import(&bytes, target, 0xFFFE, false);
 
         let _ = fs::remove_file(first);
         let _ = fs::remove_file(second);
         let _ = fs::remove_file(out);
     }
+}
+
+#[test]
+fn linker_run_preserves_consumer_weak_reference_after_dylib_resolution() {
+    let weak_object = scratch("dylib-weak-consumer.o");
+    let strong_object = scratch("dylib-strong-consumer.o");
+    let tbd = scratch("dylib-consumer-weakness.tbd");
+    let weak_output = scratch("dylib-weak-consumer.out");
+    let strong_output = scratch("dylib-strong-consumer.out");
+    let symbol = "_optional_from_strong_provider";
+
+    fs::write(
+        &weak_object,
+        synthetic_got_reference_object("_main", symbol, true),
+    )
+    .unwrap();
+    fs::write(
+        &strong_object,
+        synthetic_got_reference_object("_main", symbol, false),
+    )
+    .unwrap();
+    fs::write(
+        &tbd,
+        format!(
+            r#"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libconsumerweakness.dylib'
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ {symbol} ]
+...
+"#
+        ),
+    )
+    .unwrap();
+
+    let mut weak_outputs = Vec::new();
+    let mut strong_outputs = Vec::new();
+    for jobs in [1, 4] {
+        for (object, output, captures) in [
+            (&weak_object, &weak_output, &mut weak_outputs),
+            (&strong_object, &strong_output, &mut strong_outputs),
+        ] {
+            Linker::run(&LinkOptions {
+                inputs: vec![object.clone(), tbd.clone()],
+                output: Some(output.clone()),
+                kind: OutputKind::Executable,
+                jobs: Some(jobs),
+                ..LinkOptions::default()
+            })
+            .unwrap();
+            captures.push(fs::read(output).unwrap());
+        }
+    }
+
+    assert_eq!(
+        weak_outputs[0], weak_outputs[1],
+        "weak -j1/-j4 output differs"
+    );
+    assert_eq!(
+        strong_outputs[0], strong_outputs[1],
+        "strong -j1/-j4 output differs"
+    );
+    assert_got_import(&weak_outputs[0], symbol, 1, true);
+    assert_ne!(
+        parse_header(&weak_outputs[0]).unwrap().flags & MH_BINDS_TO_WEAK,
+        0,
+        "consumer weak reference must mark the output as binding weakly"
+    );
+    assert_got_import(&strong_outputs[0], symbol, 1, false);
+    assert_eq!(
+        parse_header(&strong_outputs[0]).unwrap().flags & MH_BINDS_TO_WEAK,
+        0,
+        "strong consumer of a regular export must remain a strong import"
+    );
+
+    let _ = fs::remove_file(weak_object);
+    let _ = fs::remove_file(strong_object);
+    let _ = fs::remove_file(tbd);
+    let _ = fs::remove_file(weak_output);
+    let _ = fs::remove_file(strong_output);
 }
 
 #[test]

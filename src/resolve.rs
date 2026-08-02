@@ -920,6 +920,16 @@ impl SymbolTable {
                 InsertOutcome::Kept(id)
             }
             Action::Replace => {
+                let mut sym = sym;
+                if let (
+                    Symbol::Undefined { weak_ref, .. },
+                    Symbol::DylibImport { weak_import, .. },
+                ) = (&self.symbols[id.0 as usize], &mut sym)
+                {
+                    // Provider weakness and consumer weakness independently
+                    // require weak-import metadata in the linked image.
+                    *weak_import |= *weak_ref;
+                }
                 self.symbols[id.0 as usize] = sym;
                 self.transitions.push(Transition {
                     id,
@@ -3373,6 +3383,30 @@ mod tests {
         let di = dylib_import(&mut t, "_x", 1);
         let out = t.insert(di).unwrap();
         assert!(matches!(out, InsertOutcome::Replaced { .. }));
+    }
+
+    #[test]
+    fn dylib_resolution_preserves_consumer_weak_reference() {
+        let mut table = SymbolTable::new();
+        let weak_reference = weak_undef(&mut table, "_optional");
+        let id = match table.insert(weak_reference).unwrap() {
+            InsertOutcome::Inserted(id) => id,
+            other => panic!("unexpected insert outcome: {other:?}"),
+        };
+        let strong_provider = dylib_import(&mut table, "_optional", 1);
+
+        assert!(matches!(
+            table.insert(strong_provider),
+            Ok(InsertOutcome::Replaced { .. })
+        ));
+        assert!(matches!(
+            table.get(id),
+            Symbol::DylibImport {
+                ordinal: 1,
+                weak_import: true,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -2147,6 +2147,231 @@ fn dynamic_executable_calls_shared_answer_through_plt() {
 }
 
 #[test]
+fn nondefault_visibility_undefineds_cannot_bind_to_shared_objects() {
+    if !cfg!(target_os = "linux") {
+        harness_skip!("requires GNU ELF visibility diagnostics on Linux");
+        return;
+    }
+    let Some(gas) = gas() else {
+        harness_skip!("no GNU assembler on this host");
+        return;
+    };
+    let Some(ld) = system_ld() else {
+        harness_skip!("no system ld to build and check the reference shared object");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        harness_skip!("no standard dynamic loader on this host");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "afs_ld_elf_nondefault_visibility_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let provider_obj = dir.join("provider.o");
+    assemble(
+        &gas,
+        ".text\n\
+         .globl answer\n\
+         .type answer,@function\n\
+         answer:\n\
+             movl $42, %eax\n\
+             ret\n",
+        &dir.join("provider.s"),
+        &provider_obj,
+    );
+    let provider = dir.join("libvisibility.so.1");
+    let shared_result = Command::new(&ld)
+        .args(["-shared", "-soname", "libvisibility.so.1", "-o"])
+        .arg(&provider)
+        .arg(&provider_obj)
+        .output()
+        .unwrap();
+    assert!(
+        shared_result.status.success(),
+        "reference shared-object link: {}",
+        String::from_utf8_lossy(&shared_result.stderr)
+    );
+
+    for visibility in ["hidden", "protected", "internal"] {
+        let main_obj = dir.join(format!("{visibility}.o"));
+        assemble(
+            &gas,
+            &format!(
+                ".text\n\
+                 .globl _start\n\
+                 .type _start,@function\n\
+                 .globl answer\n\
+                 .{visibility} answer\n\
+                 _start:\n\
+                     call answer@PLT\n\
+                     movl %eax, %edi\n\
+                     movl $60, %eax\n\
+                     syscall\n"
+            ),
+            &dir.join(format!("{visibility}.s")),
+            &main_obj,
+        );
+
+        let reference = dir.join(format!("{visibility}-reference"));
+        let reference_result = Command::new(&ld)
+            .args(["--dynamic-linker", interp, "-o"])
+            .arg(&reference)
+            .arg(&main_obj)
+            .arg(&provider)
+            .output()
+            .unwrap();
+        let reference_diagnostic = String::from_utf8_lossy(&reference_result.stderr);
+        assert!(
+            !reference_result.status.success(),
+            "reference linker accepted an undefined {visibility} symbol"
+        );
+        assert!(
+            reference_diagnostic.contains(visibility) && reference_diagnostic.contains("answer"),
+            "reference linker did not confirm the {visibility} fixture: {reference_diagnostic}"
+        );
+
+        for as_needed in [false, true] {
+            let mode = if as_needed { "as-needed" } else { "retained" };
+            let output = dir.join(format!("{visibility}-{mode}-afs"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_afs-ld"));
+            command.args(["--dynamic-linker", interp]);
+            if as_needed {
+                command.arg("--as-needed");
+            }
+            let result = command
+                .arg("-o")
+                .arg(&output)
+                .arg(&main_obj)
+                .arg(&provider)
+                .output()
+                .unwrap();
+            let diagnostic = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                !result.status.success(),
+                "afs-ld imported an undefined {visibility} symbol in {mode} mode"
+            );
+            assert!(
+                diagnostic.contains(visibility)
+                    && diagnostic.contains("answer")
+                    && diagnostic.contains("isn't defined"),
+                "unexpected afs-ld {visibility} diagnostic in {mode} mode: {diagnostic}"
+            );
+        }
+    }
+
+    let ar = ["/usr/bin/ar", "/usr/local/bin/ar"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.exists());
+    if let Some(ar) = ar {
+        let local_provider_obj = dir.join("local-provider.o");
+        assemble(
+            &gas,
+            ".text\n\
+             .globl answer\n\
+             .type answer,@function\n\
+             answer:\n\
+                 movl $17, %eax\n\
+                 ret\n",
+            &dir.join("local-provider.s"),
+            &local_provider_obj,
+        );
+        let archive = dir.join("liblocal.a");
+        let archive_result = Command::new(ar)
+            .arg("rcs")
+            .arg(&archive)
+            .arg(&local_provider_obj)
+            .output()
+            .unwrap();
+        assert!(
+            archive_result.status.success(),
+            "archive fixture build: {}",
+            String::from_utf8_lossy(&archive_result.stderr)
+        );
+
+        for (name, linker) in [
+            ("afs", PathBuf::from(env!("CARGO_BIN_EXE_afs-ld"))),
+            ("reference", ld.clone()),
+        ] {
+            let output = dir.join(format!("hidden-archive-{name}"));
+            let result = Command::new(linker)
+                .args(["--dynamic-linker", interp, "--as-needed", "-o"])
+                .arg(&output)
+                .arg(dir.join("hidden.o"))
+                .arg(&provider)
+                .arg(&archive)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{name} linker did not let the archive satisfy the hidden reference: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let image = std::fs::read(&output).unwrap();
+            let needed = if section_bytes(&image, ".dynstr").is_some() {
+                needed_libraries(&image)
+            } else {
+                Vec::new()
+            };
+            assert!(
+                needed.is_empty(),
+                "{name} linker retained a DSO that cannot satisfy hidden visibility: {needed:?}"
+            );
+            assert_eq!(
+                Command::new(&output).output().unwrap().status.code(),
+                Some(17),
+                "{name} linker did not bind the hidden reference to the archive"
+            );
+        }
+    } else {
+        harness_skip!("archive ordering leg has no ar on this host");
+    }
+
+    let default_obj = dir.join("default.o");
+    assemble(
+        &gas,
+        ".text\n\
+         .globl _start\n\
+         .type _start,@function\n\
+         _start:\n\
+             call answer@PLT\n\
+             movl %eax, %edi\n\
+             movl $60, %eax\n\
+             syscall\n",
+        &dir.join("default.s"),
+        &default_obj,
+    );
+    let default_output = dir.join("default-afs");
+    let default_result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&default_output)
+        .arg(&default_obj)
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert!(
+        default_result.status.success(),
+        "default-visible import must remain valid: {}",
+        String::from_utf8_lossy(&default_result.stderr)
+    );
+    let run = Command::new(&default_output)
+        .env("LD_LIBRARY_PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "default-visible import did not execute through the DSO: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn no_as_needed_retains_constructor_only_shared_library() {
     let Some(gas) = gas() else {
         eprintln!("\nHARNESS_SKIP suite=elf_link_run test=no_as_needed_retains_constructor_only_shared_library count=1 reason=\"no GNU assembler on this host\"");

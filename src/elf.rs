@@ -60,6 +60,11 @@ pub const STB_LOCAL: u8 = 0;
 pub const STB_GLOBAL: u8 = 1;
 pub const STB_WEAK: u8 = 2;
 
+pub const STV_DEFAULT: u8 = 0;
+pub const STV_INTERNAL: u8 = 1;
+pub const STV_HIDDEN: u8 = 2;
+pub const STV_PROTECTED: u8 = 3;
+
 pub const SHN_UNDEF: u16 = 0;
 pub const SHN_ABS: u16 = 0xfff1;
 pub const SHN_COMMON: u16 = 0xfff2;
@@ -246,6 +251,9 @@ pub struct Symbol {
     pub bind: u8,
     /// `st_info & 0xf`: STT_FUNC, STT_OBJECT, STT_GNU_IFUNC, ...
     pub typ: u8,
+    /// `st_other & 0x3`: STV_DEFAULT, STV_INTERNAL, STV_HIDDEN, or
+    /// STV_PROTECTED.
+    pub visibility: u8,
     pub shndx: u16,
     /// Object-local section index remapped to `sections` index for
     /// ordinary sections; SHN_* specials keep their meaning via shndx.
@@ -468,6 +476,7 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
                 name: cstr(strdat, ru32(e, 0) as usize, name, &strtab.name)?,
                 bind: e[4] >> 4,
                 typ: e[4] & 0xf,
+                visibility: e[5] & 0x3,
                 shndx,
                 section: remap.get(&(shndx as usize)).copied(),
                 value: ru64(e, 8),
@@ -1221,22 +1230,35 @@ fn armap_offset(ar: &crate::archive::Archive, name: &str) -> Option<u64> {
     any
 }
 
-/// Strong-undefined names an object references, in first-seen order,
-/// skipping any already defined. Weak-undefined does not pull archive
-/// members (it resolves to 0 if left unsatisfied).
+/// Strong-undefined names an object references, in first-seen order.
+/// Default-visible references may be satisfied by any selected definition;
+/// non-default references remain demand until this output's objects define
+/// them. Weak-undefined does not pull archive members (it resolves to 0 if
+/// left unsatisfied).
 fn undefined_demand(
     objects: &[ElfObject],
     additional: &[String],
     defined: &HashSet<String>,
 ) -> Vec<String> {
+    let mut object_definitions = HashSet::new();
+    for object in objects {
+        defined_names(object, &mut object_definitions);
+    }
     let mut seen: HashSet<String> = HashSet::new();
     let mut demand = Vec::new();
     for obj in objects {
         for sym in &obj.symbols {
+            let already_defined = if sym.visibility == STV_DEFAULT {
+                defined.contains(&sym.name)
+            } else {
+                // A non-default undefined symbol may be satisfied only by
+                // the output component itself, never by a selected DSO.
+                object_definitions.contains(&sym.name)
+            };
             if sym.shndx != SHN_UNDEF
                 || sym.bind != STB_GLOBAL
                 || sym.name.is_empty()
-                || defined.contains(&sym.name)
+                || already_defined
                 || LINKER_SYMS.contains(&sym.name.as_str())
             {
                 continue;
@@ -1257,6 +1279,57 @@ fn undefined_demand(
         demand.push(name.clone());
     }
     demand
+}
+
+fn shared_satisfies_default_visible_demand(
+    objects: &[ElfObject],
+    defined: &HashSet<String>,
+    exports: &HashMap<String, Export>,
+) -> bool {
+    objects.iter().flat_map(|obj| &obj.symbols).any(|sym| {
+        sym.shndx == SHN_UNDEF
+            && sym.bind == STB_GLOBAL
+            && sym.visibility == STV_DEFAULT
+            && !sym.name.is_empty()
+            && !defined.contains(&sym.name)
+            && !LINKER_SYMS.contains(&sym.name.as_str())
+            && exports.contains_key(&sym.name)
+    })
+}
+
+fn visibility_name(visibility: u8) -> &'static str {
+    match visibility {
+        STV_INTERNAL => "internal",
+        STV_HIDDEN => "hidden",
+        STV_PROTECTED => "protected",
+        _ => "default-visible",
+    }
+}
+
+fn validate_nondefault_undefineds(
+    objects: &[ElfObject],
+    globals: &HashMap<String, (usize, usize)>,
+) -> Result<(), ElfError> {
+    for object in objects {
+        for symbol in &object.symbols {
+            if symbol.shndx != SHN_UNDEF
+                || symbol.bind != STB_GLOBAL
+                || symbol.visibility == STV_DEFAULT
+                || symbol.name.is_empty()
+                || globals.contains_key(&symbol.name)
+                || LINKER_SYMS.contains(&symbol.name.as_str())
+            {
+                continue;
+            }
+            return err(format!(
+                "{} symbol '{}' isn't defined (referenced from {})",
+                visibility_name(symbol.visibility),
+                symbol.name,
+                object.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn uncovered_shared_demand(
@@ -3329,9 +3402,11 @@ fn process_dynamic_range(
                 let candidate_soname = candidate.soname.clone();
                 let candidate_exports: HashSet<String> =
                     candidate.exports.keys().cloned().collect();
-                let regular_select = undefined_demand(&state.objects, &[], &state.defined)
-                    .iter()
-                    .any(|name| candidate.exports.contains_key(name));
+                let regular_select = shared_satisfies_default_visible_demand(
+                    &state.objects,
+                    &state.defined,
+                    &candidate.exports,
+                );
                 let shared_select = state.shared_metadata.iter().any(|details| {
                     details.complete
                         && !details.needed.contains(&candidate.soname)
@@ -3590,6 +3665,7 @@ pub fn link_dynamic_exec(
     // deterministic version aliasing (see resolve_globals), then allocate
     // coalesced COMMON storage into .bss before layout.
     let globals = resolve_globals(objects)?;
+    validate_nondefault_undefineds(objects, &globals)?;
     let common_place = place_common_symbols(objects, &globals, &mut outs, &mut out_index)?;
 
     for base in [".preinit_array", ".init_array", ".fini_array"] {
@@ -5284,6 +5360,7 @@ mod resolve_globals_tests {
             name: name.to_string(),
             bind,
             typ: 0,
+            visibility: STV_DEFAULT,
             shndx,
             section: if shndx == DEF { Some(0) } else { None },
             value: 0,
@@ -5296,6 +5373,7 @@ mod resolve_globals_tests {
             name: name.to_string(),
             bind: STB_GLOBAL,
             typ: STT_OBJECT,
+            visibility: STV_DEFAULT,
             shndx: SHN_COMMON,
             section: None,
             value: align,
@@ -5436,6 +5514,7 @@ mod output_section_tests {
                     name: "_start".to_string(),
                     bind: STB_GLOBAL,
                     typ: STT_FUNC,
+                    visibility: STV_DEFAULT,
                     shndx: 1,
                     section: Some(0),
                     value: 0,
@@ -5605,6 +5684,7 @@ mod eh_frame_hdr_tests {
                 name: "_start".to_string(),
                 bind: STB_GLOBAL,
                 typ: STT_FUNC,
+                visibility: STV_DEFAULT,
                 shndx: 1,
                 section: Some(0),
                 value: 0,

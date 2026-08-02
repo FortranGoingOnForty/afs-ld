@@ -1792,6 +1792,64 @@ fn maximum_tbd_versions_are_preserved_deterministically() {
 }
 
 #[test]
+fn double_quoted_utf8_tbd_symbol_resolves_deterministically() {
+    let object = scratch("utf8-tbd-symbol.o");
+    let tbd = scratch("utf8-tbd-symbol.tbd");
+    let output = scratch("utf8-tbd-symbol.dylib");
+    let symbol = "_café";
+    fs::write(&object, synthetic_undefined_object(symbol)).unwrap();
+    fs::write(
+        &tbd,
+        format!(
+            "--- !tapi-tbd\n\
+             tbd-version: 4\n\
+             targets: [ arm64-macos ]\n\
+             install-name: '/usr/lib/libutf8-symbol.dylib'\n\
+             exports:\n\
+             \x20 - targets: [ arm64-macos ]\n\
+             \x20   symbols: [ \"{symbol}\" ]\n\
+             ...\n"
+        ),
+    )
+    .unwrap();
+
+    let mut images = Vec::new();
+    for jobs in [1, 4] {
+        let _ = fs::remove_file(&output);
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&object)
+            .arg(&tbd)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        assert!(
+            result.status.success(),
+            "double-quoted UTF-8 TBD symbol failed with -j{jobs}:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let image = fs::read(&output).unwrap();
+        let header = parse_header(&image).unwrap();
+        let commands = parse_commands(&header, &image).unwrap();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            LoadCommand::Dylib(dylib)
+                if dylib.cmd == LC_LOAD_DYLIB
+                    && dylib.name == "/usr/lib/libutf8-symbol.dylib"
+        )));
+        images.push(image);
+    }
+    assert_eq!(images[0], images[1], "-j1 and -j4 outputs differ");
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(tbd);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
 fn linker_rejects_non_linkable_macho_filetypes() {
     for (stem, filetype, filetype_name) in [
         ("execute", MH_EXECUTE, "MH_EXECUTE"),

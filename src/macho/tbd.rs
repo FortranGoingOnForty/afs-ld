@@ -736,24 +736,24 @@ fn parse_direct_scalar(raw: &str) -> String {
 }
 
 fn parse_direct_double_quoted(raw: &str) -> String {
-    let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            let ch = match bytes[i + 1] {
-                b'n' => '\n',
-                b'r' => '\r',
-                b't' => '\t',
-                b'"' => '"',
-                b'\\' => '\\',
-                other => other as char,
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            let Some(escaped) = chars.next() else {
+                out.push(ch);
+                break;
             };
-            out.push(ch);
-            i += 2;
+            out.push(match escaped {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '"' => '"',
+                '\\' => '\\',
+                other => other,
+            });
         } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            out.push(ch);
         }
     }
     out
@@ -1213,6 +1213,29 @@ mod tests {
         balance.scan(" ");
         balance.scan("_continued\", _tail ]");
         assert!(!balance.is_unbalanced());
+    }
+
+    #[test]
+    fn target_fast_path_preserves_utf8_in_double_quoted_scalars() {
+        let src = r#"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: "/usr/lib/libcafé.dylib"
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ "_café", "_snowman_☃", "_crab_🦀", "_escaped_\t_é" ]
+...
+"#;
+
+        let generic = filter_docs_for_target(parse_tbd(src).unwrap(), &arm64_macos());
+        let direct = parse_tbd_for_target_direct(src, &arm64_macos(), true).unwrap();
+
+        assert_eq!(direct, generic);
+        assert_eq!(direct[0].install_name, "/usr/lib/libcafé.dylib");
+        assert_eq!(
+            direct[0].exports[0].value.symbols,
+            ["_café", "_snowman_☃", "_crab_🦀", "_escaped_\t_é"]
+        );
     }
 
     #[test]

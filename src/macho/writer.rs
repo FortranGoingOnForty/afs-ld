@@ -104,6 +104,7 @@ pub enum WriteError {
     DirectBindSectionMissing(crate::resolve::AtomId),
     ImportSymbolMissing(SymbolId),
     ImportSymbolWrongKind(SymbolId),
+    UnrepresentableLibraryOrdinal(u16),
     MalformedRelocations(PathBuf, u8, String),
     MalformedLoh(PathBuf, String),
     SymbolListRead(PathBuf, String),
@@ -157,6 +158,10 @@ impl fmt::Display for WriteError {
                     symbol
                 )
             }
+            WriteError::UnrepresentableLibraryOrdinal(ordinal) => write!(
+                f,
+                "dylib ordinal {ordinal} cannot be encoded in Mach-O n_desc; maximum ordinary library ordinal is 253"
+            ),
             WriteError::MalformedRelocations(path, section, detail) => write!(
                 f,
                 "failed to parse relocations in {} section {}: {detail}",
@@ -1650,6 +1655,19 @@ fn collect_imports(
     Ok(out)
 }
 
+fn encode_n_desc_library_ordinal(ordinal: u16) -> Result<u16, WriteError> {
+    let encoded = if ordinal <= MAX_LIBRARY_ORDINAL {
+        ordinal
+    } else if ordinal == (0xff00 | DYNAMIC_LOOKUP_ORDINAL) {
+        DYNAMIC_LOOKUP_ORDINAL
+    } else if ordinal == (0xff00 | EXECUTABLE_ORDINAL) {
+        EXECUTABLE_ORDINAL
+    } else {
+        return Err(WriteError::UnrepresentableLibraryOrdinal(ordinal));
+    };
+    Ok(encoded << 8)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SymbolPlanBuildTimings {
     locals: Duration,
@@ -1934,7 +1952,7 @@ fn build_output_symbols_profiled(
     sort_local_symbols(&mut locals);
     external_defineds.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
     for import in imports {
-        let mut n_desc = import.ordinal << 8;
+        let mut n_desc = encode_n_desc_library_ordinal(import.ordinal)?;
         if import.weak_import {
             n_desc |= N_WEAK_REF;
         }
@@ -2837,6 +2855,27 @@ mod tests {
     use crate::string_table::StringTable;
 
     use super::*;
+
+    #[test]
+    fn n_desc_library_ordinals_preserve_defined_boundaries_and_specials() {
+        assert_eq!(encode_n_desc_library_ordinal(0).unwrap(), 0);
+        assert_eq!(
+            encode_n_desc_library_ordinal(MAX_LIBRARY_ORDINAL).unwrap(),
+            0xfd00
+        );
+        assert!(matches!(
+            encode_n_desc_library_ordinal(MAX_LIBRARY_ORDINAL + 1),
+            Err(WriteError::UnrepresentableLibraryOrdinal(0xfe))
+        ));
+        assert_eq!(
+            encode_n_desc_library_ordinal(0xff00 | DYNAMIC_LOOKUP_ORDINAL).unwrap(),
+            0xfe00
+        );
+        assert_eq!(
+            encode_n_desc_library_ordinal(0xff00 | EXECUTABLE_ORDINAL).unwrap(),
+            0xff00
+        );
+    }
 
     fn decode_function_starts_blob(blob: &[u8]) -> Vec<u64> {
         let mut out = Vec::new();

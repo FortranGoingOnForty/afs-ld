@@ -169,6 +169,11 @@ pub const N_INDR: u8 = 0xa;
 pub const NO_SECT: u8 = 0;
 
 // nlist_64 n_desc bits
+/// Largest ordinary two-level namespace library ordinal encodable in
+/// `nlist_64::n_desc`. The following two values are reserved by Mach-O.
+pub const MAX_LIBRARY_ORDINAL: u16 = 0xfd;
+pub const DYNAMIC_LOOKUP_ORDINAL: u16 = 0xfe;
+pub const EXECUTABLE_ORDINAL: u16 = 0xff;
 pub const REFERENCED_DYNAMICALLY: u16 = 0x0010;
 pub const N_NO_DEAD_STRIP: u16 = 0x0020;
 pub const N_WEAK_REF: u16 = 0x0040;

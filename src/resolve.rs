@@ -22,6 +22,7 @@ use std::thread;
 
 use crate::archive::{Archive, ArchiveError, ArchiveMetadata, MemberLoadError};
 use crate::input::ObjectFile;
+use crate::macho::constants::MAX_LIBRARY_ORDINAL;
 use crate::macho::dylib::DylibFile;
 use crate::macho::reader::ReadError;
 
@@ -258,6 +259,7 @@ pub struct Inputs {
 pub enum InputAddError {
     Read(ReadError),
     Archive(ArchiveError),
+    TooManyDylibDependencies,
 }
 
 impl std::fmt::Display for InputAddError {
@@ -265,6 +267,10 @@ impl std::fmt::Display for InputAddError {
         match self {
             InputAddError::Read(e) => write!(f, "{e}"),
             InputAddError::Archive(e) => write!(f, "{e}"),
+            InputAddError::TooManyDylibDependencies => write!(
+                f,
+                "too many dylib dependencies: Mach-O supports at most 253 ordinary library ordinals"
+            ),
         }
     }
 }
@@ -368,7 +374,7 @@ impl Inputs {
     /// [`Inputs::add_dylib_from_tbd`].
     pub fn add_dylib(&mut self, path: PathBuf, bytes: Vec<u8>) -> Result<DylibId, InputAddError> {
         let file = DylibFile::parse(&path, &bytes)?;
-        let ordinal = self.next_dylib_ordinal();
+        let ordinal = self.next_dylib_ordinal()?;
         let id = DylibId(self.dylibs.len() as u32);
         self.dylibs.push(DylibInput {
             path,
@@ -384,8 +390,12 @@ impl Inputs {
     /// Register a TBD-backed dylib. The caller materializes the `DylibFile`
     /// via `DylibFile::from_tbd(path, tbd, target)` so the target filter
     /// is explicit.
-    pub fn add_dylib_from_file(&mut self, path: PathBuf, file: DylibFile) -> DylibId {
-        let ordinal = self.next_dylib_ordinal();
+    pub fn add_dylib_from_file(
+        &mut self,
+        path: PathBuf,
+        file: DylibFile,
+    ) -> Result<DylibId, InputAddError> {
+        let ordinal = self.next_dylib_ordinal()?;
         let load = DylibLoadMeta {
             install_name: file.install_name.clone(),
             current_version: file.current_version,
@@ -400,7 +410,10 @@ impl Inputs {
         path: PathBuf,
         file: DylibFile,
         load: DylibLoadMeta,
-    ) -> DylibId {
+    ) -> Result<DylibId, InputAddError> {
+        if load.ordinal > MAX_LIBRARY_ORDINAL {
+            return Err(InputAddError::TooManyDylibDependencies);
+        }
         let id = DylibId(self.dylibs.len() as u32);
         self.dylibs.push(DylibInput {
             path,
@@ -410,16 +423,22 @@ impl Inputs {
             file,
             ordinal: load.ordinal,
         });
-        id
+        Ok(id)
     }
 
-    pub fn next_dylib_ordinal(&self) -> u16 {
-        self.dylibs
+    pub fn next_dylib_ordinal(&self) -> Result<u16, InputAddError> {
+        let ordinal = self
+            .dylibs
             .iter()
             .map(|dylib| dylib.ordinal)
             .max()
             .unwrap_or(0)
-            + 1
+            .checked_add(1)
+            .ok_or(InputAddError::TooManyDylibDependencies)?;
+        if ordinal > MAX_LIBRARY_ORDINAL {
+            return Err(InputAddError::TooManyDylibDependencies);
+        }
+        Ok(ordinal)
     }
 
     // ---- accessors ----
@@ -2497,6 +2516,45 @@ mod tests {
         DylibFile::from_tbd("libChoice.tbd", &document, &target)
     }
 
+    #[test]
+    fn dylib_registry_rejects_reserved_ordinals_without_mutating() {
+        let mut inputs = Inputs::new();
+        for ordinal in 1..=MAX_LIBRARY_ORDINAL {
+            let id = inputs
+                .add_dylib_from_file(
+                    PathBuf::from(format!("libordinal{ordinal:03}.tbd")),
+                    dylib_exporting("_target"),
+                )
+                .unwrap();
+            assert_eq!(id, DylibId(u32::from(ordinal - 1)));
+        }
+
+        let accepted = inputs.dylibs.len();
+        let error = inputs
+            .add_dylib_from_file(
+                PathBuf::from("libordinal254.tbd"),
+                dylib_exporting("_reserved"),
+            )
+            .unwrap_err();
+        assert!(matches!(error, InputAddError::TooManyDylibDependencies));
+        assert_eq!(inputs.dylibs.len(), accepted);
+
+        let error = inputs
+            .add_dylib_from_file_with_meta(
+                PathBuf::from("libexplicit254.tbd"),
+                dylib_exporting("_reserved"),
+                DylibLoadMeta {
+                    install_name: "/usr/lib/libexplicit254.dylib".into(),
+                    current_version: 0,
+                    compatibility_version: 0,
+                    ordinal: MAX_LIBRARY_ORDINAL + 1,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, InputAddError::TooManyDylibDependencies));
+        assert_eq!(inputs.dylibs.len(), accepted);
+    }
+
     fn resolve_first_archive_value(first: u64, second: u64) -> u64 {
         use crate::macho::constants::{N_EXT, N_UNDF};
 
@@ -2598,16 +2656,18 @@ mod tests {
                     archive_order,
                 )
                 .unwrap();
-            let dylib = inputs.add_dylib_from_file_with_meta(
-                PathBuf::from("libChoice.tbd"),
-                dylib_exporting("_choice"),
-                DylibLoadMeta {
-                    install_name: "/usr/lib/libChoice.dylib".into(),
-                    current_version: 0,
-                    compatibility_version: 0,
-                    ordinal: 1,
-                },
-            );
+            let dylib = inputs
+                .add_dylib_from_file_with_meta(
+                    PathBuf::from("libChoice.tbd"),
+                    dylib_exporting("_choice"),
+                    DylibLoadMeta {
+                        install_name: "/usr/lib/libChoice.dylib".into(),
+                        current_version: 0,
+                        compatibility_version: 0,
+                        ordinal: 1,
+                    },
+                )
+                .unwrap();
             let order = [
                 OrderedInputEntry::object(0, main),
                 OrderedInputEntry::archive(archive_order, archive),

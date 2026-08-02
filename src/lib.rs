@@ -654,17 +654,26 @@ impl Linker {
                 }
                 Ok(loaded) => {
                     let load_order = loaded.load_order();
-                    let mut registered = register_loaded_initial_input(&mut inputs, loaded);
-                    if resolved_inputs[load_order].force_load {
-                        let OrderedInput::Archive(id) = registered.ordered[0].input else {
-                            unreachable!("force-loaded input must be registered as an archive");
-                        };
-                        registered.ordered[0] =
-                            OrderedInputEntry::force_load_archive(load_order, id);
+                    match register_loaded_initial_input(&mut inputs, loaded) {
+                        Ok(mut registered) => {
+                            if resolved_inputs[load_order].force_load {
+                                let OrderedInput::Archive(id) = registered.ordered[0].input else {
+                                    unreachable!(
+                                        "force-loaded input must be registered as an archive"
+                                    );
+                                };
+                                registered.ordered[0] =
+                                    OrderedInputEntry::force_load_archive(load_order, id);
+                            }
+                            phases.add_input_load(registered.timings);
+                            input_order.extend(registered.ordered);
+                            loaded_inputs[load_order] = true;
+                        }
+                        Err(error) => retain_earliest_input_error(
+                            &mut first_input_error,
+                            InitialLoadError { load_order, error },
+                        ),
                     }
-                    phases.add_input_load(registered.timings);
-                    input_order.extend(registered.ordered);
-                    loaded_inputs[load_order] = true;
                 }
                 Err(error) => retain_earliest_input_error(&mut first_input_error, error),
             }
@@ -677,10 +686,9 @@ impl Linker {
                 DeferredDylibInput::Path { path, .. } => {
                     register_input(&mut inputs, &path, load_order, include_tbd_exports)
                 }
-                DeferredDylibInput::Loaded(input) => Ok(register_loaded_initial_input(
-                    &mut inputs,
-                    LoadedInitialInput::Dylib(input),
-                )),
+                DeferredDylibInput::Loaded(input) => {
+                    register_loaded_initial_input(&mut inputs, LoadedInitialInput::Dylib(input))
+                }
             };
             match result {
                 Ok(registered) => {
@@ -1496,15 +1504,15 @@ fn load_archive_input(
 fn register_loaded_initial_input(
     inputs: &mut Inputs,
     loaded: LoadedInitialInput,
-) -> RegisteredInput {
+) -> Result<RegisteredInput, LinkError> {
     match loaded {
         LoadedInitialInput::Object(input) => {
             let id =
                 inputs.add_parsed_object(input.path, input.bytes, input.parsed, input.load_order);
-            RegisteredInput::one(
+            Ok(RegisteredInput::one(
                 input.timings,
                 OrderedInputEntry::object(input.load_order, id),
-            )
+            ))
         }
         LoadedInitialInput::Archive(input) => {
             let id = inputs.add_parsed_archive(
@@ -1513,17 +1521,17 @@ fn register_loaded_initial_input(
                 input.metadata,
                 input.load_order,
             );
-            RegisteredInput::one(
+            Ok(RegisteredInput::one(
                 input.timings,
                 OrderedInputEntry::archive(input.load_order, id),
-            )
+            ))
         }
         LoadedInitialInput::Dylib(input) => {
-            let id = inputs.add_dylib_from_file(input.path, input.parsed);
-            RegisteredInput::one(
+            let id = inputs.add_dylib_from_file(input.path, input.parsed)?;
+            Ok(RegisteredInput::one(
                 input.timings,
                 OrderedInputEntry::dylib(input.load_order, id),
-            )
+            ))
         }
     }
 }
@@ -1590,12 +1598,12 @@ fn register_input(
                     .as_deref()
                     .map(parse_version)
                     .unwrap_or(DEFAULT_TBD_VERSION),
-                ordinal: inputs.next_dylib_ordinal(),
+                ordinal: inputs.next_dylib_ordinal()?,
             };
             for doc in &docs {
                 let file = DylibFile::from_tbd(path, doc, &target);
                 let id =
-                    inputs.add_dylib_from_file_with_meta(path.to_path_buf(), file, load.clone());
+                    inputs.add_dylib_from_file_with_meta(path.to_path_buf(), file, load.clone())?;
                 ordered.push(OrderedInputEntry::dylib(load_order, id));
             }
             timings.tbd_materialize = phase_started.elapsed();

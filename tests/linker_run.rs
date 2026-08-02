@@ -6072,6 +6072,110 @@ fn linker_run_carries_tbd_inputs_into_load_commands() {
 }
 
 #[test]
+fn linker_run_enforces_the_macho_library_ordinal_boundary() {
+    const MAX_ORDINARY_LIBRARY_ORDINAL: usize = 0xfd;
+    const SENTINEL: &[u8] = b"previous complete Mach-O output";
+
+    let dir = scratch("library-ordinal-boundary");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let max_object = dir.join("max-ordinal.o");
+    let reserved_object = dir.join("reserved-ordinal.o");
+    fs::write(
+        &max_object,
+        synthetic_got_reference_object("_max_probe", "_max_target", false),
+    )
+    .unwrap();
+    fs::write(
+        &reserved_object,
+        synthetic_got_reference_object("_reserved_probe", "_reserved_target", false),
+    )
+    .unwrap();
+
+    let mut dependencies = Vec::new();
+    for ordinal in 1..=MAX_ORDINARY_LIBRARY_ORDINAL + 1 {
+        let path = dir.join(format!("libordinal{ordinal:03}.tbd"));
+        let exported_symbol = match ordinal {
+            MAX_ORDINARY_LIBRARY_ORDINAL => "_max_target",
+            ordinal if ordinal == MAX_ORDINARY_LIBRARY_ORDINAL + 1 => "_reserved_target",
+            _ => "",
+        };
+        let exports = if exported_symbol.is_empty() {
+            String::new()
+        } else {
+            format!("exports:\n  - targets: [ arm64-macos ]\n    symbols: [ {exported_symbol} ]\n")
+        };
+        fs::write(
+            &path,
+            format!(
+                "--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64-macos ]\ninstall-name: '/usr/lib/libordinal{ordinal:03}.dylib'\n{exports}...\n"
+            ),
+        )
+        .unwrap();
+        dependencies.push(path);
+    }
+
+    let mut max_outputs = Vec::new();
+    let max_output = dir.join("max-ordinal.dylib");
+    for jobs in [1, 4] {
+        let mut inputs = vec![max_object.clone()];
+        inputs.extend_from_slice(&dependencies[..MAX_ORDINARY_LIBRARY_ORDINAL]);
+        Linker::run(&LinkOptions {
+            inputs,
+            output: Some(max_output.clone()),
+            install_name: Some("@rpath/max-ordinal.dylib".into()),
+            kind: OutputKind::Dylib,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        max_outputs.push(fs::read(&max_output).unwrap());
+    }
+
+    assert_eq!(max_outputs[0], max_outputs[1]);
+    let max_bytes = &max_outputs[0];
+    let load_names = load_dylib_names(max_bytes).unwrap();
+    assert_eq!(load_names.len(), MAX_ORDINARY_LIBRARY_ORDINAL);
+    assert_eq!(load_names.last().unwrap(), "/usr/lib/libordinal253.dylib");
+    assert_eq!(
+        canonical_symbol_record_map(max_bytes)["_max_target"].n_desc >> 8,
+        MAX_ORDINARY_LIBRARY_ORDINAL as u16
+    );
+    assert!(decode_bind_records(max_bytes, false)
+        .unwrap()
+        .iter()
+        .any(|record| {
+            record.symbol == "_max_target" && record.ordinal == MAX_ORDINARY_LIBRARY_ORDINAL as u16
+        }));
+
+    let mut diagnostics = Vec::new();
+    for jobs in [1, 4] {
+        let output = dir.join(format!("reserved-ordinal-j{jobs}.dylib"));
+        fs::write(&output, SENTINEL).unwrap();
+        let mut inputs = vec![reserved_object.clone()];
+        inputs.extend_from_slice(&dependencies);
+        let error = Linker::run(&LinkOptions {
+            inputs,
+            output: Some(output.clone()),
+            kind: OutputKind::Dylib,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .expect_err("ordinary dylib ordinal 254 must be rejected");
+        diagnostics.push(error.to_string());
+        assert_eq!(fs::read(output).unwrap(), SENTINEL);
+    }
+    assert_eq!(diagnostics[0], diagnostics[1]);
+    assert_eq!(
+        diagnostics[0],
+        "too many dylib dependencies: Mach-O supports at most 253 ordinary library ordinals"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn linker_run_handles_non_standard_segment_without_panicking() {
     if !have_xcrun() {
         harness_skip!("xcrun as unavailable");

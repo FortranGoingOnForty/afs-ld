@@ -25,14 +25,14 @@ use afs_ld::macho::constants::{
     CPU_SUBTYPE_LIB64, CPU_TYPE_ARM64, EXPORT_SYMBOL_FLAGS_REEXPORT,
     EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL,
     LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS,
-    LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, MH_MAGIC_64, MH_OBJECT,
-    MH_SUBSECTIONS_VIA_SYMBOLS, N_ABS, N_ALT_ENTRY, N_EXT, N_INDR, N_PEXT, N_SECT, N_UNDF,
-    N_WEAK_REF, REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED,
-    REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB,
-    REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
-    REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB, REBASE_OPCODE_MASK,
-    REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM, REBASE_TYPE_POINTER,
-    SECTION_TYPE_MASK, SG_READ_ONLY, S_ATTR_DEBUG, S_ATTR_PURE_INSTRUCTIONS,
+    LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, MH_BINDS_TO_WEAK, MH_MAGIC_64,
+    MH_OBJECT, MH_SUBSECTIONS_VIA_SYMBOLS, MH_WEAK_DEFINES, N_ABS, N_ALT_ENTRY, N_EXT, N_INDR,
+    N_PEXT, N_SECT, N_UNDF, N_WEAK_DEF, N_WEAK_REF, REBASE_IMMEDIATE_MASK,
+    REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE,
+    REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
+    REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
+    REBASE_OPCODE_MASK, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
+    REBASE_TYPE_POINTER, SECTION_TYPE_MASK, SG_READ_ONLY, S_ATTR_DEBUG, S_ATTR_PURE_INSTRUCTIONS,
     S_ATTR_SOME_INSTRUCTIONS, S_REGULAR, S_ZEROFILL,
 };
 use afs_ld::macho::dylib::DylibFile;
@@ -1157,6 +1157,10 @@ fn synthetic_alias_object(alias: &str, target: &str, private_alias: bool) -> Vec
 }
 
 fn synthetic_absolute_object(name: &str, value: u64) -> Vec<u8> {
+    synthetic_absolute_object_with_desc(name, value, 0)
+}
+
+fn synthetic_absolute_object_with_desc(name: &str, value: u64, n_desc: u16) -> Vec<u8> {
     let mut strings = vec![0];
     let strx = strings.len() as u32;
     strings.extend_from_slice(name.as_bytes());
@@ -1165,7 +1169,7 @@ fn synthetic_absolute_object(name: &str, value: u64) -> Vec<u8> {
         strx,
         n_type: N_ABS | N_EXT,
         n_sect: 0,
-        n_desc: 0,
+        n_desc,
         n_value: value,
     };
     synthetic_atomless_object(strings, &[symbol])
@@ -3882,6 +3886,54 @@ fn linker_run_emits_minimal_dylib_from_real_object() {
 }
 
 #[test]
+fn linker_run_marks_surviving_external_weak_definitions_in_the_image_header() {
+    const WEAK_VALUE: u64 = 0x1234_5678;
+
+    let obj = scratch("weak-definition.o");
+    let out = scratch("weak-definition.dylib");
+    fs::write(
+        &obj,
+        synthetic_absolute_object_with_desc("_weak_definition", WEAK_VALUE, N_WEAK_DEF),
+    )
+    .unwrap();
+
+    let mut outputs = Vec::new();
+    for jobs in [1, 4] {
+        Linker::run(&LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Dylib,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        outputs.push(fs::read(&out).unwrap());
+    }
+    assert_eq!(outputs[0], outputs[1], "-j1 and -j4 output differs");
+
+    let bytes = &outputs[0];
+    let header = parse_header(bytes).unwrap();
+    assert_eq!(
+        header.flags & (MH_WEAK_DEFINES | MH_BINDS_TO_WEAK),
+        MH_WEAK_DEFINES | MH_BINDS_TO_WEAK
+    );
+    let symbol = canonical_symbol_record_map(bytes)
+        .remove("_weak_definition")
+        .unwrap();
+    assert_eq!(symbol.n_type, N_ABS | N_EXT);
+    assert_ne!(symbol.n_desc & N_WEAK_DEF, 0);
+    let export = canonical_export_records(bytes)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.name == "_weak_definition")
+        .unwrap();
+    assert_ne!(export.flags & EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, 0);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_uses_dylib_identity_flags() {
     if !have_xcrun() {
         harness_skip!("xcrun as unavailable");
@@ -4541,6 +4593,11 @@ fn linker_run_emits_flat_weak_bind_for_permitted_unresolved_reference() {
 
     let bytes = &outputs[0];
     assert_flat_got_import(bytes, "_optional", true);
+    assert_ne!(
+        parse_header(bytes).unwrap().flags & MH_BINDS_TO_WEAK,
+        0,
+        "weak import bindings must mark the image as binding to weak symbols"
+    );
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
@@ -4563,6 +4620,7 @@ fn linker_run_emits_required_flat_bind_for_strong_unresolved_reference() {
     Linker::run(&opts).unwrap();
 
     let bytes = fs::read(&out).unwrap();
+    assert_eq!(parse_header(&bytes).unwrap().flags & MH_BINDS_TO_WEAK, 0);
     assert_flat_got_import(&bytes, target, false);
 
     let _ = fs::remove_file(obj);

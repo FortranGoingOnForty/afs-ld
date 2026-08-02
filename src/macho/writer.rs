@@ -374,7 +374,7 @@ pub(crate) fn write_finalized_with_linkedit_for_header(
         },
         ncmds: commands.len() as u32,
         sizeofcmds,
-        flags: header_flags(layout, kind),
+        flags: header_flags(layout, kind, linkedit_plan),
         reserved: 0,
     };
 
@@ -779,11 +779,17 @@ fn build_version_command(opts: &LinkOptions) -> BuildVersionCmd {
     }
 }
 
-fn header_flags(layout: &Layout, kind: OutputKind) -> u32 {
+fn header_flags(layout: &Layout, kind: OutputKind, linkedit_plan: &LinkEditPlan) -> u32 {
     let mut flags = match kind {
         OutputKind::Executable => MH_DYLDLINK | MH_NOUNDEFS | MH_TWOLEVEL | MH_PIE,
         OutputKind::Dylib => MH_DYLDLINK | MH_TWOLEVEL | MH_NOUNDEFS,
     };
+    if linkedit_plan.defines_weak_symbols {
+        flags |= MH_WEAK_DEFINES;
+    }
+    if linkedit_plan.binds_to_weak_symbols {
+        flags |= MH_BINDS_TO_WEAK;
+    }
     if layout
         .sections
         .iter()
@@ -841,6 +847,8 @@ pub struct LinkEditPlan {
     indirect_starts: HashMap<(String, String), u32>,
     lazy_bind_offsets: HashMap<SymbolId, u32>,
     pub map_symbols: Vec<LinkMapSymbol>,
+    defines_weak_symbols: bool,
+    binds_to_weak_symbols: bool,
 }
 
 impl LinkEditPlan {
@@ -934,6 +942,8 @@ fn build_linkedit_plan_profiled(
                 indirect_starts: HashMap::new(),
                 lazy_bind_offsets: HashMap::new(),
                 map_symbols: Vec::new(),
+                defines_weak_symbols: false,
+                binds_to_weak_symbols: false,
             },
             timings,
         ));
@@ -961,6 +971,16 @@ fn build_linkedit_plan_profiled(
     timings.symbol_plan_locals += symbol_plan_timings.locals;
     timings.symbol_plan_globals += symbol_plan_timings.globals;
     timings.symbol_plan_strtab += symbol_plan_timings.strtab;
+    let external_defined_start = symbol_plan.dysymtab.iextdefsym as usize;
+    let external_defined_end = external_defined_start + symbol_plan.dysymtab.nextdefsym as usize;
+    let defines_weak_symbols = symbol_plan
+        .exports
+        .iter()
+        .any(|export| export.flags & EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION != 0);
+    let uses_external_weak_definition = symbol_plan.symbols
+        [external_defined_start..external_defined_end]
+        .iter()
+        .any(InputSymbol::weak_def);
     let mut symtab_bytes = Vec::with_capacity(symbol_plan.symbols.len() * NLIST_SIZE);
     write_nlist_table(&symbol_plan.symbols, &mut symtab_bytes);
 
@@ -1007,6 +1027,7 @@ fn build_linkedit_plan_profiled(
     let dyld_started = std::time::Instant::now();
     let phase_started = std::time::Instant::now();
     let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
+    let binds_to_weak_symbols = uses_external_weak_definition || bind_streams.binds_to_weak_symbols;
     let bind_bytes = pad_dyld_info_stream(bind_streams.bind);
     let weak_bind_bytes = pad_dyld_info_stream(bind_streams.weak_bind);
     let lazy_bind_bytes = pad_dyld_info_stream(bind_streams.lazy_bind);
@@ -1113,6 +1134,8 @@ fn build_linkedit_plan_profiled(
             indirect_starts,
             lazy_bind_offsets: bind_streams.lazy_offsets,
             map_symbols: symbol_plan.map_symbols,
+            defines_weak_symbols,
+            binds_to_weak_symbols,
         },
         timings,
     ))
@@ -1228,6 +1251,7 @@ struct BindStreams {
     weak_bind: Vec<u8>,
     lazy_bind: Vec<u8>,
     lazy_offsets: HashMap<SymbolId, u32>,
+    binds_to_weak_symbols: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2504,6 +2528,7 @@ fn build_bind_streams(
     let weak_bind = Vec::new();
     let mut lazy_bind = OpcodeStream::new();
     let mut lazy_offsets = HashMap::new();
+    let mut binds_to_weak_symbols = false;
     let layout_index = BindLayoutIndex::build(layout)?;
 
     if let Some(tlv_bootstrap) = synthetic_plan.tlv_bootstrap_symbol {
@@ -2621,6 +2646,7 @@ fn build_bind_streams(
     if let Some(last) = bind_specs.last_mut() {
         last.terminate = true;
     }
+    binds_to_weak_symbols |= bind_specs.iter().any(|spec| spec.weak_import);
 
     if !synthetic_plan.lazy_pointers.entries.is_empty() {
         let segment_index = segment_index(layout, "__DATA")?;
@@ -2635,6 +2661,7 @@ fn build_bind_streams(
                 .get(&entry.symbol)
                 .copied()
                 .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
+            binds_to_weak_symbols |= import.weak_import;
             let slot_addr = section.addr + section.synthetic_offset + (idx as u64) * 8;
             lazy_offsets.insert(entry.symbol, lazy_bind.len() as u32);
             emit_lazy_bind_record(
@@ -2653,6 +2680,7 @@ fn build_bind_streams(
         weak_bind,
         lazy_bind: lazy_bind.into_vec(),
         lazy_offsets,
+        binds_to_weak_symbols,
     })
 }
 

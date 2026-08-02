@@ -81,6 +81,8 @@ pub const MH_NOUNDEFS: u32 = 0x1;
 pub const MH_DYLDLINK: u32 = 0x4;
 pub const MH_TWOLEVEL: u32 = 0x80;
 pub const MH_SUBSECTIONS_VIA_SYMBOLS: u32 = 0x2000;
+pub const MH_WEAK_DEFINES: u32 = 0x8000;
+pub const MH_BINDS_TO_WEAK: u32 = 0x0001_0000;
 pub const MH_PIE: u32 = 0x0020_0000;
 pub const MH_HAS_TLV_DESCRIPTORS: u32 = 0x0080_0000;
 

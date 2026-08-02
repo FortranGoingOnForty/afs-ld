@@ -32,8 +32,9 @@ use afs_ld::macho::constants::{
     REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
     REBASE_OPCODE_MASK, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
-    REBASE_TYPE_POINTER, SECTION_TYPE_MASK, SG_READ_ONLY, S_ATTR_DEBUG, S_ATTR_PURE_INSTRUCTIONS,
-    S_ATTR_SOME_INSTRUCTIONS, S_REGULAR, S_ZEROFILL,
+    REBASE_TYPE_POINTER, SECTION_TYPE_MASK, SG_READ_ONLY, S_ATTR_DEBUG, S_ATTR_LIVE_SUPPORT,
+    S_ATTR_NO_TOC, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_ATTR_STRIP_STATIC_SYMS,
+    S_COALESCED, S_REGULAR, S_ZEROFILL,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::Exports;
@@ -1185,6 +1186,185 @@ fn synthetic_compact_unwind_alias_object(
     bytes
 }
 
+fn synthetic_dwarf_unwind_object() -> Vec<u8> {
+    let text = [
+        0x1f, 0x20, 0x03, 0xd5, // _main: nop
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+    let mut compact_unwind = vec![0u8; 32];
+    compact_unwind[8..12].copy_from_slice(&(text.len() as u32).to_le_bytes());
+    compact_unwind[12..16].copy_from_slice(&0x0300_0000u32.to_le_bytes());
+
+    // This is the canonical CIE/FDE shape emitted by LLVM's Mach-O assembler
+    // for an arm64 function whose CFI cannot be represented compactly. The FDE
+    // starts at section offset 0x14 and has an initial-location relocation to
+    // _main relative to the start of __eh_frame.
+    let mut eh_frame = vec![
+        0x10, 0x00, 0x00, 0x00, // CIE payload length
+        0x00, 0x00, 0x00, 0x00, // CIE id
+        0x01, 0x7a, 0x52, 0x00, // version 1, augmentation "zR"
+        0x01, 0x78, 0x1e, 0x01, // code/data alignment, return register, aug len
+        0x10, 0x0c, 0x1f, 0x00, // pcrel pointer encoding, CFA=WSP
+        0x18, 0x00, 0x00, 0x00, // FDE payload length
+        0x18, 0x00, 0x00, 0x00, // CIE back-pointer
+    ];
+    eh_frame.extend_from_slice(&(-28i64).to_le_bytes());
+    eh_frame.extend_from_slice(&(text.len() as u64).to_le_bytes());
+    eh_frame.extend_from_slice(&[0x00, 0x0f, 0x01, 0x9c]);
+    assert_eq!(eh_frame.len(), 0x30);
+
+    let compact_relocs = write_relocs(&[Reloc {
+        offset: 0,
+        kind: RelocKind::Unsigned,
+        length: RelocLength::Quad,
+        pcrel: false,
+        referent: Referent::Section(1),
+        addend: 0,
+        subtrahend: None,
+    }])
+    .unwrap();
+    let mut compact_reloc_bytes = Vec::new();
+    write_raw_relocs(&compact_relocs, &mut compact_reloc_bytes);
+
+    let mut strings = vec![0];
+    let mut add_string = |name: &str| {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        strx
+    };
+    let eh_base_strx = add_string("L_eh_base");
+    let main_strx = add_string("_main");
+    let eh_frame_addr = (text.len() + compact_unwind.len()) as u64;
+    let symbols = [
+        RawNlist {
+            strx: eh_base_strx,
+            n_type: N_SECT,
+            n_sect: 3,
+            n_desc: 0,
+            n_value: eh_frame_addr,
+        },
+        RawNlist {
+            strx: main_strx,
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+    ];
+    let eh_frame_relocs = write_relocs(&[Reloc {
+        offset: 0x1c,
+        kind: RelocKind::Subtractor,
+        length: RelocLength::Quad,
+        pcrel: false,
+        referent: Referent::Symbol(1),
+        addend: 0,
+        subtrahend: Some(Referent::Symbol(0)),
+    }])
+    .unwrap();
+    let mut eh_frame_reloc_bytes = Vec::new();
+    write_raw_relocs(&eh_frame_relocs, &mut eh_frame_reloc_bytes);
+
+    let data_size = text.len() + compact_unwind.len() + eh_frame.len();
+    let mut segment = Segment64 {
+        segname: name16(""),
+        vmaddr: 0,
+        vmsize: data_size as u64,
+        fileoff: 0,
+        filesize: data_size as u64,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections: vec![
+            Section64Header {
+                sectname: name16("__text"),
+                segname: name16("__TEXT"),
+                addr: 0,
+                size: text.len() as u64,
+                offset: 0,
+                align: 2,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+            Section64Header {
+                sectname: name16("__compact_unwind"),
+                segname: name16("__LD"),
+                addr: text.len() as u64,
+                size: compact_unwind.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: compact_relocs.len() as u32,
+                flags: S_REGULAR | S_ATTR_DEBUG,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+            Section64Header {
+                sectname: name16("__eh_frame"),
+                segname: name16("__TEXT"),
+                addr: eh_frame_addr,
+                size: eh_frame.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: eh_frame_relocs.len() as u32,
+                flags: S_COALESCED | S_ATTR_LIVE_SUPPORT | S_ATTR_NO_TOC | S_ATTR_STRIP_STATIC_SYMS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+        ],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    segment.sections[1].offset = data_offset + text.len() as u32;
+    segment.sections[2].offset = data_offset + eh_frame_addr as u32;
+    segment.sections[1].reloff = data_offset + data_size as u32;
+    segment.sections[2].reloff = segment.sections[1].reloff + compact_reloc_bytes.len() as u32;
+    let symoff = segment.sections[2].reloff + eh_frame_reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&compact_unwind);
+    bytes.extend_from_slice(&eh_frame);
+    bytes.extend_from_slice(&compact_reloc_bytes);
+    bytes.extend_from_slice(&eh_frame_reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
 fn synthetic_same_address_entry_alias_object() -> Vec<u8> {
     let text = [
         SAME_ADDRESS_ENTRY_CODE.as_slice(),
@@ -1615,6 +1795,31 @@ fn output_section(bytes: &[u8], segname: &str, sectname: &str) -> Option<(u64, V
         }
     }
     None
+}
+
+fn eh_frame_fde_offsets(bytes: &[u8]) -> Vec<u32> {
+    let mut offsets = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let length_bytes: [u8; 4] = bytes
+            .get(offset..offset + 4)
+            .expect("truncated DWARF record length")
+            .try_into()
+            .unwrap();
+        let length = u32::from_le_bytes(length_bytes);
+        assert_ne!(length, u32::MAX, "DWARF64 records are outside this fixture");
+        if length == 0 {
+            break;
+        }
+        let end = offset + 4 + length as usize;
+        assert!(end <= bytes.len(), "DWARF record overruns __eh_frame");
+        let cie_pointer = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        if cie_pointer != 0 {
+            offsets.push(offset as u32);
+        }
+        offset = end;
+    }
+    offsets
 }
 
 fn output_sections(bytes: &[u8], segname: &str, sectname: &str) -> Vec<(u64, Vec<u8>)> {
@@ -9396,6 +9601,99 @@ fn linker_run_resolves_compact_unwind_function_aliases() {
 
     let no_unwind = link(&synthetic_compact_unwind_alias_object(None), 4);
     assert!(output_section(&no_unwind, "__TEXT", "__unwind_info").is_none());
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_dwarf_unwind_encoding_points_to_final_fde() {
+    const DWARF_MODE: u32 = 0x0300_0000;
+    const DWARF_OFFSET_MASK: u32 = 0x00ff_ffff;
+
+    let obj = scratch("dwarf-unwind-offset.o");
+    let out = scratch("dwarf-unwind-offset.out");
+    let fixture = synthetic_dwarf_unwind_object();
+    let parsed = ObjectFile::parse(&obj, &fixture).unwrap();
+    let compact = parsed
+        .sections
+        .iter()
+        .find(|section| section.sectname == "__compact_unwind")
+        .expect("fixture must contain compact unwind input");
+    assert_eq!(u32_le(&compact.data[12..16]), DWARF_MODE);
+    let input_eh_frame = parsed
+        .sections
+        .iter()
+        .find(|section| section.sectname == "__eh_frame")
+        .expect("fixture must contain an FDE");
+    assert_eq!(eh_frame_fde_offsets(&input_eh_frame.data), vec![0x14]);
+
+    let link = |jobs| {
+        fs::write(&obj, &fixture).unwrap();
+        Linker::run(&LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        fs::read(&out).unwrap()
+    };
+    let outputs = [link(1), link(4)];
+    assert_eq!(outputs[0], outputs[1]);
+    assert!(output_section(&outputs[0], "__LD", "__compact_unwind").is_none());
+
+    let decoded = canonical_unwind_info(&outputs[0]);
+    assert_eq!(decoded.records.len(), 1);
+    assert_eq!(decoded.records[0].function_offset, 0);
+    let (_, eh_frame) = output_section(&outputs[0], "__TEXT", "__eh_frame").unwrap();
+    let fde_offsets = eh_frame_fde_offsets(&eh_frame);
+    assert_eq!(fde_offsets, vec![0x14]);
+    assert_eq!(decoded.records[0].encoding & 0x0f00_0000, DWARF_MODE);
+    assert_eq!(
+        decoded.records[0].encoding & DWARF_OFFSET_MASK,
+        fde_offsets[0]
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_rejects_dwarf_unwind_without_fde_and_preserves_output() {
+    const DWARF_MODE: u32 = 0x0300_0000;
+    const SENTINEL: &[u8] = b"AFSLD-056 existing output";
+
+    let obj = scratch("dwarf-unwind-missing-fde.o");
+    let out = scratch("dwarf-unwind-missing-fde.out");
+    let mut fixture = synthetic_compact_unwind_alias_object(Some(SyntheticUnwindReferent::Direct));
+    let compact = output_section_header(&fixture, "__LD", "__compact_unwind")
+        .expect("fixture must contain compact unwind input");
+    let encoding_offset = compact.offset as usize + 12;
+    fixture[encoding_offset..encoding_offset + 4].copy_from_slice(&DWARF_MODE.to_le_bytes());
+    fs::write(&obj, fixture).unwrap();
+
+    let mut diagnostics = Vec::new();
+    for jobs in [1, 4] {
+        fs::write(&out, SENTINEL).unwrap();
+        let error = Linker::run(&LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .expect_err("DWARF-mode compact unwind without an FDE must be rejected");
+        diagnostics.push(error.to_string());
+        assert_eq!(fs::read(&out).unwrap(), SENTINEL);
+    }
+    assert_eq!(diagnostics[0], diagnostics[1]);
+    assert!(
+        diagnostics[0].contains("has no retained __eh_frame FDE"),
+        "unexpected diagnostic: {}",
+        diagnostics[0]
+    );
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);

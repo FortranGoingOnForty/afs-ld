@@ -116,6 +116,12 @@ struct UnwindRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedReference {
+    address: u64,
+    atom: Option<AtomId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodedLsdaRecord {
     pub function_offset: u32,
     pub lsda_offset: u32,
@@ -191,6 +197,7 @@ fn collect_records(
         .iter()
         .map(|input| (input.id, input.object))
         .collect();
+    let dwarf_fde_hints = collect_dwarf_fde_hints(layout, atoms);
     let compact_unwind_sections: HashSet<(InputId, u8)> = atoms
         .iter()
         .filter(|(_, atom)| atom.section == AtomSection::CompactUnwind)
@@ -261,8 +268,7 @@ fn collect_records(
             .get(&(atom.origin, atom.input_section))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let function_addr =
-            resolve_function_address(atom_id, atom, obj, relocs, atoms, sym_table, layout)?;
+        let function = resolve_function(atom_id, atom, obj, relocs, atoms, sym_table, layout)?;
         let personality_offset = resolve_metadata_offset(
             atom_id,
             atom,
@@ -307,15 +313,42 @@ fn collect_records(
         .transpose()?;
 
         let function_offset =
-            u32::try_from(function_addr.saturating_sub(text_base)).map_err(|_| UnwindError {
+            u32::try_from(function.address.saturating_sub(text_base)).map_err(|_| UnwindError {
                 input: obj.path.clone(),
                 atom: atom_id,
                 detail: "function start exceeds 32-bit unwind offset range".to_string(),
             })?;
+        let mut encoding = u32::from_le_bytes(atom.data[12..16].try_into().unwrap());
+        if encoding & UNWIND_ARM64_MODE_MASK == UNWIND_ARM64_MODE_DWARF {
+            let function_atom = function.atom.ok_or_else(|| UnwindError {
+                input: obj.path.clone(),
+                atom: atom_id,
+                detail: "DWARF-mode unwind function does not resolve to an output atom".to_string(),
+            })?;
+            let fde_hint = dwarf_fde_hints
+                .get(&function_atom)
+                .ok_or_else(|| UnwindError {
+                    input: obj.path.clone(),
+                    atom: atom_id,
+                    detail: format!(
+                        "DWARF-mode unwind function atom {:?} has no retained __eh_frame FDE",
+                        function_atom
+                    ),
+                })?
+                .ok_or_else(|| UnwindError {
+                    input: obj.path.clone(),
+                    atom: atom_id,
+                    detail: format!(
+                        "DWARF-mode unwind function atom {:?} has multiple retained __eh_frame FDEs",
+                        function_atom
+                    ),
+                })?;
+            encoding = (encoding & !UNWIND_ARM64_DWARF_SECTION_OFFSET_MASK) | fde_hint;
+        }
         records.push(UnwindRecord {
             function_offset,
             code_len: u32::from_le_bytes(atom.data[8..12].try_into().unwrap()),
-            encoding: u32::from_le_bytes(atom.data[12..16].try_into().unwrap()),
+            encoding,
             personality_offset,
             lsda_offset,
         });
@@ -325,7 +358,36 @@ fn collect_records(
     Ok(records)
 }
 
-fn resolve_function_address(
+fn collect_dwarf_fde_hints(layout: &Layout, atoms: &AtomTable) -> HashMap<AtomId, Option<u32>> {
+    let mut hints = HashMap::new();
+    let Some(eh_frame) = layout
+        .sections
+        .iter()
+        .find(|section| section.segment == "__TEXT" && section.name == "__eh_frame")
+    else {
+        return hints;
+    };
+    for placed in &eh_frame.atoms {
+        let fde = atoms.get(placed.atom);
+        let Some(function_atom) = fde.parent_of else {
+            continue;
+        };
+        let hint = if placed.offset <= u64::from(UNWIND_ARM64_DWARF_SECTION_OFFSET_MASK) {
+            placed.offset as u32
+        } else {
+            // A zero hint remains correct: the unwinder linearly scans forward
+            // from a valid CFI record when the exact FDE offset is unencodable.
+            0
+        };
+        hints
+            .entry(function_atom)
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(hint));
+    }
+    hints
+}
+
+fn resolve_function(
     atom_id: AtomId,
     atom: &Atom,
     obj: &crate::input::ObjectFile,
@@ -333,13 +395,19 @@ fn resolve_function_address(
     atoms: &AtomTable,
     sym_table: &SymbolTable,
     layout: &Layout,
-) -> Result<u64, UnwindError> {
+) -> Result<ResolvedReference, UnwindError> {
     if let Some(parent) = atom.parent_of {
-        return layout.atom_addr(parent).ok_or_else(|| UnwindError {
-            input: obj.path.clone(),
-            atom: atom_id,
-            detail: format!("function atom {:?} missing from final layout", parent),
-        });
+        return layout
+            .atom_addr(parent)
+            .map(|address| ResolvedReference {
+                address,
+                atom: Some(parent),
+            })
+            .ok_or_else(|| UnwindError {
+                input: obj.path.clone(),
+                atom: atom_id,
+                detail: format!("function atom {:?} missing from final layout", parent),
+            });
     }
     let Some(reloc) = relocs
         .iter()
@@ -351,7 +419,7 @@ fn resolve_function_address(
             detail: "function_start reloc is missing".to_string(),
         });
     };
-    resolve_reference_address(
+    resolve_reference(
         atom_id,
         atom,
         obj,
@@ -394,23 +462,26 @@ fn resolve_metadata_offset(
             detail: format!("{label} field has inline value but no relocation"),
         });
     };
-    Ok(Some(resolve_reference_address(
-        atom_id,
-        atom,
-        obj,
-        atoms,
-        sym_table,
-        layout,
-        Some(synthetic_plan),
-        reloc.referent,
-        raw_value as u32,
-        label,
-        allow_import_got,
-    )?))
+    Ok(Some(
+        resolve_reference(
+            atom_id,
+            atom,
+            obj,
+            atoms,
+            sym_table,
+            layout,
+            Some(synthetic_plan),
+            reloc.referent,
+            raw_value as u32,
+            label,
+            allow_import_got,
+        )?
+        .address,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_reference_address(
+fn resolve_reference(
     atom_id: AtomId,
     atom: &Atom,
     obj: &crate::input::ObjectFile,
@@ -422,7 +493,7 @@ fn resolve_reference_address(
     target_offset: u32,
     label: &str,
     allow_import_got: bool,
-) -> Result<u64, UnwindError> {
+) -> Result<ResolvedReference, UnwindError> {
     match referent {
         Referent::Section(section_idx) => {
             let input_section = obj
@@ -457,7 +528,10 @@ fn resolve_reference_address(
                 });
             };
             let atom_input_addr = input_section.addr + candidate.input_offset as u64;
-            Ok(base_addr + (target_offset as u64 - atom_input_addr))
+            Ok(ResolvedReference {
+                address: base_addr + (target_offset as u64 - atom_input_addr),
+                atom: Some(candidate_id),
+            })
         }
         Referent::Symbol(sym_idx) => {
             let input_symbol = obj
@@ -498,11 +572,21 @@ fn resolve_reference_address(
                             ),
                         });
                     };
-                    Ok(base_addr + *value)
+                    Ok(ResolvedReference {
+                        address: base_addr + *value,
+                        atom: Some(*target_atom),
+                    })
                 }
-                Symbol::Absolute { value, .. } => Ok(*value),
+                Symbol::Absolute { value, .. } => Ok(ResolvedReference {
+                    address: *value,
+                    atom: None,
+                }),
                 Symbol::DylibImport { .. } if allow_import_got => {
                     personality_got_addr(layout, synthetic_plan, symbol_id, atom_id, obj, label)
+                        .map(|address| ResolvedReference {
+                            address,
+                            atom: None,
+                        })
                 }
                 other => Err(UnwindError {
                     input: obj.path.clone(),
@@ -842,9 +926,6 @@ fn finalize_unwind_records(
             });
         } else {
             encoding &= !UNWIND_HAS_LSDA;
-        }
-        if encoding & UNWIND_ARM64_MODE_MASK == UNWIND_ARM64_MODE_DWARF {
-            encoding &= !UNWIND_ARM64_DWARF_SECTION_OFFSET_MASK;
         }
         finalized.push(UnwindRecord {
             encoding,

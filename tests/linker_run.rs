@@ -1038,6 +1038,153 @@ fn synthetic_defined_alias_object(
     bytes
 }
 
+#[derive(Clone, Copy)]
+enum SyntheticUnwindReferent {
+    Direct,
+    IndirectAlias,
+}
+
+fn synthetic_compact_unwind_alias_object(
+    unwind_referent: Option<SyntheticUnwindReferent>,
+) -> Vec<u8> {
+    let text = [
+        0x00, 0x00, 0x80, 0x52, // _main: mov w0, #0
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+    let mut strings = vec![0];
+    let mut add_string = |name: &str| {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        strx
+    };
+    let main_strx = add_string("_main");
+    let alias_strx = add_string("_alias");
+    let symbols = [
+        RawNlist {
+            strx: main_strx,
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: alias_strx,
+            n_type: N_INDR | N_EXT,
+            n_sect: 0,
+            n_desc: 0,
+            n_value: main_strx as u64,
+        },
+    ];
+
+    let mut compact_unwind = Vec::new();
+    let mut reloc_bytes = Vec::new();
+    if let Some(referent) = unwind_referent {
+        compact_unwind.resize(32, 0);
+        compact_unwind[8..12].copy_from_slice(&(text.len() as u32).to_le_bytes());
+        compact_unwind[12..16].copy_from_slice(&0x0200_0000u32.to_le_bytes());
+        let raw_relocs = write_relocs(&[Reloc {
+            offset: 0,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(match referent {
+                SyntheticUnwindReferent::Direct => 0,
+                SyntheticUnwindReferent::IndirectAlias => 1,
+            }),
+            addend: 0,
+            subtrahend: None,
+        }])
+        .unwrap();
+        write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+    }
+
+    let mut sections = vec![Section64Header {
+        sectname: name16("__text"),
+        segname: name16("__TEXT"),
+        addr: 0,
+        size: text.len() as u64,
+        offset: 0,
+        align: 2,
+        reloff: 0,
+        nreloc: 0,
+        flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+        reserved1: 0,
+        reserved2: 0,
+        reserved3: 0,
+    }];
+    if unwind_referent.is_some() {
+        sections.push(Section64Header {
+            sectname: name16("__compact_unwind"),
+            segname: name16("__LD"),
+            addr: text.len() as u64,
+            size: compact_unwind.len() as u64,
+            offset: 0,
+            align: 3,
+            reloff: 0,
+            nreloc: 1,
+            flags: S_REGULAR | S_ATTR_DEBUG,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        });
+    }
+
+    let data_size = text.len() + compact_unwind.len();
+    let mut segment = Segment64 {
+        segname: name16(""),
+        vmaddr: 0,
+        vmsize: data_size as u64,
+        fileoff: 0,
+        filesize: data_size as u64,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections,
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    if unwind_referent.is_some() {
+        segment.sections[1].offset = data_offset + text.len() as u32;
+        segment.sections[1].reloff = data_offset + data_size as u32;
+    }
+    let symoff = data_offset + data_size as u32 + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&compact_unwind);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
 fn synthetic_same_address_entry_alias_object() -> Vec<u8> {
     let text = [
         SAME_ADDRESS_ENTRY_CODE.as_slice(),
@@ -9015,6 +9162,60 @@ fn linker_run_emits_leaf_unwind_info_like_ld() {
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_resolves_compact_unwind_function_aliases() {
+    let obj = scratch("compact-unwind-alias.o");
+    let out = scratch("compact-unwind-alias.out");
+    let direct_fixture =
+        synthetic_compact_unwind_alias_object(Some(SyntheticUnwindReferent::Direct));
+    let alias_fixture =
+        synthetic_compact_unwind_alias_object(Some(SyntheticUnwindReferent::IndirectAlias));
+
+    let parsed = ObjectFile::parse(&obj, &alias_fixture).unwrap();
+    let compact = parsed
+        .sections
+        .iter()
+        .find(|section| section.sectname == "__compact_unwind")
+        .expect("alias fixture must contain compact unwind data");
+    let relocs =
+        parse_relocs(&parse_raw_relocs(&compact.raw_relocs, 0, compact.nreloc).unwrap()).unwrap();
+    assert_eq!(relocs.len(), 1);
+    assert_eq!(relocs[0].referent, Referent::Symbol(1));
+    assert_eq!(parsed.symbol_name(&parsed.symbols[1]).unwrap(), "_alias");
+    assert_eq!(parsed.symbols[1].kind(), SymKind::Indirect);
+
+    let link = |fixture: &[u8], jobs| {
+        fs::write(&obj, fixture).unwrap();
+        Linker::run(&LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        fs::read(&out).unwrap()
+    };
+
+    let direct_outputs = [link(&direct_fixture, 1), link(&direct_fixture, 4)];
+    assert_eq!(direct_outputs[0], direct_outputs[1]);
+    let direct_unwind = canonical_unwind_info(&direct_outputs[0]);
+    assert_eq!(direct_unwind.records.len(), 1);
+    assert_eq!(direct_unwind.records[0].function_offset, 0);
+    assert_eq!(direct_unwind.records[0].encoding, 0x0200_0000);
+
+    let alias_outputs = [link(&alias_fixture, 1), link(&alias_fixture, 4)];
+    assert_eq!(alias_outputs[0], alias_outputs[1]);
+    assert_eq!(alias_outputs[0], direct_outputs[0]);
+    assert_eq!(canonical_unwind_info(&alias_outputs[0]), direct_unwind);
+
+    let no_unwind = link(&synthetic_compact_unwind_alias_object(None), 4);
+    assert!(output_section(&no_unwind, "__TEXT", "__unwind_info").is_none());
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
 }
 
 #[test]

@@ -473,16 +473,15 @@ fn resolve_reference_address(
                 atom: atom_id,
                 detail: err.to_string(),
             })?;
-            let Some((symbol_id, symbol)) = sym_table
-                .iter()
-                .find(|(_, symbol)| sym_table.interner.resolve(symbol.name()) == name)
-            else {
-                return Err(UnwindError {
-                    input: obj.path.clone(),
-                    atom: atom_id,
-                    detail: format!("{label} symbol `{name}` was not resolved"),
-                });
+            let unresolved = || UnwindError {
+                input: obj.path.clone(),
+                atom: atom_id,
+                detail: format!("{label} symbol `{name}` was not resolved"),
             };
+            let interned_name = sym_table.interner.get(name).ok_or_else(&unresolved)?;
+            let (symbol_id, symbol) = sym_table
+                .resolve_chain(interned_name)
+                .map_err(|_| unresolved())?;
             match symbol {
                 Symbol::Defined {
                     atom: target_atom,

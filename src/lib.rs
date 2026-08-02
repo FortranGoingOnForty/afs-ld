@@ -1562,7 +1562,9 @@ fn register_input(
         }
         Some("dylib") => {
             let phase_started = Instant::now();
-            let id = inputs.add_dylib_with_kind(path.to_path_buf(), bytes, load_kind)?;
+            let file = DylibFile::parse(path, &bytes)
+                .map_err(|source| LinkError::macho_parse(path, source))?;
+            let id = inputs.add_dylib_from_file_with_kind(path.to_path_buf(), file, load_kind)?;
             ordered.push(OrderedInputEntry::dylib(load_order, id));
             timings.dylib_parse = phase_started.elapsed();
         }

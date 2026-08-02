@@ -331,14 +331,17 @@ fn synthetic_common_with_regular_common_section() -> Vec<u8> {
     bytes
 }
 
-fn synthetic_dylib(install_name: &str) -> Vec<u8> {
-    let id = DylibCmd {
-        cmd: LC_ID_DYLIB,
-        name: install_name.to_string(),
-        timestamp: 2,
-        current_version: 1 << 16,
-        compatibility_version: 1 << 16,
-    };
+fn synthetic_dylib_with_ids(install_names: &[&str]) -> Vec<u8> {
+    let commands = install_names
+        .iter()
+        .map(|install_name| DylibCmd {
+            cmd: LC_ID_DYLIB,
+            name: (*install_name).to_string(),
+            timestamp: 2,
+            current_version: 1 << 16,
+            compatibility_version: 1 << 16,
+        })
+        .collect::<Vec<_>>();
     let mut bytes = Vec::new();
     write_header(
         &MachHeader64 {
@@ -346,15 +349,21 @@ fn synthetic_dylib(install_name: &str) -> Vec<u8> {
             cputype: CPU_TYPE_ARM64,
             cpusubtype: CPU_SUBTYPE_ARM64_ALL,
             filetype: MH_DYLIB,
-            ncmds: 1,
-            sizeofcmds: id.wire_size(),
+            ncmds: commands.len() as u32,
+            sizeofcmds: commands.iter().map(DylibCmd::wire_size).sum(),
             flags: 0,
             reserved: 0,
         },
         &mut bytes,
     );
-    id.write(&mut bytes);
+    for command in commands {
+        command.write(&mut bytes);
+    }
     bytes
+}
+
+fn synthetic_dylib(install_name: &str) -> Vec<u8> {
+    synthetic_dylib_with_ids(&[install_name])
 }
 
 fn synthetic_macho_with_truncated_commands(filetype: u32) -> Vec<u8> {
@@ -1604,6 +1613,58 @@ fn macho_parse_diagnostics_include_input_paths() {
     }
 
     let _ = fs::remove_file(valid);
+}
+
+#[test]
+fn malformed_dylib_identities_are_rejected_without_output() {
+    let cases = [
+        ("missing", Vec::new(), "missing LC_ID_DYLIB load command"),
+        ("empty", vec![""], "LC_ID_DYLIB install name is empty"),
+        (
+            "duplicate",
+            vec!["@rpath/libfirst.dylib", "@rpath/libsecond.dylib"],
+            "multiple LC_ID_DYLIB load commands",
+        ),
+    ];
+
+    for (case, install_names, expected) in cases {
+        let input = scratch(&format!("invalid-dylib-id-{case}.dylib"));
+        fs::write(&input, synthetic_dylib_with_ids(&install_names)).unwrap();
+
+        for jobs in [1, 4] {
+            let output = scratch(&format!("invalid-dylib-id-{case}-{jobs}.dylib"));
+            let _ = fs::remove_file(&output);
+            let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+                .arg("-dylib")
+                .arg("-j")
+                .arg(jobs.to_string())
+                .arg(&input)
+                .arg("-o")
+                .arg(&output)
+                .output()
+                .expect("afs-ld should run");
+            let stderr = String::from_utf8_lossy(&result.stderr);
+
+            assert!(
+                !result.status.success(),
+                "malformed {case} identity was accepted with -j{jobs}"
+            );
+            assert!(
+                stderr.contains(&input.display().to_string()),
+                "missing malformed dylib path with -j{jobs}:\n{stderr}"
+            );
+            assert!(
+                stderr.contains(expected),
+                "unexpected malformed {case} diagnostic with -j{jobs}:\n{stderr}"
+            );
+            assert!(
+                !output.exists(),
+                "rejected {case} identity left an output with -j{jobs}"
+            );
+        }
+
+        let _ = fs::remove_file(input);
+    }
 }
 
 #[test]

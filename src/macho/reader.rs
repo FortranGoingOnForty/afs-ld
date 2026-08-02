@@ -30,6 +30,8 @@ pub enum ReadError {
     UnsupportedCpuSubtype { got: u32 },
     /// A parser was given a different kind of Mach-O image than it accepts.
     UnexpectedFiletype { got: u32, expected: u32 },
+    /// An `MH_DYLIB` does not carry exactly one usable `LC_ID_DYLIB`.
+    BadDylibIdentity { reason: &'static str },
     /// A load command's `cmdsize` field is malformed.
     BadCmdsize {
         cmd: u32,
@@ -69,6 +71,9 @@ impl fmt::Display for ReadError {
                 macho_filetype_name(*got).unwrap_or("unknown"),
                 macho_filetype_name(*expected).unwrap_or("unknown")
             ),
+            ReadError::BadDylibIdentity { reason } => {
+                write!(f, "malformed MH_DYLIB identity: {reason}")
+            }
             ReadError::BadCmdsize { cmd, cmdsize, at_offset, reason } => write!(
                 f,
                 "load command 0x{cmd:x} at offset 0x{at_offset:x}: cmdsize {cmdsize} invalid ({reason})"

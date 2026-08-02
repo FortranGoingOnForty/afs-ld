@@ -90,9 +90,7 @@ impl DylibFile {
         }
         let commands = parse_commands(&header, file_bytes)?;
 
-        let mut install_name = String::new();
-        let mut current_version = 0u32;
-        let mut compatibility_version = 0u32;
+        let mut identity = None;
         let mut dependencies: Vec<DylibDependency> = Vec::new();
         let mut rpaths: Vec<String> = Vec::new();
         let mut symtab: Option<SymtabCmd> = None;
@@ -100,9 +98,17 @@ impl DylibFile {
         for cmd in &commands {
             match cmd {
                 LoadCommand::Dylib(d) if d.cmd == LC_ID_DYLIB => {
-                    install_name = d.name.clone();
-                    current_version = d.current_version;
-                    compatibility_version = d.compatibility_version;
+                    if identity.is_some() {
+                        return Err(ReadError::BadDylibIdentity {
+                            reason: "multiple LC_ID_DYLIB load commands",
+                        });
+                    }
+                    if d.name.is_empty() {
+                        return Err(ReadError::BadDylibIdentity {
+                            reason: "LC_ID_DYLIB install name is empty",
+                        });
+                    }
+                    identity = Some(d);
                 }
                 LoadCommand::Dylib(d) => {
                     if let Some(kind) = DylibLoadKind::from_cmd(d.cmd) {
@@ -122,6 +128,12 @@ impl DylibFile {
             }
         }
 
+        let identity = identity.ok_or(ReadError::BadDylibIdentity {
+            reason: "missing LC_ID_DYLIB load command",
+        })?;
+        let install_name = identity.name.clone();
+        let current_version = identity.current_version;
+        let compatibility_version = identity.compatibility_version;
         let exports = locate_exports(&commands, file_bytes)?;
 
         Ok(DylibFile {
@@ -367,6 +379,34 @@ mod tests {
         assert_eq!(dy.install_name, "@rpath/libfoo.dylib");
         assert_eq!(dy.current_version, (1 << 16) | (2 << 8) | 3);
         assert_eq!(dy.compatibility_version, 1 << 16);
+    }
+
+    #[test]
+    fn parse_dylib_requires_exactly_one_nonempty_identity() {
+        let cases = [
+            (
+                Vec::new(),
+                "malformed MH_DYLIB identity: missing LC_ID_DYLIB load command",
+            ),
+            (
+                vec![LoadCommand::Dylib(dylib_cmd(LC_ID_DYLIB, ""))],
+                "malformed MH_DYLIB identity: LC_ID_DYLIB install name is empty",
+            ),
+            (
+                vec![
+                    LoadCommand::Dylib(dylib_cmd(LC_ID_DYLIB, "@rpath/libfirst.dylib")),
+                    LoadCommand::Dylib(dylib_cmd(LC_ID_DYLIB, "@rpath/libsecond.dylib")),
+                ],
+                "malformed MH_DYLIB identity: multiple LC_ID_DYLIB load commands",
+            ),
+        ];
+
+        for (commands, expected) in cases {
+            let image = make_dylib_image(commands);
+            let error = DylibFile::parse("/tmp/invalid.dylib", &image)
+                .expect_err("malformed dylib identity must be rejected");
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]

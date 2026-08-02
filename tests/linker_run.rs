@@ -6607,6 +6607,139 @@ fn linker_run_carries_tbd_inputs_into_load_commands() {
 }
 
 #[test]
+fn linker_run_resolves_reexported_inline_tbd_documents_through_the_umbrella() {
+    let object = scratch("inline-tbd-reexport.o");
+    let tbd = scratch("inline-tbd-reexport.tbd");
+    let output = scratch("inline-tbd-reexport.out");
+    let child_symbol = "_inline_child_export";
+    fs::write(
+        &object,
+        synthetic_got_reference_object("_main", child_symbol, false),
+    )
+    .unwrap();
+    fs::write(
+        &tbd,
+        format!(
+            r#"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libinline_umbrella.dylib'
+reexported-libraries:
+  - targets: [ arm64-macos ]
+    libraries: [ '/usr/lib/libinline_middle.dylib' ]
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libinline_middle.dylib'
+parent-umbrella:
+  - targets: [ arm64-macos ]
+    umbrella: inline_umbrella
+reexported-libraries:
+  - targets: [ arm64-macos ]
+    libraries: [ '/usr/lib/libinline_child.dylib' ]
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libinline_child.dylib'
+parent-umbrella:
+  - targets: [ arm64-macos ]
+    umbrella: inline_umbrella
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ {child_symbol} ]
+...
+"#
+        ),
+    )
+    .unwrap();
+
+    let mut outputs = Vec::new();
+    for jobs in [1, 4] {
+        Linker::run(&LinkOptions {
+            inputs: vec![object.clone(), tbd.clone()],
+            output: Some(output.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        outputs.push(fs::read(&output).unwrap());
+    }
+    assert_eq!(outputs[0], outputs[1], "-j1 and -j4 output differs");
+    assert_eq!(
+        load_dylib_names(&outputs[0]).unwrap(),
+        ["/usr/lib/libinline_umbrella.dylib"]
+    );
+    assert_got_import(&outputs[0], child_symbol, 1, false);
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(tbd);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn linker_run_rejects_exports_from_unrelated_inline_tbd_documents() {
+    const SENTINEL: &[u8] = b"AFSLD-057 existing output";
+
+    let object = scratch("inline-tbd-unrelated.o");
+    let tbd = scratch("inline-tbd-unrelated.tbd");
+    let output = scratch("inline-tbd-unrelated.out");
+    let unrelated_symbol = "_unrelated_inline_export";
+    fs::write(
+        &object,
+        synthetic_got_reference_object("_main", unrelated_symbol, false),
+    )
+    .unwrap();
+    fs::write(
+        &tbd,
+        format!(
+            r#"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libinline_primary.dylib'
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ _primary_export ]
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libinline_unrelated.dylib'
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ {unrelated_symbol} ]
+...
+"#
+        ),
+    )
+    .unwrap();
+
+    let mut diagnostics = Vec::new();
+    for jobs in [1, 4] {
+        fs::write(&output, SENTINEL).unwrap();
+        let error = Linker::run(&LinkOptions {
+            inputs: vec![object.clone(), tbd.clone()],
+            output: Some(output.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .expect_err("an unrelated inline TBD document must not satisfy imports");
+        diagnostics.push(error.to_string());
+        assert_eq!(fs::read(&output).unwrap(), SENTINEL);
+    }
+    assert_eq!(diagnostics[0], diagnostics[1]);
+    assert!(
+        diagnostics[0].contains(&format!("undefined symbol: {unrelated_symbol}")),
+        "unexpected diagnostic: {}",
+        diagnostics[0]
+    );
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(tbd);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
 fn linker_run_enforces_the_macho_library_ordinal_boundary() {
     const MAX_ORDINARY_LIBRARY_ORDINAL: usize = 0xfd;
     const SENTINEL: &[u8] = b"previous complete Mach-O output";

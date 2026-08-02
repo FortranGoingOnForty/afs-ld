@@ -30,7 +30,10 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::{collections::VecDeque, fs, io};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fs, io,
+};
 
 use archive::ArchiveMetadata;
 use atom::{
@@ -46,7 +49,7 @@ use macho::constants::{
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
 use macho::reader::{parse_header, ReadError};
 use macho::tbd::{
-    parse_tbd_for_target, parse_tbd_metadata_for_target, parse_version, Arch, Platform, Target,
+    parse_tbd_for_target, parse_tbd_metadata_for_target, parse_version, Arch, Platform, Target, Tbd,
 };
 use reloc::arm64::RelocError;
 use resolve::{
@@ -1585,10 +1588,7 @@ fn register_input(
             if docs.is_empty() {
                 return Err(LinkError::NoTbdDocument(path.to_path_buf()));
             }
-            let canonical = docs
-                .iter()
-                .find(|doc| doc.parent_umbrella.is_empty())
-                .unwrap_or_else(|| &docs[0]);
+            let canonical = &docs[0];
             let load = DylibLoadMeta {
                 install_name: canonical.install_name.clone(),
                 current_version: canonical
@@ -1604,7 +1604,7 @@ fn register_input(
                 ordinal: inputs.next_dylib_ordinal()?,
                 load_kind,
             };
-            for doc in &docs {
+            for doc in reachable_tbd_documents(&docs) {
                 let file = DylibFile::from_tbd(path, doc, &target);
                 let id =
                     inputs.add_dylib_from_file_with_meta(path.to_path_buf(), file, load.clone())?;
@@ -1620,6 +1620,39 @@ fn register_input(
         }
     }
     Ok(RegisteredInput { timings, ordered })
+}
+
+fn reachable_tbd_documents(docs: &[Tbd]) -> Vec<&Tbd> {
+    debug_assert!(!docs.is_empty());
+
+    let mut by_install_name = BTreeMap::new();
+    for (index, doc) in docs.iter().enumerate() {
+        by_install_name
+            .entry(doc.install_name.as_str())
+            .or_insert(index);
+    }
+
+    let mut reachable = vec![false; docs.len()];
+    let mut pending = VecDeque::from([0]);
+    reachable[0] = true;
+    while let Some(index) = pending.pop_front() {
+        for reexports in &docs[index].reexported_libraries {
+            for install_name in &reexports.value {
+                let Some(&child_index) = by_install_name.get(install_name.as_str()) else {
+                    continue;
+                };
+                if !reachable[child_index] {
+                    reachable[child_index] = true;
+                    pending.push_back(child_index);
+                }
+            }
+        }
+    }
+
+    docs.iter()
+        .zip(reachable)
+        .filter_map(|(doc, reachable)| reachable.then_some(doc))
+        .collect()
 }
 
 fn inputs_may_need_dylib_exports(inputs: &Inputs) -> Result<bool, LinkError> {

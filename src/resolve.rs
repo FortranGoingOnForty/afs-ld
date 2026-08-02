@@ -182,17 +182,17 @@ pub struct DylibInput {
     pub file: DylibFile,
     /// Install name surfaced in the output's `LC_LOAD_DYLIB` list.
     ///
-    /// Multi-document TBD inputs may seed exports from several sibling
-    /// documents while still canonicalizing them back to one umbrella load
-    /// command (e.g. `libSystem.tbd`).
+    /// Multi-document TBD inputs may seed exports from the top-level document
+    /// and its reachable inline re-exports while still canonicalizing them to
+    /// one umbrella load command (e.g. `libSystem.tbd`).
     pub load_install_name: String,
     /// Current-version field surfaced in the output `LC_LOAD_DYLIB`.
     pub load_current_version: u32,
     /// Compatibility-version field surfaced in the output `LC_LOAD_DYLIB`.
     pub load_compatibility_version: u32,
     /// 1-based two-level-namespace ordinal encoded into undefined symbols and
-    /// bind opcodes. Matches the output's `LC_LOAD_DYLIB` ordering, so several
-    /// parsed TBD documents from one umbrella input may legitimately share it.
+    /// bind opcodes. Matches the output's `LC_LOAD_DYLIB` ordering, so the
+    /// reachable re-export graph from one umbrella input legitimately shares it.
     pub ordinal: u16,
     /// How the output loads this dependency. Weak loads make every import from
     /// the dependency weak, independently of provider or consumer symbol bits.

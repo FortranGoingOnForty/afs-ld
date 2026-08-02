@@ -9,7 +9,40 @@
 // Magic and file types
 pub const MH_MAGIC_64: u32 = 0xFEEDFACF;
 pub const CPU_TYPE_ARM64: u32 = 0x0100_000C;
+/// Capability bits occupy the high byte of a Mach-O CPU subtype.
+pub const CPU_SUBTYPE_MASK: u32 = 0xFF00_0000;
+/// General Mach-O feature bit identifying a 64-bit library ABI.
+pub const CPU_SUBTYPE_LIB64: u32 = 0x8000_0000;
 pub const CPU_SUBTYPE_ARM64_ALL: u32 = 0;
+pub const CPU_SUBTYPE_ARM64_V8: u32 = 1;
+pub const CPU_SUBTYPE_ARM64E: u32 = 2;
+/// ARM64e's versioned userspace ABI marker.
+pub const CPU_SUBTYPE_ARM64E_VERSIONED_ABI: u32 = 0x8000_0000;
+/// ARM64e's kernel ABI marker.
+pub const CPU_SUBTYPE_ARM64E_KERNEL_ABI: u32 = 0x4000_0000;
+/// ARM64e pointer-authentication ABI version field.
+pub const CPU_SUBTYPE_ARM64E_PTRAUTH_VERSION_MASK: u32 = 0x0F00_0000;
+const CPU_SUBTYPE_ARM64E_CAPABILITY_MASK: u32 = CPU_SUBTYPE_ARM64E_VERSIONED_ABI
+    | CPU_SUBTYPE_ARM64E_KERNEL_ABI
+    | CPU_SUBTYPE_ARM64E_PTRAUTH_VERSION_MASK;
+
+/// Return whether afs-ld can preserve the complete ARM64 subtype contract.
+///
+/// ARM64e stores its ABI and pointer-authentication capabilities in the high
+/// byte. The other defined ARM64 subtypes may carry only Mach-O's general
+/// `LIB64` feature bit. Rejecting any other high bits prevents malformed or
+/// future metadata from being silently relabeled by the current linker.
+pub const fn is_supported_arm64_cpu_subtype(cpu_subtype: u32) -> bool {
+    let base = cpu_subtype & !CPU_SUBTYPE_MASK;
+    let capabilities = cpu_subtype & CPU_SUBTYPE_MASK;
+    match base {
+        CPU_SUBTYPE_ARM64_ALL | CPU_SUBTYPE_ARM64_V8 => {
+            capabilities == 0 || capabilities == CPU_SUBTYPE_LIB64
+        }
+        CPU_SUBTYPE_ARM64E => capabilities & !CPU_SUBTYPE_ARM64E_CAPABILITY_MASK == 0,
+        _ => false,
+    }
+}
 
 pub const MH_OBJECT: u32 = 1;
 pub const MH_EXECUTE: u32 = 2;

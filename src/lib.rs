@@ -40,7 +40,9 @@ use atom::{
 use icf::IcfError;
 use input::ObjectFile;
 use layout::{ExtraLayoutSections, Layout, LayoutInput};
-use macho::constants::{macho_filetype_name, MH_DYLIB, MH_OBJECT, SECTION_TYPE_MASK, S_ZEROFILL};
+use macho::constants::{
+    macho_filetype_name, CPU_SUBTYPE_ARM64_ALL, MH_DYLIB, MH_OBJECT, SECTION_TYPE_MASK, S_ZEROFILL,
+};
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
 use macho::reader::{parse_header, ReadError};
 use macho::tbd::{
@@ -241,6 +243,12 @@ pub enum LinkError {
     DuplicateSymbols(String),
     UndefinedSymbols(String),
     UnsupportedArch(String),
+    IncompatibleCpuSubtypes {
+        reference_path: PathBuf,
+        reference_subtype: u32,
+        path: PathBuf,
+        subtype: u32,
+    },
     NoTbdDocument(PathBuf),
     MissingExecutableEntry,
     EntrySymbolNotFound(String),
@@ -372,6 +380,17 @@ impl std::fmt::Display for LinkError {
             LinkError::UnsupportedArch(arch) => {
                 write!(f, "unsupported arch `{arch}` (afs-ld requires arm64)")
             }
+            LinkError::IncompatibleCpuSubtypes {
+                reference_path,
+                reference_subtype,
+                path,
+                subtype,
+            } => write!(
+                f,
+                "incompatible ARM64 CPU subtypes: {} uses 0x{reference_subtype:08x}, but {} uses 0x{subtype:08x}; all object inputs must use one exact subtype and capability set",
+                reference_path.display(),
+                path.display()
+            ),
             LinkError::NoTbdDocument(path) => {
                 write!(f, "{}: no arm64-macos TBD document found", path.display())
             }
@@ -762,6 +781,8 @@ impl Linker {
             return Err(LinkError::DuplicateSymbols(msg));
         }
 
+        let output_cpu_subtype = resolve_output_cpu_subtype(&inputs)?;
+
         let mut referrers = resolution_report.referrers.clone();
         referrers.extend_from(&force_report.referrers);
         let unresolved = classify_unresolved(&mut sym_table, opts.undefined_treatment);
@@ -1041,9 +1062,9 @@ impl Linker {
         let phase_started = Instant::now();
         let mut image = Vec::new();
         let entry_point = resolve_entry_point(opts, &sym_table)?;
-        macho::writer::write_finalized_with_linkedit(
+        macho::writer::write_finalized_with_linkedit_for_header(
             &layout,
-            opts.kind,
+            macho::writer::OutputHeaderSpec::new(opts.kind, output_cpu_subtype),
             opts,
             entry_point,
             &dylib_loads,
@@ -1083,6 +1104,33 @@ impl Linker {
             total_wall: overall_started.elapsed(),
         })
     }
+}
+
+fn resolve_output_cpu_subtype(inputs: &Inputs) -> Result<u32, LinkError> {
+    let mut objects: Vec<_> = inputs.objects.iter().collect();
+    objects.sort_by(|left, right| {
+        left.load_order
+            .cmp(&right.load_order)
+            .then_with(|| left.archive_member_offset.cmp(&right.archive_member_offset))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    let Some(reference) = objects.first() else {
+        return Ok(CPU_SUBTYPE_ARM64_ALL);
+    };
+    let reference_subtype = reference.parsed.header.cpusubtype;
+    for object in objects.iter().skip(1) {
+        let subtype = object.parsed.header.cpusubtype;
+        if subtype != reference_subtype {
+            return Err(LinkError::IncompatibleCpuSubtypes {
+                reference_path: reference.path.clone(),
+                reference_subtype,
+                path: object.path.clone(),
+                subtype,
+            });
+        }
+    }
+    Ok(reference_subtype)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

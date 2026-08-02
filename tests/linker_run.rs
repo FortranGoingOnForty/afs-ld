@@ -21,12 +21,13 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
-    BIND_SYMBOL_FLAGS_WEAK_IMPORT, CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64,
-    EXPORT_SYMBOL_FLAGS_REEXPORT, EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, INDIRECT_SYMBOL_ABS,
-    INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
-    LC_FUNCTION_STARTS, LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, MH_MAGIC_64,
-    MH_OBJECT, MH_SUBSECTIONS_VIA_SYMBOLS, N_ABS, N_ALT_ENTRY, N_EXT, N_INDR, N_PEXT, N_SECT,
-    N_UNDF, N_WEAK_REF, REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, CPU_SUBTYPE_ARM64E, CPU_SUBTYPE_ARM64_ALL, CPU_SUBTYPE_ARM64_V8,
+    CPU_SUBTYPE_LIB64, CPU_TYPE_ARM64, EXPORT_SYMBOL_FLAGS_REEXPORT,
+    EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL,
+    LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS,
+    LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, MH_MAGIC_64, MH_OBJECT,
+    MH_SUBSECTIONS_VIA_SYMBOLS, N_ABS, N_ALT_ENTRY, N_EXT, N_INDR, N_PEXT, N_SECT, N_UNDF,
+    N_WEAK_REF, REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED,
     REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB,
     REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB, REBASE_OPCODE_MASK,
@@ -201,6 +202,35 @@ fn compile_dylib_c(src: &str, out: &PathBuf) -> Result<(), String> {
 
 fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-linker-run-{}-{name}", std::process::id()))
+}
+
+fn with_cpu_subtype(mut object: Vec<u8>, cpu_subtype: u32) -> Vec<u8> {
+    object[8..12].copy_from_slice(&cpu_subtype.to_le_bytes());
+    object
+}
+
+fn append_archive_field(archive: &mut Vec<u8>, value: &str, width: usize) {
+    assert!(value.len() <= width);
+    archive.extend_from_slice(value.as_bytes());
+    archive.resize(archive.len() + width - value.len(), b' ');
+}
+
+fn synthetic_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = b"!<arch>\n".to_vec();
+    for (name, body) in members {
+        append_archive_field(&mut archive, &format!("{name}/"), 16);
+        append_archive_field(&mut archive, "0", 12);
+        append_archive_field(&mut archive, "0", 6);
+        append_archive_field(&mut archive, "0", 6);
+        append_archive_field(&mut archive, "100644", 8);
+        append_archive_field(&mut archive, &body.len().to_string(), 10);
+        archive.extend_from_slice(b"`\n");
+        archive.extend_from_slice(body);
+        if body.len() % 2 != 0 {
+            archive.push(b'\n');
+        }
+    }
+    archive
 }
 
 fn name16(name: &str) -> [u8; 16] {
@@ -3093,6 +3123,302 @@ fn sign_extend_26(value: i64) -> i64 {
     } else {
         value
     }
+}
+
+#[test]
+fn linker_run_preserves_arm64e_cpu_subtype_and_capabilities_deterministically() {
+    const ARM64E_PTRAUTH_ABI_V0: u32 = 0x8000_0002;
+    const ABSOLUTE_VALUE: u64 = 0x1234_5678_9abc_def0;
+
+    let reference = scratch("arm64e-subtype-reference.o");
+    let definition = scratch("arm64e-subtype-definition.o");
+    let out = scratch("arm64e-subtype.out");
+    fs::write(
+        &reference,
+        with_cpu_subtype(
+            synthetic_got_reference_object("_main", "_absolute", false),
+            ARM64E_PTRAUTH_ABI_V0,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        with_cpu_subtype(
+            synthetic_absolute_object("_absolute", ABSOLUTE_VALUE),
+            ARM64E_PTRAUTH_ABI_V0,
+        ),
+    )
+    .unwrap();
+
+    let _ = fs::remove_file(&out);
+    let mut outputs = Vec::new();
+    for _ in 0..2 {
+        Linker::run(&LinkOptions {
+            inputs: vec![reference.clone(), definition.clone()],
+            output: Some(out.clone()),
+            arch: Some("arm64".into()),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        outputs.push(fs::read(&out).unwrap());
+    }
+
+    assert_eq!(
+        parse_header(&outputs[0]).unwrap().cpusubtype,
+        ARM64E_PTRAUTH_ABI_V0
+    );
+    assert_eq!(
+        outputs[0], outputs[1],
+        "repeated ARM64e links must be byte-identical"
+    );
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_preserves_other_defined_arm64_subtypes() {
+    for cpu_subtype in [
+        CPU_SUBTYPE_ARM64_V8,
+        CPU_SUBTYPE_LIB64,
+        CPU_SUBTYPE_ARM64_V8 | CPU_SUBTYPE_LIB64,
+    ] {
+        let reference = scratch(&format!("arm64-subtype-{cpu_subtype:08x}-reference.o"));
+        let definition = scratch(&format!("arm64-subtype-{cpu_subtype:08x}-definition.o"));
+        let out = scratch(&format!("arm64-subtype-{cpu_subtype:08x}.out"));
+        fs::write(
+            &reference,
+            with_cpu_subtype(
+                synthetic_got_reference_object("_main", "_absolute", false),
+                cpu_subtype,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &definition,
+            with_cpu_subtype(synthetic_absolute_object("_absolute", 42), cpu_subtype),
+        )
+        .unwrap();
+
+        let _ = fs::remove_file(&out);
+        Linker::run(&LinkOptions {
+            inputs: vec![reference.clone(), definition.clone()],
+            output: Some(out.clone()),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        assert_eq!(
+            parse_header(&fs::read(&out).unwrap()).unwrap().cpusubtype,
+            cpu_subtype
+        );
+
+        let _ = fs::remove_file(reference);
+        let _ = fs::remove_file(definition);
+        let _ = fs::remove_file(out);
+    }
+}
+
+#[test]
+fn linker_run_rejects_conflicting_arm64e_capabilities_without_replacing_output() {
+    const ARM64E_PTRAUTH_ABI_V0: u32 = 0x8000_0002;
+    const ARM64E_PTRAUTH_ABI_V1: u32 = 0x8100_0002;
+    const SENTINEL: &[u8] = b"pre-existing output\n";
+
+    let reference = scratch("arm64e-conflict-reference.o");
+    let definition = scratch("arm64e-conflict-definition.o");
+    let out = scratch("arm64e-conflict.out");
+    fs::write(
+        &reference,
+        with_cpu_subtype(
+            synthetic_got_reference_object("_main", "_absolute", false),
+            ARM64E_PTRAUTH_ABI_V0,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        with_cpu_subtype(
+            synthetic_absolute_object("_absolute", 42),
+            ARM64E_PTRAUTH_ABI_V1,
+        ),
+    )
+    .unwrap();
+    fs::write(&out, SENTINEL).unwrap();
+
+    let error = Linker::run(&LinkOptions {
+        inputs: vec![reference.clone(), definition.clone()],
+        output: Some(out.clone()),
+        ..LinkOptions::default()
+    })
+    .unwrap_err();
+
+    let diagnostic = error.to_string();
+    assert!(
+        diagnostic.contains("incompatible ARM64 CPU subtypes"),
+        "unexpected diagnostic: {diagnostic}"
+    );
+    assert!(diagnostic.contains(&reference.display().to_string()));
+    assert!(diagnostic.contains(&definition.display().to_string()));
+    assert_eq!(fs::read(&out).unwrap(), SENTINEL);
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_rejects_unknown_arm64_cpu_subtype_without_publishing_output() {
+    let object = scratch("unknown-arm64-subtype.o");
+    let out = scratch("unknown-arm64-subtype.out");
+    let _ = fs::remove_file(&out);
+    fs::write(
+        &object,
+        with_cpu_subtype(
+            synthetic_got_reference_object("_main", "_unused", false),
+            0x0000_0003,
+        ),
+    )
+    .unwrap();
+
+    let error = Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(out.clone()),
+        ..LinkOptions::default()
+    })
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported ARM64 CPU subtype 0x00000003"),
+        "unexpected diagnostic: {error}"
+    );
+    assert!(!out.exists());
+
+    let _ = fs::remove_file(object);
+}
+
+#[test]
+fn linker_run_preserves_arm64e_subtype_from_force_loaded_archive_members() {
+    const ARM64E_PTRAUTH_ABI_V0: u32 = 0x8000_0002;
+
+    let archive_path = scratch("arm64e-subtype.a");
+    let out = scratch("arm64e-subtype-archive.out");
+    let _ = fs::remove_file(&out);
+    let reference = with_cpu_subtype(
+        synthetic_got_reference_object("_main", "_absolute", false),
+        ARM64E_PTRAUTH_ABI_V0,
+    );
+    let definition = with_cpu_subtype(
+        synthetic_absolute_object("_absolute", 42),
+        ARM64E_PTRAUTH_ABI_V0,
+    );
+    fs::write(
+        &archive_path,
+        synthetic_archive(&[("main.o", &reference), ("absolute.o", &definition)]),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![archive_path.clone()],
+        output: Some(out.clone()),
+        all_load: true,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    assert_eq!(
+        parse_header(&fs::read(&out).unwrap()).unwrap().cpusubtype,
+        ARM64E_PTRAUTH_ABI_V0
+    );
+
+    let _ = fs::remove_file(archive_path);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn clang_arm64e_object_subtype_round_trips_when_available() {
+    let source = scratch("arm64e-subtype.s");
+    let object = scratch("arm64e-clang.o");
+    let out = scratch("arm64e-clang.out");
+    fs::write(
+        &source,
+        r#"
+            .section __TEXT,__text,regular,pure_instructions
+            .globl _main
+            _main:
+                mov w0, #42
+                ret
+            .subsections_via_symbols
+        "#,
+    )
+    .unwrap();
+
+    let (mut compiler, compiler_name) = if have_xcrun_tool("clang") {
+        let mut compiler = Command::new("xcrun");
+        compiler.args([
+            "--sdk",
+            "macosx",
+            "clang",
+            "-arch",
+            "arm64e",
+            "-x",
+            "assembler",
+            "-c",
+        ]);
+        (compiler, "xcrun clang")
+    } else if have_tool("clang") {
+        let targets = Command::new("clang")
+            .arg("--print-targets")
+            .output()
+            .unwrap();
+        if !targets.status.success()
+            || !String::from_utf8_lossy(&targets.stdout).contains("aarch64")
+        {
+            harness_skip!("installed clang has no AArch64 backend");
+            let _ = fs::remove_file(source);
+            return;
+        }
+        let mut compiler = Command::new("clang");
+        compiler.args(["--target=arm64e-apple-macos11", "-x", "assembler", "-c"]);
+        (compiler, "clang ARM64e cross-target")
+    } else {
+        harness_skip!("clang unavailable");
+        let _ = fs::remove_file(source);
+        return;
+    };
+    let compile = compiler
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{compiler_name} fixture compilation failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let input_subtype = parse_header(&fs::read(&object).unwrap())
+        .unwrap()
+        .cpusubtype;
+    assert_eq!(input_subtype & 0x00ff_ffff, CPU_SUBTYPE_ARM64E);
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(out.clone()),
+        arch: Some("arm64".into()),
+        ..LinkOptions::default()
+    })
+    .unwrap();
+    assert_eq!(
+        parse_header(&fs::read(&out).unwrap()).unwrap().cpusubtype,
+        input_subtype
+    );
+
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(out);
 }
 
 #[test]

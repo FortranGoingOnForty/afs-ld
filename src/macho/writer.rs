@@ -323,6 +323,39 @@ pub fn write_finalized_with_linkedit(
     linkedit_plan: &LinkEditPlan,
     out: &mut Vec<u8>,
 ) -> Result<(), WriteError> {
+    write_finalized_with_linkedit_for_header(
+        layout,
+        OutputHeaderSpec::new(kind, CPU_SUBTYPE_ARM64_ALL),
+        opts,
+        entry_point,
+        dylibs,
+        linkedit_plan,
+        out,
+    )
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct OutputHeaderSpec {
+    kind: OutputKind,
+    cpu_subtype: u32,
+}
+
+impl OutputHeaderSpec {
+    pub(crate) const fn new(kind: OutputKind, cpu_subtype: u32) -> Self {
+        Self { kind, cpu_subtype }
+    }
+}
+
+pub(crate) fn write_finalized_with_linkedit_for_header(
+    layout: &Layout,
+    header_spec: OutputHeaderSpec,
+    opts: &LinkOptions,
+    entry_point: Option<EntryPoint>,
+    dylibs: &[DylibDependency],
+    linkedit_plan: &LinkEditPlan,
+    out: &mut Vec<u8>,
+) -> Result<(), WriteError> {
+    let OutputHeaderSpec { kind, cpu_subtype } = header_spec;
     let _linkedit_segment = layout
         .segment("__LINKEDIT")
         .cloned()
@@ -334,7 +367,7 @@ pub fn write_finalized_with_linkedit(
     let header = MachHeader64 {
         magic: MH_MAGIC_64,
         cputype: CPU_TYPE_ARM64,
-        cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+        cpusubtype: cpu_subtype,
         filetype: match kind {
             OutputKind::Executable => MH_EXECUTE,
             OutputKind::Dylib => MH_DYLIB,

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::atom::{AtomFlags, AtomSection, AtomTable};
-use crate::input::ObjectFile;
+use crate::input::{DataInCodeEntry, ObjectFile};
 use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
 use crate::leb::write_uleb;
 use crate::macho::constants::*;
@@ -1054,8 +1054,8 @@ fn build_linkedit_plan_profiled(
     )?;
     let function_starts_bytes =
         build_function_starts(layout, inputs.0.layout_inputs, inputs.0.atom_table)?;
-    // Current Apple ld keeps the command but omits the final metadata payload.
-    let data_in_code_bytes = Vec::new();
+    let data_in_code_bytes =
+        build_data_in_code(layout, inputs.0.layout_inputs, inputs.0.atom_table)?;
     timings.metadata_tables += phase_started.elapsed();
 
     let mut cursor = base_off as u64;
@@ -1552,6 +1552,80 @@ fn build_function_starts(
     out.push(0);
     while !out.len().is_multiple_of(8) {
         out.push(0);
+    }
+    Ok(out)
+}
+
+fn build_data_in_code(
+    layout: &Layout,
+    inputs: &[LayoutInput<'_>],
+    atom_table: &AtomTable,
+) -> Result<Vec<u8>, WriteError> {
+    let image_base = layout
+        .segment("__TEXT")
+        .ok_or(WriteError::MissingSegment("__TEXT"))?
+        .vm_addr;
+    let atoms_by_input_section = atom_table.by_input_section();
+    // Keep original atom identities here. Folded and dead-stripped atoms are
+    // absent from the final layout, so their source metadata must disappear
+    // instead of being redirected onto a surviving atom.
+    let atom_ranges = build_atom_range_index(atom_table, &atoms_by_input_section, None);
+    let atom_addrs = atom_addresses(layout);
+    let mut entries = Vec::new();
+
+    for input in inputs {
+        for entry in &input.object.data_in_code {
+            let entry_start = u64::from(entry.offset);
+            let entry_end = entry_start + u64::from(entry.length);
+
+            for (section_index, section) in input.object.sections.iter().enumerate() {
+                let Some(section_end) = section.addr.checked_add(section.size) else {
+                    continue;
+                };
+                if !is_executable(section.kind)
+                    || entry_start < section.addr
+                    || entry_end > section_end
+                {
+                    continue;
+                }
+                let Ok(input_section) = u8::try_from(section_index + 1) else {
+                    continue;
+                };
+                let section_offset = (entry_start - section.addr) as u32;
+                let Some((atom, delta)) = find_containing_atom_range(
+                    &atom_ranges,
+                    input.id,
+                    input_section,
+                    section_offset,
+                    u32::from(entry.length),
+                ) else {
+                    break;
+                };
+                let Some(&atom_addr) = atom_addrs.get(&atom) else {
+                    break;
+                };
+                let output_addr = atom_addr
+                    .checked_add(u64::from(delta))
+                    .ok_or(WriteError::OffsetTooLarge("data-in-code entry offset"))?;
+                let output_offset = output_addr
+                    .checked_sub(image_base)
+                    .ok_or(WriteError::OffsetTooLarge("data-in-code entry offset"))?;
+                entries.push(DataInCodeEntry {
+                    offset: u32_fit(output_offset, "data-in-code entry offset")?,
+                    length: entry.length,
+                    kind: entry.kind,
+                });
+                break;
+            }
+        }
+    }
+
+    entries.sort_unstable_by_key(|entry| (entry.offset, entry.length, entry.kind));
+    let mut out = Vec::with_capacity(entries.len() * 8);
+    for entry in entries {
+        out.extend_from_slice(&entry.offset.to_le_bytes());
+        out.extend_from_slice(&entry.length.to_le_bytes());
+        out.extend_from_slice(&entry.kind.to_le_bytes());
     }
     Ok(out)
 }

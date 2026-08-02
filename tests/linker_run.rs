@@ -22,12 +22,12 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
     BIND_SYMBOL_FLAGS_WEAK_IMPORT, CPU_SUBTYPE_ARM64E, CPU_SUBTYPE_ARM64_ALL, CPU_SUBTYPE_ARM64_V8,
-    CPU_SUBTYPE_LIB64, CPU_TYPE_ARM64, EXPORT_SYMBOL_FLAGS_REEXPORT,
-    EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL,
-    LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS,
-    LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, MH_BINDS_TO_WEAK, MH_MAGIC_64,
-    MH_OBJECT, MH_SUBSECTIONS_VIA_SYMBOLS, MH_WEAK_DEFINES, N_ABS, N_ALT_ENTRY, N_EXT, N_INDR,
-    N_PEXT, N_SECT, N_UNDF, N_WEAK_DEF, N_WEAK_REF, REBASE_IMMEDIATE_MASK,
+    CPU_SUBTYPE_LIB64, CPU_TYPE_ARM64, DICE_KIND_DATA, DICE_KIND_JUMP_TABLE32,
+    EXPORT_SYMBOL_FLAGS_REEXPORT, EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, INDIRECT_SYMBOL_ABS,
+    INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
+    LC_FUNCTION_STARTS, LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, MH_BINDS_TO_WEAK,
+    MH_MAGIC_64, MH_OBJECT, MH_SUBSECTIONS_VIA_SYMBOLS, MH_WEAK_DEFINES, N_ABS, N_ALT_ENTRY, N_EXT,
+    N_INDR, N_PEXT, N_SECT, N_UNDF, N_WEAK_DEF, N_WEAK_REF, REBASE_IMMEDIATE_MASK,
     REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE,
     REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
     REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
@@ -39,8 +39,8 @@ use afs_ld::macho::constants::{
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::exports::Exports;
 use afs_ld::macho::reader::{
-    parse_commands, parse_header, u32_le, write_header, LoadCommand, MachHeader64, Section64Header,
-    Segment64, SymtabCmd, HEADER_SIZE,
+    parse_commands, parse_header, u32_le, write_header, LinkEditDataCmd, LoadCommand, MachHeader64,
+    Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
 };
 use afs_ld::reloc::{
     parse_raw_relocs, parse_relocs, write_raw_relocs, write_relocs, Referent, Reloc, RelocKind,
@@ -49,7 +49,7 @@ use afs_ld::reloc::{
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, RawNlist, SymKind, NLIST_SIZE};
 use afs_ld::synth::unwind::decode_unwind_info;
-use afs_ld::{FrameworkSpec, LinkError, LinkOptions, Linker, OutputKind};
+use afs_ld::{FrameworkSpec, IcfMode, LinkError, LinkOptions, Linker, OutputKind};
 use common::artifacts::workspace_artifact;
 use common::harness::{
     canonical_export_records, compare_sections, diff_macho, CanonicalExportKind,
@@ -1641,6 +1641,95 @@ fn synthetic_aligned_subsections_object() -> Vec<u8> {
     bytes
 }
 
+fn synthetic_data_in_code_object(
+    symbol_name: &str,
+    section_name: &str,
+    section_addr: u32,
+    kind: u16,
+    private_extern: bool,
+) -> Vec<u8> {
+    const RET: [u8; 4] = [0xc0, 0x03, 0x5f, 0xd6];
+    const TABLE: [u8; 4] = [0, 0, 0, 0];
+
+    let text = [RET.as_slice(), TABLE.as_slice(), RET.as_slice()].concat();
+    let mut strings = vec![0];
+    strings.extend_from_slice(symbol_name.as_bytes());
+    strings.push(0);
+    let symbol = RawNlist {
+        strx: 1,
+        n_type: N_SECT | N_EXT | if private_extern { N_PEXT } else { 0 },
+        n_sect: 1,
+        n_desc: 0,
+        n_value: u64::from(section_addr),
+    };
+    let mut segment = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: u64::from(section_addr),
+        vmsize: text.len() as u64,
+        fileoff: 0,
+        filesize: text.len() as u64,
+        maxprot: 5,
+        initprot: 5,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16(section_name),
+            segname: name16("__TEXT"),
+            addr: u64::from(section_addr),
+            size: text.len() as u64,
+            offset: 0,
+            align: 2,
+            reloff: 0,
+            nreloc: 0,
+            flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + LinkEditDataCmd::WIRE_SIZE + SymtabCmd::WIRE_SIZE;
+    let text_offset = HEADER_SIZE as u32 + sizeofcmds;
+    let data_in_code_offset = text_offset + text.len() as u32;
+    let symoff = data_in_code_offset + 8;
+    let stroff = symoff + NLIST_SIZE as u32;
+    segment.fileoff = u64::from(text_offset);
+    segment.sections[0].offset = text_offset;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 3,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    LinkEditDataCmd {
+        dataoff: data_in_code_offset,
+        datasize: 8,
+    }
+    .write(LC_DATA_IN_CODE, &mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: 1,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&(section_addr + RET.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&(TABLE.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(&kind.to_le_bytes());
+    symbol.write(&mut bytes);
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
 fn synthetic_branch_addend_object() -> Vec<u8> {
     const BL: [u8; 4] = 0x9400_0000u32.to_le_bytes();
     const RET: [u8; 4] = 0xd65f_03c0u32.to_le_bytes();
@@ -2375,18 +2464,6 @@ fn decode_data_in_code(bytes: &[u8]) -> Vec<DataInCodeRecord> {
             offset: u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
             length: u16::from_le_bytes(chunk[4..6].try_into().unwrap()),
             kind: u16::from_le_bytes(chunk[6..8].try_into().unwrap()),
-        })
-        .collect()
-}
-
-fn canonical_data_in_code(bytes: &[u8]) -> Vec<DataInCodeRecord> {
-    let text = output_section_header(bytes, "__TEXT", "__text").unwrap();
-    decode_data_in_code(bytes)
-        .into_iter()
-        .map(|record| DataInCodeRecord {
-            offset: record.offset - text.offset,
-            length: record.length,
-            kind: record.kind,
         })
         .collect()
 }
@@ -10571,244 +10648,186 @@ fn linker_run_emits_function_starts_for_other_text_sections_like_ld() {
 }
 
 #[test]
-fn linker_run_omits_data_in_code_like_ld() {
-    if !have_xcrun() {
-        harness_skip!("xcrun unavailable");
-        return;
-    }
-    let Some(sdk) = sdk_path() else {
-        harness_skip!("xcrun --show-sdk-path unavailable");
-        return;
-    };
-    let Some(sdk_ver) = sdk_version() else {
-        harness_skip!("xcrun --show-sdk-version unavailable");
-        return;
-    };
-    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
-    if !tbd.exists() {
-        harness_skip!("no libSystem.tbd at {}", tbd.display());
-        return;
-    }
-
-    let obj = scratch("data-in-code.o");
-    let our_out = scratch("data-in-code-ours.out");
-    let apple_out = scratch("data-in-code-apple.out");
-    let asm = r#"
-        .text
-        .globl _main
-        .p2align 2
-    _main:
-        mov w0, #0
-        b Ldispatch
-        .p2align 2
-    Ltable:
-        .data_region jt32
-        .long Lcase0-Ltable
-        .long Lcase1-Ltable
-        .end_data_region
-    Ldispatch:
-        cmp w0, #0
-        b.eq Lcase0
-        b Lcase1
-    Lcase0:
-        mov w0, #1
-        ret
-    Lcase1:
-        mov w0, #2
-        ret
-        .subsections_via_symbols
-    "#;
-    require_fixture!("assembly fixture", assemble(asm, &obj));
-
-    let opts = LinkOptions {
-        inputs: vec![obj.clone(), tbd],
-        output: Some(our_out.clone()),
-        kind: OutputKind::Executable,
-        ..LinkOptions::default()
-    };
-    Linker::run(&opts).unwrap();
-    apple_link_with_args(
-        &obj,
-        &apple_out,
-        "_main",
-        &sdk,
-        &sdk_ver,
-        &["-data_in_code_info"],
+fn linker_run_preserves_and_rebases_data_in_code_records_deterministically() {
+    let prefix = scratch("AFSLD-058-data-in-code-prefix.o");
+    let marked = scratch("AFSLD-058-data-in-code-marked.o");
+    let output = scratch("AFSLD-058-data-in-code.out");
+    fs::write(&prefix, synthetic_aligned_subsections_object()).unwrap();
+    fs::write(
+        &marked,
+        synthetic_data_in_code_object("_main", "__text", 0, DICE_KIND_JUMP_TABLE32, false),
     )
     .unwrap();
 
-    let our_bytes = fs::read(&our_out).unwrap();
-    let apple_bytes = fs::read(&apple_out).unwrap();
-    let our_dic = raw_linkedit_data_cmd(&our_bytes, LC_DATA_IN_CODE);
-    let apple_dic = raw_linkedit_data_cmd(&apple_bytes, LC_DATA_IN_CODE);
-    assert_eq!(our_dic.1, 0);
-    assert_eq!(our_dic.1, apple_dic.1);
-    assert!(decode_data_in_code(&our_bytes).is_empty());
-    assert!(canonical_data_in_code(&apple_bytes).is_empty());
+    let mut outputs = Vec::new();
+    for jobs in [1, 4] {
+        Linker::run(&LinkOptions {
+            inputs: vec![prefix.clone(), marked.clone()],
+            output: Some(output.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        outputs.push(fs::read(&output).unwrap());
+    }
 
-    let _ = fs::remove_file(obj);
-    let _ = fs::remove_file(our_out);
-    let _ = fs::remove_file(apple_out);
+    let [serial, parallel] = outputs.as_slice() else {
+        unreachable!()
+    };
+    assert_eq!(serial, parallel, "-j1 and -j4 output differs");
+    let image_base = segment_vmaddr(serial, "__TEXT").unwrap();
+    let main_offset = u32::try_from(symbol_values(serial)["_main"] - image_base).unwrap();
+    assert_eq!(
+        decode_data_in_code(serial),
+        vec![DataInCodeRecord {
+            offset: main_offset + 4,
+            length: 4,
+            kind: DICE_KIND_JUMP_TABLE32,
+        }]
+    );
+
+    let _ = fs::remove_file(prefix);
+    let _ = fs::remove_file(marked);
+    let _ = fs::remove_file(output);
 }
 
 #[test]
-fn linker_run_omits_data_in_code_in_later_text_section_like_ld() {
-    if !have_xcrun() {
-        harness_skip!("xcrun unavailable");
-        return;
-    }
-    let Some(sdk) = sdk_path() else {
-        harness_skip!("xcrun --show-sdk-path unavailable");
-        return;
-    };
-    let Some(sdk_ver) = sdk_version() else {
-        harness_skip!("xcrun --show-sdk-version unavailable");
-        return;
-    };
-    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
-    if !tbd.exists() {
-        harness_skip!("no libSystem.tbd at {}", tbd.display());
-        return;
-    }
-
-    let obj = scratch("data-in-code-late.o");
-    let our_out = scratch("data-in-code-late-ours.out");
-    let apple_out = scratch("data-in-code-late-apple.out");
-    let asm = r#"
-        .text
-        .globl _main
-        .p2align 2
-    _main:
-        ret
-
-        .section __TEXT,__text2,regular,pure_instructions
-        .globl _helper
-        .p2align 2
-    _helper:
-        b Ldispatch
-        .p2align 2
-    Ltable:
-        .data_region jt32
-        .long Lcase0-Ltable
-        .long Lcase1-Ltable
-        .end_data_region
-    Ldispatch:
-        ret
-    Lcase0:
-        ret
-    Lcase1:
-        ret
-        .subsections_via_symbols
-    "#;
-    require_fixture!("assembly fixture", assemble(asm, &obj));
-
-    let opts = LinkOptions {
-        inputs: vec![obj.clone(), tbd],
-        output: Some(our_out.clone()),
-        kind: OutputKind::Executable,
-        ..LinkOptions::default()
-    };
-    Linker::run(&opts).unwrap();
-    apple_link_with_args(
-        &obj,
-        &apple_out,
-        "_main",
-        &sdk,
-        &sdk_ver,
-        &["-data_in_code_info"],
+fn linker_run_sorts_rebased_data_in_code_across_output_sections() {
+    let later = scratch("AFSLD-058-data-in-code-later.o");
+    let main = scratch("AFSLD-058-data-in-code-main.o");
+    let output = scratch("AFSLD-058-data-in-code-sections.out");
+    fs::write(
+        &later,
+        synthetic_data_in_code_object("_helper", "__text2", 0x80, DICE_KIND_DATA, false),
+    )
+    .unwrap();
+    fs::write(
+        &main,
+        synthetic_data_in_code_object("_main", "__text", 0, DICE_KIND_JUMP_TABLE32, false),
     )
     .unwrap();
 
-    let our_bytes = fs::read(&our_out).unwrap();
-    let apple_bytes = fs::read(&apple_out).unwrap();
-    assert!(canonical_data_in_code(&our_bytes).is_empty());
-    assert!(canonical_data_in_code(&apple_bytes).is_empty());
+    Linker::run(&LinkOptions {
+        // Input order intentionally disagrees with final section order.
+        inputs: vec![later.clone(), main.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
 
-    let _ = fs::remove_file(obj);
-    let _ = fs::remove_file(our_out);
-    let _ = fs::remove_file(apple_out);
+    let bytes = fs::read(&output).unwrap();
+    let image_base = segment_vmaddr(&bytes, "__TEXT").unwrap();
+    let symbols = symbol_values(&bytes);
+    let main_offset = u32::try_from(symbols["_main"] - image_base).unwrap() + 4;
+    let helper_offset = u32::try_from(symbols["_helper"] - image_base).unwrap() + 4;
+    assert!(main_offset < helper_offset);
+    assert_eq!(
+        decode_data_in_code(&bytes),
+        vec![
+            DataInCodeRecord {
+                offset: main_offset,
+                length: 4,
+                kind: DICE_KIND_JUMP_TABLE32,
+            },
+            DataInCodeRecord {
+                offset: helper_offset,
+                length: 4,
+                kind: DICE_KIND_DATA,
+            },
+        ]
+    );
+
+    let _ = fs::remove_file(later);
+    let _ = fs::remove_file(main);
+    let _ = fs::remove_file(output);
 }
 
 #[test]
-fn linker_run_omits_data_in_code_after_large_first_text_section_like_ld() {
-    if !have_xcrun() {
-        harness_skip!("xcrun unavailable");
-        return;
-    }
-    let Some(sdk) = sdk_path() else {
-        harness_skip!("xcrun --show-sdk-path unavailable");
-        return;
-    };
-    let Some(sdk_ver) = sdk_version() else {
-        harness_skip!("xcrun --show-sdk-version unavailable");
-        return;
-    };
-    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
-    if !tbd.exists() {
-        harness_skip!("no libSystem.tbd at {}", tbd.display());
-        return;
-    }
-
-    let obj = scratch("data-in-code-large-first.o");
-    let our_out = scratch("data-in-code-large-first-ours.out");
-    let apple_out = scratch("data-in-code-large-first-apple.out");
-    let asm = r#"
-        .text
-        .globl _main
-        .p2align 2
-    _main:
-        nop
-        nop
-        nop
-        nop
-        nop
-        ret
-
-        .section __TEXT,__text2,regular,pure_instructions
-        .globl _helper
-    _helper:
-        b Ldispatch
-        .p2align 2
-    Ltable:
-        .data_region jt32
-        .long Lcase0-Ltable
-        .long Lcase1-Ltable
-        .end_data_region
-    Ldispatch:
-        ret
-    Lcase0:
-        ret
-    Lcase1:
-        ret
-        .subsections_via_symbols
-    "#;
-    require_fixture!("assembly fixture", assemble(asm, &obj));
-
-    let opts = LinkOptions {
-        inputs: vec![obj.clone(), tbd],
-        output: Some(our_out.clone()),
-        kind: OutputKind::Executable,
-        ..LinkOptions::default()
-    };
-    Linker::run(&opts).unwrap();
-    apple_link_with_args(
-        &obj,
-        &apple_out,
-        "_main",
-        &sdk,
-        &sdk_ver,
-        &["-data_in_code_info"],
+fn linker_run_omits_data_in_code_for_dead_stripped_atoms() {
+    let main = scratch("AFSLD-058-data-in-code-live.o");
+    let unused = scratch("AFSLD-058-data-in-code-dead.o");
+    let output = scratch("AFSLD-058-data-in-code-dead-strip.out");
+    fs::write(
+        &main,
+        synthetic_data_in_code_object("_main", "__text", 0, DICE_KIND_JUMP_TABLE32, false),
+    )
+    .unwrap();
+    fs::write(
+        &unused,
+        synthetic_data_in_code_object("_unused", "__text", 0, DICE_KIND_DATA, false),
     )
     .unwrap();
 
-    let our_bytes = fs::read(&our_out).unwrap();
-    let apple_bytes = fs::read(&apple_out).unwrap();
-    assert!(canonical_data_in_code(&our_bytes).is_empty());
-    assert!(canonical_data_in_code(&apple_bytes).is_empty());
+    Linker::run(&LinkOptions {
+        inputs: vec![main.clone(), unused.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Executable,
+        dead_strip: true,
+        ..LinkOptions::default()
+    })
+    .unwrap();
 
-    let _ = fs::remove_file(obj);
-    let _ = fs::remove_file(our_out);
-    let _ = fs::remove_file(apple_out);
+    let bytes = fs::read(&output).unwrap();
+    let image_base = segment_vmaddr(&bytes, "__TEXT").unwrap();
+    let symbols = symbol_values(&bytes);
+    assert!(!symbols.contains_key("_unused"));
+    assert_eq!(
+        decode_data_in_code(&bytes),
+        vec![DataInCodeRecord {
+            offset: u32::try_from(symbols["_main"] - image_base).unwrap() + 4,
+            length: 4,
+            kind: DICE_KIND_JUMP_TABLE32,
+        }]
+    );
+
+    let _ = fs::remove_file(main);
+    let _ = fs::remove_file(unused);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn linker_run_emits_data_in_code_for_one_surviving_icf_atom() {
+    let first = scratch("AFSLD-058-data-in-code-icf-first.o");
+    let second = scratch("AFSLD-058-data-in-code-icf-second.o");
+    let output = scratch("AFSLD-058-data-in-code-icf.dylib");
+    fs::write(
+        &first,
+        synthetic_data_in_code_object("_first", "__text", 0, DICE_KIND_JUMP_TABLE32, true),
+    )
+    .unwrap();
+    fs::write(
+        &second,
+        synthetic_data_in_code_object("_second", "__text", 0, DICE_KIND_JUMP_TABLE32, true),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![first.clone(), second.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        icf_mode: IcfMode::Safe,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    let image_base = segment_vmaddr(&bytes, "__TEXT").unwrap();
+    let symbols = symbol_values(&bytes);
+    assert_eq!(symbols["_first"], symbols["_second"]);
+    assert_eq!(
+        decode_data_in_code(&bytes),
+        vec![DataInCodeRecord {
+            offset: u32::try_from(symbols["_first"] - image_base).unwrap() + 4,
+            length: 4,
+            kind: DICE_KIND_JUMP_TABLE32,
+        }]
+    );
+
+    let _ = fs::remove_file(first);
+    let _ = fs::remove_file(second);
+    let _ = fs::remove_file(output);
 }
 
 #[test]

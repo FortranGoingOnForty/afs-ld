@@ -36,7 +36,7 @@ pub struct ObjectFile {
 /// One `data_in_code_entry` preserved from an input object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataInCodeEntry {
-    /// File offset from the input Mach-O header.
+    /// Offset in the input object's section-address coordinate space.
     pub offset: u32,
     pub length: u16,
     pub kind: u16,

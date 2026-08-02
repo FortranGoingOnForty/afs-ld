@@ -1662,7 +1662,7 @@ fn inputs_may_need_dylib_exports(inputs: &Inputs) -> Result<bool, LinkError> {
         let object = inputs.object_file(input_id)?;
         if object.symbols.iter().any(|sym| {
             sym.stab_kind().is_none()
-                && (sym.is_ext() || sym.is_private_ext())
+                && sym.participates_in_global_resolution()
                 && sym.kind() == SymKind::Undef
                 && !sym.is_common()
         }) {

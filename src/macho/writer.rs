@@ -1492,6 +1492,9 @@ fn symbol_referent_id(
         return None;
     };
     let input_sym = obj.symbols.get(sym_idx as usize)?;
+    if !input_sym.participates_in_global_resolution() {
+        return None;
+    }
     let name = obj.symbol_name(input_sym).ok()?;
     symbol_name_index.get(name).copied()
 }
@@ -2286,7 +2289,7 @@ fn last_section_symbol_at_each_location(object: &ObjectFile) -> HashMap<(u8, u64
             symbol.stab_kind().is_none()
                 && symbol.kind() == SymKind::Sect
                 && !symbol.alt_entry()
-                && (symbol.is_ext() || symbol.is_private_ext())
+                && symbol.participates_in_global_resolution()
         })
         .map(|(index, symbol)| ((symbol.sect_idx(), symbol.value()), index))
         .collect()
@@ -2299,7 +2302,7 @@ fn is_overlapping_section_alias(
 ) -> bool {
     if symbol.kind() != SymKind::Sect
         || symbol.alt_entry()
-        || !(symbol.is_ext() || symbol.is_private_ext())
+        || !symbol.participates_in_global_resolution()
     {
         return false;
     }
@@ -3523,6 +3526,24 @@ mod tests {
             loh: Vec::new(),
             data_in_code: Vec::new(),
         }
+    }
+
+    #[test]
+    fn rebase_symbol_lookup_preserves_local_identity_on_name_collision() {
+        let mut object = object_with_text_symbols(&[("_same", 0x1000, 0)]);
+        let global = SymbolId(9);
+        let symbols = HashMap::from([("_same".to_string(), global)]);
+
+        assert_eq!(
+            symbol_referent_id(&object, Referent::Symbol(0), &symbols),
+            None
+        );
+
+        object.symbols[0].raw.n_type = N_SECT | N_PEXT;
+        assert_eq!(
+            symbol_referent_id(&object, Referent::Symbol(0), &symbols),
+            Some(global)
+        );
     }
 
     #[test]

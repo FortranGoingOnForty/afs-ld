@@ -361,7 +361,7 @@ pub fn atomize_object(
                 s.stab_kind().is_none()
                     && s.kind() == SymKind::Sect
                     && s.sect_idx() == sect_idx_one
-                    && (s.is_ext() || s.is_private_ext() || s.alt_entry())
+                    && (s.participates_in_global_resolution() || s.alt_entry())
             })
             .map(|(i, s)| {
                 let offset = s.value().saturating_sub(sect.addr) as u32;

@@ -244,6 +244,7 @@ enum FoldReferent {
     Atom(AtomId),
     Absolute(u64),
     Symbol(SymbolId),
+    LocalSymbol { input: InputId, symbol: u32 },
     Section { input: InputId, section: u8 },
 }
 
@@ -483,6 +484,15 @@ fn normalize_referent(
     match referent {
         Referent::Symbol(sym_idx) => {
             let input_sym = object.symbols.get(sym_idx as usize)?;
+            if !input_sym.participates_in_global_resolution() {
+                return match input_sym.kind() {
+                    SymKind::Abs => Some(FoldReferent::Absolute(input_sym.value())),
+                    _ => Some(FoldReferent::LocalSymbol {
+                        input,
+                        symbol: sym_idx,
+                    }),
+                };
+            }
             let name = object.symbol_name(input_sym).ok()?;
             let &symbol_id = resolved_by_name.get(name)?;
             match sym_table.get(symbol_id) {
@@ -645,7 +655,7 @@ fn target_atoms_for_reloc(
             let Some(input_sym) = object.symbols.get(sym_idx as usize) else {
                 return Vec::new();
             };
-            if input_sym.kind() == SymKind::Sect && !input_sym.is_ext() {
+            if input_sym.kind() == SymKind::Sect && !input_sym.participates_in_global_resolution() {
                 let Some(target_section) = object.section_for_symbol(input_sym) else {
                     return Vec::new();
                 };
@@ -1106,6 +1116,32 @@ mod tests {
         assert!(plan.redirects().is_empty());
         assert!(plan.kept_atoms().contains(&first));
         assert!(plan.kept_atoms().contains(&second));
+    }
+
+    #[test]
+    fn icf_normalization_does_not_rebind_local_symbol_to_global_collision() {
+        let object = local_symbol_literal_reference_object();
+        let mut symbols = SymbolTable::new();
+        let global = AtomId(77);
+        defined_symbol(&mut symbols, "Lliteral", global, false);
+        let resolved_by_name = resolved_symbol_map(&symbols);
+
+        let normalized = normalize_referent(
+            InputId(0),
+            &object,
+            Referent::Symbol(0),
+            &symbols,
+            &resolved_by_name,
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            normalized,
+            Some(FoldReferent::LocalSymbol {
+                input: InputId(0),
+                symbol: 0,
+            })
+        );
     }
 
     #[test]

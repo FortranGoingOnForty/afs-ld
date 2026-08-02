@@ -900,9 +900,11 @@ fn resolve_branch_target_key(
                     "symbol index is out of range".to_string(),
                 )
             })?;
-            if let Ok(name) = obj.symbol_name(input_sym) {
-                if let Some(symbol_id) = resolve.symbol_name_index.get(name).copied() {
-                    return Ok(BranchTargetKey::Symbol(symbol_id));
+            if input_sym.participates_in_global_resolution() {
+                if let Ok(name) = obj.symbol_name(input_sym) {
+                    if let Some(symbol_id) = resolve.symbol_name_index.get(name).copied() {
+                        return Ok(BranchTargetKey::Symbol(symbol_id));
+                    }
                 }
             }
             match input_sym.kind() {
@@ -1277,16 +1279,18 @@ fn resolve_symbol_referent(
         )
     })?;
 
-    if let Ok(name) = obj.symbol_name(input_sym) {
-        if let Some(symbol_id) = resolve.symbol_name_index.get(name).copied() {
-            return resolve_global_symbol(
-                obj,
-                atom,
-                kind,
-                name,
-                resolve.sym_table.get(symbol_id),
-                resolve,
-            );
+    if input_sym.participates_in_global_resolution() {
+        if let Ok(name) = obj.symbol_name(input_sym) {
+            if let Some(symbol_id) = resolve.symbol_name_index.get(name).copied() {
+                return resolve_global_symbol(
+                    obj,
+                    atom,
+                    kind,
+                    name,
+                    resolve.sym_table.get(symbol_id),
+                    resolve,
+                );
+            }
         }
     }
 
@@ -1311,6 +1315,9 @@ fn symbol_referent_id(
         return None;
     };
     let input_sym = obj.symbols.get(sym_idx as usize)?;
+    if !input_sym.participates_in_global_resolution() {
+        return None;
+    }
     let name = obj.symbol_name(input_sym).ok()?;
     resolve.symbol_name_index.get(name).copied()
 }
@@ -2960,6 +2967,88 @@ mod tests {
         assert!(fits_signed(-(1 << 25), 26));
         assert!(!fits_signed(1 << 25, 26));
         assert!(!fits_signed(-(1 << 25) - 1, 26));
+    }
+
+    #[test]
+    fn local_symbol_referent_ignores_same_named_global() {
+        let mut object = thunk_test_object(Vec::new(), 4, 8);
+        object.symbols[0].raw.n_type = N_SECT;
+        let caller = test_atom(0, 4);
+
+        let mut atoms = AtomTable::new();
+        let local_target = atoms.push(test_atom(4, 4));
+        let mut global_atom = test_atom(0, 4);
+        global_atom.origin = InputId(1);
+        let global_target = atoms.push(global_atom);
+
+        let mut symbols = SymbolTable::new();
+        let name = symbols.intern("_target");
+        symbols
+            .insert(Symbol::Defined {
+                name,
+                origin: InputId(1),
+                atom: global_target,
+                value: 0,
+                weak: false,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap();
+        let symbol_name_index = build_symbol_name_index(&symbols);
+        let atom_addrs = HashMap::from([(local_target, 0x1000), (global_target, 0x2000)]);
+        let atoms_by_input_section = atoms.by_input_section();
+        let section_addrs = HashMap::new();
+        let empty_symbol_addrs = HashMap::new();
+        let resolve = ResolveView {
+            sym_table: &symbols,
+            symbol_name_index: &symbol_name_index,
+            atom_table: &atoms,
+            atom_addrs: &atom_addrs,
+            atoms_by_input_section: &atoms_by_input_section,
+            section_addrs: &section_addrs,
+            stub_addrs: &empty_symbol_addrs,
+            got_addrs: &empty_symbol_addrs,
+            thread_pointer_addrs: &empty_symbol_addrs,
+            lazy_pointer_addrs: &empty_symbol_addrs,
+            stub_helper_entry_addrs: &empty_symbol_addrs,
+            stub_helper_header_addr: None,
+            dyld_private_addr: None,
+            icf_redirects: None,
+        };
+
+        assert!(!object.symbols[0].is_ext());
+        assert!(!object.symbols[0].is_private_ext());
+        assert!(symbol_name_index.contains_key("_target"));
+        assert_eq!(
+            symbol_referent_id(&object, Referent::Symbol(0), &resolve),
+            None
+        );
+        assert_eq!(
+            resolve_branch_target_key(
+                &object,
+                &caller,
+                Reloc {
+                    offset: 0,
+                    kind: RelocKind::Branch26,
+                    length: RelocLength::Word,
+                    pcrel: true,
+                    referent: Referent::Symbol(0),
+                    addend: 0,
+                    subtrahend: None,
+                },
+                &resolve,
+            )
+            .unwrap(),
+            BranchTargetKey::InputSectionOffset {
+                origin: InputId(0),
+                input_section: 1,
+                input_offset: 4,
+            }
+        );
+        assert_eq!(
+            resolve_symbol_referent(&object, &caller, RelocKind::Unsigned, 0, &resolve).unwrap(),
+            0x1000
+        );
     }
 
     #[test]

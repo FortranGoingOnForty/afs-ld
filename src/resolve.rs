@@ -1314,7 +1314,7 @@ pub fn seed_object(
             continue;
         }
         // Only externals and private-externals participate.
-        if !input_sym.is_ext() && !input_sym.is_private_ext() {
+        if !input_sym.participates_in_global_resolution() {
             continue;
         }
         let Ok(name_str) = obj.symbol_name(input_sym) else {

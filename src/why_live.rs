@@ -915,7 +915,7 @@ fn referent_atoms(
             let Some(input_sym) = object.symbols.get(symbol_index as usize) else {
                 return Vec::new();
             };
-            if input_sym.kind() == SymKind::Sect && !input_sym.is_ext() {
+            if input_sym.kind() == SymKind::Sect && !input_sym.participates_in_global_resolution() {
                 let Some(section) = object.section_for_symbol(input_sym) else {
                     return Vec::new();
                 };
@@ -995,6 +995,9 @@ fn target_symbols_for_reloc(
         return None;
     };
     let input_sym = object.symbols.get(symbol_index as usize)?;
+    if !input_sym.participates_in_global_resolution() {
+        return None;
+    }
     let name = object.symbol_name(input_sym).ok()?;
     resolved_by_name.get(name).copied().map(|sid| vec![sid])
 }
@@ -1442,21 +1445,49 @@ mod tests {
             flags: AtomFlags::NONE,
             parent_of: None,
         });
+        let global_collision = atoms.push(Atom {
+            id: AtomId(0),
+            origin: InputId(1),
+            input_section: 1,
+            section: AtomSection::Data,
+            input_offset: 0,
+            size: 8,
+            align_pow2: 3,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 8],
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        });
+        let mut symbols = SymbolTable::new();
+        let collision_name = symbols.intern("Ltarget");
+        symbols
+            .insert(Symbol::Defined {
+                name: collision_name,
+                origin: InputId(1),
+                atom: global_collision,
+                value: 0,
+                weak: false,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap();
+        let resolved_by_name = resolved_symbol_map(&symbols);
+        assert_eq!(
+            target_symbols_for_reloc(&object, Referent::Symbol(0), &resolved_by_name),
+            None
+        );
         let inputs = [LayoutInput {
             id: InputId(0),
             object: &object,
             load_order: 0,
             archive_member_offset: None,
         }];
-        let analysis = DeadStripAnalysis::build(
-            &LinkOptions::default(),
-            &inputs,
-            &atoms,
-            &SymbolTable::new(),
-            None,
-        );
+        let analysis =
+            DeadStripAnalysis::build(&LinkOptions::default(), &inputs, &atoms, &symbols, None);
 
         assert!(analysis.live_atoms().contains(&source));
         assert!(analysis.live_atoms().contains(&target));
+        assert!(!analysis.live_atoms().contains(&global_collision));
     }
 }

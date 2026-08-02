@@ -344,6 +344,30 @@ fn synthetic_icf_const_object(symbol: &str) -> Vec<u8> {
     )
 }
 
+fn synthetic_local_symbol_collision_reference_object() -> Vec<u8> {
+    let mut data = 0u64.to_le_bytes().to_vec();
+    data.extend_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+    synthetic_single_section_object(
+        "__DATA",
+        "__localref",
+        S_REGULAR,
+        &data,
+        &[Reloc {
+            offset: 0,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(0),
+            addend: 0,
+            subtrahend: None,
+        }],
+        &[
+            ("_same", N_SECT, 1, 0, 8),
+            ("_local_pointer", N_SECT | N_EXT, 1, 0, 0),
+        ],
+    )
+}
+
 fn synthetic_subtractor_difference_object(minuend: &str, subtrahend: &str) -> Vec<u8> {
     synthetic_single_section_object(
         "__DATA",
@@ -12007,6 +12031,63 @@ fn linker_run_icf_safe_preserves_section_relative_literal_pointers() {
     let _ = fs::remove_file(object);
     let _ = fs::remove_file(baseline_output);
     let _ = fs::remove_file(icf_output);
+}
+
+#[test]
+fn linker_run_preserves_local_symbol_identity_on_global_name_collision() {
+    let local_object = scratch("AFSLD-068-local-reference.o");
+    let global_object = scratch("AFSLD-068-global-target.o");
+    let output = scratch("AFSLD-068-local-symbol-collision.dylib");
+    fs::write(
+        &local_object,
+        synthetic_local_symbol_collision_reference_object(),
+    )
+    .unwrap();
+    fs::write(
+        &global_object,
+        synthetic_single_section_object(
+            "__DATA",
+            "__global",
+            S_REGULAR,
+            &0xaaaa_bbbb_cccc_ddddu64.to_le_bytes(),
+            &[],
+            &[("_same", N_SECT | N_EXT, 1, 0, 0)],
+        ),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![local_object.clone(), global_object.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    let (local_addr, local_data) = output_section(&bytes, "__DATA", "__localref")
+        .expect("local collision fixture must retain __DATA,__localref");
+    let (global_addr, global_data) = output_section(&bytes, "__DATA", "__global")
+        .expect("local collision fixture must retain __DATA,__global");
+    assert_eq!(&local_data[8..], &0x1111_2222_3333_4444u64.to_le_bytes());
+    assert_eq!(global_data, 0xaaaa_bbbb_cccc_ddddu64.to_le_bytes());
+    assert_ne!(local_addr + 8, global_addr);
+    let emitted_pointer = u64::from_le_bytes(local_data[..8].try_into().unwrap());
+    assert_eq!(emitted_pointer, local_addr + 8);
+    assert_ne!(emitted_pointer, global_addr);
+    assert_eq!(
+        decode_rebase_records(&bytes).unwrap(),
+        vec![RebaseRecord {
+            segment: "__DATA".into(),
+            section: "__localref".into(),
+            section_offset: 0,
+            rebase_type: REBASE_TYPE_POINTER,
+        }]
+    );
+
+    let _ = fs::remove_file(local_object);
+    let _ = fs::remove_file(global_object);
+    let _ = fs::remove_file(output);
 }
 
 #[test]

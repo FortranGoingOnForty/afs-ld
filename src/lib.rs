@@ -49,7 +49,7 @@ use macho::constants::{
 use macho::dylib::{DylibDependency, DylibFile, DylibLoadKind};
 use macho::reader::{parse_header, ReadError};
 use macho::tbd::{
-    parse_tbd_for_target, parse_tbd_metadata_for_target, parse_version, Arch, Platform, Target, Tbd,
+    parse_tbd_for_target, parse_tbd_metadata_for_target, Arch, Platform, Target, Tbd,
 };
 use reloc::arm64::RelocError;
 use resolve::{
@@ -235,7 +235,10 @@ pub enum LinkError {
     Seed(resolve::SeedError),
     Fetch(resolve::FetchError),
     Write(macho::writer::WriteError),
-    Tbd(macho::tbd::TbdError),
+    Tbd {
+        path: PathBuf,
+        source: macho::tbd::TbdError,
+    },
     Reloc(RelocError),
     Synth(synth::SynthError),
     Unwind(synth::unwind::UnwindError),
@@ -365,7 +368,7 @@ impl std::fmt::Display for LinkError {
             LinkError::Seed(e) => write!(f, "{e}"),
             LinkError::Fetch(e) => write!(f, "{e}"),
             LinkError::Write(e) => write!(f, "{e}"),
-            LinkError::Tbd(e) => write!(f, "{e}"),
+            LinkError::Tbd { path, source } => write!(f, "{}: {source}", path.display()),
             LinkError::Reloc(e) => write!(f, "{e}"),
             LinkError::Synth(e) => write!(f, "{e}"),
             LinkError::Unwind(e) => write!(f, "{e}"),
@@ -465,12 +468,6 @@ impl From<resolve::FetchError> for LinkError {
 impl From<macho::writer::WriteError> for LinkError {
     fn from(value: macho::writer::WriteError) -> Self {
         LinkError::Write(value)
-    }
-}
-
-impl From<macho::tbd::TbdError> for LinkError {
-    fn from(value: macho::tbd::TbdError) -> Self {
-        LinkError::Tbd(value)
     }
 }
 
@@ -1570,20 +1567,25 @@ fn register_input(
         }
         Some("tbd") => {
             let phase_started = Instant::now();
-            let text = std::str::from_utf8(&bytes).map_err(|e| {
-                LinkError::Tbd(macho::tbd::TbdError::Schema {
+            let text = std::str::from_utf8(&bytes).map_err(|e| LinkError::Tbd {
+                path: path.to_path_buf(),
+                source: macho::tbd::TbdError::Schema {
                     msg: format!("TBD input is not UTF-8: {e}"),
-                })
+                },
             })?;
             let target = Target {
                 arch: Arch::Arm64,
                 platform: Platform::MacOs,
             };
             let docs = if include_tbd_exports {
-                parse_tbd_for_target(text, &target)?
+                parse_tbd_for_target(text, &target)
             } else {
-                parse_tbd_metadata_for_target(text, &target)?
-            };
+                parse_tbd_metadata_for_target(text, &target)
+            }
+            .map_err(|source| LinkError::Tbd {
+                path: path.to_path_buf(),
+                source,
+            })?;
             timings.tbd_decode = phase_started.elapsed();
 
             let phase_started = Instant::now();
@@ -1593,15 +1595,9 @@ fn register_input(
             let canonical = &docs[0];
             let load = DylibLoadMeta {
                 install_name: canonical.install_name.clone(),
-                current_version: canonical
-                    .current_version
-                    .as_deref()
-                    .map(parse_version)
-                    .unwrap_or(DEFAULT_TBD_VERSION),
+                current_version: canonical.current_version.unwrap_or(DEFAULT_TBD_VERSION),
                 compatibility_version: canonical
                     .compatibility_version
-                    .as_deref()
-                    .map(parse_version)
                     .unwrap_or(DEFAULT_TBD_VERSION),
                 ordinal: inputs.next_dylib_ordinal()?,
                 load_kind,

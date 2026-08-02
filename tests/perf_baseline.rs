@@ -89,7 +89,8 @@ fn executable_opts(inputs: Vec<PathBuf>, output: PathBuf) -> LinkOptions {
         output: Some(output),
         syslibroot: sdk_path().map(PathBuf::from),
         platform_version: sdk_version().map(|v| {
-            let parsed = afs_ld::macho::tbd::parse_version(&v);
+            let parsed = afs_ld::macho::tbd::parse_version(&v)
+                .expect("the SDK version must fit Mach-O's packed-version format");
             afs_ld::PlatformVersion {
                 minos: parsed,
                 sdk: parsed,

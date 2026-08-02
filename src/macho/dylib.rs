@@ -14,7 +14,7 @@ use super::exports::{ExportEntry, ExportKind, Exports};
 use super::reader::{
     parse_commands, parse_header, LoadCommand, MachHeader64, ReadError, SymtabCmd,
 };
-use super::tbd::{parse_version, SymbolLists, Target, Tbd};
+use super::tbd::{SymbolLists, Target, Tbd};
 
 const DEFAULT_TBD_VERSION: u32 = 1 << 16;
 
@@ -239,16 +239,8 @@ impl DylibFile {
             header: synthetic_header(),
             commands: Vec::new(),
             install_name: tbd.install_name.clone(),
-            current_version: tbd
-                .current_version
-                .as_deref()
-                .map(parse_version)
-                .unwrap_or(DEFAULT_TBD_VERSION),
-            compatibility_version: tbd
-                .compatibility_version
-                .as_deref()
-                .map(parse_version)
-                .unwrap_or(DEFAULT_TBD_VERSION),
+            current_version: tbd.current_version.unwrap_or(DEFAULT_TBD_VERSION),
+            compatibility_version: tbd.compatibility_version.unwrap_or(DEFAULT_TBD_VERSION),
             dependencies,
             rpaths: Vec::new(),
             symtab: None,

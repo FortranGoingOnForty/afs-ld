@@ -87,8 +87,12 @@ pub fn dump_tbd_file(path: &Path) -> io::Result<()> {
             "  [{i}] install_name={:?} targets=[{}] current={} compat={}",
             tbd.install_name,
             targets.join(", "),
-            tbd.current_version.as_deref().unwrap_or("-"),
-            tbd.compatibility_version.as_deref().unwrap_or("-")
+            tbd.current_version
+                .map(version_str)
+                .unwrap_or_else(|| "-".to_string()),
+            tbd.compatibility_version
+                .map(version_str)
+                .unwrap_or_else(|| "-".to_string())
         )?;
         if !tbd.reexported_libraries.is_empty() {
             let total: usize = tbd.reexported_libraries.iter().map(|s| s.value.len()).sum();

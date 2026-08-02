@@ -1668,6 +1668,130 @@ fn malformed_dylib_identities_are_rejected_without_output() {
 }
 
 #[test]
+fn malformed_tbd_versions_are_rejected_without_output() {
+    let cases = [
+        ("nondigit", "current-version", "1.x.3"),
+        ("empty", "compatibility-version", ""),
+        ("extra-component", "current-version", "1.2.3.4"),
+        ("major-overflow", "compatibility-version", "65536"),
+        ("minor-overflow", "current-version", "1.256"),
+        ("patch-overflow", "compatibility-version", "1.2.256"),
+        ("integer-overflow", "current-version", "4294967296"),
+    ];
+
+    for (case, field, value) in cases {
+        let input = scratch(&format!("invalid-tbd-version-{case}.tbd"));
+        fs::write(
+            &input,
+            format!(
+                "--- !tapi-tbd\n\
+                 tbd-version: 4\n\
+                 targets: [ arm64-macos ]\n\
+                 install-name: '/usr/lib/libbad.dylib'\n\
+                 {field}: '{value}'\n\
+                 ...\n"
+            ),
+        )
+        .unwrap();
+
+        for jobs in [1, 4] {
+            let output = scratch(&format!("invalid-tbd-version-{case}-{jobs}.dylib"));
+            let _ = fs::remove_file(&output);
+            let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+                .arg("-dylib")
+                .arg("-j")
+                .arg(jobs.to_string())
+                .arg(&input)
+                .arg("-o")
+                .arg(&output)
+                .output()
+                .expect("afs-ld should run");
+            let stderr = String::from_utf8_lossy(&result.stderr);
+
+            assert!(
+                !result.status.success(),
+                "{case} {field} {value:?} was accepted with -j{jobs}"
+            );
+            assert!(
+                stderr.contains(&input.display().to_string()),
+                "missing malformed TBD path with -j{jobs}:\n{stderr}"
+            );
+            assert!(
+                stderr.contains(field) && stderr.contains(&format!("{value:?}")),
+                "unexpected {case} {field} diagnostic with -j{jobs}:\n{stderr}"
+            );
+            assert!(
+                !output.exists(),
+                "rejected {case} {field} left an output with -j{jobs}"
+            );
+        }
+
+        let _ = fs::remove_file(input);
+    }
+}
+
+#[test]
+fn maximum_tbd_versions_are_preserved_deterministically() {
+    let input = scratch("maximum-tbd-version.tbd");
+    let install_name = "/usr/lib/libmaximum-version.dylib";
+    fs::write(
+        &input,
+        format!(
+            "--- !tapi-tbd\n\
+             tbd-version: 4\n\
+             targets: [ arm64-macos ]\n\
+             install-name: '{install_name}'\n\
+             current-version: 65535.255.255\n\
+             compatibility-version: 65535.255\n\
+             ...\n"
+        ),
+    )
+    .unwrap();
+
+    let mut images = Vec::new();
+    let output = scratch("maximum-tbd-version-output.dylib");
+    for jobs in [1, 4] {
+        let _ = fs::remove_file(&output);
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        assert!(
+            result.status.success(),
+            "maximum legal TBD version failed with -j{jobs}:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+
+        let image = fs::read(&output).unwrap();
+        let header = parse_header(&image).unwrap();
+        let commands = parse_commands(&header, &image).unwrap();
+        let load = commands
+            .iter()
+            .find_map(|command| match command {
+                LoadCommand::Dylib(dylib)
+                    if dylib.cmd == LC_LOAD_DYLIB && dylib.name == install_name =>
+                {
+                    Some(dylib)
+                }
+                _ => None,
+            })
+            .expect("linked image must load the TBD install name");
+        assert_eq!(load.current_version, u32::MAX);
+        assert_eq!(load.compatibility_version, 0xffff_ff00);
+        images.push(image);
+        let _ = fs::remove_file(&output);
+    }
+    assert!(images[0] == images[1], "-j1 and -j4 outputs differ");
+
+    let _ = fs::remove_file(input);
+}
+
+#[test]
 fn linker_rejects_non_linkable_macho_filetypes() {
     for (stem, filetype, filetype_name) in [
         ("execute", MH_EXECUTE, "MH_EXECUTE"),

@@ -42,9 +42,9 @@ pub struct Tbd {
     pub version: u32,
     pub targets: Vec<Target>,
     pub install_name: String,
-    /// Textual — may be `"1351"` or `"1.2.3"`. Packed to u32 via `parse_version`.
-    pub current_version: Option<String>,
-    pub compatibility_version: Option<String>,
+    /// Mach-O `0xMMMMmmpp` packed versions, validated while decoding.
+    pub current_version: Option<u32>,
+    pub compatibility_version: Option<u32>,
     pub parent_umbrella: Vec<Scoped<String>>,
     pub allowable_clients: Vec<Scoped<Vec<String>>>,
     pub reexported_libraries: Vec<Scoped<Vec<String>>>,
@@ -257,11 +257,14 @@ fn parse_direct_document(
                 i += 1;
             }
             "current-version" => {
-                tbd.current_version = Some(parse_direct_scalar(rest));
+                let value = parse_direct_scalar(rest);
+                tbd.current_version = Some(parse_version_field(&value, "current-version")?);
                 i += 1;
             }
             "compatibility-version" => {
-                tbd.compatibility_version = Some(parse_direct_scalar(rest));
+                let value = parse_direct_scalar(rest);
+                tbd.compatibility_version =
+                    Some(parse_version_field(&value, "compatibility-version")?);
                 i += 1;
             }
             "parent-umbrella" => {
@@ -788,9 +791,11 @@ fn decode_document(doc: Document) -> Result<Tbd, TbdError> {
             "tbd-version" => tbd.version = scalar_u32(v, "tbd-version")?,
             "targets" => tbd.targets = decode_target_list(v)?,
             "install-name" => tbd.install_name = scalar_string(v, "install-name")?,
-            "current-version" => tbd.current_version = Some(scalar_string(v, "current-version")?),
+            "current-version" => {
+                tbd.current_version = Some(scalar_packed_version(v, "current-version")?)
+            }
             "compatibility-version" => {
-                tbd.compatibility_version = Some(scalar_string(v, "compatibility-version")?)
+                tbd.compatibility_version = Some(scalar_packed_version(v, "compatibility-version")?)
             }
             "parent-umbrella" => tbd.parent_umbrella = decode_scoped_umbrella(v)?,
             "allowable-clients" => tbd.allowable_clients = decode_scoped_string_list(v, "clients")?,
@@ -964,6 +969,11 @@ fn scalar_u32(v: Value, context: &str) -> Result<u32, TbdError> {
         .map_err(|_| schema(&format!("{context} must parse as a u32: {s:?}")))
 }
 
+fn scalar_packed_version(v: Value, context: &str) -> Result<u32, TbdError> {
+    let value = scalar_string(v, context)?;
+    parse_version_field(&value, context)
+}
+
 fn scalar_string(v: Value, context: &str) -> Result<String, TbdError> {
     match v {
         Value::Scalar(s) => Ok(s),
@@ -977,15 +987,44 @@ fn schema(msg: &str) -> TbdError {
     }
 }
 
-/// Pack a `"X.Y.Z"` / `"X.Y"` / `"X"` / `"1351"` version string to
-/// Mach-O's 0xXXXXYYZZ form. Missing fields become 0; extra components
-/// are truncated. Plain integers like `1351` become `1351 << 16`.
-pub fn parse_version(s: &str) -> u32 {
-    let mut parts = s.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
-    let x = parts.next().unwrap_or(0);
-    let y = parts.next().unwrap_or(0);
-    let z = parts.next().unwrap_or(0);
-    (x << 16) | ((y & 0xff) << 8) | (z & 0xff)
+/// Parse one to three decimal components into Mach-O's `0xMMMMmmpp`
+/// packed-version representation.
+pub fn parse_version(s: &str) -> Result<u32, TbdError> {
+    parse_version_field(s, "version")
+}
+
+fn parse_version_field(s: &str, context: &str) -> Result<u32, TbdError> {
+    let mut parts = s.split('.');
+    let major = parse_version_part(parts.next().unwrap_or_default(), u16::MAX.into())
+        .ok_or_else(|| invalid_packed_version(context, s))?;
+    let minor = match parts.next() {
+        Some(part) => parse_version_part(part, u8::MAX.into())
+            .ok_or_else(|| invalid_packed_version(context, s))?,
+        None => 0,
+    };
+    let patch = match parts.next() {
+        Some(part) => parse_version_part(part, u8::MAX.into())
+            .ok_or_else(|| invalid_packed_version(context, s))?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return Err(invalid_packed_version(context, s));
+    }
+    Ok((major << 16) | (minor << 8) | patch)
+}
+
+fn invalid_packed_version(context: &str, value: &str) -> TbdError {
+    schema(&format!(
+        "{context} must be 1 to 3 decimal components with major <= 65535 and minor/patch <= 255: {value:?}"
+    ))
+}
+
+fn parse_version_part(part: &str, maximum: u32) -> Option<u32> {
+    if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value = part.parse::<u32>().ok()?;
+    (value <= maximum).then_some(value)
 }
 
 impl Target {
@@ -1223,11 +1262,88 @@ mod tests {
     }
 
     #[test]
+    fn all_tbd_decoders_reject_malformed_packed_versions() {
+        let cases = [
+            ("empty", ""),
+            ("nondigit", "1.x.3"),
+            ("leading-empty-component", ".1"),
+            ("middle-empty-component", "1..3"),
+            ("trailing-empty-component", "1."),
+            ("extra-component", "1.2.3.4"),
+            ("major-overflow", "65536"),
+            ("minor-overflow", "1.256"),
+            ("patch-overflow", "1.2.256"),
+            ("integer-overflow", "4294967296"),
+        ];
+
+        for field in ["current-version", "compatibility-version"] {
+            for (case, value) in cases {
+                let src = format!(
+                    "--- !tapi-tbd\n\
+                     tbd-version: 4\n\
+                     targets: [ arm64-macos ]\n\
+                     install-name: '/usr/lib/libbad.dylib'\n\
+                     {field}: '{value}'\n\
+                     ...\n"
+                );
+                let expected_value = format!("{value:?}");
+                for (decoder, result) in [
+                    ("generic", parse_tbd(&src)),
+                    (
+                        "direct",
+                        parse_tbd_for_target_direct(&src, &arm64_macos(), true),
+                    ),
+                    ("target", parse_tbd_for_target(&src, &arm64_macos())),
+                    (
+                        "metadata",
+                        parse_tbd_metadata_for_target(&src, &arm64_macos()),
+                    ),
+                ] {
+                    let error = match result {
+                        Ok(_) => panic!("{decoder} decoder accepted {case} {field} {value:?}"),
+                        Err(error) => error,
+                    };
+                    let diagnostic = error.to_string();
+                    assert!(
+                        diagnostic.contains(field) && diagnostic.contains(&expected_value),
+                        "{decoder} decoder returned an unhelpful {case} {field} diagnostic: {diagnostic}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn parse_version_packs_major_dot_minor_dot_patch() {
-        assert_eq!(parse_version("1.2.3"), (1 << 16) | (2 << 8) | 3);
-        assert_eq!(parse_version("11"), 11 << 16);
-        assert_eq!(parse_version("14.0"), 14 << 16);
-        assert_eq!(parse_version("1351"), 1351 << 16);
+        assert_eq!(parse_version("1.2.3").unwrap(), (1 << 16) | (2 << 8) | 3);
+        assert_eq!(parse_version("11").unwrap(), 11 << 16);
+        assert_eq!(parse_version("14.0").unwrap(), 14 << 16);
+        assert_eq!(parse_version("1351").unwrap(), 1351 << 16);
+        assert_eq!(parse_version("65535.255.255").unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn parse_version_rejects_invalid_text_and_component_overflow() {
+        for value in [
+            "",
+            "+1",
+            " 1",
+            "1 ",
+            ".1",
+            "1.",
+            "1..3",
+            "1.x.3",
+            "1.2.3.4",
+            "65536",
+            "1.256",
+            "1.2.256",
+            "4294967296",
+        ] {
+            assert!(
+                parse_version(value).is_err(),
+                "accepted malformed packed version {value:?}"
+            );
+        }
     }
 
     #[test]
@@ -1255,7 +1371,7 @@ mod tests {
                    ...\n";
         let tbd = &parse_tbd(src).unwrap()[0];
         assert_eq!(tbd.install_name, "/usr/lib/libSystem.B.dylib");
-        assert_eq!(tbd.current_version.as_deref(), Some("1351"));
+        assert_eq!(tbd.current_version, Some(1351 << 16));
         assert_eq!(tbd.exports[0].value.symbols.len(), 5);
     }
 }

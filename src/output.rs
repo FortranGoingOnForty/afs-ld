@@ -1,10 +1,10 @@
-//! Atomic publication of primary linker outputs.
+//! Atomic publication and identity checks for linker artifacts.
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -34,6 +34,79 @@ pub fn write_atomic(
     permission_mode: PermissionMode,
 ) -> io::Result<()> {
     write_atomic_with(output, permission_mode, |file| file.write_all(contents))
+}
+
+/// Return whether two paths currently name, or would publish to, the same file.
+///
+/// Existing paths are compared by filesystem identity so hard links and
+/// symlinks are detected. Missing leaves are compared after resolving their
+/// deepest existing ancestor, which also handles relative paths, `.` / `..`,
+/// and symlinked parent directories.
+pub(crate) fn paths_alias(left: &Path, right: &Path) -> io::Result<bool> {
+    let left_identity = existing_file_identity(left)?;
+    let right_identity = existing_file_identity(right)?;
+    if left_identity.is_some() && left_identity == right_identity {
+        return Ok(true);
+    }
+
+    Ok(comparison_path(left)? == comparison_path(right)?)
+}
+
+fn existing_file_identity(path: &Path) -> io::Result<Option<(u64, u64)>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn comparison_path(path: &Path) -> io::Result<PathBuf> {
+    let mut ancestor = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut missing_suffix = Vec::new();
+
+    loop {
+        match fs::canonicalize(&ancestor) {
+            Ok(mut canonical) => {
+                for component in missing_suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(normalize_lexically(&canonical));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(component) = ancestor.components().next_back() else {
+                    return Err(error);
+                };
+                if matches!(component, Component::RootDir | Component::Prefix(_)) {
+                    return Err(error);
+                }
+                missing_suffix.push(component.as_os_str().to_os_string());
+                if !ancestor.pop() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 fn write_atomic_with(

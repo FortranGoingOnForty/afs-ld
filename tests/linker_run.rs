@@ -13266,3 +13266,144 @@ fn linker_run_icf_safe_prefers_earlier_input_order_winner() {
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(map);
 }
+
+#[test]
+fn linker_run_rejects_link_map_alias_of_unpublished_output() {
+    let directory = scratch("AFSLD-071-map-output-alias");
+    let nested = directory.join("nested");
+    let object = directory.join("input.o");
+    let output = directory.join("linked.dylib");
+    let map_alias = nested.join("..").join("linked.dylib");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(
+        &object,
+        synthetic_single_section_object(
+            "__TEXT",
+            "__const",
+            S_REGULAR,
+            &[0x71; 8],
+            &[],
+            &[("_value", N_SECT | N_EXT, 1, 0, 0)],
+        ),
+    )
+    .unwrap();
+
+    let result = Linker::run(&LinkOptions {
+        inputs: vec![object],
+        output: Some(output.clone()),
+        map: Some(map_alias.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    });
+    let output_exists = output.exists();
+    let _ = fs::remove_dir_all(&directory);
+
+    assert!(
+        matches!(
+            result,
+            Err(LinkError::LinkMapAliasesOutput {
+                map,
+                output: rejected_output,
+            }) if map == map_alias && rejected_output == output
+        ),
+        "a link map must report its conflict with the primary output"
+    );
+    assert!(
+        !output_exists,
+        "path-alias rejection must happen before publishing the primary output"
+    );
+}
+
+#[test]
+fn linker_run_preserves_existing_output_when_link_map_aliases_it() {
+    const SENTINEL: &[u8] = b"previous complete executable";
+    let directory = scratch("AFSLD-071-existing-output-alias");
+    let object = directory.join("input.o");
+    let output = directory.join("linked.dylib");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        &object,
+        synthetic_single_section_object(
+            "__TEXT",
+            "__const",
+            S_REGULAR,
+            &[0x71; 8],
+            &[],
+            &[("_value", N_SECT | N_EXT, 1, 0, 0)],
+        ),
+    )
+    .unwrap();
+    fs::write(&output, SENTINEL).unwrap();
+
+    let result = Linker::run(&LinkOptions {
+        inputs: vec![object],
+        output: Some(output.clone()),
+        map: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    });
+    let output_after = fs::read(&output).unwrap();
+    let _ = fs::remove_dir_all(&directory);
+
+    assert!(matches!(
+        result,
+        Err(LinkError::LinkMapAliasesOutput { .. })
+    ));
+    assert_eq!(
+        output_after, SENTINEL,
+        "alias rejection must preserve the previously published output"
+    );
+}
+
+#[test]
+fn linker_run_rejects_link_map_filesystem_aliases_of_inputs() {
+    for alias_kind in ["symlink", "hardlink"] {
+        let directory = scratch(&format!("AFSLD-071-map-input-{alias_kind}"));
+        let object = directory.join("input.o");
+        let output = directory.join("linked.dylib");
+        let map_alias = directory.join("linked.map");
+        fs::create_dir_all(&directory).unwrap();
+        let object_bytes = synthetic_single_section_object(
+            "__TEXT",
+            "__const",
+            S_REGULAR,
+            &[0x71; 8],
+            &[],
+            &[("_value", N_SECT | N_EXT, 1, 0, 0)],
+        );
+        fs::write(&object, &object_bytes).unwrap();
+        match alias_kind {
+            "symlink" => std::os::unix::fs::symlink(&object, &map_alias).unwrap(),
+            "hardlink" => fs::hard_link(&object, &map_alias).unwrap(),
+            _ => unreachable!(),
+        }
+
+        let result = Linker::run(&LinkOptions {
+            inputs: vec![object.clone()],
+            output: Some(output.clone()),
+            map: Some(map_alias.clone()),
+            kind: OutputKind::Dylib,
+            ..LinkOptions::default()
+        });
+        let object_after = fs::read(&object).unwrap();
+        let output_exists = output.exists();
+        let _ = fs::remove_dir_all(&directory);
+
+        assert!(
+            matches!(
+                result,
+                Err(LinkError::LinkMapAliasesInput { map, input })
+                    if map == map_alias && input == object
+            ),
+            "a {alias_kind} link map alias must identify the protected input"
+        );
+        assert_eq!(
+            object_after, object_bytes,
+            "a rejected {alias_kind} map alias must leave the input byte-exact"
+        );
+        assert!(
+            !output_exists,
+            "input-alias rejection must happen before publishing the primary output"
+        );
+    }
+}

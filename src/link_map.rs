@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::icf::FoldedSymbol;
 use crate::layout::{Layout, LayoutInput};
 use crate::macho::writer::LinkEditPlan;
+use crate::output::{self, PermissionMode};
 use crate::why_live::DeadStrippedSymbol;
 use crate::LinkOptions;
 
@@ -90,5 +91,5 @@ pub fn write_link_map(
         writeln!(&mut out, "{:<7} {}", file, symbol.name).unwrap();
     }
 
-    std::fs::write(path, out)
+    output::write_atomic(path, out.as_bytes(), PermissionMode::Preserve)
 }

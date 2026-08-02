@@ -266,6 +266,14 @@ pub enum LinkError {
     ThunkPlanningDidNotConverge,
     WhyLive(String),
     UnsupportedOption(String),
+    LinkMapAliasesOutput {
+        map: PathBuf,
+        output: PathBuf,
+    },
+    LinkMapAliasesInput {
+        map: PathBuf,
+        input: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -430,6 +438,18 @@ impl std::fmt::Display for LinkError {
             }
             LinkError::WhyLive(msg) => write!(f, "{msg}"),
             LinkError::UnsupportedOption(msg) => write!(f, "{msg}"),
+            LinkError::LinkMapAliasesOutput { map, output } => write!(
+                f,
+                "link map path {} aliases primary output path {}",
+                map.display(),
+                output.display()
+            ),
+            LinkError::LinkMapAliasesInput { map, input } => write!(
+                f,
+                "link map path {} aliases input path {}",
+                map.display(),
+                input.display()
+            ),
         }
     }
 }
@@ -725,6 +745,7 @@ impl Linker {
             }
             return Err(error.error);
         }
+        validate_link_map_ownership(opts, &resolved_inputs)?;
         phases.input_parsing = phase_started.elapsed();
 
         let mut sym_table = SymbolTable::new();
@@ -1109,7 +1130,10 @@ impl Linker {
                 &linkedit,
                 &folded_symbols,
                 &dead_stripped,
-            )?;
+            )
+            .map_err(|error| {
+                io::Error::new(error.kind(), format!("{}: {error}", map_path.display()))
+            })?;
         }
         phases.write_output = phase_started.elapsed();
         Ok(LinkProfile {
@@ -1288,6 +1312,55 @@ fn default_output_path(opts: &LinkOptions) -> PathBuf {
     opts.output
         .clone()
         .unwrap_or_else(|| PathBuf::from("a.out"))
+}
+
+fn validate_link_map_ownership(
+    opts: &LinkOptions,
+    resolved_inputs: &[ResolvedInput],
+) -> Result<(), LinkError> {
+    let Some(map) = opts.map.as_deref() else {
+        return Ok(());
+    };
+    let output = default_output_path(opts);
+    if publication_paths_alias(map, &output)? {
+        return Err(LinkError::LinkMapAliasesOutput {
+            map: map.to_path_buf(),
+            output,
+        });
+    }
+
+    let read_paths = resolved_inputs
+        .iter()
+        .map(|input| input.path.as_path())
+        .chain(opts.force_load_archives.iter().map(PathBuf::as_path))
+        .chain(opts.exported_symbols_lists.iter().map(PathBuf::as_path))
+        .chain(opts.unexported_symbols_lists.iter().map(PathBuf::as_path));
+    for input in read_paths {
+        if publication_paths_alias(map, input)? {
+            return Err(LinkError::LinkMapAliasesInput {
+                map: map.to_path_buf(),
+                input: input.to_path_buf(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn publication_paths_alias(
+    left: &std::path::Path,
+    right: &std::path::Path,
+) -> Result<bool, LinkError> {
+    output::paths_alias(left, right).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "unable to compare publication paths {} and {}: {error}",
+                left.display(),
+                right.display()
+            ),
+        )
+        .into()
+    })
 }
 
 struct LoadedObjectInput {

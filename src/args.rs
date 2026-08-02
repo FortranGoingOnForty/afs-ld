@@ -67,6 +67,11 @@ const KNOWN_FLAGS: &[&str] = &[
 ];
 
 const RESPONSE_FILE_DEPTH_LIMIT: usize = 8;
+const PACKED_VERSION_MAJOR_MAX: u32 = u16::MAX as u32;
+const PACKED_VERSION_MINOR_MAX: u32 = u8::MAX as u32;
+const PACKED_VERSION_PATCH_MAX: u32 = u8::MAX as u32;
+const PACKED_VERSION_FORMAT: &str =
+    "version like <major>[.<minor>[.<patch>]] with major at most 65535 and minor/patch at most 255";
 
 #[derive(Debug)]
 pub enum ArgsError {
@@ -210,27 +215,63 @@ fn unknown_flag(flag: &str) -> ArgsError {
     }
 }
 
-fn parse_version_component(flag: &str, value: &str) -> Result<u32, ArgsError> {
-    let mut parts = value.split('.');
-    let parse_part = |piece: Option<&str>| -> Result<u32, ArgsError> {
-        let raw = piece.unwrap_or("0");
-        raw.parse::<u32>().map_err(|_| ArgsError::InvalidValue {
-            flag: flag.to_string(),
-            value: value.to_string(),
-            expected: "version like <major>[.<minor>[.<patch>]]".into(),
-        })
-    };
-    let major = parse_part(parts.next())?;
-    let minor = parse_part(parts.next())?;
-    let patch = parse_part(parts.next())?;
-    if parts.next().is_some() {
-        return Err(ArgsError::InvalidValue {
-            flag: flag.to_string(),
-            value: value.to_string(),
-            expected: "version like <major>[.<minor>[.<patch>]]".into(),
-        });
+fn invalid_packed_version(flag: &str, value: &str, expected: String) -> ArgsError {
+    ArgsError::InvalidValue {
+        flag: flag.to_string(),
+        value: value.to_string(),
+        expected,
     }
-    Ok((major << 16) | ((minor & 0xff) << 8) | (patch & 0xff))
+}
+
+fn parse_packed_version_part(
+    flag: &str,
+    value: &str,
+    raw: &str,
+    component: &str,
+    maximum: u32,
+) -> Result<u32, ArgsError> {
+    let parsed = raw
+        .parse::<u32>()
+        .map_err(|_| invalid_packed_version(flag, value, PACKED_VERSION_FORMAT.to_string()))?;
+    if parsed > maximum {
+        return Err(invalid_packed_version(
+            flag,
+            value,
+            format!("{component} component must be at most {maximum}"),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_packed_version(flag: &str, value: &str) -> Result<u32, ArgsError> {
+    let mut parts = value.split('.');
+    let major = parse_packed_version_part(
+        flag,
+        value,
+        parts.next().unwrap_or_default(),
+        "major",
+        PACKED_VERSION_MAJOR_MAX,
+    )?;
+    let minor = match parts.next() {
+        Some(raw) => {
+            parse_packed_version_part(flag, value, raw, "minor", PACKED_VERSION_MINOR_MAX)?
+        }
+        None => 0,
+    };
+    let patch = match parts.next() {
+        Some(raw) => {
+            parse_packed_version_part(flag, value, raw, "patch", PACKED_VERSION_PATCH_MAX)?
+        }
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return Err(invalid_packed_version(
+            flag,
+            value,
+            PACKED_VERSION_FORMAT.to_string(),
+        ));
+    }
+    Ok((major << 16) | (minor << 8) | patch)
 }
 
 fn parse_jobs(value: &str) -> Result<usize, ArgsError> {
@@ -573,8 +614,8 @@ pub fn parse_preprocessed_with_force_loads(
                     .next()
                     .ok_or_else(|| ArgsError::MissingValue("-platform_version".into()))?;
                 opts.platform_version = Some(PlatformVersion {
-                    minos: parse_version_component("-platform_version", minos_raw)?,
-                    sdk: parse_version_component("-platform_version", sdk_raw)?,
+                    minos: parse_packed_version("-platform_version", minos_raw)?,
+                    sdk: parse_packed_version("-platform_version", sdk_raw)?,
                 });
             }
             "-r" => {
@@ -619,14 +660,14 @@ pub fn parse_preprocessed_with_force_loads(
                 let value = it
                     .next()
                     .ok_or_else(|| ArgsError::MissingValue("-current_version".into()))?;
-                opts.current_version = Some(parse_version_component("-current_version", value)?);
+                opts.current_version = Some(parse_packed_version("-current_version", value)?);
             }
             "-compatibility_version" => {
                 let value = it
                     .next()
                     .ok_or_else(|| ArgsError::MissingValue("-compatibility_version".into()))?;
                 opts.compatibility_version =
-                    Some(parse_version_component("-compatibility_version", value)?);
+                    Some(parse_packed_version("-compatibility_version", value)?);
             }
             "-exported_symbols_list" => {
                 opts.exported_symbols_lists
@@ -1054,6 +1095,84 @@ mod tests {
                 ..
             } if flag == "-platform_version" && value == "13.bad"
         ));
+    }
+
+    #[test]
+    fn version_flags_accept_maximum_packed_components() {
+        let opts = parse(&argv(&[
+            "-platform_version",
+            "macos",
+            "65535.255.255",
+            "65535.255.255",
+            "-current_version",
+            "65535.255.255",
+            "-compatibility_version",
+            "65535.255.255",
+            "main.o",
+        ]))
+        .unwrap();
+
+        let platform = opts.platform_version.expect("platform version");
+        assert_eq!(platform.minos, u32::MAX);
+        assert_eq!(platform.sdk, u32::MAX);
+        assert_eq!(opts.current_version, Some(u32::MAX));
+        assert_eq!(opts.compatibility_version, Some(u32::MAX));
+    }
+
+    #[test]
+    fn version_flags_reject_component_overflow() {
+        let cases = [
+            (
+                vec!["-platform_version", "macos", "65536.0.0", "1.0"],
+                "-platform_version",
+                "65536.0.0",
+                "major component must be at most 65535",
+            ),
+            (
+                vec!["-platform_version", "macos", "1.256.0", "1.0"],
+                "-platform_version",
+                "1.256.0",
+                "minor component must be at most 255",
+            ),
+            (
+                vec!["-platform_version", "macos", "1.0.256", "1.0"],
+                "-platform_version",
+                "1.0.256",
+                "patch component must be at most 255",
+            ),
+            (
+                vec!["-platform_version", "macos", "1.0", "65536.0.0"],
+                "-platform_version",
+                "65536.0.0",
+                "major component must be at most 65535",
+            ),
+            (
+                vec!["-current_version", "1.256.0"],
+                "-current_version",
+                "1.256.0",
+                "minor component must be at most 255",
+            ),
+            (
+                vec!["-compatibility_version", "1.0.256"],
+                "-compatibility_version",
+                "1.0.256",
+                "patch component must be at most 255",
+            ),
+        ];
+
+        for (args, expected_flag, expected_value, expected_reason) in cases {
+            let err = parse(&argv(&args)).expect_err(expected_value);
+            assert!(matches!(
+                err,
+                ArgsError::InvalidValue {
+                    ref flag,
+                    ref value,
+                    ref expected,
+                } if flag == expected_flag
+                    && value == expected_value
+                    && expected.contains(expected_reason)
+            ));
+        }
     }
 
     #[test]

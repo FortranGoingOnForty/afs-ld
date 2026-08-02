@@ -678,6 +678,53 @@ fn version_flag_prints_version_and_exits_successfully() {
 }
 
 #[test]
+fn overflowing_macho_versions_are_rejected_before_output_publication() {
+    let output = scratch("AFSLD-073-version-overflow.out");
+    let sentinel = b"previously-published-output";
+    fs::write(&output, sentinel).unwrap();
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["-platform_version", "macos", "65536.0.0", "1.0"],
+            "major component must be at most 65535",
+        ),
+        (
+            &["-platform_version", "macos", "1.0", "1.256.0"],
+            "minor component must be at most 255",
+        ),
+        (
+            &["-current_version", "1.0.256"],
+            "patch component must be at most 255",
+        ),
+        (
+            &["-compatibility_version", "65536.0.0"],
+            "major component must be at most 65535",
+        ),
+    ];
+
+    for (args, expected) in cases {
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-o")
+            .arg(&output)
+            .args(*args)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(2), "args: {args:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(expected),
+            "args: {args:?}; stderr: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            fs::read(&output).unwrap(),
+            sentinel,
+            "args: {args:?} must not replace an existing output"
+        );
+    }
+
+    let _ = fs::remove_file(output);
+}
+
+#[test]
 fn no_uuid_flag_omits_uuid_load_command() {
     if !have_xcrun() {
         harness_skip!("xcrun as unavailable");

@@ -2372,6 +2372,173 @@ fn nondefault_visibility_undefineds_cannot_bind_to_shared_objects() {
 }
 
 #[test]
+fn shared_object_undefined_end_binds_to_the_executable_linker_symbol() {
+    if !cfg!(target_os = "linux") {
+        harness_skip!("requires GNU ELF linker-symbol behavior on Linux");
+        return;
+    }
+    let Some(gas) = gas() else {
+        harness_skip!("no GNU assembler on this host");
+        return;
+    };
+    let Some(ld) = system_ld() else {
+        harness_skip!("no system ld to build and check the reference shared object");
+        return;
+    };
+    let Some(interp) = rtld() else {
+        harness_skip!("no standard dynamic loader on this host");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_elf_dynamic_end_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let consumer_obj = dir.join("consumer.o");
+    assemble(
+        &gas,
+        ".text\n\
+         .globl answer\n\
+         .type answer,@function\n\
+         answer:\n\
+             movq _end@GOTPCREL(%rip), %rax\n\
+             testq %rax, %rax\n\
+             setne %al\n\
+             movzbl %al, %eax\n\
+             imull $42, %eax, %eax\n\
+             ret\n",
+        &dir.join("consumer.s"),
+        &consumer_obj,
+    );
+    let script = dir.join("shared.ld");
+    std::fs::write(
+        &script,
+        "SECTIONS\n{\n  . = 0x1000;\n  .text : { *(.text) }\n}\n",
+    )
+    .unwrap();
+    let consumer = dir.join("libconsumer.so.1");
+    let shared_result = Command::new(&ld)
+        .args(["-shared", "-T"])
+        .arg(&script)
+        .args(["-soname", "libconsumer.so.1", "-o"])
+        .arg(&consumer)
+        .arg(&consumer_obj)
+        .output()
+        .unwrap();
+    assert!(
+        shared_result.status.success(),
+        "reference shared-object link: {}",
+        String::from_utf8_lossy(&shared_result.stderr)
+    );
+    let parsed_consumer = afs_ld::elf::parse_shared(
+        &consumer.display().to_string(),
+        &std::fs::read(&consumer).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        parsed_consumer.undefs.iter().any(|name| name == "_end"),
+        "fixture DSO must retain a dynamic undefined _end"
+    );
+
+    let main_obj = dir.join("main.o");
+    assemble(
+        &gas,
+        ".text\n\
+         .globl _start\n\
+         .type _start,@function\n\
+         _start:\n\
+             call answer@PLT\n\
+             movl %eax, %edi\n\
+             movl $60, %eax\n\
+             syscall\n",
+        &dir.join("main.s"),
+        &main_obj,
+    );
+
+    let reference = dir.join("reference");
+    let reference_result = Command::new(&ld)
+        .args(["--dynamic-linker", interp, "-o"])
+        .arg(&reference)
+        .arg(&main_obj)
+        .arg(&consumer)
+        .output()
+        .unwrap();
+    assert!(
+        reference_result.status.success(),
+        "reference executable link: {}",
+        String::from_utf8_lossy(&reference_result.stderr)
+    );
+    assert_eq!(
+        Command::new(&reference)
+            .env("LD_LIBRARY_PATH", &dir)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(42),
+        "reference executable did not publish _end to the DSO"
+    );
+
+    let output = dir.join("afs");
+    let link = |path: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .args(["--dynamic-linker", interp, "-o"])
+            .arg(path)
+            .arg(&main_obj)
+            .arg(&consumer)
+            .output()
+            .unwrap()
+    };
+    let result = link(&output);
+    assert!(
+        result.status.success(),
+        "afs-ld must publish its _end definition: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let image = std::fs::read(&output).unwrap();
+    let dynstr = section_bytes(&image, ".dynstr").expect("dynamic string table");
+    let end_symbol = section_bytes(&image, ".dynsym")
+        .expect("dynamic symbol table")
+        .chunks_exact(24)
+        .find(|symbol| {
+            let offset = u32::from_le_bytes(symbol[0..4].try_into().unwrap()) as usize;
+            let Some(length) = dynstr[offset..].iter().position(|&byte| byte == 0) else {
+                return false;
+            };
+            &dynstr[offset..offset + length] == b"_end"
+        })
+        .expect("defined dynamic _end symbol");
+    assert_ne!(
+        u16::from_le_bytes(end_symbol[6..8].try_into().unwrap()),
+        afs_ld::elf::SHN_UNDEF,
+        "the executable's dynamic _end must be defined"
+    );
+    assert_ne!(
+        u64::from_le_bytes(end_symbol[8..16].try_into().unwrap()),
+        0,
+        "the executable's dynamic _end must carry its final address"
+    );
+    assert_eq!(
+        Command::new(&output)
+            .env("LD_LIBRARY_PATH", &dir)
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(42),
+        "the DSO did not bind to afs-ld's dynamic _end"
+    );
+
+    let output_again = dir.join("afs-again");
+    let again = link(&output_again);
+    assert!(again.status.success());
+    assert_eq!(
+        image,
+        std::fs::read(&output_again).unwrap(),
+        "linker-symbol back-exports must be deterministic"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn no_as_needed_retains_constructor_only_shared_library() {
     let Some(gas) = gas() else {
         eprintln!("\nHARNESS_SKIP suite=elf_link_run test=no_as_needed_retains_constructor_only_shared_library count=1 reason=\"no GNU assembler on this host\"");

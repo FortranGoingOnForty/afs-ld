@@ -39,6 +39,7 @@ const VERSYM_HIDDEN: u16 = 0x8000;
 const VER_NDX_GLOBAL: u16 = 1;
 
 pub const ET_DYN: u16 = 3;
+pub const STT_NOTYPE: u8 = 0;
 pub const STT_OBJECT: u8 = 1;
 pub const STT_FUNC: u8 = 2;
 /// `.dynamic` tag: shared-object name.
@@ -139,6 +140,9 @@ const LINKER_SYMS: &[&str] = &[
     "_edata",
     "_end",
 ];
+/// Linker-provided symbols that GNU-compatible executables publish for
+/// runtime references from retained shared objects.
+const DYNAMIC_LINKER_SYMS: &[&str] = &["__bss_start", "_edata", "_end"];
 /// Sentinel object index marking a linker-provided pseudo definition;
 /// the paired symbol index is an offset into [`LINKER_SYMS`].
 const LINKER_MARK: usize = usize::MAX;
@@ -909,6 +913,21 @@ enum GotSlot {
     Zero,
 }
 
+#[derive(Clone, Copy)]
+enum DynamicExportDef {
+    Object { object: usize, symbol: usize },
+    Linker { symbol: usize },
+}
+
+impl DynamicExportDef {
+    fn address_target(self) -> (usize, usize) {
+        match self {
+            Self::Object { object, symbol } => (object, symbol),
+            Self::Linker { symbol } => (LINKER_MARK, symbol),
+        }
+    }
+}
+
 fn output_rank(flags: u64, is_bss: bool) -> u32 {
     if flags & SHF_EXECINSTR != 0 {
         0
@@ -1206,6 +1225,13 @@ fn defined_names(obj: &ElfObject, out: &mut HashSet<String>) {
             out.insert(base.to_string());
         }
     }
+}
+
+fn dynamic_linker_symbol_index(name: &str) -> Option<usize> {
+    if !DYNAMIC_LINKER_SYMS.contains(&name) {
+        return None;
+    }
+    LINKER_SYMS.iter().position(|candidate| *candidate == name)
 }
 
 /// Resolve a symbol name to its defining member's header offset in an
@@ -3587,6 +3613,7 @@ pub fn link_dynamic_with_as_needed_and_gc(
                     .iter()
                     .find(|name| {
                         !state.defined.contains(*name)
+                            && dynamic_linker_symbol_index(name).is_none()
                             && !dependency_covers(details, name, &state.dependency_exports)
                     })
                     .map(|name| (lib, name))
@@ -3989,7 +4016,7 @@ pub fn link_dynamic_exec(
     // the executable (e.g. crt1.o's `environ`/`__progname`, which libc
     // needs). Driven by library-undef order for determinism.
     let mut export_names: Vec<String> = Vec::new();
-    let mut export_def: Vec<(usize, usize)> = Vec::new(); // (obj, sym) of the definition
+    let mut export_def: Vec<DynamicExportDef> = Vec::new();
     {
         let mut seen: HashSet<String> = HashSet::new();
         for lib in shared {
@@ -4000,16 +4027,26 @@ pub fn link_dynamic_exec(
                 if let Some(&(doi, dsi)) = globals.get(u) {
                     seen.insert(u.clone());
                     export_names.push(u.clone());
-                    export_def.push((doi, dsi));
+                    export_def.push(DynamicExportDef::Object {
+                        object: doi,
+                        symbol: dsi,
+                    });
+                } else if let Some(symbol) = dynamic_linker_symbol_index(u) {
+                    seen.insert(u.clone());
+                    export_names.push(u.clone());
+                    export_def.push(DynamicExportDef::Linker { symbol });
                 }
             }
         }
     }
     let n_exp = export_names.len();
-    for &(doi, dsi) in &export_def {
-        if objects[doi].symbols[dsi].typ == STT_GNU_IFUNC {
+    for definition in &export_def {
+        let DynamicExportDef::Object { object, symbol } = *definition else {
+            continue;
+        };
+        if objects[object].symbols[symbol].typ == STT_GNU_IFUNC {
             let next = local_ifunc_slot.len();
-            local_ifunc_slot.entry((doi, dsi)).or_insert(next);
+            local_ifunc_slot.entry((object, symbol)).or_insert(next);
         }
     }
     let n_local_ifunc = local_ifunc_slot.len();
@@ -4066,18 +4103,26 @@ pub fn link_dynamic_exec(
         dynsym[e + 4] = (STB_GLOBAL << 4) | styp;
         // st_other=0, st_shndx=0 (UND), value/size=0 already zeroed.
     }
-    for (j, &(doi, dsi)) in export_def.iter().enumerate() {
+    for (j, definition) in export_def.iter().enumerate() {
         let e = (1 + n_imp + j) * 24;
-        let sym = &objects[doi].symbols[dsi];
         dynsym[e..e + 4].copy_from_slice(&export_name_off[j].to_le_bytes());
-        if sym.typ == STT_GNU_IFUNC {
-            dynsym[e + 4] = (STB_GLOBAL << 4) | STT_FUNC;
-            // st_shndx is patched to .plt after section headers are built;
-            // canonical PLT exports have st_size=0.
-        } else {
-            dynsym[e + 4] = (STB_GLOBAL << 4) | sym.typ;
-            dynsym[e + 6..e + 8].copy_from_slice(&SHN_ABS.to_le_bytes());
-            dynsym[e + 16..e + 24].copy_from_slice(&sym.size.to_le_bytes());
+        match *definition {
+            DynamicExportDef::Object { object, symbol } => {
+                let sym = &objects[object].symbols[symbol];
+                if sym.typ == STT_GNU_IFUNC {
+                    dynsym[e + 4] = (STB_GLOBAL << 4) | STT_FUNC;
+                    // st_shndx is patched to .plt after section headers are built;
+                    // canonical PLT exports have st_size=0.
+                } else {
+                    dynsym[e + 4] = (STB_GLOBAL << 4) | sym.typ;
+                    dynsym[e + 6..e + 8].copy_from_slice(&SHN_ABS.to_le_bytes());
+                    dynsym[e + 16..e + 24].copy_from_slice(&sym.size.to_le_bytes());
+                }
+            }
+            DynamicExportDef::Linker { .. } => {
+                dynsym[e + 4] = (STB_GLOBAL << 4) | STT_NOTYPE;
+                dynsym[e + 6..e + 8].copy_from_slice(&SHN_ABS.to_le_bytes());
+            }
         }
         // st_value (e+8..e+16) is patched post-layout.
     }
@@ -4658,12 +4703,13 @@ pub fn link_dynamic_exec(
     }
 
     // Patch exported symbols' st_value now that addresses are resolved.
-    for (j, &(doi, dsi)) in export_def.iter().enumerate() {
+    for (j, definition) in export_def.iter().enumerate() {
         let e = (1 + n_imp + j) * 24;
         // Executable IFUNC exports are canonical functions: DSOs bind to the
         // same PLT address used by in-image references instead of asking the
         // loader to invoke the resolver independently.
-        let addr = sym_vaddr(doi, dsi)?;
+        let (object, symbol) = definition.address_target();
+        let addr = sym_vaddr(object, symbol)?;
         dynsym[e + 8..e + 16].copy_from_slice(&addr.to_le_bytes());
     }
 
@@ -5094,8 +5140,11 @@ pub fn link_dynamic_exec(
     if let Some(plt_idx) = plt_idx {
         let plt_shndx = u16::try_from(plt_idx)
             .map_err(|_| ElfError("too many ELF sections for a symbol section index".into()))?;
-        for (j, &(doi, dsi)) in export_def.iter().enumerate() {
-            if objects[doi].symbols[dsi].typ == STT_GNU_IFUNC {
+        for (j, definition) in export_def.iter().enumerate() {
+            let DynamicExportDef::Object { object, symbol } = *definition else {
+                continue;
+            };
+            if objects[object].symbols[symbol].typ == STT_GNU_IFUNC {
                 let e = (1 + n_imp + j) * 24;
                 dynsym[e + 6..e + 8].copy_from_slice(&plt_shndx.to_le_bytes());
             }

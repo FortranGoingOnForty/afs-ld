@@ -4453,6 +4453,9 @@ fn link_dynamic_exec_with_policy(
     let bss_order: Vec<usize> = (0..outs.len()).filter(|&i| outs[i].is_bss).collect();
     for &i in &bss_order {
         outs[i].vaddr = next_multiple(v, outs[i].align.max(1));
+        // NOBITS occupies no bytes, but its section header still carries
+        // the conceptual file position defined by the containing LOAD.
+        outs[i].file_off = rw_start_fo + (outs[i].vaddr - rw_start_v);
         v = outs[i].vaddr + outs[i].bss_size;
     }
     let rw_mem_end_v = v;
@@ -5340,7 +5343,7 @@ fn link_dynamic_exec_with_policy(
             SHT_NOBITS,
             o.flags,
             o.vaddr,
-            o.vaddr,
+            o.file_off,
             o.bss_size,
             0,
             0,
@@ -5717,6 +5720,117 @@ mod output_section_tests {
         )
         .unwrap_err();
         assert_eq!(dynamic_error.to_string(), static_error.to_string());
+    }
+}
+
+#[cfg(test)]
+mod dynamic_nobits_header_tests {
+    use super::*;
+
+    fn section_header(image: &[u8], name: &str) -> (u32, u64, u64, u64) {
+        let shoff = ru64(image, 40) as usize;
+        let shentsize = ru16(image, 58) as usize;
+        let shnum = ru16(image, 60) as usize;
+        let shstrndx = ru16(image, 62) as usize;
+        let shstr = shoff + shstrndx * shentsize;
+        let shstr_off = ru64(image, shstr + 24) as usize;
+
+        for index in 0..shnum {
+            let header = shoff + index * shentsize;
+            let name_offset = shstr_off + ru32(image, header) as usize;
+            let name_end = image[name_offset..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .expect("section name must terminate");
+            if &image[name_offset..name_offset + name_end] == name.as_bytes() {
+                return (
+                    ru32(image, header + 4),
+                    ru64(image, header + 16),
+                    ru64(image, header + 24),
+                    ru64(image, header + 32),
+                );
+            }
+        }
+        panic!("missing section {name}");
+    }
+
+    fn load_segment(image: &[u8], address: u64) -> (u64, u64, u64, u64) {
+        let phoff = ru64(image, 32) as usize;
+        let phentsize = ru16(image, 54) as usize;
+        let phnum = ru16(image, 56) as usize;
+
+        for index in 0..phnum {
+            let header = phoff + index * phentsize;
+            if ru32(image, header) != PT_LOAD {
+                continue;
+            }
+            let vaddr = ru64(image, header + 16);
+            let memsz = ru64(image, header + 40);
+            if (vaddr..vaddr + memsz).contains(&address) {
+                return (
+                    ru64(image, header + 8),
+                    vaddr,
+                    ru64(image, header + 32),
+                    memsz,
+                );
+            }
+        }
+        panic!("no PT_LOAD contains address {address:#x}");
+    }
+
+    #[test]
+    fn dynamic_nobits_offset_follows_writable_load_mapping() {
+        let object = ElfObject {
+            name: "nobits.o".to_string(),
+            sections: vec![
+                Section {
+                    name: ".text".to_string(),
+                    sh_type: SHT_PROGBITS,
+                    sh_flags: SHF_ALLOC | SHF_EXECINSTR,
+                    sh_addralign: 16,
+                    sh_entsize: 0,
+                    data: vec![0xc3],
+                    nobits_size: 0,
+                    relas: Vec::new(),
+                },
+                Section {
+                    name: ".bss".to_string(),
+                    sh_type: SHT_NOBITS,
+                    sh_flags: SHF_ALLOC | SHF_WRITE,
+                    sh_addralign: 64,
+                    sh_entsize: 0,
+                    data: Vec::new(),
+                    nobits_size: 96,
+                    relas: Vec::new(),
+                },
+            ],
+            symbols: vec![Symbol {
+                name: "_start".to_string(),
+                bind: STB_GLOBAL,
+                typ: STT_FUNC,
+                visibility: STV_DEFAULT,
+                shndx: 1,
+                section: Some(0),
+                value: 0,
+                size: 1,
+            }],
+            requires_executable_stack: false,
+        };
+
+        let image = link_dynamic_exec(&[object], &[], "_start", "/unused/interp", false)
+            .expect("dynamic link");
+        let (section_type, address, offset, size) = section_header(&image, ".bss");
+        assert_eq!(section_type, SHT_NOBITS);
+
+        let (segment_offset, segment_vaddr, segment_filesz, segment_memsz) =
+            load_segment(&image, address);
+        assert_eq!(
+            offset - segment_offset,
+            address - segment_vaddr,
+            "NOBITS sh_offset must use the containing PT_LOAD's file mapping"
+        );
+        assert!(offset >= segment_offset + segment_filesz);
+        assert!(address + size <= segment_vaddr + segment_memsz);
     }
 }
 

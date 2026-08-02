@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -28,6 +27,7 @@ use crate::resolve::{Symbol, SymbolId, SymbolTable};
 use crate::section::{is_executable, SectionKind};
 use crate::string_table::StringTableBuilder;
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind, NLIST_SIZE};
+use crate::symbol_visibility::{SymbolVisibilityError, SymbolVisibilityPolicy};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::{
     code_sig::{sha256, CodeSignatureError, CodeSignaturePlan},
@@ -188,6 +188,13 @@ impl fmt::Display for WriteError {
 
 impl std::error::Error for WriteError {}
 
+impl From<SymbolVisibilityError> for WriteError {
+    fn from(error: SymbolVisibilityError) -> Self {
+        let (path, detail) = error.into_parts();
+        Self::SymbolListRead(path, detail)
+    }
+}
+
 pub fn write(
     layout: &Layout,
     kind: OutputKind,
@@ -225,7 +232,25 @@ pub fn finalize_layout_with_linkedit(
     dylibs: &[DylibDependency],
     context: LinkEditContext<'_>,
 ) -> Result<(Layout, LinkEditPlan, LinkEditBuildTimings), WriteError> {
-    finalize_with_linkedit(layout, kind, opts, dylibs, Some(LinkEditInputs(context)))
+    let visibility = SymbolVisibilityPolicy::from_opts(opts)?;
+    finalize_layout_with_linkedit_and_visibility(layout, kind, opts, dylibs, context, &visibility)
+}
+
+pub(crate) fn finalize_layout_with_linkedit_and_visibility(
+    layout: &Layout,
+    kind: OutputKind,
+    opts: &LinkOptions,
+    dylibs: &[DylibDependency],
+    context: LinkEditContext<'_>,
+    visibility: &SymbolVisibilityPolicy,
+) -> Result<(Layout, LinkEditPlan, LinkEditBuildTimings), WriteError> {
+    finalize_with_linkedit(
+        layout,
+        kind,
+        opts,
+        dylibs,
+        Some(LinkEditInputs(context, visibility)),
+    )
 }
 
 pub fn build_parsed_reloc_cache(
@@ -962,13 +987,12 @@ fn build_linkedit_plan_profiled(
         .iter()
         .map(|record| (record.symbol, record))
         .collect();
-    let visibility = SymbolVisibilityPolicy::from_opts(opts)?;
     let (symbol_plan, symbol_plan_timings) = build_output_symbols_profiled(
         layout,
         kind,
         opts.dead_strip,
         opts.strip_locals,
-        &visibility,
+        inputs.1,
         inputs,
         &imports,
     )?;
@@ -1179,7 +1203,7 @@ struct ImportSymbolRecord {
 }
 
 #[derive(Clone, Copy)]
-struct LinkEditInputs<'a>(LinkEditContext<'a>);
+struct LinkEditInputs<'a>(LinkEditContext<'a>, &'a SymbolVisibilityPolicy);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputSymbolPartition {
@@ -1202,43 +1226,6 @@ struct OutputSymbolSpec {
     indirect_target: Option<String>,
     export_kind: Option<ExportKind>,
     export_flags: u64,
-}
-
-#[derive(Debug, Clone)]
-struct SymbolVisibilityPolicy {
-    exported: Vec<String>,
-    unexported: Vec<String>,
-}
-
-impl SymbolVisibilityPolicy {
-    fn from_opts(opts: &LinkOptions) -> Result<Self, WriteError> {
-        let mut exported = opts.exported_symbols.clone();
-        let mut unexported = opts.unexported_symbols.clone();
-        for path in &opts.exported_symbols_lists {
-            exported.extend(read_symbol_patterns(path)?);
-        }
-        for path in &opts.unexported_symbols_lists {
-            unexported.extend(read_symbol_patterns(path)?);
-        }
-        Ok(Self {
-            exported,
-            unexported,
-        })
-    }
-
-    fn hides(&self, name: &str) -> bool {
-        if !self.exported.is_empty()
-            && !self
-                .exported
-                .iter()
-                .any(|pattern| wildcard_matches(pattern, name))
-        {
-            return true;
-        }
-        self.unexported
-            .iter()
-            .any(|pattern| wildcard_matches(pattern, name))
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -2500,48 +2487,6 @@ fn absolute_symbol_type(private_extern: bool) -> u8 {
     } else {
         N_ABS | N_EXT
     }
-}
-
-fn read_symbol_patterns(path: &PathBuf) -> Result<Vec<String>, WriteError> {
-    let contents = fs::read_to_string(path)
-        .map_err(|err| WriteError::SymbolListRead(path.clone(), err.to_string()))?;
-    Ok(contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect())
-}
-
-fn wildcard_matches(pattern: &str, value: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let value = value.as_bytes();
-    let mut p = 0usize;
-    let mut v = 0usize;
-    let mut star = None;
-    let mut backtrack = 0usize;
-
-    while v < value.len() {
-        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == value[v]) {
-            p += 1;
-            v += 1;
-        } else if p < pattern.len() && pattern[p] == b'*' {
-            star = Some(p);
-            p += 1;
-            backtrack = v;
-        } else if let Some(star_idx) = star {
-            p = star_idx + 1;
-            backtrack += 1;
-            v = backtrack;
-        } else {
-            return false;
-        }
-    }
-
-    while p < pattern.len() && pattern[p] == b'*' {
-        p += 1;
-    }
-    p == pattern.len()
 }
 
 fn place_optional_block(

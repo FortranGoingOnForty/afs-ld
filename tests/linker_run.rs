@@ -4855,6 +4855,71 @@ fn linker_run_honors_unexported_symbol_filters_like_ld() {
 }
 
 #[test]
+fn linker_run_dead_strip_applies_dylib_export_policy_to_roots() {
+    let obj = scratch("AFSLD-069-export-policy.o");
+    let out = scratch("AFSLD-069-export-policy.dylib");
+    let exported_list = scratch("AFSLD-069-exported.txt");
+    let unexported_list = scratch("AFSLD-069-unexported.txt");
+    let inline_keep = 0x1111_2222_3333_4444u64;
+    let listed_keep = 0x5555_6666_7777_8888u64;
+    let blocked = 0x9999_aaaa_bbbb_ccccu64;
+    let mut data = inline_keep.to_le_bytes().to_vec();
+    data.extend_from_slice(&listed_keep.to_le_bytes());
+    data.extend_from_slice(&blocked.to_le_bytes());
+    fs::write(
+        &obj,
+        synthetic_single_section_object(
+            "__DATA",
+            "__policy",
+            S_REGULAR,
+            &data,
+            &[],
+            &[
+                ("_inline_keep", N_SECT | N_EXT, 1, 0, 0),
+                ("_listed_keep", N_SECT | N_EXT, 1, 0, 8),
+                ("_blocked", N_SECT | N_EXT, 1, 0, 16),
+            ],
+        ),
+    )
+    .unwrap();
+    fs::write(&exported_list, "_listed_*\n").unwrap();
+    fs::write(&unexported_list, "_blocked\n").unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Dylib,
+        dead_strip: true,
+        exported_symbols: vec!["_inline_keep".into(), "_blocked".into()],
+        exported_symbols_lists: vec![exported_list.clone()],
+        unexported_symbols_lists: vec![unexported_list.clone()],
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    assert_eq!(
+        output_section(&bytes, "__DATA", "__policy")
+            .expect("policy fixture section must survive")
+            .1,
+        [inline_keep.to_le_bytes(), listed_keep.to_le_bytes()].concat()
+    );
+    assert_eq!(
+        dyld_info_export_names(&bytes).unwrap(),
+        vec!["_inline_keep".to_string(), "_listed_keep".to_string()]
+    );
+    let symbols = canonical_symbol_record_map(&bytes);
+    assert!(symbols.contains_key("_inline_keep"));
+    assert!(symbols.contains_key("_listed_keep"));
+    assert!(!symbols.contains_key("_blocked"));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+    let _ = fs::remove_file(exported_list);
+    let _ = fs::remove_file(unexported_list);
+}
+
+#[test]
 fn linker_run_loads_minimal_dylib_via_dlopen() {
     if !have_xcrun() || !have_tool("codesign") {
         harness_skip!("xcrun clang/as or codesign unavailable");

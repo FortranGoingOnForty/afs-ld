@@ -8,6 +8,7 @@ use crate::layout::LayoutInput;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent};
 use crate::resolve::{AtomId, InputId, Symbol, SymbolId, SymbolTable};
 use crate::symbol::SymKind;
+use crate::symbol_visibility::SymbolVisibilityPolicy;
 use crate::{LinkOptions, OutputKind};
 
 #[derive(Debug, Clone)]
@@ -50,8 +51,9 @@ pub struct DeadStripAnalysis {
 }
 
 impl DeadStripAnalysis {
-    pub fn build(
+    pub(crate) fn build(
         opts: &LinkOptions,
+        visibility: &SymbolVisibilityPolicy,
         layout_inputs: &[LayoutInput<'_>],
         atom_table: &AtomTable,
         sym_table: &SymbolTable,
@@ -59,7 +61,7 @@ impl DeadStripAnalysis {
     ) -> Self {
         let resolved_by_name = resolved_symbol_map(sym_table);
         let atom_symbols = atom_symbol_sets(atom_table);
-        let roots = root_atoms(opts, atom_table, sym_table, entry_symbol);
+        let roots = root_atoms(opts, visibility, atom_table, sym_table, entry_symbol);
         let forward_edges =
             build_forward_edges(layout_inputs, atom_table, sym_table, &resolved_by_name);
         let parent_edges = parent_edges(atom_table);
@@ -265,25 +267,44 @@ impl DeadStripAnalysis {
     }
 }
 
-pub fn format_explanations(
+#[derive(Clone, Copy)]
+pub(crate) struct WhyLiveState<'a> {
+    dead_strip: Option<&'a DeadStripAnalysis>,
+    folded_symbols: &'a [FoldedSymbol],
+}
+
+impl<'a> WhyLiveState<'a> {
+    pub(crate) fn new(
+        dead_strip: Option<&'a DeadStripAnalysis>,
+        folded_symbols: &'a [FoldedSymbol],
+    ) -> Self {
+        Self {
+            dead_strip,
+            folded_symbols,
+        }
+    }
+}
+
+pub(crate) fn format_explanations(
     opts: &LinkOptions,
+    visibility: &SymbolVisibilityPolicy,
     layout_inputs: &[LayoutInput<'_>],
     atom_table: &AtomTable,
     sym_table: &SymbolTable,
     entry_symbol: Option<SymbolId>,
-    dead_strip: Option<&DeadStripAnalysis>,
-    folded_symbols: &[FoldedSymbol],
+    state: WhyLiveState<'_>,
 ) -> Result<Option<String>, String> {
     if opts.why_live.is_empty() {
         return Ok(None);
     }
 
-    let folded_by_name: HashMap<&str, &str> = folded_symbols
+    let folded_by_name: HashMap<&str, &str> = state
+        .folded_symbols
         .iter()
         .map(|symbol| (symbol.name.as_str(), symbol.winner.as_str()))
         .collect();
 
-    if let Some(dead_strip) = dead_strip {
+    if let Some(dead_strip) = state.dead_strip {
         let mut out = String::new();
         for (idx, requested) in opts.why_live.iter().enumerate() {
             let winner = folded_by_name
@@ -304,7 +325,14 @@ pub fn format_explanations(
         return Ok(Some(out));
     }
 
-    let graph = WhyLiveGraph::build(opts, layout_inputs, atom_table, sym_table, entry_symbol);
+    let graph = WhyLiveGraph::build(
+        opts,
+        visibility,
+        layout_inputs,
+        atom_table,
+        sym_table,
+        entry_symbol,
+    );
     let mut out = String::new();
     for (idx, requested) in opts.why_live.iter().enumerate() {
         let winner = folded_by_name
@@ -370,13 +398,14 @@ struct WhyLiveGraph<'a> {
 impl<'a> WhyLiveGraph<'a> {
     fn build(
         opts: &LinkOptions,
+        visibility: &SymbolVisibilityPolicy,
         layout_inputs: &[LayoutInput<'_>],
         atom_table: &AtomTable,
         sym_table: &'a SymbolTable,
         entry_symbol: Option<SymbolId>,
     ) -> Self {
         let resolved_by_name = resolved_symbol_map(sym_table);
-        let roots = root_symbols(opts, atom_table, sym_table, entry_symbol);
+        let roots = root_symbols(opts, visibility, atom_table, sym_table, entry_symbol);
         let reverse_edges = build_reverse_edges(layout_inputs, atom_table, &resolved_by_name);
         Self {
             sym_table,
@@ -442,6 +471,7 @@ fn resolved_symbol_map(sym_table: &SymbolTable) -> HashMap<String, SymbolId> {
 
 fn root_symbols(
     opts: &LinkOptions,
+    visibility: &SymbolVisibilityPolicy,
     atom_table: &AtomTable,
     sym_table: &SymbolTable,
     entry_symbol: Option<SymbolId>,
@@ -468,23 +498,19 @@ fn root_symbols(
             } => {
                 roots.entry(symbol_id).or_insert(RootReason::NoDeadStrip);
             }
-            Symbol::Defined {
-                private_extern: false,
-                ..
-            } if opts.kind == OutputKind::Dylib => {
+            Symbol::Defined { .. }
+                if is_exported_dylib_symbol(opts, visibility, sym_table, symbol) =>
+            {
                 roots.entry(symbol_id).or_insert(RootReason::ExportedDylib);
             }
-            Symbol::Absolute {
-                private_extern: false,
-                ..
-            } if opts.kind == OutputKind::Dylib => {
+            Symbol::Absolute { .. }
+                if is_exported_dylib_symbol(opts, visibility, sym_table, symbol) =>
+            {
                 roots.entry(symbol_id).or_insert(RootReason::ExportedDylib);
             }
-            Symbol::Alias {
-                name,
-                private_extern: false,
-                ..
-            } if opts.kind == OutputKind::Dylib => {
+            Symbol::Alias { name, .. }
+                if is_exported_dylib_symbol(opts, visibility, sym_table, symbol) =>
+            {
                 if let Ok((target_id, target)) = sym_table.resolve_chain(*name) {
                     if matches!(target, Symbol::Defined { .. } | Symbol::Absolute { .. }) {
                         roots.entry(target_id).or_insert(RootReason::ExportedDylib);
@@ -499,6 +525,7 @@ fn root_symbols(
 
 fn root_atoms(
     opts: &LinkOptions,
+    visibility: &SymbolVisibilityPolicy,
     atom_table: &AtomTable,
     sym_table: &SymbolTable,
     entry_symbol: Option<SymbolId>,
@@ -530,18 +557,14 @@ fn root_atoms(
             } if atom.0 != 0 && symbol_no_dead_strip_is_root(atom_table, *atom) => {
                 roots.entry(*atom).or_insert(RootReason::NoDeadStrip);
             }
-            Symbol::Defined {
-                atom,
-                private_extern: false,
-                ..
-            } if opts.kind == OutputKind::Dylib && atom.0 != 0 => {
+            Symbol::Defined { atom, .. }
+                if atom.0 != 0 && is_exported_dylib_symbol(opts, visibility, sym_table, symbol) =>
+            {
                 roots.entry(*atom).or_insert(RootReason::ExportedDylib);
             }
-            Symbol::Alias {
-                name,
-                private_extern: false,
-                ..
-            } if opts.kind == OutputKind::Dylib => {
+            Symbol::Alias { name, .. }
+                if is_exported_dylib_symbol(opts, visibility, sym_table, symbol) =>
+            {
                 if let Ok((_, Symbol::Defined { atom, .. })) = sym_table.resolve_chain(*name) {
                     if atom.0 != 0 {
                         roots.entry(*atom).or_insert(RootReason::ExportedDylib);
@@ -553,6 +576,24 @@ fn root_atoms(
     }
 
     roots
+}
+
+fn is_exported_dylib_symbol(
+    opts: &LinkOptions,
+    visibility: &SymbolVisibilityPolicy,
+    sym_table: &SymbolTable,
+    symbol: &Symbol,
+) -> bool {
+    if opts.kind != OutputKind::Dylib {
+        return false;
+    }
+    let private_extern = match symbol {
+        Symbol::Defined { private_extern, .. }
+        | Symbol::Absolute { private_extern, .. }
+        | Symbol::Alias { private_extern, .. } => *private_extern,
+        _ => return false,
+    };
+    !private_extern && !visibility.hides(sym_table.interner.resolve(symbol.name()))
 }
 
 fn symbol_no_dead_strip_is_root(atom_table: &AtomTable, atom_id: AtomId) -> bool {
@@ -1121,7 +1162,7 @@ mod tests {
         );
     }
 
-    fn alias_roots_private_target(private_alias: bool) -> (bool, bool) {
+    fn alias_roots_private_target(private_alias: bool, exported_symbols: &[&str]) -> (bool, bool) {
         let mut atoms = AtomTable::new();
         let target_atom = atoms.push(Atom {
             id: AtomId(0),
@@ -1162,19 +1203,102 @@ mod tests {
             .unwrap();
         let opts = LinkOptions {
             kind: OutputKind::Dylib,
+            exported_symbols: exported_symbols
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             ..LinkOptions::default()
         };
+        let visibility = SymbolVisibilityPolicy::from_opts(&opts).unwrap();
 
         (
-            root_symbols(&opts, &atoms, &symbols, None).contains_key(&target_symbol),
-            root_atoms(&opts, &atoms, &symbols, None).contains_key(&target_atom),
+            root_symbols(&opts, &visibility, &atoms, &symbols, None).contains_key(&target_symbol),
+            root_atoms(&opts, &visibility, &atoms, &symbols, None).contains_key(&target_atom),
         )
     }
 
     #[test]
     fn dylib_alias_roots_follow_alias_visibility() {
-        assert_eq!(alias_roots_private_target(false), (true, true));
-        assert_eq!(alias_roots_private_target(true), (false, false));
+        assert_eq!(alias_roots_private_target(false, &[]), (true, true));
+        assert_eq!(alias_roots_private_target(true, &[]), (false, false));
+        assert_eq!(
+            alias_roots_private_target(false, &["_different_alias"]),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn dylib_roots_respect_export_policy() {
+        let mut atoms = AtomTable::new();
+        let kept_atom = atoms.push(Atom {
+            input_offset: 0,
+            ..bare_test_atom()
+        });
+        let hidden_atom = atoms.push(Atom {
+            input_offset: 8,
+            ..bare_test_atom()
+        });
+        let blocked_atom = atoms.push(Atom {
+            input_offset: 16,
+            ..bare_test_atom()
+        });
+        let forced_atom = atoms.push(Atom {
+            input_offset: 24,
+            ..bare_test_atom()
+        });
+        let mut symbols = SymbolTable::new();
+        for (name, atom) in [
+            ("_kept", kept_atom),
+            ("_hidden", hidden_atom),
+            ("_blocked", blocked_atom),
+        ] {
+            let name = symbols.intern(name);
+            symbols
+                .insert(Symbol::Defined {
+                    name,
+                    origin: InputId(0),
+                    atom,
+                    value: 0,
+                    weak: false,
+                    private_extern: false,
+                    no_dead_strip: false,
+                })
+                .unwrap();
+        }
+        let forced_name = symbols.intern("_forced");
+        symbols
+            .insert(Symbol::Defined {
+                name: forced_name,
+                origin: InputId(0),
+                atom: forced_atom,
+                value: 0,
+                weak: false,
+                private_extern: false,
+                no_dead_strip: true,
+            })
+            .unwrap();
+        let opts = LinkOptions {
+            kind: OutputKind::Dylib,
+            exported_symbols: vec!["_kept".into(), "_blocked".into()],
+            unexported_symbols: vec!["_blocked".into()],
+            ..LinkOptions::default()
+        };
+        let visibility = SymbolVisibilityPolicy::from_opts(&opts).unwrap();
+
+        let atom_roots = root_atoms(&opts, &visibility, &atoms, &symbols, None);
+        let symbol_roots = root_symbols(&opts, &visibility, &atoms, &symbols, None);
+        let symbol_id = |name| {
+            symbol_roots.contains_key(&symbols.lookup_str(name).expect("fixture symbol exists"))
+        };
+
+        assert!(atom_roots.contains_key(&kept_atom));
+        assert!(!atom_roots.contains_key(&hidden_atom));
+        assert!(!atom_roots.contains_key(&blocked_atom));
+        assert!(atom_roots.contains_key(&forced_atom));
+        assert!(symbol_id("_kept"));
+        assert!(!symbol_id("_hidden"));
+        assert!(!symbol_id("_blocked"));
+        assert!(symbol_id("_forced"));
     }
 
     fn live_support_result(
@@ -1291,14 +1415,27 @@ mod tests {
         } else {
             None
         };
-        let analysis =
-            DeadStripAnalysis::build(&LinkOptions::default(), &inputs, &atoms, &symbols, None);
+        let analysis = DeadStripAnalysis::build(
+            &LinkOptions::default(),
+            &SymbolVisibilityPolicy::default(),
+            &inputs,
+            &atoms,
+            &symbols,
+            None,
+        );
 
         (
             analysis.live_atoms().contains(&support),
             analysis.live_atoms().contains(&target),
             support_symbol.is_some_and(|symbol| {
-                root_symbols(&LinkOptions::default(), &atoms, &symbols, None).contains_key(&symbol)
+                root_symbols(
+                    &LinkOptions::default(),
+                    &SymbolVisibilityPolicy::default(),
+                    &atoms,
+                    &symbols,
+                    None,
+                )
+                .contains_key(&symbol)
             }),
         )
     }
@@ -1328,7 +1465,13 @@ mod tests {
             ..bare_test_atom()
         });
 
-        let roots = root_atoms(&LinkOptions::default(), &atoms, &SymbolTable::new(), None);
+        let roots = root_atoms(
+            &LinkOptions::default(),
+            &SymbolVisibilityPolicy::default(),
+            &atoms,
+            &SymbolTable::new(),
+            None,
+        );
         assert!(roots.contains_key(&atom));
     }
 
@@ -1483,8 +1626,14 @@ mod tests {
             load_order: 0,
             archive_member_offset: None,
         }];
-        let analysis =
-            DeadStripAnalysis::build(&LinkOptions::default(), &inputs, &atoms, &symbols, None);
+        let analysis = DeadStripAnalysis::build(
+            &LinkOptions::default(),
+            &SymbolVisibilityPolicy::default(),
+            &inputs,
+            &atoms,
+            &symbols,
+            None,
+        );
 
         assert!(analysis.live_atoms().contains(&source));
         assert!(analysis.live_atoms().contains(&target));

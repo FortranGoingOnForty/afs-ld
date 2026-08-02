@@ -23,6 +23,7 @@ pub mod resolve;
 pub mod section;
 pub mod string_table;
 pub mod symbol;
+mod symbol_visibility;
 pub mod synth;
 pub mod why_live;
 
@@ -865,10 +866,13 @@ impl Linker {
         let phase_started = Instant::now();
         let entry_symbol = find_entry_symbol_id(opts, &sym_table)?;
         phases.layout_entry_lookup = phase_started.elapsed();
+        let symbol_visibility = symbol_visibility::SymbolVisibilityPolicy::from_opts(opts)
+            .map_err(macho::writer::WriteError::from)?;
         let phase_started = Instant::now();
         let dead_strip = opts.dead_strip.then(|| {
             why_live::DeadStripAnalysis::build(
                 opts,
+                &symbol_visibility,
                 &layout_inputs,
                 &atom_table,
                 &sym_table,
@@ -986,12 +990,13 @@ impl Linker {
         for _ in 0..4 {
             let phase_started = Instant::now();
             let (next_layout, next_linkedit, linkedit_timings) =
-                macho::writer::finalize_layout_with_linkedit(
+                macho::writer::finalize_layout_with_linkedit_and_visibility(
                     &layout,
                     opts.kind,
                     opts,
                     &dylib_loads,
                     linkedit_context,
+                    &symbol_visibility,
                 )?;
             synth_linkedit_finalize += phase_started.elapsed();
             synth_linkedit_symbol_plan += linkedit_timings.symbol_plan;
@@ -1056,12 +1061,12 @@ impl Linker {
 
         if let Some(report) = why_live::format_explanations(
             opts,
+            &symbol_visibility,
             &layout_inputs,
             &atom_table,
             &sym_table,
             entry_symbol,
-            dead_strip.as_ref(),
-            &folded_symbols,
+            why_live::WhyLiveState::new(dead_strip.as_ref(), &folded_symbols),
         )
         .map_err(LinkError::WhyLive)?
         {

@@ -1820,6 +1820,7 @@ fn build_output_symbols_profiled(
             atom_ranges: &atom_ranges,
             atom_sections: &atom_sections,
             atom_addrs: &atom_addrs,
+            dead_strip,
             input_id: input.id,
             file_index: file_index_by_input[&input.id],
         };
@@ -2210,9 +2211,16 @@ fn collect_local_symbols(
                     offset,
                 )
                 .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
-                let addr = ctx.atom_addrs.get(&atom_id).copied().ok_or(
-                    WriteError::DefinedSymbolAtomMissing(SymbolId(u32::MAX), atom_id),
-                )? + delta as u64;
+                let Some(addr) = ctx.atom_addrs.get(&atom_id).copied() else {
+                    if ctx.dead_strip {
+                        continue;
+                    }
+                    return Err(WriteError::DefinedSymbolAtomMissing(
+                        SymbolId(u32::MAX),
+                        atom_id,
+                    ));
+                };
+                let addr = addr + delta as u64;
                 let n_sect = *ctx.atom_sections.get(&atom_id).ok_or(
                     WriteError::DefinedSymbolSectionMissing(SymbolId(u32::MAX), atom_id),
                 )?;
@@ -2306,6 +2314,7 @@ struct LocalSymbolContext<'a> {
     atom_ranges: &'a AtomRangeIndex,
     atom_sections: &'a HashMap<crate::resolve::AtomId, u8>,
     atom_addrs: &'a HashMap<crate::resolve::AtomId, u64>,
+    dead_strip: bool,
     input_id: InputId,
     file_index: usize,
 }

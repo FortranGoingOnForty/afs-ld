@@ -11798,6 +11798,55 @@ fn linker_run_icf_safe_preserves_cross_object_subtractor_difference() {
 }
 
 #[test]
+fn linker_run_dead_strip_omits_private_symbols_from_removed_atoms() {
+    let object = scratch("AFSLD-066-dead-private.o");
+    let output = scratch("AFSLD-066-dead-private.dylib");
+    fs::write(
+        &object,
+        synthetic_single_section_object(
+            "__TEXT",
+            "__const",
+            S_REGULAR,
+            &[0x11; 16],
+            &[],
+            &[
+                ("_live", N_SECT | N_EXT, 1, 0, 0),
+                ("_dead_private", N_SECT | N_EXT | N_PEXT, 1, 0, 8),
+            ],
+        ),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        dead_strip: true,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    assert_eq!(
+        output_section(&bytes, "__TEXT", "__const")
+            .expect("live public atom must retain __TEXT,__const")
+            .1
+            .len(),
+        8,
+        "dead stripping must remove the unreferenced private atom"
+    );
+    let symbols = canonical_symbol_record_map(&bytes);
+    assert!(symbols.contains_key("_live"));
+    assert!(
+        !symbols.contains_key("_dead_private"),
+        "a symbol whose atom was dead stripped must not be emitted"
+    );
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
 fn linker_run_icf_safe_keeps_cross_object_section_targets_distinct() {
     if !have_xcrun() || !have_xcrun_tool("ld") || !have_tool("codesign") {
         harness_skip!("xcrun as/ld or codesign unavailable");

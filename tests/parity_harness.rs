@@ -62,7 +62,12 @@ fn executable_with_function_starts(payload: &[u8]) -> Vec<u8> {
     )
 }
 
-fn executable_with_export(trie: &[u8], segments: Vec<Segment64>, symbol: RawNlist) -> Vec<u8> {
+fn executable_with_export(
+    trie: &[u8],
+    segments: Vec<Segment64>,
+    symbol: RawNlist,
+    symbol_name: &str,
+) -> Vec<u8> {
     let command_size = segments.iter().map(Segment64::wire_size).sum::<u32>()
         + LinkEditDataCmd::WIRE_SIZE
         + SymtabCmd::WIRE_SIZE
@@ -70,6 +75,7 @@ fn executable_with_export(trie: &[u8], segments: Vec<Segment64>, symbol: RawNlis
     let trie_offset = HEADER_SIZE as u32 + command_size;
     let symbol_offset = trie_offset + trie.len() as u32;
     let string_offset = symbol_offset + 16;
+    let string_size = symbol_name.len() as u32 + 2;
     let mut commands = segments
         .into_iter()
         .map(LoadCommand::Segment64)
@@ -83,7 +89,7 @@ fn executable_with_export(trie: &[u8], segments: Vec<Segment64>, symbol: RawNlis
             symoff: symbol_offset,
             nsyms: 1,
             stroff: string_offset,
-            strsize: 4,
+            strsize: string_size,
         }),
         LoadCommand::Dysymtab(DysymtabCmd {
             iextdefsym: 0,
@@ -93,7 +99,9 @@ fn executable_with_export(trie: &[u8], segments: Vec<Segment64>, symbol: RawNlis
     ]);
     let mut bytes = executable_with_commands(&commands, trie);
     symbol.write(&mut bytes);
-    bytes.extend_from_slice(b"\0_x\0");
+    bytes.push(0);
+    bytes.extend_from_slice(symbol_name.as_bytes());
+    bytes.push(0);
     bytes
 }
 
@@ -115,6 +123,7 @@ fn executable_with_absolute_export(trie_address: u64, symbol_value: u64) -> Vec<
             n_desc: 0,
             n_value: symbol_value,
         },
+        "_x",
     )
 }
 
@@ -216,6 +225,55 @@ fn executable_with_section_export(
             n_desc: 0,
             n_value: IMAGE_BASE + section_image_offset + symbol_section_offset,
         },
+        "_x",
+    )
+}
+
+fn executable_with_header_export(trie_address: u64, symbol_value: u64) -> Vec<u8> {
+    const IMAGE_BASE: u64 = 0x1000;
+
+    let trie = build_export_trie(&[ExportEntry {
+        name: "__mh_execute_header".to_string(),
+        flags: EXPORT_SYMBOL_FLAGS_KIND_REGULAR,
+        kind: ExportKind::Regular {
+            address: trie_address,
+        },
+    }]);
+    let text = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: IMAGE_BASE,
+        vmsize: 0x1000,
+        fileoff: 0,
+        filesize: 0,
+        maxprot: 0,
+        initprot: 0,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: IMAGE_BASE + 0x20,
+            size: 0x100,
+            offset: 0,
+            align: 0,
+            reloff: 0,
+            nreloc: 0,
+            flags: S_REGULAR,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    executable_with_export(
+        &trie,
+        vec![text],
+        RawNlist {
+            strx: 1,
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: symbol_value,
+        },
+        "__mh_execute_header",
     )
 }
 
@@ -311,6 +369,27 @@ fn export_record_parity_rejects_trie_and_symbol_address_disagreement() {
         error.contains("export"),
         "unexpected consistency diagnostic: {error}"
     );
+}
+
+#[test]
+fn export_record_parity_validates_mach_header_export_location() {
+    const IMAGE_BASE: u64 = 0x1000;
+
+    let matching = executable_with_header_export(0, IMAGE_BASE);
+    compare_command_details(&matching, &matching, &[CommandCheck::ExportRecords])
+        .expect("the executable header export should map to image offset zero");
+
+    for invalid in [
+        executable_with_header_export(0x20, IMAGE_BASE),
+        executable_with_header_export(0, IMAGE_BASE + 8),
+    ] {
+        let error = compare_command_details(&invalid, &invalid, &[CommandCheck::ExportRecords])
+            .expect_err("the header trie and LC_SYMTAB records must identify the Mach-O header");
+        assert!(
+            error.contains("__mh_execute_header"),
+            "unexpected consistency diagnostic: {error}"
+        );
+    }
 }
 
 #[test]

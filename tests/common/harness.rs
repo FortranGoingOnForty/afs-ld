@@ -1743,11 +1743,17 @@ struct CanonicalSymbolRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CanonicalExportKind {
-    Regular(CanonicalSectionLocation),
-    ThreadLocal(CanonicalSectionLocation),
+    Regular(CanonicalExportLocation),
+    ThreadLocal(CanonicalExportLocation),
     Absolute(u64),
     Reexport { ordinal: u32, imported_name: String },
     StubAndResolver { stub: u64, resolver: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CanonicalExportLocation {
+    Section(CanonicalSectionLocation),
+    ImageHeader,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1821,10 +1827,10 @@ pub(crate) fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExpo
         .map(|entry| -> Result<CanonicalExportRecord, String> {
             let kind = match entry.kind {
                 ExportKind::Regular { address } => CanonicalExportKind::Regular(
-                    canonical_export_location(bytes, &entry.name, "regular", address)?,
+                    canonical_export_location(bytes, &entry.name, "regular", address, true)?,
                 ),
                 ExportKind::ThreadLocal { address } => CanonicalExportKind::ThreadLocal(
-                    canonical_export_location(bytes, &entry.name, "thread-local", address)?,
+                    canonical_export_location(bytes, &entry.name, "thread-local", address, false)?,
                 ),
                 ExportKind::Absolute { address } => CanonicalExportKind::Absolute(address),
                 ExportKind::Reexport {
@@ -1838,7 +1844,7 @@ pub(crate) fn canonical_export_records(bytes: &[u8]) -> Result<Vec<CanonicalExpo
                     CanonicalExportKind::StubAndResolver { stub, resolver }
                 }
             };
-            validate_export_symbol(&entry.name, &kind, &symbol_records)?;
+            validate_export_symbol(bytes, &entry.name, &kind, &symbol_records)?;
             Ok(CanonicalExportRecord {
                 name: entry.name,
                 flags: entry.flags,
@@ -1855,7 +1861,16 @@ fn canonical_export_location(
     name: &str,
     kind: &str,
     image_offset: u64,
-) -> Result<CanonicalSectionLocation, String> {
+    allow_image_header: bool,
+) -> Result<CanonicalExportLocation, String> {
+    if name == "__mh_execute_header" {
+        if allow_image_header && image_offset == 0 {
+            return Ok(CanonicalExportLocation::ImageHeader);
+        }
+        return Err(format!(
+            "{kind} export `{name}` must point at Mach-O image offset 0, got 0x{image_offset:x}"
+        ));
+    }
     let text_base = segment_regions(bytes)?
         .into_iter()
         .find(|segment| segment.segname == "__TEXT")
@@ -1864,12 +1879,15 @@ fn canonical_export_location(
     let address = text_base.checked_add(image_offset).ok_or_else(|| {
         format!("{kind} export `{name}` address overflows the Mach-O image address space")
     })?;
-    canonical_section_location(bytes, address).map_err(|error| {
-        format!("{kind} export `{name}` trie address 0x{image_offset:x} is invalid: {error}")
-    })
+    canonical_section_location(bytes, address)
+        .map(CanonicalExportLocation::Section)
+        .map_err(|error| {
+            format!("{kind} export `{name}` trie address 0x{image_offset:x} is invalid: {error}")
+        })
 }
 
 fn validate_export_symbol(
+    bytes: &[u8],
     name: &str,
     export_kind: &CanonicalExportKind,
     symbol_records: &BTreeMap<String, CanonicalSymbolRecord>,
@@ -1878,12 +1896,27 @@ fn validate_export_symbol(
         return Err(format!("export `{name}` has no LC_SYMTAB record"));
     };
     let agrees = match export_kind {
-        CanonicalExportKind::Regular(location) | CanonicalExportKind::ThreadLocal(location) => {
+        CanonicalExportKind::Regular(CanonicalExportLocation::Section(location))
+        | CanonicalExportKind::ThreadLocal(CanonicalExportLocation::Section(location)) => {
             (symbol.n_type & N_TYPE) == N_SECT
                 && symbol.section.as_ref()
                     == Some(&(location.segname.clone(), location.sectname.clone()))
                 && symbol.value == location.offset
         }
+        CanonicalExportKind::Regular(CanonicalExportLocation::ImageHeader) => {
+            let text_base = segment_regions(bytes)?
+                .into_iter()
+                .find(|segment| segment.segname == "__TEXT")
+                .map(|segment| segment.vmaddr)
+                .ok_or_else(|| format!("header export `{name}` has no __TEXT image base"))?;
+            (symbol.n_type & N_TYPE) == N_SECT
+                && symbol
+                    .section
+                    .as_ref()
+                    .is_some_and(|(segment, _)| segment == "__TEXT")
+                && symbol.value == text_base
+        }
+        CanonicalExportKind::ThreadLocal(CanonicalExportLocation::ImageHeader) => false,
         CanonicalExportKind::Absolute(address) => {
             (symbol.n_type & N_TYPE) == N_ABS
                 && symbol.section.is_none()

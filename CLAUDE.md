@@ -7,9 +7,12 @@ adds linker-specific discipline on top.
 ## Repository Context
 
 `afs-ld` is a **git submodule** of [ARMFORTAS](https://github.com/FortranGoingOnForty/armfortas),
-the bespoke ARM64 Fortran compiler. It is the standalone ARM64 Mach-O
-linker: reads `MH_OBJECT` from `afs-as`, static archives (`.a`), binary
-dylibs, and TAPI TBD text stubs; emits `MH_EXECUTE` and `MH_DYLIB`.
+the bespoke Fortran compiler. It provides standalone final linking for ARM64
+Mach-O and x86_64 ELF. The Mach-O path reads `MH_OBJECT` from `afs-as`, static
+archives (`.a`), binary dylibs, and TAPI TBD text stubs, then emits
+`MH_EXECUTE` and `MH_DYLIB`. The ELF path emits static and dynamically linked
+non-PIE `ET_EXEC` images from relocatable objects, archives, linker scripts,
+and shared objects.
 
 It knows nothing about Fortran. The boundary with the compiler is the
 CLI — an `ld`-compatible flag surface.
@@ -28,9 +31,10 @@ cargo clippy -p afs-ld --all-targets -- -D warnings
 
 cargo test --lib -p afs-ld                     # unit tests only
 cargo test --test <name> -p afs-ld             # one integration test file
-cargo test --test parity_matrix                # vs Apple `ld` across the corpus (Sprint 27)
-cargo test --test hello_world                  # executable end-to-end (Sprint 18)
-cargo test --test hello_library                # dylib end-to-end (Sprint 18.5)
+cargo test --test parity_matrix                # vs Apple `ld` across the corpus
+cargo test --test linker_run                   # Mach-O pipeline and output invariants
+cargo test --test linker_write_integration     # executable/dylib write integration
+cargo test --test elf_link_run                 # static/dynamic x86_64 ELF e2e
 cargo test --test reader_corpus_round_trip     # afs-as corpus → byte-identity
 cargo test --test archive_runtime              # libarmfortas_rt.a reality check
 cargo test --test dylib_integration            # clang-built dylib → DylibFile
@@ -56,12 +60,12 @@ Every time a new decoder lands, extend the relevant `--dump*` output.
 
 ## Target
 
-- **Architecture**: arm64 Mach-O (primary; the rules below) plus
-  x86_64 ELF static linking (x16 arc, src/elf.rs — rungs 1-2 landed
-  2026-07-05: freestanding + full static libc.a/crt via archive
-  selection, GOT, TLS local-exec, IFUNC/IPLT, init arrays, symbol
-  versioning; parent repo .docs/sprints/x16-afs-ld-elf.md).
-- **OS**: macOS. Mach-O file format, Apple AAPCS64 calling convention.
+- **Architecture**: ARM64 Mach-O (primary; the rules below) plus x86_64 ELF
+  static and dynamic executable linking (`src/elf.rs`: ordered archives,
+  shared-library imports, GOT/PLT, TLS, IFUNC/IPLT, init arrays, unwind
+  headers, garbage collection, and symbol versioning; parent repo
+  `.docs/sprints/x16-afs-ld-elf.md`).
+- **OS**: macOS for Mach-O; x86_64 Linux and FreeBSD for ELF executable output.
 - **Goal**: parity with Apple `ld` for the binaries armfortas produces and
   the fortsh milestone. Not a toy. Not a subset. The full Mach-O/dyld
   contract for our use cases.
@@ -86,7 +90,7 @@ Every time a new decoder lands, extend the relevant `--dump*` output.
 
 ## Architecture
 
-Pipeline, end-to-end:
+Mach-O pipeline, end-to-end:
 
 ```
 args → inputs → resolve → atomize → layout → apply relocs → synth sections → write → sign
@@ -94,6 +98,9 @@ args → inputs → resolve → atomize → layout → apply relocs → synth se
 args.rs  input.rs resolve.rs atom.rs layout.rs  reloc/arm64.rs  synth/*.rs  macho/   synth/
                  symbol.rs                                                   writer    code_sig
 ```
+
+The x86_64 ELF pipeline is intentionally self-contained in `src/elf.rs`; CLI
+format detection and output publication are routed through `src/main.rs`.
 
 ### Module responsibilities
 
@@ -103,21 +110,25 @@ args.rs  input.rs resolve.rs atom.rs layout.rs  reloc/arm64.rs  synth/*.rs  mach
   - `reader.rs`: `MachHeader64`, `LoadCommand` enum, per-command structs (`Segment64`, `Section64Header`, `SymtabCmd`, `DysymtabCmd`, `BuildVersionCmd`, `DylibCmd`, `RpathCmd`, `DyldInfoCmd`, `LinkEditDataCmd`). Every variant has `parse(cmdsize, payload)` and `write(&mut Vec<u8>)` paired as round-trip.
   - `dylib.rs`: `DylibFile::parse` — pulls `LC_ID_DYLIB`, dependency chain, rpaths, and routes export-trie bytes through to `exports.rs`.
   - `exports.rs`: `ExportTrie`, `ExportKind`, cycle-safe walker with `MAX_DEPTH=128`.
-  - `writer.rs`: emits `MH_EXECUTE` / `MH_DYLIB` (lands at Sprint 10+).
+  - `writer.rs`: emits finalized `MH_EXECUTE` / `MH_DYLIB` images and load-command/linkedit metadata.
   - `tbd.rs`: TAPI TBD v4 YAML-subset parser (Sprint 6).
 - **`src/archive.rs`** — BSD + SysV + GNU-thin static archives. Lazy member fetch via `fetch_object_defining(name)`.
-- **`src/input.rs`** — `ObjectFile` aggregate: header + load commands + sections + symbols + strings + dysymtab. Sprint 4 adds archive fetching; Sprint 7 introduces `InputFile` enum.
+- **`src/input.rs`** — `ObjectFile` aggregate: header + load commands + sections + symbols + strings + dysymtab.
 - **`src/symbol.rs`** — `RawNlist` (wire form, round-trip) + `InputSymbol` accessors (kind, ext, weak_ref/def, common size/alignment, library ordinal, indirect strx).
 - **`src/string_table.rs`** — owned `StringTable` with suffix-dedup-aware `strx → &str` lookup.
 - **`src/section.rs`** — `SectionKind` taxonomy (code / data / zerofill / TLS / literals / stubs / GOT / compact-unwind / eh_frame) derived from `(segname, sectname, flags)`; `InputSection` with data + raw-reloc slices.
 - **`src/reloc/`** — ARM64 relocs.
   - `mod.rs`: `RawRelocation` (bit-packed), `Reloc` (fused; ADDEND / SUBTRACTOR prefixes folded into primaries), `parse_relocs` / `write_relocs` (reversible), `validate_relocs` (bounds, referent range, kind-vs-length-vs-pcrel).
-  - `arm64.rs`: reloc application against final addresses (Sprint 11).
-  - `loh.rs`: LOH preservation / relaxation (Sprint 25).
-- **`src/leb.rs`** — ULEB128/SLEB128 codec reused by export trie, function-starts deltas, dyld opcode streams, chained fixups.
+  - `arm64.rs`: relocation application against final addresses.
+- **`src/loh.rs`** — LOH preservation and relaxation.
+- **`src/elf.rs`** — x86_64 ELF readers, resolution, layout, relocations, static/dynamic `ET_EXEC` writers.
+- **`src/leb.rs`** — ULEB128/SLEB128 codec used by the export trie,
+  function-starts deltas, and classic dyld opcode streams; a future chained
+  producer may reuse it for its imports table.
 - **`src/diag.rs`** — diagnostics. Path + byte offset + caret, matching `afs-as/src/diag*.rs` style. Deterministic output: no wall clock, no pid, no thread-id in error text.
 - **`src/dump.rs`** — `--dump*` inspection modes. Every time a reader decodes something new, extend the dump.
-- **`src/driver.rs`** — orchestrator (Sprint 20).
+- **`src/lib.rs`** — Mach-O pipeline orchestrator exposed through `Linker`.
+- **`src/main.rs`** — CLI routing, including early x86_64 ELF mode selection.
 
 ## Coding Conventions
 
@@ -126,10 +137,9 @@ args.rs  input.rs resolve.rs atom.rs layout.rs  reloc/arm64.rs  synth/*.rs  mach
   outside tests. When a new `LoadCommand` variant lands, every
   `match` that inspects `LoadCommand` has to grow a new arm; the
   compiler enforces this and that's the point.
-- **`unsafe` only where genuinely required.** The one known case is
-  `libc::mmap` for large input files (Sprint 28). Keep blocks small,
-  comment the invariant, and never let unsafe leak across module
-  boundaries.
+- **`unsafe` only where genuinely required.** The current source tree has no
+  unsafe blocks. Any future use needs a small, documented invariant and must not
+  leak unsafe assumptions across module boundaries.
 - **Byte-level round-trip for every wire structure.** Don't add a
   parser without its writer. Don't add a writer without a test that
   proves `write(parse(x)) == x`. See `src/macho/reader.rs` for the
@@ -195,13 +205,14 @@ of regression:
 | `tests/reader_empty.rs`              | CLI contract: empty argv → `afs-ld: error: no input files`, exit 2 |
 | `tests/diff_harness_sanity.rs`       | Harness zero-diffs on identical inputs |
 | `tests/diff_harness_finds_critical.rs` | Harness catches intentional byte differences |
-| `tests/hello_world.rs`               | Executable end-to-end (Sprint 18) |
-| `tests/hello_library.rs`             | Dylib end-to-end (Sprint 18.5) |
-| `tests/parity_matrix.rs`             | Corpus byte-level differential vs Apple `ld` (Sprint 27) |
-| `tests/armfortas_integration.rs`     | Parent's integration suite under `AFS_LD=1` (Sprint 21) |
+| `tests/linker_run.rs`                | Mach-O pipeline, structural output, determinism, runtime, and failure atomicity |
+| `tests/linker_write_integration.rs`  | Real-object executable/dylib write integration |
+| `tests/parity_matrix.rs`             | Corpus structural/runtime differential vs Apple `ld` |
+| `tests/elf_*.rs`                     | x86_64 ELF static/dynamic linking, ordering, malformed input, and policy behavior |
+| `tests/documentation_claims.rs`      | Authoritative capability text tracks both shipped link pipelines |
 
-Corpus fixtures live in `tests/corpus/`. Every new relocation kind,
-section kind, or CLI flag lands a corpus entry in the same sprint.
+Mach-O parity fixtures live in `tests/parity_corpus/`. Every new relocation
+kind, section kind, or CLI flag needs a focused fixture or integration witness.
 
 ## Audit Discipline
 
@@ -246,21 +257,22 @@ a decoder or encoder:
 
 - **No LLVM, no `ld64` fork.** We own the stack. `.refs/llvm/lld/MachO/`
   is architectural inspiration; we do not link against it.
-- **Both `LC_DYLD_INFO_ONLY` (classic) and `LC_DYLD_CHAINED_FIXUPS`
-  (modern).** Classic first (Sprint 15) so hello-world works on
-  macOS 11+; chained immediately after (Sprint 15.5) so we match the
-  Apple default on macOS 12+. Gate via `-fixup_chains` /
-  `-no_fixup_chains`; default depends on `-platform_version`.
-- **Dylib output from day one.** The writer is dylib-aware from
-  Sprint 10; the hello-library milestone is Sprint 18.5, not
-  Sprint 25 as originally scoped.
+- **Only classic dyld-info output is shipped.** The writer emits
+  `LC_DYLD_INFO_ONLY`; it does not emit `LC_DYLD_CHAINED_FIXUPS`.
+  `-no_fixup_chains` selects the classic path and is the default.
+  `-fixup_chains` remains recognized for compatibility but is rejected before
+  output publication until the planned chained-fixup producer and parity suite
+  exist.
+- **Dylib output is a first-class writer mode.** Executable and dylib output
+  share layout and metadata machinery while retaining distinct load-command and
+  entry-point contracts.
 - **Ad-hoc code signing is mandatory.** macOS 11+ kills unsigned arm64
-  binaries at exec time. Sprint 22 ships our own SHA-256 code-signature
-  emitter; we do not shell out to `codesign`.
-- **Owned bytes over borrowed slices, for now.** `InputSection::data`,
-  `StringTable::raw`, and their peers are `Vec<u8>`. Input buffers
-  can drop after `ObjectFile::parse` returns. `mmap` + borrowed slices
-  arrive in Sprint 28 if profiling justifies the complexity.
+  binaries at exec time. The crate ships its own SHA-256 code-signature emitter;
+  production linking does not shell out to `codesign`.
+- **Owned bytes over borrowed slices.** `InputSection::data`,
+  `StringTable::raw`, and their peers are `Vec<u8>`. Input buffers can drop
+  after `ObjectFile::parse` returns. A mapped/borrowed representation requires
+  profiling evidence and an explicit ownership redesign.
 - **Ordinals from load-command order.** Two-level-namespace ordinals
   are 1-based positions in `LC_*_DYLIB` appearance order. Do not
   renumber on re-export or umbrella expansion.

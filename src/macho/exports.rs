@@ -142,28 +142,31 @@ fn read_terminal(
     node_off: usize,
     accumulated: &str,
 ) -> Result<Option<ExportEntry>, ReadError> {
-    let (terminal_size, n) = read_uleb_at(trie, node_off)?;
-    if terminal_size == 0 {
+    let (payload_start, payload_end) = terminal_bounds(trie, node_off)?;
+    if payload_start == payload_end {
         return Ok(None);
     }
-    let mut cursor = node_off + n;
-    let (flags, m) = read_uleb_at(trie, cursor)?;
+    // Keep offsets absolute for diagnostics while preventing every field
+    // decoder from observing bytes after the declared terminal payload.
+    let terminal = &trie[..payload_end];
+    let mut cursor = payload_start;
+    let (flags, m) = read_uleb_at(terminal, cursor)?;
     cursor += m;
     let kind = if flags & EXPORT_SYMBOL_FLAGS_REEXPORT != 0 {
-        let (ord, on) = read_uleb_at(trie, cursor)?;
+        let (ord, on) = read_uleb_at(terminal, cursor)?;
         cursor += on;
-        let imported_name = read_cstring(trie, cursor)?.to_string();
+        let imported_name = read_cstring(terminal, cursor)?.to_string();
         ExportKind::Reexport {
             ordinal: ord as u32,
             imported_name,
         }
     } else if flags & EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER != 0 {
-        let (stub, sn) = read_uleb_at(trie, cursor)?;
+        let (stub, sn) = read_uleb_at(terminal, cursor)?;
         cursor += sn;
-        let (resolver, _rn) = read_uleb_at(trie, cursor)?;
+        let (resolver, _rn) = read_uleb_at(terminal, cursor)?;
         ExportKind::StubAndResolver { stub, resolver }
     } else {
-        let (addr, _an) = read_uleb_at(trie, cursor)?;
+        let (addr, _an) = read_uleb_at(terminal, cursor)?;
         match flags & EXPORT_SYMBOL_FLAGS_KIND_MASK {
             EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL => ExportKind::ThreadLocal { address: addr },
             EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE => ExportKind::Absolute { address: addr },
@@ -288,17 +291,17 @@ fn lookup(
 
 // ---- primitives ----------------------------------------------------------
 
-fn skip_terminal(trie: &[u8], node_off: usize) -> Result<usize, ReadError> {
+fn terminal_bounds(trie: &[u8], node_off: usize) -> Result<(usize, usize), ReadError> {
     let (terminal_size, n) = read_uleb_at(trie, node_off)?;
-    let end = node_off
-        .checked_add(n)
-        .and_then(|p| p.checked_add(terminal_size as usize))
-        .ok_or(ReadError::BadCmdsize {
-            cmd: 0,
-            cmdsize: 0,
-            at_offset: node_off,
-            reason: "export trie terminal_size overflows",
-        })?;
+    let overflow = || ReadError::BadCmdsize {
+        cmd: 0,
+        cmdsize: 0,
+        at_offset: node_off,
+        reason: "export trie terminal_size overflows",
+    };
+    let start = node_off.checked_add(n).ok_or_else(&overflow)?;
+    let terminal_size = usize::try_from(terminal_size).map_err(|_| overflow())?;
+    let end = start.checked_add(terminal_size).ok_or_else(overflow)?;
     if end > trie.len() {
         return Err(ReadError::Truncated {
             need: end,
@@ -306,7 +309,11 @@ fn skip_terminal(trie: &[u8], node_off: usize) -> Result<usize, ReadError> {
             context: "export trie terminal payload",
         });
     }
-    Ok(end)
+    Ok((start, end))
+}
+
+fn skip_terminal(trie: &[u8], node_off: usize) -> Result<usize, ReadError> {
+    terminal_bounds(trie, node_off).map(|(_, end)| end)
 }
 
 fn read_uleb_at(trie: &[u8], off: usize) -> Result<(u64, usize), ReadError> {
@@ -478,5 +485,51 @@ mod tests {
         let root = encode_root_with_children(&[("_x", 1000)], 256);
         let trie = Exports::from_trie_bytes(&root);
         assert!(trie.entries().is_err());
+    }
+
+    #[test]
+    fn short_terminal_payload_cannot_consume_child_count() {
+        // The terminal declares one payload byte containing only flags. The
+        // following zero is the node's child count, not the missing address.
+        let exports = Exports::from_trie_bytes(&[1, 0, 0]);
+
+        for error in [
+            exports
+                .entries()
+                .expect_err("short terminal must fail during trie traversal"),
+            exports
+                .lookup("")
+                .expect_err("short terminal must fail during direct lookup"),
+        ] {
+            assert!(matches!(
+                error,
+                ReadError::Truncated {
+                    need: 1,
+                    have: 0,
+                    context: "ULEB128 (unterminated)",
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn special_terminal_payloads_cannot_consume_child_count() {
+        for (kind, flags) in [
+            ("reexport", EXPORT_SYMBOL_FLAGS_REEXPORT),
+            ("stub and resolver", EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER),
+        ] {
+            // The payload contains flags and one kind-specific integer. The
+            // trailing zero is child_count, not an empty imported name or a
+            // missing resolver address.
+            let exports = Exports::from_trie_bytes(&[2, flags as u8, 1, 0]);
+            assert!(
+                exports.entries().is_err(),
+                "short {kind} terminal passed trie traversal"
+            );
+            assert!(
+                exports.lookup("").is_err(),
+                "short {kind} terminal passed direct lookup"
+            );
+        }
     }
 }

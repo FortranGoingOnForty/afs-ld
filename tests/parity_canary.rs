@@ -2,6 +2,10 @@
 
 mod common;
 
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::path::PathBuf;
 
 use common::harness::{
@@ -11,7 +15,7 @@ use common::harness::{
 #[test]
 fn mutated_text_byte_is_not_tolerated() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
 

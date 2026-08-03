@@ -4,7 +4,9 @@
 //! and errors on anything else with a precise diagnostic. Sprint 19 grows this
 //! into the full `ld`-compatible surface described in `.docs/sprints/sprint19.md`.
 
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::resolve::{levenshtein, UndefinedTreatment};
 use crate::{
@@ -64,6 +66,13 @@ const KNOWN_FLAGS: &[&str] = &[
     "--dump-tbd",
 ];
 
+const RESPONSE_FILE_DEPTH_LIMIT: usize = 8;
+const PACKED_VERSION_MAJOR_MAX: u32 = u16::MAX as u32;
+const PACKED_VERSION_MINOR_MAX: u32 = u8::MAX as u32;
+const PACKED_VERSION_PATCH_MAX: u32 = u8::MAX as u32;
+const PACKED_VERSION_FORMAT: &str =
+    "version like <major>[.<minor>[.<patch>]] with major at most 65535 and minor/patch at most 255";
+
 #[derive(Debug)]
 pub enum ArgsError {
     /// A flag that takes an argument was supplied without one.
@@ -78,6 +87,30 @@ pub enum ArgsError {
     UnknownFlag {
         flag: String,
         suggestion: Option<String>,
+    },
+    /// A response file could not be read as UTF-8 text.
+    ResponseFileRead {
+        path: PathBuf,
+        referenced_at: Option<(PathBuf, usize, usize)>,
+        source: io::Error,
+    },
+    /// A response file contains malformed quoting.
+    ResponseFileSyntax {
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        message: String,
+    },
+    /// A response file includes itself, directly or indirectly.
+    ResponseFileCycle {
+        path: PathBuf,
+        referenced_at: Option<(PathBuf, usize, usize)>,
+    },
+    /// Nested response files exceeded the defensive recursion bound.
+    ResponseFileDepth {
+        path: PathBuf,
+        referenced_at: Option<(PathBuf, usize, usize)>,
+        limit: usize,
     },
 }
 
@@ -110,8 +143,63 @@ impl std::fmt::Display for ArgsError {
                 }
                 write!(f, " (Sprint 19 adds the full `ld` surface)")
             }
+            ArgsError::ResponseFileRead {
+                path,
+                referenced_at,
+                source,
+            } => {
+                write!(
+                    f,
+                    "cannot read response file `{}`: {source}",
+                    path.display()
+                )?;
+                write_response_reference(f, referenced_at.as_ref())
+            }
+            ArgsError::ResponseFileSyntax {
+                path,
+                line,
+                column,
+                message,
+            } => write!(
+                f,
+                "cannot parse response file `{}` at {line}:{column}: {message}",
+                path.display()
+            ),
+            ArgsError::ResponseFileCycle {
+                path,
+                referenced_at,
+            } => {
+                write!(
+                    f,
+                    "circular response file inclusion of `{}`",
+                    path.display()
+                )?;
+                write_response_reference(f, referenced_at.as_ref())
+            }
+            ArgsError::ResponseFileDepth {
+                path,
+                referenced_at,
+                limit,
+            } => {
+                write!(
+                    f,
+                    "response file nesting exceeds limit of {limit} at `{}`",
+                    path.display()
+                )?;
+                write_response_reference(f, referenced_at.as_ref())
+            }
         }
     }
+}
+
+fn write_response_reference(
+    f: &mut std::fmt::Formatter<'_>,
+    referenced_at: Option<&(PathBuf, usize, usize)>,
+) -> std::fmt::Result {
+    if let Some((path, line, column)) = referenced_at {
+        write!(f, " (referenced at `{}`:{line}:{column})", path.display())?;
+    }
+    Ok(())
 }
 
 fn unknown_flag(flag: &str) -> ArgsError {
@@ -127,27 +215,63 @@ fn unknown_flag(flag: &str) -> ArgsError {
     }
 }
 
-fn parse_version_component(flag: &str, value: &str) -> Result<u32, ArgsError> {
-    let mut parts = value.split('.');
-    let parse_part = |piece: Option<&str>| -> Result<u32, ArgsError> {
-        let raw = piece.unwrap_or("0");
-        raw.parse::<u32>().map_err(|_| ArgsError::InvalidValue {
-            flag: flag.to_string(),
-            value: value.to_string(),
-            expected: "version like <major>[.<minor>[.<patch>]]".into(),
-        })
-    };
-    let major = parse_part(parts.next())?;
-    let minor = parse_part(parts.next())?;
-    let patch = parse_part(parts.next())?;
-    if parts.next().is_some() {
-        return Err(ArgsError::InvalidValue {
-            flag: flag.to_string(),
-            value: value.to_string(),
-            expected: "version like <major>[.<minor>[.<patch>]]".into(),
-        });
+fn invalid_packed_version(flag: &str, value: &str, expected: String) -> ArgsError {
+    ArgsError::InvalidValue {
+        flag: flag.to_string(),
+        value: value.to_string(),
+        expected,
     }
-    Ok((major << 16) | ((minor & 0xff) << 8) | (patch & 0xff))
+}
+
+fn parse_packed_version_part(
+    flag: &str,
+    value: &str,
+    raw: &str,
+    component: &str,
+    maximum: u32,
+) -> Result<u32, ArgsError> {
+    let parsed = raw
+        .parse::<u32>()
+        .map_err(|_| invalid_packed_version(flag, value, PACKED_VERSION_FORMAT.to_string()))?;
+    if parsed > maximum {
+        return Err(invalid_packed_version(
+            flag,
+            value,
+            format!("{component} component must be at most {maximum}"),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_packed_version(flag: &str, value: &str) -> Result<u32, ArgsError> {
+    let mut parts = value.split('.');
+    let major = parse_packed_version_part(
+        flag,
+        value,
+        parts.next().unwrap_or_default(),
+        "major",
+        PACKED_VERSION_MAJOR_MAX,
+    )?;
+    let minor = match parts.next() {
+        Some(raw) => {
+            parse_packed_version_part(flag, value, raw, "minor", PACKED_VERSION_MINOR_MAX)?
+        }
+        None => 0,
+    };
+    let patch = match parts.next() {
+        Some(raw) => {
+            parse_packed_version_part(flag, value, raw, "patch", PACKED_VERSION_PATCH_MAX)?
+        }
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return Err(invalid_packed_version(
+            flag,
+            value,
+            PACKED_VERSION_FORMAT.to_string(),
+        ));
+    }
+    Ok((major << 16) | (minor << 8) | patch)
 }
 
 fn parse_jobs(value: &str) -> Result<usize, ArgsError> {
@@ -168,6 +292,207 @@ fn parse_jobs(value: &str) -> Result<usize, ArgsError> {
     Ok(jobs)
 }
 
+#[derive(Debug)]
+struct ResponseToken {
+    value: String,
+    line: usize,
+    column: usize,
+}
+
+/// Normalize driver-wrapped flags and expand GNU-style `@file` arguments in
+/// place before target-format routing.
+///
+/// Nested response paths are resolved relative to the file containing them.
+/// `@@path` escapes a literal `@path`, and Darwin loader paths are never
+/// interpreted as response files.
+#[doc(hidden)]
+pub fn preprocess_args(argv: &[String]) -> Result<Vec<String>, ArgsError> {
+    let mut preprocessed = Vec::with_capacity(argv.len());
+    let mut stack = Vec::new();
+    for arg in argv {
+        preprocess_arg(arg, None, None, 0, &mut stack, &mut preprocessed)?;
+    }
+    Ok(preprocessed)
+}
+
+fn preprocess_arg(
+    arg: &str,
+    base_dir: Option<&Path>,
+    referenced_at: Option<(PathBuf, usize, usize)>,
+    depth: usize,
+    stack: &mut Vec<PathBuf>,
+    preprocessed: &mut Vec<String>,
+) -> Result<(), ArgsError> {
+    if let Some(wrapped) = arg.strip_prefix("-Wl,") {
+        for piece in wrapped.split(',').filter(|piece| !piece.is_empty()) {
+            preprocess_arg(
+                piece,
+                base_dir,
+                referenced_at.clone(),
+                depth,
+                stack,
+                preprocessed,
+            )?;
+        }
+        return Ok(());
+    }
+    if let Some(literal) = arg.strip_prefix("@@") {
+        preprocessed.push(format!("@{literal}"));
+        return Ok(());
+    }
+    if is_darwin_loader_path(arg) {
+        preprocessed.push(arg.to_string());
+        return Ok(());
+    }
+    let Some(path) = arg.strip_prefix('@') else {
+        preprocessed.push(arg.to_string());
+        return Ok(());
+    };
+
+    let resolved = resolve_response_path(path, base_dir);
+    if depth >= RESPONSE_FILE_DEPTH_LIMIT {
+        return Err(ArgsError::ResponseFileDepth {
+            path: resolved,
+            referenced_at,
+            limit: RESPONSE_FILE_DEPTH_LIMIT,
+        });
+    }
+
+    let canonical = fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+    if stack.contains(&canonical) {
+        return Err(ArgsError::ResponseFileCycle {
+            path: resolved,
+            referenced_at,
+        });
+    }
+
+    let body = fs::read_to_string(&resolved).map_err(|source| ArgsError::ResponseFileRead {
+        path: resolved.clone(),
+        referenced_at: referenced_at.clone(),
+        source,
+    })?;
+    let tokens = parse_response_tokens(&body, &resolved)?;
+    let next_base = resolved.parent();
+
+    stack.push(canonical);
+    let result = tokens.into_iter().try_for_each(|token| {
+        preprocess_arg(
+            &token.value,
+            next_base,
+            Some((resolved.clone(), token.line, token.column)),
+            depth + 1,
+            stack,
+            preprocessed,
+        )
+    });
+    stack.pop();
+    result
+}
+
+fn is_darwin_loader_path(arg: &str) -> bool {
+    arg.starts_with("@rpath/")
+        || arg.starts_with("@loader_path/")
+        || arg.starts_with("@executable_path/")
+}
+
+fn resolve_response_path(path: &str, base_dir: Option<&Path>) -> PathBuf {
+    let candidate = PathBuf::from(path);
+    if candidate.is_absolute() {
+        candidate
+    } else if let Some(base_dir) = base_dir {
+        base_dir.join(candidate)
+    } else {
+        candidate
+    }
+}
+
+fn parse_response_tokens(body: &str, path: &Path) -> Result<Vec<ResponseToken>, ArgsError> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = body.chars().peekable();
+    let mut line = 1usize;
+    let mut column = 1usize;
+    let mut token_start = None;
+    let mut quote = None;
+
+    while let Some(ch) = chars.next() {
+        let ch_line = line;
+        let ch_column = column;
+        advance_response_position(ch, &mut line, &mut column);
+
+        if let Some((delimiter, _, _)) = quote {
+            match ch {
+                '\\' => {
+                    if let Some(escaped) = chars.next() {
+                        advance_response_position(escaped, &mut line, &mut column);
+                        current.push(escaped);
+                    } else {
+                        current.push('\\');
+                    }
+                }
+                value if value == delimiter => quote = None,
+                _ => current.push(ch),
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => {
+                token_start.get_or_insert((ch_line, ch_column));
+                quote = Some((ch, ch_line, ch_column));
+            }
+            '\\' => {
+                token_start.get_or_insert((ch_line, ch_column));
+                if let Some(escaped) = chars.next() {
+                    advance_response_position(escaped, &mut line, &mut column);
+                    current.push(escaped);
+                } else {
+                    current.push('\\');
+                }
+            }
+            whitespace if whitespace.is_whitespace() => {
+                if let Some((start_line, start_column)) = token_start.take() {
+                    tokens.push(ResponseToken {
+                        value: std::mem::take(&mut current),
+                        line: start_line,
+                        column: start_column,
+                    });
+                }
+            }
+            _ => {
+                token_start.get_or_insert((ch_line, ch_column));
+                current.push(ch);
+            }
+        }
+    }
+
+    if let Some((delimiter, quote_line, quote_column)) = quote {
+        return Err(ArgsError::ResponseFileSyntax {
+            path: path.to_path_buf(),
+            line: quote_line,
+            column: quote_column,
+            message: format!("unterminated {delimiter} quote"),
+        });
+    }
+    if let Some((start_line, start_column)) = token_start {
+        tokens.push(ResponseToken {
+            value: current,
+            line: start_line,
+            column: start_column,
+        });
+    }
+    Ok(tokens)
+}
+
+fn advance_response_position(ch: char, line: &mut usize, column: &mut usize) {
+    if ch == '\n' {
+        *line += 1;
+        *column = 1;
+    } else {
+        *column += 1;
+    }
+}
+
 #[deprecated(
     since = "0.1.0",
     note = "grouped LinkOptions cannot preserve mixed input order; use parse_ordered"
@@ -184,11 +509,21 @@ pub fn parse_ordered(argv: &[String]) -> Result<ParsedArgs, ArgsError> {
 pub fn parse_ordered_with_force_loads(
     argv: &[String],
 ) -> Result<(ParsedArgs, Vec<usize>), ArgsError> {
-    let normalized = normalize_wl(argv);
+    let preprocessed = preprocess_args(argv)?;
+    parse_preprocessed_with_force_loads(&preprocessed)
+}
+
+/// Parse arguments that have already passed through [`preprocess_args`]. The
+/// binary uses this entry point to avoid reading response files twice after it
+/// performs target-format routing.
+#[doc(hidden)]
+pub fn parse_preprocessed_with_force_loads(
+    argv: &[String],
+) -> Result<(ParsedArgs, Vec<usize>), ArgsError> {
     let mut opts = LinkOptions::default();
     let mut input_specs = Vec::new();
     let mut force_load_positions = Vec::new();
-    let mut it = normalized.iter();
+    let mut it = argv.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-o" => {
@@ -279,8 +614,8 @@ pub fn parse_ordered_with_force_loads(
                     .next()
                     .ok_or_else(|| ArgsError::MissingValue("-platform_version".into()))?;
                 opts.platform_version = Some(PlatformVersion {
-                    minos: parse_version_component("-platform_version", minos_raw)?,
-                    sdk: parse_version_component("-platform_version", sdk_raw)?,
+                    minos: parse_packed_version("-platform_version", minos_raw)?,
+                    sdk: parse_packed_version("-platform_version", sdk_raw)?,
                 });
             }
             "-r" => {
@@ -325,14 +660,14 @@ pub fn parse_ordered_with_force_loads(
                 let value = it
                     .next()
                     .ok_or_else(|| ArgsError::MissingValue("-current_version".into()))?;
-                opts.current_version = Some(parse_version_component("-current_version", value)?);
+                opts.current_version = Some(parse_packed_version("-current_version", value)?);
             }
             "-compatibility_version" => {
                 let value = it
                     .next()
                     .ok_or_else(|| ArgsError::MissingValue("-compatibility_version".into()))?;
                 opts.compatibility_version =
-                    Some(parse_version_component("-compatibility_version", value)?);
+                    Some(parse_packed_version("-compatibility_version", value)?);
             }
             "-exported_symbols_list" => {
                 opts.exported_symbols_lists
@@ -498,26 +833,42 @@ pub fn parse_ordered_with_force_loads(
     ))
 }
 
-fn normalize_wl(argv: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(argv.len());
-    for arg in argv {
-        if let Some(rest) = arg.strip_prefix("-Wl,") {
-            out.extend(
-                rest.split(',')
-                    .filter(|piece| !piece.is_empty())
-                    .map(ToString::to_string),
-            );
-        } else {
-            out.push(arg.clone());
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_RESPONSE_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    struct ResponseTestDir {
+        path: PathBuf,
+    }
+
+    impl ResponseTestDir {
+        fn new() -> Self {
+            let id = NEXT_RESPONSE_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "afs_ld_response_test_{}_{}",
+                std::process::id(),
+                id
+            ));
+            fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+
+        fn write(&self, name: &str, contents: &str) -> PathBuf {
+            let path = self.path.join(name);
+            fs::write(&path, contents).unwrap();
+            path
+        }
+    }
+
+    impl Drop for ResponseTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
@@ -747,6 +1098,84 @@ mod tests {
     }
 
     #[test]
+    fn version_flags_accept_maximum_packed_components() {
+        let opts = parse(&argv(&[
+            "-platform_version",
+            "macos",
+            "65535.255.255",
+            "65535.255.255",
+            "-current_version",
+            "65535.255.255",
+            "-compatibility_version",
+            "65535.255.255",
+            "main.o",
+        ]))
+        .unwrap();
+
+        let platform = opts.platform_version.expect("platform version");
+        assert_eq!(platform.minos, u32::MAX);
+        assert_eq!(platform.sdk, u32::MAX);
+        assert_eq!(opts.current_version, Some(u32::MAX));
+        assert_eq!(opts.compatibility_version, Some(u32::MAX));
+    }
+
+    #[test]
+    fn version_flags_reject_component_overflow() {
+        let cases = [
+            (
+                vec!["-platform_version", "macos", "65536.0.0", "1.0"],
+                "-platform_version",
+                "65536.0.0",
+                "major component must be at most 65535",
+            ),
+            (
+                vec!["-platform_version", "macos", "1.256.0", "1.0"],
+                "-platform_version",
+                "1.256.0",
+                "minor component must be at most 255",
+            ),
+            (
+                vec!["-platform_version", "macos", "1.0.256", "1.0"],
+                "-platform_version",
+                "1.0.256",
+                "patch component must be at most 255",
+            ),
+            (
+                vec!["-platform_version", "macos", "1.0", "65536.0.0"],
+                "-platform_version",
+                "65536.0.0",
+                "major component must be at most 65535",
+            ),
+            (
+                vec!["-current_version", "1.256.0"],
+                "-current_version",
+                "1.256.0",
+                "minor component must be at most 255",
+            ),
+            (
+                vec!["-compatibility_version", "1.0.256"],
+                "-compatibility_version",
+                "1.0.256",
+                "patch component must be at most 255",
+            ),
+        ];
+
+        for (args, expected_flag, expected_value, expected_reason) in cases {
+            let err = parse(&argv(&args)).expect_err(expected_value);
+            assert!(matches!(
+                err,
+                ArgsError::InvalidValue {
+                    ref flag,
+                    ref value,
+                    ref expected,
+                } if flag == expected_flag
+                    && value == expected_value
+                    && expected.contains(expected_reason)
+            ));
+        }
+    }
+
+    #[test]
     fn undefined_flag_records_dynamic_lookup() {
         let opts = parse(&argv(&["-undefined", "dynamic_lookup", "main.o"])).unwrap();
         assert_eq!(opts.undefined_treatment, UndefinedTreatment::DynamicLookup);
@@ -831,6 +1260,228 @@ mod tests {
         let opts = parse(&argv(&["-Wl,-map,link.map", "main.o"])).unwrap();
         assert_eq!(opts.map.as_deref(), Some(std::path::Path::new("link.map")));
         assert_eq!(opts.inputs, vec![PathBuf::from("main.o")]);
+    }
+
+    #[test]
+    fn wl_and_response_preprocessing_compose_recursively_in_place() {
+        let dir = ResponseTestDir::new();
+        dir.write("inner.rsp", "-Wl,middle.o,-lSystem\n");
+        let outer = dir.write("outer.rsp", "-Wl,@inner.rsp\n");
+
+        let parsed = parse_ordered(&[
+            "before.o".into(),
+            format!("-Wl,@{}", outer.display()),
+            "after.o".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.input_specs,
+            vec![
+                InputSpec::Path(PathBuf::from("before.o")),
+                InputSpec::Path(PathBuf::from("middle.o")),
+                InputSpec::Library("System".into()),
+                InputSpec::Path(PathBuf::from("after.o")),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_wl_fields_do_not_disturb_input_order() {
+        let parsed =
+            parse_ordered(&argv(&["before.o", "-Wl,,middle.o,,-lSystem,,", "after.o"])).unwrap();
+        assert_eq!(
+            parsed.input_specs,
+            vec![
+                InputSpec::Path(PathBuf::from("before.o")),
+                InputSpec::Path(PathBuf::from("middle.o")),
+                InputSpec::Library("System".into()),
+                InputSpec::Path(PathBuf::from("after.o")),
+            ]
+        );
+    }
+
+    #[test]
+    fn wl_wrapping_preserves_escaped_at_and_darwin_loader_paths() {
+        let parsed =
+            parse_ordered(&argv(&["-Wl,@@response.o,@rpath/libdependency.dylib"])).unwrap();
+        assert_eq!(
+            parsed.options.inputs,
+            vec![
+                PathBuf::from("@response.o"),
+                PathBuf::from("@rpath/libdependency.dylib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn response_files_expand_in_place_with_quotes_escapes_and_nesting() {
+        let dir = ResponseTestDir::new();
+        dir.write(
+            "inner.rsp",
+            "\"middle object.o\" escaped\\ object.o -lSystem\n",
+        );
+        let outer = dir.write(
+            "outer.rsp",
+            "-force_load \"forced archive.a\"\n@inner.rsp\n",
+        );
+
+        let (parsed, force_load_positions) = parse_ordered_with_force_loads(&[
+            "before.o".into(),
+            format!("@{}", outer.display()),
+            "after.o".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.input_specs,
+            vec![
+                InputSpec::Path(PathBuf::from("before.o")),
+                InputSpec::Path(PathBuf::from("forced archive.a")),
+                InputSpec::Path(PathBuf::from("middle object.o")),
+                InputSpec::Path(PathBuf::from("escaped object.o")),
+                InputSpec::Library("System".into()),
+                InputSpec::Path(PathBuf::from("after.o")),
+            ]
+        );
+        assert_eq!(force_load_positions, vec![1]);
+    }
+
+    #[test]
+    fn empty_response_file_contributes_no_arguments() {
+        let dir = ResponseTestDir::new();
+        let response = dir.write("empty.rsp", " \n\t");
+        let opts = parse(&[
+            "before.o".into(),
+            format!("@{}", response.display()),
+            "after.o".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            opts.inputs,
+            vec![PathBuf::from("before.o"), PathBuf::from("after.o")]
+        );
+    }
+
+    #[test]
+    fn escaped_at_and_darwin_loader_paths_remain_literal() {
+        let parsed = parse_ordered(&argv(&[
+            "@@response.o",
+            "@rpath/libdependency.dylib",
+            "@loader_path/libdependency.dylib",
+            "@executable_path/libdependency.dylib",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.options.inputs,
+            vec![
+                PathBuf::from("@response.o"),
+                PathBuf::from("@rpath/libdependency.dylib"),
+                PathBuf::from("@loader_path/libdependency.dylib"),
+                PathBuf::from("@executable_path/libdependency.dylib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unreadable_response_file_is_a_hard_parse_error() {
+        let dir = ResponseTestDir::new();
+        let missing = dir.path.join("missing.rsp");
+        let err = parse(&[format!("@{}", missing.display())]).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::ResponseFileRead { ref path, .. } if path == &missing
+        ));
+        assert!(err.to_string().contains("cannot read response file"));
+    }
+
+    #[test]
+    fn response_file_syntax_errors_name_the_exact_location() {
+        let dir = ResponseTestDir::new();
+        let response = dir.write("malformed.rsp", "before.o\n\"unterminated\n");
+        let err = parse(&[format!("@{}", response.display())]).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::ResponseFileSyntax {
+                ref path,
+                line: 2,
+                column: 1,
+                ..
+            } if path == &response
+        ));
+        assert!(err.to_string().contains("at 2:1: unterminated \" quote"));
+    }
+
+    #[test]
+    fn response_file_cycles_are_rejected() {
+        let dir = ResponseTestDir::new();
+        let first = dir.write("first.rsp", "@second.rsp\n");
+        let second = dir.write("second.rsp", "@first.rsp\n");
+        let err = parse(&[format!("@{}", first.display())]).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::ResponseFileCycle {
+                ref path,
+                referenced_at: Some((ref source, 1, 1)),
+            } if path == &first && source == &second
+        ));
+    }
+
+    #[test]
+    fn response_file_nesting_is_bounded() {
+        let dir = ResponseTestDir::new();
+        let files = (0..=RESPONSE_FILE_DEPTH_LIMIT)
+            .map(|index| dir.path.join(format!("{index}.rsp")))
+            .collect::<Vec<_>>();
+        for (index, file) in files.iter().take(RESPONSE_FILE_DEPTH_LIMIT).enumerate() {
+            fs::write(file, format!("@{}.rsp\n", index + 1)).unwrap();
+        }
+        fs::write(&files[RESPONSE_FILE_DEPTH_LIMIT], "main.o\n").unwrap();
+
+        let err = parse(&[format!("@{}", files[0].display())]).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::ResponseFileDepth {
+                ref path,
+                limit: RESPONSE_FILE_DEPTH_LIMIT,
+                ..
+            } if path == &files[RESPONSE_FILE_DEPTH_LIMIT]
+        ));
+    }
+
+    #[test]
+    fn quoted_empty_response_arguments_are_preserved() {
+        let tokens = parse_response_tokens("\"\" '' value", Path::new("inline.rsp")).unwrap();
+        assert_eq!(
+            tokens
+                .into_iter()
+                .map(|token| token.value)
+                .collect::<Vec<_>>(),
+            vec!["", "", "value"]
+        );
+    }
+
+    #[test]
+    fn large_response_file_preserves_every_input_in_order() {
+        const INPUT_COUNT: usize = 16_384;
+
+        let dir = ResponseTestDir::new();
+        let contents = (0..INPUT_COUNT)
+            .map(|index| format!("object_{index:05}.o"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let response = dir.write("large.rsp", &contents);
+        let parsed = parse_ordered(&[format!("@{}", response.display())]).unwrap();
+
+        assert_eq!(parsed.input_specs.len(), INPUT_COUNT);
+        assert_eq!(
+            parsed.input_specs.first(),
+            Some(&InputSpec::Path(PathBuf::from("object_00000.o")))
+        );
+        assert_eq!(
+            parsed.input_specs.last(),
+            Some(&InputSpec::Path(PathBuf::from("object_16383.o")))
+        );
     }
 
     #[test]

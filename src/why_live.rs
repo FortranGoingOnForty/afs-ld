@@ -8,6 +8,7 @@ use crate::layout::LayoutInput;
 use crate::reloc::{parse_raw_relocs, parse_relocs, Referent};
 use crate::resolve::{AtomId, InputId, Symbol, SymbolId, SymbolTable};
 use crate::symbol::SymKind;
+use crate::symbol_visibility::SymbolVisibilityPolicy;
 use crate::{LinkOptions, OutputKind};
 
 #[derive(Debug, Clone)]
@@ -50,8 +51,9 @@ pub struct DeadStripAnalysis {
 }
 
 impl DeadStripAnalysis {
-    pub fn build(
+    pub(crate) fn build(
         opts: &LinkOptions,
+        visibility: &SymbolVisibilityPolicy,
         layout_inputs: &[LayoutInput<'_>],
         atom_table: &AtomTable,
         sym_table: &SymbolTable,
@@ -59,7 +61,7 @@ impl DeadStripAnalysis {
     ) -> Self {
         let resolved_by_name = resolved_symbol_map(sym_table);
         let atom_symbols = atom_symbol_sets(atom_table);
-        let roots = root_atoms(opts, atom_table, sym_table, entry_symbol);
+        let roots = root_atoms(opts, visibility, atom_table, sym_table, entry_symbol);
         let forward_edges =
             build_forward_edges(layout_inputs, atom_table, sym_table, &resolved_by_name);
         let parent_edges = parent_edges(atom_table);
@@ -265,25 +267,44 @@ impl DeadStripAnalysis {
     }
 }
 
-pub fn format_explanations(
+#[derive(Clone, Copy)]
+pub(crate) struct WhyLiveState<'a> {
+    dead_strip: Option<&'a DeadStripAnalysis>,
+    folded_symbols: &'a [FoldedSymbol],
+}
+
+impl<'a> WhyLiveState<'a> {
+    pub(crate) fn new(
+        dead_strip: Option<&'a DeadStripAnalysis>,
+        folded_symbols: &'a [FoldedSymbol],
+    ) -> Self {
+        Self {
+            dead_strip,
+            folded_symbols,
+        }
+    }
+}
+
+pub(crate) fn format_explanations(
     opts: &LinkOptions,
+    visibility: &SymbolVisibilityPolicy,
     layout_inputs: &[LayoutInput<'_>],
     atom_table: &AtomTable,
     sym_table: &SymbolTable,
     entry_symbol: Option<SymbolId>,
-    dead_strip: Option<&DeadStripAnalysis>,
-    folded_symbols: &[FoldedSymbol],
+    state: WhyLiveState<'_>,
 ) -> Result<Option<String>, String> {
     if opts.why_live.is_empty() {
         return Ok(None);
     }
 
-    let folded_by_name: HashMap<&str, &str> = folded_symbols
+    let folded_by_name: HashMap<&str, &str> = state
+        .folded_symbols
         .iter()
         .map(|symbol| (symbol.name.as_str(), symbol.winner.as_str()))
         .collect();
 
-    if let Some(dead_strip) = dead_strip {
+    if let Some(dead_strip) = state.dead_strip {
         let mut out = String::new();
         for (idx, requested) in opts.why_live.iter().enumerate() {
             let winner = folded_by_name
@@ -304,7 +325,14 @@ pub fn format_explanations(
         return Ok(Some(out));
     }
 
-    let graph = WhyLiveGraph::build(opts, layout_inputs, atom_table, sym_table, entry_symbol);
+    let graph = WhyLiveGraph::build(
+        opts,
+        visibility,
+        layout_inputs,
+        atom_table,
+        sym_table,
+        entry_symbol,
+    );
     let mut out = String::new();
     for (idx, requested) in opts.why_live.iter().enumerate() {
         let winner = folded_by_name
@@ -370,13 +398,14 @@ struct WhyLiveGraph<'a> {
 impl<'a> WhyLiveGraph<'a> {
     fn build(
         opts: &LinkOptions,
+        visibility: &SymbolVisibilityPolicy,
         layout_inputs: &[LayoutInput<'_>],
         atom_table: &AtomTable,
         sym_table: &'a SymbolTable,
         entry_symbol: Option<SymbolId>,
     ) -> Self {
         let resolved_by_name = resolved_symbol_map(sym_table);
-        let roots = root_symbols(opts, atom_table, sym_table, entry_symbol);
+        let roots = root_symbols(opts, visibility, atom_table, sym_table, entry_symbol);
         let reverse_edges = build_reverse_edges(layout_inputs, atom_table, &resolved_by_name);
         Self {
             sym_table,
@@ -442,6 +471,7 @@ fn resolved_symbol_map(sym_table: &SymbolTable) -> HashMap<String, SymbolId> {
 
 fn root_symbols(
     opts: &LinkOptions,
+    visibility: &SymbolVisibilityPolicy,
     atom_table: &AtomTable,
     sym_table: &SymbolTable,
     entry_symbol: Option<SymbolId>,
@@ -468,23 +498,19 @@ fn root_symbols(
             } => {
                 roots.entry(symbol_id).or_insert(RootReason::NoDeadStrip);
             }
-            Symbol::Defined {
-                private_extern: false,
-                ..
-            } if opts.kind == OutputKind::Dylib => {
+            Symbol::Defined { .. }
+                if is_exported_dylib_symbol(opts, visibility, sym_table, symbol) =>
+            {
                 roots.entry(symbol_id).or_insert(RootReason::ExportedDylib);
             }
-            Symbol::Absolute {
-                private_extern: false,
-                ..
-            } if opts.kind == OutputKind::Dylib => {
+            Symbol::Absolute { .. }
+                if is_exported_dylib_symbol(opts, visibility, sym_table, symbol) =>
+            {
                 roots.entry(symbol_id).or_insert(RootReason::ExportedDylib);
             }
-            Symbol::Alias {
-                name,
-                private_extern: false,
-                ..
-            } if opts.kind == OutputKind::Dylib => {
+            Symbol::Alias { name, .. }
+                if is_exported_dylib_symbol(opts, visibility, sym_table, symbol) =>
+            {
                 if let Ok((target_id, target)) = sym_table.resolve_chain(*name) {
                     if matches!(target, Symbol::Defined { .. } | Symbol::Absolute { .. }) {
                         roots.entry(target_id).or_insert(RootReason::ExportedDylib);
@@ -499,6 +525,7 @@ fn root_symbols(
 
 fn root_atoms(
     opts: &LinkOptions,
+    visibility: &SymbolVisibilityPolicy,
     atom_table: &AtomTable,
     sym_table: &SymbolTable,
     entry_symbol: Option<SymbolId>,
@@ -530,18 +557,14 @@ fn root_atoms(
             } if atom.0 != 0 && symbol_no_dead_strip_is_root(atom_table, *atom) => {
                 roots.entry(*atom).or_insert(RootReason::NoDeadStrip);
             }
-            Symbol::Defined {
-                atom,
-                private_extern: false,
-                ..
-            } if opts.kind == OutputKind::Dylib && atom.0 != 0 => {
+            Symbol::Defined { atom, .. }
+                if atom.0 != 0 && is_exported_dylib_symbol(opts, visibility, sym_table, symbol) =>
+            {
                 roots.entry(*atom).or_insert(RootReason::ExportedDylib);
             }
-            Symbol::Alias {
-                name,
-                private_extern: false,
-                ..
-            } if opts.kind == OutputKind::Dylib => {
+            Symbol::Alias { name, .. }
+                if is_exported_dylib_symbol(opts, visibility, sym_table, symbol) =>
+            {
                 if let Ok((_, Symbol::Defined { atom, .. })) = sym_table.resolve_chain(*name) {
                     if atom.0 != 0 {
                         roots.entry(*atom).or_insert(RootReason::ExportedDylib);
@@ -553,6 +576,24 @@ fn root_atoms(
     }
 
     roots
+}
+
+fn is_exported_dylib_symbol(
+    opts: &LinkOptions,
+    visibility: &SymbolVisibilityPolicy,
+    sym_table: &SymbolTable,
+    symbol: &Symbol,
+) -> bool {
+    if opts.kind != OutputKind::Dylib {
+        return false;
+    }
+    let private_extern = match symbol {
+        Symbol::Defined { private_extern, .. }
+        | Symbol::Absolute { private_extern, .. }
+        | Symbol::Alias { private_extern, .. } => *private_extern,
+        _ => return false,
+    };
+    !private_extern && !visibility.hides(sym_table.interner.resolve(symbol.name()))
 }
 
 fn symbol_no_dead_strip_is_root(atom_table: &AtomTable, atom_id: AtomId) -> bool {
@@ -568,7 +609,7 @@ fn build_reverse_edges(
     atom_table: &AtomTable,
     resolved_by_name: &HashMap<String, SymbolId>,
 ) -> HashMap<SymbolId, Vec<SymbolId>> {
-    let atoms_by_input_section = atom_table.by_input_section();
+    let atom_index = AtomOffsetIndex::new(atom_table);
     let atom_symbols = atom_symbol_sets(atom_table);
     let mut edge_set = HashSet::<(SymbolId, SymbolId)>::new();
 
@@ -585,13 +626,8 @@ fn build_reverse_edges(
             };
             let input_section = (section_idx_zero + 1) as u8;
             for reloc in relocs {
-                let Some(source_atom) = find_atom_for_offset(
-                    atom_table,
-                    &atoms_by_input_section,
-                    input.id,
-                    input_section,
-                    reloc.offset,
-                ) else {
+                let Some(source_atom) = atom_index.find(input.id, input_section, reloc.offset)
+                else {
                     continue;
                 };
                 let Some(source_symbols) = atom_symbols.get(&source_atom) else {
@@ -629,7 +665,7 @@ fn build_forward_edges(
     sym_table: &SymbolTable,
     resolved_by_name: &HashMap<String, SymbolId>,
 ) -> HashMap<AtomId, Vec<AtomId>> {
-    let atoms_by_input_section = atom_table.by_input_section();
+    let atom_index = AtomOffsetIndex::new(atom_table);
     let mut edge_set = HashSet::<(AtomId, AtomId)>::new();
 
     for input in layout_inputs {
@@ -645,13 +681,8 @@ fn build_forward_edges(
             };
             let input_section = (section_idx_zero + 1) as u8;
             for reloc in relocs {
-                let Some(source_atom) = find_atom_for_offset(
-                    atom_table,
-                    &atoms_by_input_section,
-                    input.id,
-                    input_section,
-                    reloc.offset,
-                ) else {
+                let Some(source_atom) = atom_index.find(input.id, input_section, reloc.offset)
+                else {
                     continue;
                 };
                 for target_atom in target_atoms_for_reloc(
@@ -661,10 +692,9 @@ fn build_forward_edges(
                     reloc,
                     reloc.referent,
                     reloc.subtrahend,
-                    atom_table,
                     sym_table,
                     resolved_by_name,
-                    &atoms_by_input_section,
+                    &atom_index,
                 ) {
                     if source_atom != target_atom {
                         edge_set.insert((source_atom, target_atom));
@@ -678,7 +708,7 @@ fn build_forward_edges(
         if atom.section != AtomSection::EhFrame {
             continue;
         }
-        let Some(cie_atom) = eh_frame_cie_atom(atom_table, &atoms_by_input_section, atom) else {
+        let Some(cie_atom) = eh_frame_cie_atom(&atom_index, atom) else {
             continue;
         };
         if atom_id != cie_atom {
@@ -755,31 +785,120 @@ fn atom_symbol_sets(atom_table: &AtomTable) -> HashMap<crate::resolve::AtomId, V
     out
 }
 
-fn find_atom_for_offset(
-    atom_table: &AtomTable,
-    atoms_by_input_section: &HashMap<(InputId, u8), Vec<AtomId>>,
-    input_id: InputId,
-    input_section: u8,
-    offset: u32,
-) -> Option<AtomId> {
-    atoms_by_input_section
-        .get(&(input_id, input_section))
-        .and_then(|ids| {
-            ids.iter()
-                .find_map(|atom_id| {
-                    let atom = atom_table.get(*atom_id);
-                    let start = atom.input_offset;
-                    let end = atom.input_offset.saturating_add(atom.size);
-                    (start <= offset && offset < end).then_some(*atom_id)
+#[derive(Debug, Clone, Copy)]
+struct IndexedAtom {
+    id: AtomId,
+    start: u32,
+    end: u32,
+}
+
+impl IndexedAtom {
+    fn contains(self, offset: u32) -> bool {
+        self.start <= offset && offset < self.end
+    }
+}
+
+#[derive(Debug, Default)]
+struct InputSectionAtomIndex {
+    atoms: Vec<IndexedAtom>,
+    ordered_non_overlapping: bool,
+}
+
+/// Relocation-to-atom lookup for why-live and dead-strip graph construction.
+///
+/// Normal atomization emits each input section in non-overlapping offset
+/// order, so a relocation lookup is a binary search. Keep the original scan
+/// as a defensive fallback for synthetic or malformed internal atom tables;
+/// correctness must not depend on that construction invariant.
+#[derive(Debug, Default)]
+struct AtomOffsetIndex {
+    sections: HashMap<(InputId, u8), InputSectionAtomIndex>,
+}
+
+impl AtomOffsetIndex {
+    fn new(atom_table: &AtomTable) -> Self {
+        let mut sections = HashMap::<(InputId, u8), InputSectionAtomIndex>::new();
+        for (id, atom) in atom_table.iter() {
+            let section = sections
+                .entry((atom.origin, atom.input_section))
+                .or_default();
+            let end = atom.input_offset.saturating_add(atom.size);
+            section.atoms.push(IndexedAtom {
+                id,
+                start: atom.input_offset,
+                end,
+            });
+        }
+        for section in sections.values_mut() {
+            section.ordered_non_overlapping = section
+                .atoms
+                .windows(2)
+                .all(|pair| pair[0].start <= pair[1].start && pair[0].end <= pair[1].start);
+        }
+        Self { sections }
+    }
+
+    fn find(&self, input_id: InputId, input_section: u8, offset: u32) -> Option<AtomId> {
+        self.find_with_probe(input_id, input_section, offset, || {})
+    }
+
+    fn find_with_probe(
+        &self,
+        input_id: InputId,
+        input_section: u8,
+        offset: u32,
+        mut probe: impl FnMut(),
+    ) -> Option<AtomId> {
+        let section = self.sections.get(&(input_id, input_section))?;
+        if !section.ordered_non_overlapping {
+            return section
+                .atoms
+                .iter()
+                .find_map(|atom| {
+                    probe();
+                    atom.contains(offset).then_some(atom.id)
                 })
                 .or_else(|| {
-                    ids.iter().find_map(|atom_id| {
-                        let atom = atom_table.get(*atom_id);
-                        let end = atom.input_offset.saturating_add(atom.size);
-                        (offset == end).then_some(*atom_id)
+                    section.atoms.iter().find_map(|atom| {
+                        probe();
+                        (atom.end == offset).then_some(atom.id)
                     })
-                })
-        })
+                });
+        }
+
+        let candidate = section.atoms.partition_point(|atom| {
+            probe();
+            atom.start <= offset
+        });
+        if let Some(atom) = candidate
+            .checked_sub(1)
+            .and_then(|index| section.atoms.get(index))
+        {
+            probe();
+            if atom.contains(offset) {
+                return Some(atom.id);
+            }
+        }
+
+        // Ends are nondecreasing under the section invariant. This second
+        // binary search preserves the legacy rule that an otherwise
+        // unmatched end boundary belongs to the first atom ending there.
+        let boundary = section.atoms.partition_point(|atom| {
+            probe();
+            atom.end < offset
+        });
+        section
+            .atoms
+            .get(boundary)
+            .and_then(|atom| (atom.end == offset).then_some(atom.id))
+    }
+
+    fn atom_ids(&self, input_id: InputId, input_section: u8) -> Vec<AtomId> {
+        self.sections
+            .get(&(input_id, input_section))
+            .map(|section| section.atoms.iter().map(|atom| atom.id).collect())
+            .unwrap_or_default()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -790,10 +909,9 @@ fn target_atoms_for_reloc(
     reloc: crate::reloc::Reloc,
     referent: Referent,
     subtrahend: Option<Referent>,
-    atom_table: &AtomTable,
     sym_table: &SymbolTable,
     resolved_by_name: &HashMap<String, SymbolId>,
-    atoms_by_input_section: &HashMap<(InputId, u8), Vec<AtomId>>,
+    atom_index: &AtomOffsetIndex,
 ) -> Vec<AtomId> {
     let mut out = referent_atoms(
         input_id,
@@ -801,10 +919,9 @@ fn target_atoms_for_reloc(
         source_atom,
         reloc,
         referent,
-        atom_table,
         sym_table,
         resolved_by_name,
-        atoms_by_input_section,
+        atom_index,
     );
     if let Some(subtrahend) = subtrahend {
         out.extend(referent_atoms(
@@ -813,10 +930,9 @@ fn target_atoms_for_reloc(
             source_atom,
             reloc,
             subtrahend,
-            atom_table,
             sym_table,
             resolved_by_name,
-            atoms_by_input_section,
+            atom_index,
         ));
     }
     out.sort_by_key(|aid| aid.0);
@@ -831,17 +947,16 @@ fn referent_atoms(
     source_atom: &Atom,
     reloc: crate::reloc::Reloc,
     referent: Referent,
-    atom_table: &AtomTable,
     sym_table: &SymbolTable,
     resolved_by_name: &HashMap<String, SymbolId>,
-    atoms_by_input_section: &HashMap<(InputId, u8), Vec<AtomId>>,
+    atom_index: &AtomOffsetIndex,
 ) -> Vec<AtomId> {
     match referent {
         Referent::Symbol(symbol_index) => {
             let Some(input_sym) = object.symbols.get(symbol_index as usize) else {
                 return Vec::new();
             };
-            if input_sym.kind() == SymKind::Sect && !input_sym.is_ext() {
+            if input_sym.kind() == SymKind::Sect && !input_sym.participates_in_global_resolution() {
                 let Some(section) = object.section_for_symbol(input_sym) else {
                     return Vec::new();
                 };
@@ -851,15 +966,10 @@ fn referent_atoms(
                 let Ok(section_offset) = u32::try_from(section_offset) else {
                     return Vec::new();
                 };
-                return find_atom_for_offset(
-                    atom_table,
-                    atoms_by_input_section,
-                    input_id,
-                    input_sym.sect_idx(),
-                    section_offset,
-                )
-                .into_iter()
-                .collect();
+                return atom_index
+                    .find(input_id, input_sym.sect_idx(), section_offset)
+                    .into_iter()
+                    .collect();
             }
             let Some(name) = object.symbol_name(input_sym).ok() else {
                 return Vec::new();
@@ -873,20 +983,12 @@ fn referent_atoms(
             }
         }
         Referent::Section(section_index) => {
-            if let Some(atom_id) = section_referent_atom(
-                input_id,
-                source_atom,
-                reloc,
-                section_index,
-                atom_table,
-                atoms_by_input_section,
-            ) {
+            if let Some(atom_id) =
+                section_referent_atom(input_id, source_atom, reloc, section_index, atom_index)
+            {
                 vec![atom_id]
             } else {
-                atoms_by_input_section
-                    .get(&(input_id, section_index))
-                    .cloned()
-                    .unwrap_or_default()
+                atom_index.atom_ids(input_id, section_index)
             }
         }
     }
@@ -897,8 +999,7 @@ fn section_referent_atom(
     source_atom: &Atom,
     reloc: crate::reloc::Reloc,
     section_index: u8,
-    atom_table: &AtomTable,
-    atoms_by_input_section: &HashMap<(InputId, u8), Vec<AtomId>>,
+    atom_index: &AtomOffsetIndex,
 ) -> Option<AtomId> {
     if source_atom.section == AtomSection::CompactUnwind
         && reloc.offset == source_atom.input_offset
@@ -907,22 +1008,12 @@ fn section_referent_atom(
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&source_atom.data[..8]);
         let target_offset = u64::from_le_bytes(buf) as u32;
-        return find_atom_for_offset(
-            atom_table,
-            atoms_by_input_section,
-            input_id,
-            section_index,
-            target_offset,
-        );
+        return atom_index.find(input_id, section_index, target_offset);
     }
     None
 }
 
-fn eh_frame_cie_atom(
-    atom_table: &AtomTable,
-    atoms_by_input_section: &HashMap<(InputId, u8), Vec<AtomId>>,
-    atom: &Atom,
-) -> Option<AtomId> {
+fn eh_frame_cie_atom(atom_index: &AtomOffsetIndex, atom: &Atom) -> Option<AtomId> {
     if atom.section != AtomSection::EhFrame || atom.data.len() < 8 {
         return None;
     }
@@ -933,13 +1024,7 @@ fn eh_frame_cie_atom(
         return None;
     }
     let cie_offset = atom.input_offset.checked_add(4)?.checked_sub(cie_delta)?;
-    find_atom_for_offset(
-        atom_table,
-        atoms_by_input_section,
-        atom.origin,
-        atom.input_section,
-        cie_offset,
-    )
+    atom_index.find(atom.origin, atom.input_section, cie_offset)
 }
 
 fn target_symbols_for_reloc(
@@ -951,6 +1036,9 @@ fn target_symbols_for_reloc(
         return None;
     };
     let input_sym = object.symbols.get(symbol_index as usize)?;
+    if !input_sym.participates_in_global_resolution() {
+        return None;
+    }
     let name = object.symbol_name(input_sym).ok()?;
     resolved_by_name.get(name).copied().map(|sid| vec![sid])
 }
@@ -995,7 +1083,86 @@ mod tests {
         }
     }
 
-    fn alias_roots_private_target(private_alias: bool) -> (bool, bool) {
+    fn test_offset_atom(input: InputId, section: u8, offset: u32, size: u32) -> Atom {
+        Atom {
+            origin: input,
+            input_section: section,
+            input_offset: offset,
+            size,
+            data: vec![0; size.min(8) as usize],
+            ..bare_test_atom()
+        }
+    }
+
+    #[test]
+    fn atom_offset_lookup_preserves_containment_and_end_boundary_rules() {
+        let mut atoms = AtomTable::new();
+        let first = atoms.push(test_offset_atom(InputId(7), 2, 0, 4));
+        let second = atoms.push(test_offset_atom(InputId(7), 2, 4, 4));
+        let after_gap = atoms.push(test_offset_atom(InputId(7), 2, 12, 4));
+        atoms.push(test_offset_atom(InputId(7), 2, 16, 0));
+        let zero_sized = atoms.push(test_offset_atom(InputId(7), 3, 20, 0));
+        let saturated = atoms.push(test_offset_atom(InputId(8), 1, u32::MAX - 2, 8));
+        let index = AtomOffsetIndex::new(&atoms);
+
+        let find = |input, section, offset| index.find(input, section, offset);
+        assert_eq!(find(InputId(7), 2, 0), Some(first));
+        assert_eq!(find(InputId(7), 2, 3), Some(first));
+        assert_eq!(find(InputId(7), 2, 4), Some(second));
+        assert_eq!(find(InputId(7), 2, 8), Some(second));
+        assert_eq!(find(InputId(7), 2, 9), None);
+        assert_eq!(find(InputId(7), 2, 12), Some(after_gap));
+        assert_eq!(find(InputId(7), 2, 16), Some(after_gap));
+        assert_eq!(find(InputId(7), 3, 20), Some(zero_sized));
+        assert_eq!(find(InputId(8), 1, u32::MAX - 1), Some(saturated));
+        assert_eq!(find(InputId(8), 1, u32::MAX), Some(saturated));
+        assert_eq!(find(InputId(99), 1, 0), None);
+    }
+
+    #[test]
+    fn atom_offset_lookup_preserves_legacy_order_for_noncanonical_overlaps() {
+        let mut atoms = AtomTable::new();
+        let first = atoms.push(test_offset_atom(InputId(9), 1, 4, 8));
+        atoms.push(test_offset_atom(InputId(9), 1, 0, 8));
+        let index = AtomOffsetIndex::new(&atoms);
+
+        assert_eq!(index.find(InputId(9), 1, 6), Some(first));
+    }
+
+    #[test]
+    fn atom_offset_lookup_uses_logarithmic_probes() {
+        const ATOM_COUNT: u32 = 16_384;
+        let mut atoms = AtomTable::new();
+        let mut expected = AtomId(0);
+        for index in 0..ATOM_COUNT {
+            expected = atoms.push(test_offset_atom(InputId(11), 4, index * 4, 4));
+        }
+        let index = AtomOffsetIndex::new(&atoms);
+
+        let mut interior_probes = 0;
+        let found = index.find_with_probe(InputId(11), 4, (ATOM_COUNT - 1) * 4 + 2, || {
+            interior_probes += 1;
+        });
+
+        assert_eq!(found, Some(expected));
+        assert!(
+            interior_probes <= 32,
+            "indexed interior lookup should inspect at most 32 atoms, inspected {interior_probes}"
+        );
+
+        let mut boundary_probes = 0;
+        let found = index.find_with_probe(InputId(11), 4, ATOM_COUNT * 4, || {
+            boundary_probes += 1;
+        });
+
+        assert_eq!(found, Some(expected));
+        assert!(
+            boundary_probes <= 32,
+            "indexed end-boundary lookup should inspect at most 32 atoms, inspected {boundary_probes}"
+        );
+    }
+
+    fn alias_roots_private_target(private_alias: bool, exported_symbols: &[&str]) -> (bool, bool) {
         let mut atoms = AtomTable::new();
         let target_atom = atoms.push(Atom {
             id: AtomId(0),
@@ -1036,19 +1203,102 @@ mod tests {
             .unwrap();
         let opts = LinkOptions {
             kind: OutputKind::Dylib,
+            exported_symbols: exported_symbols
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             ..LinkOptions::default()
         };
+        let visibility = SymbolVisibilityPolicy::from_opts(&opts).unwrap();
 
         (
-            root_symbols(&opts, &atoms, &symbols, None).contains_key(&target_symbol),
-            root_atoms(&opts, &atoms, &symbols, None).contains_key(&target_atom),
+            root_symbols(&opts, &visibility, &atoms, &symbols, None).contains_key(&target_symbol),
+            root_atoms(&opts, &visibility, &atoms, &symbols, None).contains_key(&target_atom),
         )
     }
 
     #[test]
     fn dylib_alias_roots_follow_alias_visibility() {
-        assert_eq!(alias_roots_private_target(false), (true, true));
-        assert_eq!(alias_roots_private_target(true), (false, false));
+        assert_eq!(alias_roots_private_target(false, &[]), (true, true));
+        assert_eq!(alias_roots_private_target(true, &[]), (false, false));
+        assert_eq!(
+            alias_roots_private_target(false, &["_different_alias"]),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn dylib_roots_respect_export_policy() {
+        let mut atoms = AtomTable::new();
+        let kept_atom = atoms.push(Atom {
+            input_offset: 0,
+            ..bare_test_atom()
+        });
+        let hidden_atom = atoms.push(Atom {
+            input_offset: 8,
+            ..bare_test_atom()
+        });
+        let blocked_atom = atoms.push(Atom {
+            input_offset: 16,
+            ..bare_test_atom()
+        });
+        let forced_atom = atoms.push(Atom {
+            input_offset: 24,
+            ..bare_test_atom()
+        });
+        let mut symbols = SymbolTable::new();
+        for (name, atom) in [
+            ("_kept", kept_atom),
+            ("_hidden", hidden_atom),
+            ("_blocked", blocked_atom),
+        ] {
+            let name = symbols.intern(name);
+            symbols
+                .insert(Symbol::Defined {
+                    name,
+                    origin: InputId(0),
+                    atom,
+                    value: 0,
+                    weak: false,
+                    private_extern: false,
+                    no_dead_strip: false,
+                })
+                .unwrap();
+        }
+        let forced_name = symbols.intern("_forced");
+        symbols
+            .insert(Symbol::Defined {
+                name: forced_name,
+                origin: InputId(0),
+                atom: forced_atom,
+                value: 0,
+                weak: false,
+                private_extern: false,
+                no_dead_strip: true,
+            })
+            .unwrap();
+        let opts = LinkOptions {
+            kind: OutputKind::Dylib,
+            exported_symbols: vec!["_kept".into(), "_blocked".into()],
+            unexported_symbols: vec!["_blocked".into()],
+            ..LinkOptions::default()
+        };
+        let visibility = SymbolVisibilityPolicy::from_opts(&opts).unwrap();
+
+        let atom_roots = root_atoms(&opts, &visibility, &atoms, &symbols, None);
+        let symbol_roots = root_symbols(&opts, &visibility, &atoms, &symbols, None);
+        let symbol_id = |name| {
+            symbol_roots.contains_key(&symbols.lookup_str(name).expect("fixture symbol exists"))
+        };
+
+        assert!(atom_roots.contains_key(&kept_atom));
+        assert!(!atom_roots.contains_key(&hidden_atom));
+        assert!(!atom_roots.contains_key(&blocked_atom));
+        assert!(atom_roots.contains_key(&forced_atom));
+        assert!(symbol_id("_kept"));
+        assert!(!symbol_id("_hidden"));
+        assert!(!symbol_id("_blocked"));
+        assert!(symbol_id("_forced"));
     }
 
     fn live_support_result(
@@ -1165,14 +1415,27 @@ mod tests {
         } else {
             None
         };
-        let analysis =
-            DeadStripAnalysis::build(&LinkOptions::default(), &inputs, &atoms, &symbols, None);
+        let analysis = DeadStripAnalysis::build(
+            &LinkOptions::default(),
+            &SymbolVisibilityPolicy::default(),
+            &inputs,
+            &atoms,
+            &symbols,
+            None,
+        );
 
         (
             analysis.live_atoms().contains(&support),
             analysis.live_atoms().contains(&target),
             support_symbol.is_some_and(|symbol| {
-                root_symbols(&LinkOptions::default(), &atoms, &symbols, None).contains_key(&symbol)
+                root_symbols(
+                    &LinkOptions::default(),
+                    &SymbolVisibilityPolicy::default(),
+                    &atoms,
+                    &symbols,
+                    None,
+                )
+                .contains_key(&symbol)
             }),
         )
     }
@@ -1202,7 +1465,13 @@ mod tests {
             ..bare_test_atom()
         });
 
-        let roots = root_atoms(&LinkOptions::default(), &atoms, &SymbolTable::new(), None);
+        let roots = root_atoms(
+            &LinkOptions::default(),
+            &SymbolVisibilityPolicy::default(),
+            &atoms,
+            &SymbolTable::new(),
+            None,
+        );
         assert!(roots.contains_key(&atom));
     }
 
@@ -1319,6 +1588,38 @@ mod tests {
             flags: AtomFlags::NONE,
             parent_of: None,
         });
+        let global_collision = atoms.push(Atom {
+            id: AtomId(0),
+            origin: InputId(1),
+            input_section: 1,
+            section: AtomSection::Data,
+            input_offset: 0,
+            size: 8,
+            align_pow2: 3,
+            owner: None,
+            alt_entries: Vec::new(),
+            data: vec![0; 8],
+            flags: AtomFlags::NONE,
+            parent_of: None,
+        });
+        let mut symbols = SymbolTable::new();
+        let collision_name = symbols.intern("Ltarget");
+        symbols
+            .insert(Symbol::Defined {
+                name: collision_name,
+                origin: InputId(1),
+                atom: global_collision,
+                value: 0,
+                weak: false,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap();
+        let resolved_by_name = resolved_symbol_map(&symbols);
+        assert_eq!(
+            target_symbols_for_reloc(&object, Referent::Symbol(0), &resolved_by_name),
+            None
+        );
         let inputs = [LayoutInput {
             id: InputId(0),
             object: &object,
@@ -1327,13 +1628,15 @@ mod tests {
         }];
         let analysis = DeadStripAnalysis::build(
             &LinkOptions::default(),
+            &SymbolVisibilityPolicy::default(),
             &inputs,
             &atoms,
-            &SymbolTable::new(),
+            &symbols,
             None,
         );
 
         assert!(analysis.live_atoms().contains(&source));
         assert!(analysis.live_atoms().contains(&target));
+        assert!(!analysis.live_atoms().contains(&global_collision));
     }
 }

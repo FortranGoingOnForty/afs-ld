@@ -97,6 +97,22 @@ fn link(output: &Path, args: &[&OsStr]) -> Output {
         .unwrap()
 }
 
+#[cfg(unix)]
+fn link_with_small_file_limit(output: &Path, args: &[&OsStr]) -> Output {
+    Command::new("/bin/sh")
+        .args([
+            "-c",
+            "trap '' 25; ulimit -f 1; exec \"$@\"",
+            "afs-ld-file-limit",
+        ])
+        .arg(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(output)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
 fn run(path: &Path) -> i32 {
     Command::new(path).status().unwrap().code().unwrap()
 }
@@ -336,6 +352,104 @@ fn explicit_emulation_and_entry_select_elf() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn primary_elf_output_preserves_previous_file_after_write_failure() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=primary_elf_output_preserves_previous_file_after_write_failure count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    const SENTINEL: &[u8] = b"previous complete ELF output";
+
+    let dir = scratch("atomic_primary_output");
+    std::fs::create_dir_all(&dir).unwrap();
+    let object = assemble(&gas, &dir, "entry", &exit_asm("_start", 42));
+    let executable = dir.join("linked");
+    std::fs::write(&executable, SENTINEL).unwrap();
+
+    let result = link_with_small_file_limit(
+        &executable,
+        &[OsStr::new("-melf_x86_64"), object.as_os_str()],
+    );
+
+    assert!(!result.status.success(), "file-limited link must fail");
+    assert_eq!(
+        std::fs::read(&executable).unwrap(),
+        SENTINEL,
+        "failed ELF publication replaced the previous complete output"
+    );
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("afs-ld-tmp")),
+        "failed ELF publication leaked a temporary output"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn response_file_selects_elf_before_format_routing() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=response_file_selects_elf_before_format_routing count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = scratch("response_file");
+    std::fs::create_dir_all(&dir).unwrap();
+    let object = assemble(&gas, &dir, "entry", &exit_asm("_start", 47));
+    let executable = dir.join("linked");
+    let response = dir.join("link.rsp");
+    std::fs::write(
+        &response,
+        format!(
+            "-melf_x86_64\n-o\n{}\n{}\n",
+            executable.display(),
+            object.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg(format!("@{}", response.display()))
+        .output()
+        .unwrap();
+    assert_linked(&output, &executable, 47);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn wl_wrapped_emulation_selects_elf_before_format_routing() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=wl_wrapped_emulation_selects_elf_before_format_routing count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = scratch("wl_wrapped");
+    std::fs::create_dir_all(&dir).unwrap();
+    let object = assemble(&gas, &dir, "entry", &exit_asm("_start", 49));
+    let direct = dir.join("direct");
+    let wrapped = dir.join("wrapped");
+
+    let direct_output = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(["-melf_x86_64", "-o"])
+        .arg(&direct)
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert_linked(&direct_output, &direct, 49);
+
+    let wrapped_output = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg(format!("-Wl,-melf_x86_64,-o,{}", wrapped.display()))
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert_linked(&wrapped_output, &wrapped, 49);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn dynamic_archive_only_invocation_extracts_entry() {
     let (Some(gas), Some(ar), Some(loader)) = (gas(), ar(), dynamic_loader()) else {
@@ -356,6 +470,114 @@ fn dynamic_archive_only_invocation_extracts_entry() {
         ],
     );
     assert_linked(&output, &executable, 48);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn missing_dynamic_linker_operand_never_falls_back_to_static_output() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=missing_dynamic_linker_operand_never_falls_back_to_static_output count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = scratch("missing_dynamic_linker");
+    std::fs::create_dir_all(&dir).unwrap();
+    let object = assemble(&gas, &dir, "entry", &exit_asm("_start", 50));
+
+    for (index, flag) in ["--dynamic-linker", "-dynamic-linker"]
+        .into_iter()
+        .enumerate()
+    {
+        let executable = dir.join(format!("missing-{index}"));
+        let output = link(
+            &executable,
+            &[
+                OsStr::new("-melf_x86_64"),
+                object.as_os_str(),
+                OsStr::new(flag),
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{flag} stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("flag `{flag}` requires a value")),
+            "{flag} stderr:\n{stderr}"
+        );
+        assert!(
+            !executable.exists(),
+            "{flag} must not publish a static fallback"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn invalid_z_policies_preserve_existing_output() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=invalid_z_policies_preserve_existing_output count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    const SENTINEL: &[u8] = b"previous complete ELF output";
+
+    let dir = scratch("invalid_z_policy");
+    std::fs::create_dir_all(&dir).unwrap();
+    let object = assemble(&gas, &dir, "entry", &exit_asm("_start", 51));
+    let cases = [
+        (
+            "unknown_separated",
+            vec!["-z", "mystery"],
+            "flag `-z` got invalid value `mystery`",
+        ),
+        (
+            "unknown_joined",
+            vec!["-zmystery"],
+            "flag `-z` got invalid value `mystery`",
+        ),
+        ("missing", vec!["-z"], "flag `-z` requires a value"),
+    ];
+
+    for (case, policy_args, expected_diagnostic) in cases {
+        let executable = dir.join(case);
+        std::fs::write(&executable, SENTINEL).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-o")
+            .arg(&executable)
+            .arg("-melf_x86_64")
+            .arg(&object)
+            .args(&policy_args)
+            .output()
+            .expect("run afs-ld");
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{case} stderr:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected_diagnostic),
+            "{case} stderr:\n{stderr}"
+        );
+        assert_eq!(
+            std::fs::read(&executable).unwrap(),
+            SENTINEL,
+            "{case} replaced the previous output"
+        );
+    }
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("afs-ld-tmp")),
+        "rejected -z policy leaked a temporary output"
+    );
 
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -6,6 +6,10 @@
 
 mod common;
 
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -21,7 +25,7 @@ use common::harness::{
 #[test]
 fn parity_corpus() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let started = Instant::now();

@@ -9,17 +9,80 @@
 // Magic and file types
 pub const MH_MAGIC_64: u32 = 0xFEEDFACF;
 pub const CPU_TYPE_ARM64: u32 = 0x0100_000C;
+/// Capability bits occupy the high byte of a Mach-O CPU subtype.
+pub const CPU_SUBTYPE_MASK: u32 = 0xFF00_0000;
+/// General Mach-O feature bit identifying a 64-bit library ABI.
+pub const CPU_SUBTYPE_LIB64: u32 = 0x8000_0000;
 pub const CPU_SUBTYPE_ARM64_ALL: u32 = 0;
+pub const CPU_SUBTYPE_ARM64_V8: u32 = 1;
+pub const CPU_SUBTYPE_ARM64E: u32 = 2;
+/// ARM64e's versioned userspace ABI marker.
+pub const CPU_SUBTYPE_ARM64E_VERSIONED_ABI: u32 = 0x8000_0000;
+/// ARM64e's kernel ABI marker.
+pub const CPU_SUBTYPE_ARM64E_KERNEL_ABI: u32 = 0x4000_0000;
+/// ARM64e pointer-authentication ABI version field.
+pub const CPU_SUBTYPE_ARM64E_PTRAUTH_VERSION_MASK: u32 = 0x0F00_0000;
+const CPU_SUBTYPE_ARM64E_CAPABILITY_MASK: u32 = CPU_SUBTYPE_ARM64E_VERSIONED_ABI
+    | CPU_SUBTYPE_ARM64E_KERNEL_ABI
+    | CPU_SUBTYPE_ARM64E_PTRAUTH_VERSION_MASK;
+
+/// Return whether afs-ld can preserve the complete ARM64 subtype contract.
+///
+/// ARM64e stores its ABI and pointer-authentication capabilities in the high
+/// byte. The other defined ARM64 subtypes may carry only Mach-O's general
+/// `LIB64` feature bit. Rejecting any other high bits prevents malformed or
+/// future metadata from being silently relabeled by the current linker.
+pub const fn is_supported_arm64_cpu_subtype(cpu_subtype: u32) -> bool {
+    let base = cpu_subtype & !CPU_SUBTYPE_MASK;
+    let capabilities = cpu_subtype & CPU_SUBTYPE_MASK;
+    match base {
+        CPU_SUBTYPE_ARM64_ALL | CPU_SUBTYPE_ARM64_V8 => {
+            capabilities == 0 || capabilities == CPU_SUBTYPE_LIB64
+        }
+        CPU_SUBTYPE_ARM64E => capabilities & !CPU_SUBTYPE_ARM64E_CAPABILITY_MASK == 0,
+        _ => false,
+    }
+}
 
 pub const MH_OBJECT: u32 = 1;
 pub const MH_EXECUTE: u32 = 2;
+pub const MH_FVMLIB: u32 = 3;
+pub const MH_CORE: u32 = 4;
+pub const MH_PRELOAD: u32 = 5;
 pub const MH_DYLIB: u32 = 6;
+pub const MH_DYLINKER: u32 = 7;
+pub const MH_BUNDLE: u32 = 8;
+pub const MH_DYLIB_STUB: u32 = 9;
+pub const MH_DSYM: u32 = 10;
+pub const MH_KEXT_BUNDLE: u32 = 11;
+pub const MH_FILESET: u32 = 12;
+
+/// Return the loader.h spelling for a known Mach-O file type.
+pub fn macho_filetype_name(filetype: u32) -> Option<&'static str> {
+    match filetype {
+        MH_OBJECT => Some("MH_OBJECT"),
+        MH_EXECUTE => Some("MH_EXECUTE"),
+        MH_FVMLIB => Some("MH_FVMLIB"),
+        MH_CORE => Some("MH_CORE"),
+        MH_PRELOAD => Some("MH_PRELOAD"),
+        MH_DYLIB => Some("MH_DYLIB"),
+        MH_DYLINKER => Some("MH_DYLINKER"),
+        MH_BUNDLE => Some("MH_BUNDLE"),
+        MH_DYLIB_STUB => Some("MH_DYLIB_STUB"),
+        MH_DSYM => Some("MH_DSYM"),
+        MH_KEXT_BUNDLE => Some("MH_KEXT_BUNDLE"),
+        MH_FILESET => Some("MH_FILESET"),
+        _ => None,
+    }
+}
 
 // Mach header flags
 pub const MH_NOUNDEFS: u32 = 0x1;
 pub const MH_DYLDLINK: u32 = 0x4;
 pub const MH_TWOLEVEL: u32 = 0x80;
 pub const MH_SUBSECTIONS_VIA_SYMBOLS: u32 = 0x2000;
+pub const MH_WEAK_DEFINES: u32 = 0x8000;
+pub const MH_BINDS_TO_WEAK: u32 = 0x0001_0000;
 pub const MH_PIE: u32 = 0x0020_0000;
 pub const MH_HAS_TLV_DESCRIPTORS: u32 = 0x0080_0000;
 
@@ -106,6 +169,11 @@ pub const N_INDR: u8 = 0xa;
 pub const NO_SECT: u8 = 0;
 
 // nlist_64 n_desc bits
+/// Largest ordinary two-level namespace library ordinal encodable in
+/// `nlist_64::n_desc`. The following two values are reserved by Mach-O.
+pub const MAX_LIBRARY_ORDINAL: u16 = 0xfd;
+pub const DYNAMIC_LOOKUP_ORDINAL: u16 = 0xfe;
+pub const EXECUTABLE_ORDINAL: u16 = 0xff;
 pub const REFERENCED_DYNAMICALLY: u16 = 0x0010;
 pub const N_NO_DEAD_STRIP: u16 = 0x0020;
 pub const N_WEAK_REF: u16 = 0x0040;

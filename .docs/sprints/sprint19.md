@@ -55,7 +55,8 @@ Recognized:
 - `-no_uuid`
 - `-dead_strip` (gates Sprint 23 pass)
 - `-icf=safe` / `-icf=none` (gates Sprint 24 pass)
-- `-fixup_chains` / `-no_fixup_chains`
+- `-no_fixup_chains` (selects the shipped classic dyld-info path)
+- `-fixup_chains` (reserved compatibility spelling; rejected until Sprint 15.5 lands)
 
 **Diagnostics**:
 - `-map <path>`: emit text link map
@@ -155,7 +156,8 @@ afs-ld: loading /usr/lib/libSystem.tbd
 - [x] `-no_uuid`
 - [x] `-dead_strip`
 - [x] `-icf=safe` / `-icf=none`
-- [x] `-fixup_chains` / `-no_fixup_chains`
+- [x] `-fixup_chains` / `-no_fixup_chains` parser wiring and explicit deferred
+  diagnostic (chained output itself remains unimplemented)
 - [x] `-Wl,<comma-separated>` normalization
 - [x] `-map <path>`
 - [x] `-t` / `-trace`

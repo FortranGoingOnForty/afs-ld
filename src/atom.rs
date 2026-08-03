@@ -165,7 +165,7 @@ pub struct Atom {
     pub input_offset: u32,
     /// Byte size. For zerofill atoms, this is virtual; `data` is empty.
     pub size: u32,
-    /// log2 of required alignment. Inherited from the containing section.
+    /// log2 of required alignment at this atom's original section offset.
     pub align_pow2: u8,
     /// Primary defining symbol, if any. Locals that split a section at
     /// `MH_SUBSECTIONS_VIA_SYMBOLS` boundaries but have no matching
@@ -361,7 +361,7 @@ pub fn atomize_object(
                 s.stab_kind().is_none()
                     && s.kind() == SymKind::Sect
                     && s.sect_idx() == sect_idx_one
-                    && (s.is_ext() || s.is_private_ext() || s.alt_entry())
+                    && (s.participates_in_global_resolution() || s.alt_entry())
             })
             .map(|(i, s)| {
                 let offset = s.value().saturating_sub(sect.addr) as u32;
@@ -391,10 +391,9 @@ pub fn atomize_object(
 
 /// Walk `__compact_unwind` atoms; for each, find its `function_start`
 /// reloc (at record offset 0), resolve the referent to a function atom
-/// within this same input, and set `parent_of`. External-symbol relocs
-/// (e.g. `__compact_unwind` referencing a function in another object)
-/// are left with `parent_of = None` and wired by Sprint 17's unwind
-/// synthesis pass, which has the full atom table.
+/// within this same input, and set `parent_of`. Section-defined symbols are
+/// resolved locally; unresolved cross-object references remain unwired for
+/// the unwind synthesis pass, which has the full symbol table.
 fn link_unwind_parents(
     input_id: InputId,
     obj: &ObjectFile,
@@ -420,12 +419,7 @@ fn link_unwind_parents(
         Err(_) => return,
     };
 
-    // Index atoms produced by this object for (section, offset) lookup.
-    let mut atom_index: HashMap<(u8, u32), AtomId> = HashMap::new();
-    for id in &out.atoms {
-        let a = table.get(*id);
-        atom_index.insert((a.input_section, a.input_offset), *id);
-    }
+    let atom_index = ObjectAtomOffsetIndex::new(table, out);
 
     // For each compact_unwind atom, find its first reloc.
     for id in &out.atoms {
@@ -437,22 +431,7 @@ fn link_unwind_parents(
         let Some(r) = fused.iter().find(|r| r.offset == record_start) else {
             continue;
         };
-        let parent = match r.referent {
-            Referent::Section(sect_idx) => {
-                // The 8-byte `function_start` field holds the target's
-                // in-section offset. For ARM64_RELOC_UNSIGNED, that byte
-                // window carries the addend directly.
-                if atom.data.len() >= 8 {
-                    let mut buf = [0u8; 8];
-                    buf.copy_from_slice(&atom.data[0..8]);
-                    let target_offset = u64::from_le_bytes(buf) as u32;
-                    atom_index.get(&(sect_idx, target_offset)).copied()
-                } else {
-                    None
-                }
-            }
-            Referent::Symbol(_) => None,
-        };
+        let parent = resolve_function_parent(obj, atom, *r, &atom_index, 0);
         if let Some(parent_id) = parent {
             table.get_mut(*id).parent_of = Some(parent_id);
         }
@@ -800,7 +779,7 @@ fn atomize_cstring(
             section: atom_section,
             input_offset: offset as u32,
             size,
-            align_pow2: sect.align_pow2 as u8,
+            align_pow2: atom_alignment_pow2(sect.align_pow2, offset as u32),
             owner: None,
             alt_entries: Vec::new(),
             data,
@@ -854,7 +833,7 @@ fn atomize_fixed_literal(
             section: atom_section,
             input_offset: offset as u32,
             size,
-            align_pow2: sect.align_pow2 as u8,
+            align_pow2: atom_alignment_pow2(sect.align_pow2, offset as u32),
             owner: None,
             alt_entries: Vec::new(),
             data,
@@ -902,7 +881,7 @@ fn atomize_compact_unwind(
             section: atom_section,
             input_offset: offset as u32,
             size,
-            align_pow2: sect.align_pow2 as u8,
+            align_pow2: atom_alignment_pow2(sect.align_pow2, offset as u32),
             owner: None,
             alt_entries: Vec::new(),
             data,
@@ -945,7 +924,7 @@ fn atomize_eh_frame(
             section: atom_section,
             input_offset: offset as u32,
             size: (end - offset) as u32,
-            align_pow2: (sect.align_pow2 as u8).min(2),
+            align_pow2: atom_alignment_pow2(sect.align_pow2.min(2), offset as u32),
             owner: None,
             alt_entries: Vec::new(),
             data: sect.data[offset..end].to_vec(),
@@ -984,7 +963,7 @@ fn resolve_function_parent(
     obj: &ObjectFile,
     atom: &Atom,
     reloc: crate::reloc::Reloc,
-    atom_index: &HashMap<(u8, u32), AtomId>,
+    atom_index: &ObjectAtomOffsetIndex,
     field_offset: usize,
 ) -> Option<AtomId> {
     match reloc.referent {
@@ -992,25 +971,96 @@ fn resolve_function_parent(
             let end = field_offset.checked_add(8)?;
             let mut buf = [0u8; 8];
             buf.copy_from_slice(atom.data.get(field_offset..end)?);
-            let target_offset = u64::from_le_bytes(buf) as u32;
-            atom_index.get(&(sect_idx, target_offset)).copied()
+            let target_offset = u32::try_from(u64::from_le_bytes(buf)).ok()?;
+            atom_index.find(sect_idx, target_offset)
         }
         Referent::Symbol(sym_idx) => {
             let input_sym = obj.symbols.get(sym_idx as usize)?;
             (input_sym.kind() == SymKind::Sect)
                 .then(|| {
-                    let target_offset = input_sym.value().saturating_sub(
-                        obj.sections
-                            .get(input_sym.sect_idx().saturating_sub(1) as usize)
-                            .map(|section| section.addr)
-                            .unwrap_or(0),
-                    ) as u32;
-                    atom_index
-                        .get(&(input_sym.sect_idx(), target_offset))
-                        .copied()
+                    let section = obj
+                        .sections
+                        .get(input_sym.sect_idx().saturating_sub(1) as usize)?;
+                    let target_offset =
+                        u32::try_from(input_sym.value().checked_sub(section.addr)?).ok()?;
+                    atom_index.find(input_sym.sect_idx(), target_offset)
                 })
                 .flatten()
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ObjectAtomRange {
+    id: AtomId,
+    start: u32,
+    end: u32,
+}
+
+impl ObjectAtomRange {
+    fn contains(self, offset: u32) -> bool {
+        self.start <= offset && offset < self.end
+    }
+}
+
+#[derive(Debug, Default)]
+struct ObjectSectionAtomIndex {
+    atoms: Vec<ObjectAtomRange>,
+    non_overlapping: bool,
+}
+
+/// Offset lookup for metadata references within one object.
+///
+/// Compiler-generated local function symbols need not split a text atom. A
+/// metadata relocation can therefore point inside an atom rather than at its
+/// first byte. Normal atomization is ordered and non-overlapping, giving a
+/// binary lookup; malformed overlaps retain a deterministic scan fallback.
+#[derive(Debug, Default)]
+struct ObjectAtomOffsetIndex {
+    sections: HashMap<u8, ObjectSectionAtomIndex>,
+}
+
+impl ObjectAtomOffsetIndex {
+    fn new(table: &AtomTable, out: &ObjectAtomization) -> Self {
+        let mut sections = HashMap::<u8, ObjectSectionAtomIndex>::new();
+        for id in &out.atoms {
+            let atom = table.get(*id);
+            sections
+                .entry(atom.input_section)
+                .or_default()
+                .atoms
+                .push(ObjectAtomRange {
+                    id: *id,
+                    start: atom.input_offset,
+                    end: atom.input_offset.saturating_add(atom.size),
+                });
+        }
+        for section in sections.values_mut() {
+            section
+                .atoms
+                .sort_by_key(|atom| (atom.start, atom.end, atom.id.0));
+            section.non_overlapping = section
+                .atoms
+                .windows(2)
+                .all(|pair| pair[0].end <= pair[1].start);
+        }
+        Self { sections }
+    }
+
+    fn find(&self, section_idx: u8, offset: u32) -> Option<AtomId> {
+        let section = self.sections.get(&section_idx)?;
+        if !section.non_overlapping {
+            return section
+                .atoms
+                .iter()
+                .find_map(|atom| atom.contains(offset).then_some(atom.id));
+        }
+        let candidate = section
+            .atoms
+            .partition_point(|atom| atom.start <= offset)
+            .checked_sub(1)?;
+        let atom = section.atoms.get(candidate)?;
+        atom.contains(offset).then_some(atom.id)
     }
 }
 
@@ -1039,11 +1089,7 @@ fn link_eh_frame_parents(
         Err(_) => return,
     };
 
-    let mut atom_index: HashMap<(u8, u32), AtomId> = HashMap::new();
-    for id in &out.atoms {
-        let a = table.get(*id);
-        atom_index.insert((a.input_section, a.input_offset), *id);
-    }
+    let atom_index = ObjectAtomOffsetIndex::new(table, out);
 
     for id in &out.atoms {
         let atom = table.get(*id);
@@ -1096,7 +1142,7 @@ fn atomize_zerofill(
             section: atom_section,
             input_offset: start,
             size,
-            align_pow2: sect.align_pow2 as u8,
+            align_pow2: atom_alignment_pow2(sect.align_pow2, start),
             owner: Some(SymbolId(*sym_idx as u32)),
             alt_entries: Vec::new(),
             data: Vec::new(), // zerofill
@@ -1128,7 +1174,7 @@ fn build_section_atom(
         section: atom_section,
         input_offset: 0,
         size: sect.size as u32,
-        align_pow2: sect.align_pow2 as u8,
+        align_pow2: atom_alignment_pow2(sect.align_pow2, 0),
         owner: None,
         alt_entries: Vec::new(),
         data,
@@ -1169,7 +1215,7 @@ fn build_slice_atom(
         section: atom_section,
         input_offset: offset,
         size,
-        align_pow2: sect.align_pow2 as u8,
+        align_pow2: atom_alignment_pow2(sect.align_pow2, offset),
         // owner is wired at back-patch time via `backpatch_symbol_atoms`;
         // atomization doesn't know the resolver-side SymbolId yet.
         owner: None,
@@ -1178,6 +1224,17 @@ fn build_slice_atom(
         flags,
         parent_of: None,
     }
+}
+
+fn atom_alignment_pow2(section_alignment_pow2: u32, input_offset: u32) -> u8 {
+    let offset_alignment_pow2 = if input_offset == 0 {
+        u32::MAX
+    } else {
+        input_offset.trailing_zeros()
+    };
+    section_alignment_pow2
+        .min(offset_alignment_pow2)
+        .min(u8::MAX as u32) as u8
 }
 
 fn section_atom_flags(sect: &InputSection) -> AtomFlags {
@@ -1276,6 +1333,16 @@ mod tests {
             flags: AtomFlags::default().with(AtomFlags::PURE_INSTRUCTIONS),
             parent_of: None,
         }
+    }
+
+    #[test]
+    fn split_atom_alignment_is_derived_from_its_section_offset() {
+        assert_eq!(atom_alignment_pow2(4, 0), 4);
+        assert_eq!(atom_alignment_pow2(4, 1), 0);
+        assert_eq!(atom_alignment_pow2(4, 4), 2);
+        assert_eq!(atom_alignment_pow2(4, 8), 3);
+        assert_eq!(atom_alignment_pow2(4, 16), 4);
+        assert_eq!(atom_alignment_pow2(2, 16), 2);
     }
 
     #[test]

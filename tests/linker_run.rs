@@ -1,5 +1,9 @@
 //! End-to-end `Linker::run` coverage for Sprint 10's newly wired pipeline.
 
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -17,24 +21,26 @@ use afs_ld::macho::constants::{
     BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB,
     BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB,
     BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, BIND_OPCODE_SET_TYPE_IMM,
-    BIND_SYMBOL_FLAGS_WEAK_IMPORT, CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64,
+    BIND_SYMBOL_FLAGS_WEAK_IMPORT, CPU_SUBTYPE_ARM64E, CPU_SUBTYPE_ARM64_ALL, CPU_SUBTYPE_ARM64_V8,
+    CPU_SUBTYPE_LIB64, CPU_TYPE_ARM64, DICE_KIND_DATA, DICE_KIND_JUMP_TABLE32,
     EXPORT_SYMBOL_FLAGS_REEXPORT, EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, INDIRECT_SYMBOL_ABS,
     INDIRECT_SYMBOL_LOCAL, LC_BUILD_VERSION, LC_DATA_IN_CODE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB,
-    LC_FUNCTION_STARTS, LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, MH_MAGIC_64,
-    MH_OBJECT, MH_SUBSECTIONS_VIA_SYMBOLS, N_ABS, N_ALT_ENTRY, N_EXT, N_INDR, N_PEXT, N_SECT,
-    N_UNDF, N_WEAK_REF, REBASE_IMMEDIATE_MASK, REBASE_OPCODE_ADD_ADDR_IMM_SCALED,
-    REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE, REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB,
-    REBASE_OPCODE_DO_REBASE_IMM_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES,
-    REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB, REBASE_OPCODE_MASK,
-    REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM, REBASE_TYPE_POINTER,
-    SECTION_TYPE_MASK, SG_READ_ONLY, S_ATTR_DEBUG, S_ATTR_PURE_INSTRUCTIONS,
-    S_ATTR_SOME_INSTRUCTIONS, S_REGULAR, S_ZEROFILL,
+    LC_FUNCTION_STARTS, LC_LINKER_OPTIMIZATION_HINT, LC_SEGMENT_64, LC_SYMTAB, MH_BINDS_TO_WEAK,
+    MH_MAGIC_64, MH_OBJECT, MH_SUBSECTIONS_VIA_SYMBOLS, MH_WEAK_DEFINES, N_ABS, N_ALT_ENTRY, N_EXT,
+    N_INDR, N_PEXT, N_SECT, N_UNDF, N_WEAK_DEF, N_WEAK_REF, REBASE_IMMEDIATE_MASK,
+    REBASE_OPCODE_ADD_ADDR_IMM_SCALED, REBASE_OPCODE_ADD_ADDR_ULEB, REBASE_OPCODE_DONE,
+    REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB, REBASE_OPCODE_DO_REBASE_IMM_TIMES,
+    REBASE_OPCODE_DO_REBASE_ULEB_TIMES, REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB,
+    REBASE_OPCODE_MASK, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, REBASE_OPCODE_SET_TYPE_IMM,
+    REBASE_TYPE_POINTER, SECTION_TYPE_MASK, SG_READ_ONLY, S_ATTR_DEBUG, S_ATTR_LIVE_SUPPORT,
+    S_ATTR_NO_TOC, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS, S_ATTR_STRIP_STATIC_SYMS,
+    S_COALESCED, S_CSTRING_LITERALS, S_REGULAR, S_ZEROFILL,
 };
 use afs_ld::macho::dylib::DylibFile;
-use afs_ld::macho::exports::{ExportKind, Exports};
+use afs_ld::macho::exports::Exports;
 use afs_ld::macho::reader::{
-    parse_commands, parse_header, u32_le, write_header, LoadCommand, MachHeader64, Section64Header,
-    Segment64, SymtabCmd, HEADER_SIZE,
+    parse_commands, parse_header, u32_le, write_header, LinkEditDataCmd, LoadCommand, MachHeader64,
+    Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
 };
 use afs_ld::reloc::{
     parse_raw_relocs, parse_relocs, write_raw_relocs, write_relocs, Referent, Reloc, RelocKind,
@@ -43,9 +49,11 @@ use afs_ld::reloc::{
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, RawNlist, SymKind, NLIST_SIZE};
 use afs_ld::synth::unwind::decode_unwind_info;
-use afs_ld::{FrameworkSpec, LinkError, LinkOptions, Linker, OutputKind};
+use afs_ld::{FrameworkSpec, IcfMode, LinkError, LinkOptions, Linker, OutputKind};
 use common::artifacts::workspace_artifact;
-use common::harness::{compare_sections, diff_macho};
+use common::harness::{
+    canonical_export_records, compare_sections, diff_macho, CanonicalExportKind,
+};
 
 fn have_xcrun() -> bool {
     Command::new("xcrun")
@@ -197,11 +205,190 @@ fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-linker-run-{}-{name}", std::process::id()))
 }
 
+fn with_cpu_subtype(mut object: Vec<u8>, cpu_subtype: u32) -> Vec<u8> {
+    object[8..12].copy_from_slice(&cpu_subtype.to_le_bytes());
+    object
+}
+
+fn append_archive_field(archive: &mut Vec<u8>, value: &str, width: usize) {
+    assert!(value.len() <= width);
+    archive.extend_from_slice(value.as_bytes());
+    archive.resize(archive.len() + width - value.len(), b' ');
+}
+
+fn synthetic_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = b"!<arch>\n".to_vec();
+    for (name, body) in members {
+        append_archive_field(&mut archive, &format!("{name}/"), 16);
+        append_archive_field(&mut archive, "0", 12);
+        append_archive_field(&mut archive, "0", 6);
+        append_archive_field(&mut archive, "0", 6);
+        append_archive_field(&mut archive, "100644", 8);
+        append_archive_field(&mut archive, &body.len().to_string(), 10);
+        archive.extend_from_slice(b"`\n");
+        archive.extend_from_slice(body);
+        if body.len() % 2 != 0 {
+            archive.push(b'\n');
+        }
+    }
+    archive
+}
+
 fn name16(name: &str) -> [u8; 16] {
     assert!(name.len() <= 16);
     let mut out = [0; 16];
     out[..name.len()].copy_from_slice(name.as_bytes());
     out
+}
+
+fn synthetic_single_section_object(
+    segment_name: &str,
+    section_name: &str,
+    section_flags: u32,
+    data: &[u8],
+    relocs: &[Reloc],
+    symbols: &[(&str, u8, u8, u16, u64)],
+) -> Vec<u8> {
+    let raw_relocs = write_relocs(relocs).unwrap();
+    let mut reloc_bytes = Vec::new();
+    write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+
+    let mut strings = vec![0];
+    let symbols: Vec<RawNlist> = symbols
+        .iter()
+        .map(|&(name, n_type, n_sect, n_desc, n_value)| {
+            let strx = strings.len() as u32;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            RawNlist {
+                strx,
+                n_type,
+                n_sect,
+                n_desc,
+                n_value,
+            }
+        })
+        .collect();
+
+    let mut segment = Segment64 {
+        segname: [0; 16],
+        vmaddr: 0,
+        vmsize: data.len() as u64,
+        fileoff: 0,
+        filesize: data.len() as u64,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16(section_name),
+            segname: name16(segment_name),
+            addr: 0,
+            size: data.len() as u64,
+            offset: 0,
+            align: 3,
+            reloff: 0,
+            nreloc: raw_relocs.len() as u32,
+            flags: section_flags,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    segment.sections[0].reloff = data_offset + data.len() as u32;
+    let symoff = segment.sections[0].reloff + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(data);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_icf_const_object(symbol: &str) -> Vec<u8> {
+    synthetic_single_section_object(
+        "__TEXT",
+        "__const",
+        S_REGULAR,
+        &0x1122_3344_5566_7788u64.to_le_bytes(),
+        &[],
+        &[(symbol, N_SECT | N_EXT | N_PEXT, 1, 0, 0)],
+    )
+}
+
+fn synthetic_local_symbol_collision_reference_object() -> Vec<u8> {
+    let mut data = 0u64.to_le_bytes().to_vec();
+    data.extend_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+    synthetic_single_section_object(
+        "__DATA",
+        "__localref",
+        S_REGULAR,
+        &data,
+        &[Reloc {
+            offset: 0,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(0),
+            addend: 0,
+            subtrahend: None,
+        }],
+        &[
+            ("_same", N_SECT, 1, 0, 8),
+            ("_local_pointer", N_SECT | N_EXT, 1, 0, 0),
+        ],
+    )
+}
+
+fn synthetic_subtractor_difference_object(minuend: &str, subtrahend: &str) -> Vec<u8> {
+    synthetic_single_section_object(
+        "__DATA",
+        "__data",
+        S_REGULAR,
+        &[0; 8],
+        &[Reloc {
+            offset: 0,
+            kind: RelocKind::Subtractor,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(2),
+            addend: 0,
+            subtrahend: Some(Referent::Symbol(1)),
+        }],
+        &[
+            ("_difference", N_SECT | N_EXT, 1, 0, 0),
+            (subtrahend, N_UNDF | N_EXT, 0, 0, 0),
+            (minuend, N_UNDF | N_EXT, 0, 0, 0),
+        ],
+    )
 }
 
 fn synthetic_got_reference_object(entry: &str, target: &str, weak_ref: bool) -> Vec<u8> {
@@ -324,6 +511,10 @@ fn synthetic_got_reference_object(entry: &str, target: &str, weak_ref: bool) -> 
 
 fn synthetic_absolute_reference_object(entry: &str, target: &str) -> Vec<u8> {
     synthetic_data_reference_object(entry, target, RelocKind::Unsigned, RelocLength::Quad, false)
+}
+
+fn synthetic_unsigned_word_reference_object(entry: &str, target: &str) -> Vec<u8> {
+    synthetic_data_reference_object(entry, target, RelocKind::Unsigned, RelocLength::Word, false)
 }
 
 fn synthetic_pointer_to_got_reference_object(
@@ -725,6 +916,227 @@ fn synthetic_icf_section_reference_object(symbol: &str, data_value: u64) -> Vec<
     bytes
 }
 
+fn synthetic_icf_local_literal_pointer_object() -> Vec<u8> {
+    let mut pointers = 0u64.to_le_bytes().to_vec();
+    pointers.extend_from_slice(&4u64.to_le_bytes());
+    let cstrings = b"dup\0dup\0";
+    let relocs = [
+        Reloc {
+            offset: 0,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Section(2),
+            addend: 0,
+            subtrahend: None,
+        },
+        Reloc {
+            offset: 8,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Section(2),
+            addend: 0,
+            subtrahend: None,
+        },
+    ];
+    let raw_relocs = write_relocs(&relocs).unwrap();
+    let mut reloc_bytes = Vec::new();
+    write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+
+    let strings = b"\0_pointers\0";
+    let symbols = [RawNlist {
+        strx: 1,
+        n_type: N_SECT | N_EXT,
+        n_sect: 1,
+        n_desc: 0,
+        n_value: 0,
+    }];
+    let mut segment = Segment64 {
+        segname: [0; 16],
+        vmaddr: 0,
+        vmsize: (pointers.len() + cstrings.len()) as u64,
+        fileoff: 0,
+        filesize: (pointers.len() + cstrings.len()) as u64,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections: vec![
+            Section64Header {
+                sectname: name16("__const"),
+                segname: name16("__DATA"),
+                addr: 0,
+                size: pointers.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: raw_relocs.len() as u32,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+            Section64Header {
+                sectname: name16("__cstring"),
+                segname: name16("__TEXT"),
+                addr: pointers.len() as u64,
+                size: cstrings.len() as u64,
+                offset: 0,
+                align: 0,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_CSTRING_LITERALS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+        ],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    segment.sections[1].offset = data_offset + pointers.len() as u32;
+    segment.sections[0].reloff = data_offset + pointers.len() as u32 + cstrings.len() as u32;
+    let symoff = segment.sections[0].reloff + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&pointers);
+    bytes.extend_from_slice(cstrings);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(strings);
+    bytes
+}
+
+fn synthetic_icf_const_domains_object(first_segment: &str, second_segment: &str) -> Vec<u8> {
+    let value = 0x1122_3344_5566_7788u64.to_le_bytes();
+
+    let mut strings = vec![0];
+    let first_strx = strings.len() as u32;
+    strings.extend_from_slice(b"_first_const\0");
+    let second_strx = strings.len() as u32;
+    strings.extend_from_slice(b"_second_const\0");
+    let symbols = [
+        RawNlist {
+            strx: first_strx,
+            n_type: N_SECT | N_EXT | N_PEXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: second_strx,
+            n_type: N_SECT | N_EXT | N_PEXT,
+            n_sect: 2,
+            n_desc: 0,
+            n_value: value.len() as u64,
+        },
+    ];
+
+    let mut segment = Segment64 {
+        segname: [0; 16],
+        vmaddr: 0,
+        vmsize: (value.len() * 2) as u64,
+        fileoff: 0,
+        filesize: (value.len() * 2) as u64,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections: vec![
+            Section64Header {
+                sectname: name16("__const"),
+                segname: name16(first_segment),
+                addr: 0,
+                size: value.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+            Section64Header {
+                sectname: name16("__const"),
+                segname: name16(second_segment),
+                addr: value.len() as u64,
+                size: value.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_REGULAR,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+        ],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    segment.sections[1].offset = data_offset + value.len() as u32;
+    let symoff = data_offset + (value.len() * 2) as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&value);
+    bytes.extend_from_slice(&value);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
 #[derive(Clone, Copy)]
 enum SyntheticAliasEncoding {
     Indirect,
@@ -894,6 +1306,379 @@ fn synthetic_defined_alias_object(
     bytes
 }
 
+#[derive(Clone, Copy)]
+enum SyntheticUnwindReferent {
+    Direct,
+    IndirectAlias,
+}
+
+fn synthetic_compact_unwind_alias_object(
+    unwind_referent: Option<SyntheticUnwindReferent>,
+) -> Vec<u8> {
+    let text = [
+        0x00, 0x00, 0x80, 0x52, // _main: mov w0, #0
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+    let mut strings = vec![0];
+    let mut add_string = |name: &str| {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        strx
+    };
+    let main_strx = add_string("_main");
+    let alias_strx = add_string("_alias");
+    let symbols = [
+        RawNlist {
+            strx: main_strx,
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: alias_strx,
+            n_type: N_INDR | N_EXT,
+            n_sect: 0,
+            n_desc: 0,
+            n_value: main_strx as u64,
+        },
+    ];
+
+    let mut compact_unwind = Vec::new();
+    let mut reloc_bytes = Vec::new();
+    if let Some(referent) = unwind_referent {
+        compact_unwind.resize(32, 0);
+        compact_unwind[8..12].copy_from_slice(&(text.len() as u32).to_le_bytes());
+        compact_unwind[12..16].copy_from_slice(&0x0200_0000u32.to_le_bytes());
+        let raw_relocs = write_relocs(&[Reloc {
+            offset: 0,
+            kind: RelocKind::Unsigned,
+            length: RelocLength::Quad,
+            pcrel: false,
+            referent: Referent::Symbol(match referent {
+                SyntheticUnwindReferent::Direct => 0,
+                SyntheticUnwindReferent::IndirectAlias => 1,
+            }),
+            addend: 0,
+            subtrahend: None,
+        }])
+        .unwrap();
+        write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+    }
+
+    let mut sections = vec![Section64Header {
+        sectname: name16("__text"),
+        segname: name16("__TEXT"),
+        addr: 0,
+        size: text.len() as u64,
+        offset: 0,
+        align: 2,
+        reloff: 0,
+        nreloc: 0,
+        flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+        reserved1: 0,
+        reserved2: 0,
+        reserved3: 0,
+    }];
+    if unwind_referent.is_some() {
+        sections.push(Section64Header {
+            sectname: name16("__compact_unwind"),
+            segname: name16("__LD"),
+            addr: text.len() as u64,
+            size: compact_unwind.len() as u64,
+            offset: 0,
+            align: 3,
+            reloff: 0,
+            nreloc: 1,
+            flags: S_REGULAR | S_ATTR_DEBUG,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        });
+    }
+
+    let data_size = text.len() + compact_unwind.len();
+    let mut segment = Segment64 {
+        segname: name16(""),
+        vmaddr: 0,
+        vmsize: data_size as u64,
+        fileoff: 0,
+        filesize: data_size as u64,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections,
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    if unwind_referent.is_some() {
+        segment.sections[1].offset = data_offset + text.len() as u32;
+        segment.sections[1].reloff = data_offset + data_size as u32;
+    }
+    let symoff = data_offset + data_size as u32 + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&compact_unwind);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_dwarf_unwind_object() -> Vec<u8> {
+    synthetic_dwarf_unwind_object_for(8, &[("_main", 0, true)], &[(0, 8)])
+}
+
+fn synthetic_nested_local_dwarf_unwind_object() -> Vec<u8> {
+    synthetic_dwarf_unwind_object_for(
+        24,
+        &[
+            ("L_local_one", 8, false),
+            ("L_local_two", 16, false),
+            ("_main", 0, true),
+        ],
+        &[(0, 8), (1, 8)],
+    )
+}
+
+/// Build LLVM-shaped compact-unwind and CFI records. `unwind_functions`
+/// indexes `text_symbols`, allowing local function entries to live inside a
+/// larger atom owned by an external symbol at a different offset.
+fn synthetic_dwarf_unwind_object_for(
+    text_len: usize,
+    text_symbols: &[(&str, u64, bool)],
+    unwind_functions: &[(usize, u32)],
+) -> Vec<u8> {
+    assert!(text_len >= 4 && text_len.is_multiple_of(4));
+    let mut text = [0x1f, 0x20, 0x03, 0xd5].repeat(text_len / 4);
+    text[text_len - 4..].copy_from_slice(&[0xc0, 0x03, 0x5f, 0xd6]);
+
+    let mut compact_unwind = vec![0u8; 32 * unwind_functions.len()];
+    for (record_index, (_, code_len)) in unwind_functions.iter().enumerate() {
+        let record = &mut compact_unwind[record_index * 32..(record_index + 1) * 32];
+        record[8..12].copy_from_slice(&code_len.to_le_bytes());
+        record[12..16].copy_from_slice(&0x0300_0000u32.to_le_bytes());
+    }
+
+    // Canonical CIE/FDE shape emitted by LLVM's Mach-O assembler for arm64
+    // functions whose CFI cannot be represented compactly.
+    let mut eh_frame = vec![
+        0x10, 0x00, 0x00, 0x00, // CIE payload length
+        0x00, 0x00, 0x00, 0x00, // CIE id
+        0x01, 0x7a, 0x52, 0x00, // version 1, augmentation "zR"
+        0x01, 0x78, 0x1e, 0x01, // code/data alignment, return register, aug len
+        0x10, 0x0c, 0x1f, 0x00, // pcrel pointer encoding, CFA=WSP
+    ];
+    let mut fde_field_offsets = Vec::with_capacity(unwind_functions.len());
+    for (_, code_len) in unwind_functions {
+        let fde_offset = eh_frame.len() as u32;
+        eh_frame.extend_from_slice(&0x18u32.to_le_bytes());
+        eh_frame.extend_from_slice(&(fde_offset + 4).to_le_bytes());
+        let field_offset = fde_offset + 8;
+        eh_frame.extend_from_slice(&(-i64::from(field_offset)).to_le_bytes());
+        eh_frame.extend_from_slice(&u64::from(*code_len).to_le_bytes());
+        eh_frame.extend_from_slice(&[0x00, 0x0f, 0x01, 0x9c]);
+        fde_field_offsets.push(field_offset);
+    }
+
+    let compact_relocs = write_relocs(
+        &unwind_functions
+            .iter()
+            .enumerate()
+            .map(|(record_index, (symbol_index, _))| {
+                assert!(*symbol_index < text_symbols.len());
+                Reloc {
+                    offset: (record_index * 32) as u32,
+                    kind: RelocKind::Unsigned,
+                    length: RelocLength::Quad,
+                    pcrel: false,
+                    referent: Referent::Symbol((*symbol_index + 1) as u32),
+                    addend: 0,
+                    subtrahend: None,
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let mut compact_reloc_bytes = Vec::new();
+    write_raw_relocs(&compact_relocs, &mut compact_reloc_bytes);
+
+    let mut strings = vec![0];
+    let mut add_string = |name: &str| {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        strx
+    };
+    let eh_base_strx = add_string("L_eh_base");
+    let text_symbol_strx: Vec<u32> = text_symbols
+        .iter()
+        .map(|(name, _, _)| add_string(name))
+        .collect();
+    let eh_frame_addr = (text.len() + compact_unwind.len()) as u64;
+    let mut symbols = vec![RawNlist {
+        strx: eh_base_strx,
+        n_type: N_SECT,
+        n_sect: 3,
+        n_desc: 0,
+        n_value: eh_frame_addr,
+    }];
+    symbols.extend(text_symbols.iter().zip(text_symbol_strx).map(
+        |((_, value, external), strx)| RawNlist {
+            strx,
+            n_type: N_SECT | if *external { N_EXT } else { 0 },
+            n_sect: 1,
+            n_desc: 0,
+            n_value: *value,
+        },
+    ));
+    let eh_frame_relocs = write_relocs(
+        &unwind_functions
+            .iter()
+            .zip(fde_field_offsets)
+            .map(|((symbol_index, _), field_offset)| Reloc {
+                offset: field_offset,
+                kind: RelocKind::Subtractor,
+                length: RelocLength::Quad,
+                pcrel: false,
+                referent: Referent::Symbol((*symbol_index + 1) as u32),
+                addend: 0,
+                subtrahend: Some(Referent::Symbol(0)),
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let mut eh_frame_reloc_bytes = Vec::new();
+    write_raw_relocs(&eh_frame_relocs, &mut eh_frame_reloc_bytes);
+
+    let data_size = text.len() + compact_unwind.len() + eh_frame.len();
+    let mut segment = Segment64 {
+        segname: name16(""),
+        vmaddr: 0,
+        vmsize: data_size as u64,
+        fileoff: 0,
+        filesize: data_size as u64,
+        maxprot: 7,
+        initprot: 7,
+        flags: 0,
+        sections: vec![
+            Section64Header {
+                sectname: name16("__text"),
+                segname: name16("__TEXT"),
+                addr: 0,
+                size: text.len() as u64,
+                offset: 0,
+                align: 2,
+                reloff: 0,
+                nreloc: 0,
+                flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+            Section64Header {
+                sectname: name16("__compact_unwind"),
+                segname: name16("__LD"),
+                addr: text.len() as u64,
+                size: compact_unwind.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: compact_relocs.len() as u32,
+                flags: S_REGULAR | S_ATTR_DEBUG,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+            Section64Header {
+                sectname: name16("__eh_frame"),
+                segname: name16("__TEXT"),
+                addr: eh_frame_addr,
+                size: eh_frame.len() as u64,
+                offset: 0,
+                align: 3,
+                reloff: 0,
+                nreloc: eh_frame_relocs.len() as u32,
+                flags: S_COALESCED | S_ATTR_LIVE_SUPPORT | S_ATTR_NO_TOC | S_ATTR_STRIP_STATIC_SYMS,
+                reserved1: 0,
+                reserved2: 0,
+                reserved3: 0,
+            },
+        ],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = data_offset as u64;
+    segment.sections[0].offset = data_offset;
+    segment.sections[1].offset = data_offset + text.len() as u32;
+    segment.sections[2].offset = data_offset + eh_frame_addr as u32;
+    segment.sections[1].reloff = data_offset + data_size as u32;
+    segment.sections[2].reloff = segment.sections[1].reloff + compact_reloc_bytes.len() as u32;
+    let symoff = segment.sections[2].reloff + eh_frame_reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&compact_unwind);
+    bytes.extend_from_slice(&eh_frame);
+    bytes.extend_from_slice(&compact_reloc_bytes);
+    bytes.extend_from_slice(&eh_frame_reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
 fn synthetic_same_address_entry_alias_object() -> Vec<u8> {
     let text = [
         SAME_ADDRESS_ENTRY_CODE.as_slice(),
@@ -1013,6 +1798,10 @@ fn synthetic_alias_object(alias: &str, target: &str, private_alias: bool) -> Vec
 }
 
 fn synthetic_absolute_object(name: &str, value: u64) -> Vec<u8> {
+    synthetic_absolute_object_with_desc(name, value, 0)
+}
+
+fn synthetic_absolute_object_with_desc(name: &str, value: u64, n_desc: u16) -> Vec<u8> {
     let mut strings = vec![0];
     let strx = strings.len() as u32;
     strings.extend_from_slice(name.as_bytes());
@@ -1021,7 +1810,7 @@ fn synthetic_absolute_object(name: &str, value: u64) -> Vec<u8> {
         strx,
         n_type: N_ABS | N_EXT,
         n_sect: 0,
-        n_desc: 0,
+        n_desc,
         n_value: value,
     };
     synthetic_atomless_object(strings, &[symbol])
@@ -1072,6 +1861,323 @@ fn synthetic_atomless_object(strings: Vec<u8>, symbols: &[RawNlist]) -> Vec<u8> 
     bytes
 }
 
+fn synthetic_aligned_subsections_object() -> Vec<u8> {
+    const RET: [u8; 4] = [0xc0, 0x03, 0x5f, 0xd6];
+    const ASSEMBLER_RESOLVED_DELTA: u64 = 4;
+
+    let mut text = Vec::with_capacity(16);
+    text.extend_from_slice(&RET);
+    text.extend_from_slice(&RET);
+    text.extend_from_slice(&ASSEMBLER_RESOLVED_DELTA.to_le_bytes());
+
+    let mut strings = vec![0];
+    let mut add_string = |name: &str| {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        strx
+    };
+    let symbols = [
+        RawNlist {
+            strx: add_string("_a"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: add_string("_b"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: RET.len() as u64,
+        },
+    ];
+
+    let mut segment = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: 0,
+        vmsize: text.len() as u64,
+        fileoff: 0,
+        filesize: text.len() as u64,
+        maxprot: 5,
+        initprot: 5,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: 0,
+            size: text.len() as u64,
+            offset: 0,
+            align: 4,
+            reloff: 0,
+            nreloc: 0,
+            flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = u64::from(data_offset);
+    segment.sections[0].offset = data_offset;
+    let symoff = data_offset + text.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_data_in_code_object(
+    symbol_name: &str,
+    section_name: &str,
+    section_addr: u32,
+    kind: u16,
+    private_extern: bool,
+) -> Vec<u8> {
+    const RET: [u8; 4] = [0xc0, 0x03, 0x5f, 0xd6];
+    const TABLE: [u8; 4] = [0, 0, 0, 0];
+
+    let text = [RET.as_slice(), TABLE.as_slice(), RET.as_slice()].concat();
+    let mut strings = vec![0];
+    strings.extend_from_slice(symbol_name.as_bytes());
+    strings.push(0);
+    let symbol = RawNlist {
+        strx: 1,
+        n_type: N_SECT | N_EXT | if private_extern { N_PEXT } else { 0 },
+        n_sect: 1,
+        n_desc: 0,
+        n_value: u64::from(section_addr),
+    };
+    let mut segment = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: u64::from(section_addr),
+        vmsize: text.len() as u64,
+        fileoff: 0,
+        filesize: text.len() as u64,
+        maxprot: 5,
+        initprot: 5,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16(section_name),
+            segname: name16("__TEXT"),
+            addr: u64::from(section_addr),
+            size: text.len() as u64,
+            offset: 0,
+            align: 2,
+            reloff: 0,
+            nreloc: 0,
+            flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + LinkEditDataCmd::WIRE_SIZE + SymtabCmd::WIRE_SIZE;
+    let text_offset = HEADER_SIZE as u32 + sizeofcmds;
+    let data_in_code_offset = text_offset + text.len() as u32;
+    let symoff = data_in_code_offset + 8;
+    let stroff = symoff + NLIST_SIZE as u32;
+    segment.fileoff = u64::from(text_offset);
+    segment.sections[0].offset = text_offset;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 3,
+            sizeofcmds,
+            flags: MH_SUBSECTIONS_VIA_SYMBOLS,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    LinkEditDataCmd {
+        dataoff: data_in_code_offset,
+        datasize: 8,
+    }
+    .write(LC_DATA_IN_CODE, &mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: 1,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&(section_addr + RET.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&(TABLE.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(&kind.to_le_bytes());
+    symbol.write(&mut bytes);
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_branch_addend_object() -> Vec<u8> {
+    const BL: [u8; 4] = 0x9400_0000u32.to_le_bytes();
+    const RET: [u8; 4] = 0xd65f_03c0u32.to_le_bytes();
+
+    let mut text = Vec::with_capacity(28);
+    text.extend_from_slice(&BL);
+    text.extend_from_slice(&BL);
+    text.extend_from_slice(&BL);
+    text.extend_from_slice(&RET);
+    text.extend_from_slice(&RET);
+    let target_offset = text.len() as u64;
+    text.extend_from_slice(&RET);
+    text.extend_from_slice(&RET);
+
+    let relocs = [
+        Reloc {
+            offset: 0,
+            kind: RelocKind::Branch26,
+            length: RelocLength::Word,
+            pcrel: true,
+            referent: Referent::Symbol(1),
+            addend: 4,
+            subtrahend: None,
+        },
+        Reloc {
+            offset: 4,
+            kind: RelocKind::Branch26,
+            length: RelocLength::Word,
+            pcrel: true,
+            referent: Referent::Symbol(1),
+            addend: -4,
+            subtrahend: None,
+        },
+        Reloc {
+            offset: 8,
+            kind: RelocKind::Branch26,
+            length: RelocLength::Word,
+            pcrel: true,
+            referent: Referent::Symbol(1),
+            addend: 4,
+            subtrahend: None,
+        },
+    ];
+    let raw_relocs = write_relocs(&relocs).unwrap();
+    let mut reloc_bytes = Vec::new();
+    write_raw_relocs(&raw_relocs, &mut reloc_bytes);
+
+    let mut strings = vec![0];
+    let mut add_string = |name: &str| {
+        let strx = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+        strx
+    };
+    let symbols = [
+        RawNlist {
+            strx: add_string("_main"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: 0,
+        },
+        RawNlist {
+            strx: add_string("_target"),
+            n_type: N_SECT | N_EXT,
+            n_sect: 1,
+            n_desc: 0,
+            n_value: target_offset,
+        },
+    ];
+
+    let mut segment = Segment64 {
+        segname: name16("__TEXT"),
+        vmaddr: 0,
+        vmsize: text.len() as u64,
+        fileoff: 0,
+        filesize: text.len() as u64,
+        maxprot: 5,
+        initprot: 5,
+        flags: 0,
+        sections: vec![Section64Header {
+            sectname: name16("__text"),
+            segname: name16("__TEXT"),
+            addr: 0,
+            size: text.len() as u64,
+            offset: 0,
+            align: 2,
+            reloff: 0,
+            nreloc: raw_relocs.len() as u32,
+            flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        }],
+    };
+    let sizeofcmds = segment.wire_size() + SymtabCmd::WIRE_SIZE;
+    let data_offset = HEADER_SIZE as u32 + sizeofcmds;
+    segment.fileoff = u64::from(data_offset);
+    segment.sections[0].offset = data_offset;
+    segment.sections[0].reloff = data_offset + text.len() as u32;
+    let symoff = segment.sections[0].reloff + reloc_bytes.len() as u32;
+    let stroff = symoff + (symbols.len() * NLIST_SIZE) as u32;
+
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_OBJECT,
+            ncmds: 2,
+            sizeofcmds,
+            flags: 0,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    segment.write(&mut bytes);
+    SymtabCmd {
+        symoff,
+        nsyms: symbols.len() as u32,
+        stroff,
+        strsize: strings.len() as u32,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&reloc_bytes);
+    for symbol in symbols {
+        symbol.write(&mut bytes);
+    }
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
 fn output_section(bytes: &[u8], segname: &str, sectname: &str) -> Option<(u64, Vec<u8>)> {
     let header = parse_header(bytes).ok()?;
     let commands = parse_commands(&header, bytes).ok()?;
@@ -1092,6 +2198,31 @@ fn output_section(bytes: &[u8], segname: &str, sectname: &str) -> Option<(u64, V
         }
     }
     None
+}
+
+fn eh_frame_fde_offsets(bytes: &[u8]) -> Vec<u32> {
+    let mut offsets = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let length_bytes: [u8; 4] = bytes
+            .get(offset..offset + 4)
+            .expect("truncated DWARF record length")
+            .try_into()
+            .unwrap();
+        let length = u32::from_le_bytes(length_bytes);
+        assert_ne!(length, u32::MAX, "DWARF64 records are outside this fixture");
+        if length == 0 {
+            break;
+        }
+        let end = offset + 4 + length as usize;
+        assert!(end <= bytes.len(), "DWARF record overruns __eh_frame");
+        let cie_pointer = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        if cie_pointer != 0 {
+            offsets.push(offset as u32);
+        }
+        offset = end;
+    }
+    offsets
 }
 
 fn output_sections(bytes: &[u8], segname: &str, sectname: &str) -> Vec<(u64, Vec<u8>)> {
@@ -1322,66 +2453,6 @@ fn assert_same_address_entry_alias_output(bytes: &[u8]) {
         })
         .expect("LC_MAIN");
     assert_eq!(entryoff, u64::from(text.offset));
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CanonicalExportKind {
-    Regular(u64),
-    ThreadLocal(u64),
-    Absolute(u64),
-    Reexport { ordinal: u32, imported_name: String },
-    StubAndResolver { stub: u64, resolver: u64 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CanonicalExportRecord {
-    name: String,
-    flags: u64,
-    kind: CanonicalExportKind,
-}
-
-fn canonical_export_records(bytes: &[u8]) -> Vec<CanonicalExportRecord> {
-    let dylib = DylibFile::parse("/tmp/canonical.dylib", bytes).unwrap();
-    let symbol_values: HashMap<String, u64> = canonical_symbol_records(bytes)
-        .into_iter()
-        .map(|record| (record.name, record.value))
-        .collect();
-    let mut out = dylib
-        .exports
-        .entries()
-        .unwrap()
-        .into_iter()
-        .map(|entry| {
-            let kind = match entry.kind {
-                ExportKind::Regular { .. } => {
-                    CanonicalExportKind::Regular(*symbol_values.get(&entry.name).unwrap())
-                }
-                ExportKind::ThreadLocal { .. } => {
-                    CanonicalExportKind::ThreadLocal(*symbol_values.get(&entry.name).unwrap())
-                }
-                ExportKind::Absolute { .. } => {
-                    CanonicalExportKind::Absolute(*symbol_values.get(&entry.name).unwrap())
-                }
-                ExportKind::Reexport {
-                    ordinal,
-                    imported_name,
-                } => CanonicalExportKind::Reexport {
-                    ordinal,
-                    imported_name,
-                },
-                ExportKind::StubAndResolver { stub, resolver } => {
-                    CanonicalExportKind::StubAndResolver { stub, resolver }
-                }
-            };
-            CanonicalExportRecord {
-                name: entry.name,
-                flags: entry.flags,
-                kind,
-            }
-        })
-        .collect::<Vec<_>>();
-    out.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
-    out
 }
 
 fn dyld_info_export_names(bytes: &[u8]) -> Result<Vec<String>, String> {
@@ -1707,18 +2778,6 @@ fn decode_data_in_code(bytes: &[u8]) -> Vec<DataInCodeRecord> {
             offset: u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
             length: u16::from_le_bytes(chunk[4..6].try_into().unwrap()),
             kind: u16::from_le_bytes(chunk[6..8].try_into().unwrap()),
-        })
-        .collect()
-}
-
-fn canonical_data_in_code(bytes: &[u8]) -> Vec<DataInCodeRecord> {
-    let text = output_section_header(bytes, "__TEXT", "__text").unwrap();
-    decode_data_in_code(bytes)
-        .into_iter()
-        .map(|record| DataInCodeRecord {
-            offset: record.offset - text.offset,
-            length: record.length,
-            kind: record.kind,
         })
         .collect()
 }
@@ -2444,12 +3503,14 @@ fn assert_dylib_export_case_matches_apple_ld(
 
     let our_bytes = fs::read(&our_out).map_err(|e| format!("read our output: {e}"))?;
     let apple_bytes = fs::read(&apple_out).map_err(|e| format!("read apple output: {e}"))?;
-    if canonical_export_records(&our_bytes) != canonical_export_records(&apple_bytes) {
+    let our_exports = canonical_export_records(&our_bytes)
+        .map_err(|error| format!("{}: invalid afs-ld exports: {error}", case.name))?;
+    let apple_exports = canonical_export_records(&apple_bytes)
+        .map_err(|error| format!("{}: invalid Apple ld exports: {error}", case.name))?;
+    if our_exports != apple_exports {
         return Err(format!(
             "{}: canonical export records diverged:\nours={:#?}\napple={:#?}",
-            case.name,
-            canonical_export_records(&our_bytes),
-            canonical_export_records(&apple_bytes)
+            case.name, our_exports, apple_exports
         ));
     }
     if dyld_info_stream(&our_bytes, DyldInfoStreamKind::WeakBind)
@@ -2816,17 +3877,313 @@ fn sign_extend_26(value: i64) -> i64 {
 }
 
 #[test]
+fn linker_run_preserves_arm64e_cpu_subtype_and_capabilities_deterministically() {
+    const ARM64E_PTRAUTH_ABI_V0: u32 = 0x8000_0002;
+    const ABSOLUTE_VALUE: u64 = 0x1234_5678_9abc_def0;
+
+    let reference = scratch("arm64e-subtype-reference.o");
+    let definition = scratch("arm64e-subtype-definition.o");
+    let out = scratch("arm64e-subtype.out");
+    fs::write(
+        &reference,
+        with_cpu_subtype(
+            synthetic_got_reference_object("_main", "_absolute", false),
+            ARM64E_PTRAUTH_ABI_V0,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        with_cpu_subtype(
+            synthetic_absolute_object("_absolute", ABSOLUTE_VALUE),
+            ARM64E_PTRAUTH_ABI_V0,
+        ),
+    )
+    .unwrap();
+
+    let _ = fs::remove_file(&out);
+    let mut outputs = Vec::new();
+    for _ in 0..2 {
+        Linker::run(&LinkOptions {
+            inputs: vec![reference.clone(), definition.clone()],
+            output: Some(out.clone()),
+            arch: Some("arm64".into()),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        outputs.push(fs::read(&out).unwrap());
+    }
+
+    assert_eq!(
+        parse_header(&outputs[0]).unwrap().cpusubtype,
+        ARM64E_PTRAUTH_ABI_V0
+    );
+    assert_eq!(
+        outputs[0], outputs[1],
+        "repeated ARM64e links must be byte-identical"
+    );
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_preserves_other_defined_arm64_subtypes() {
+    for cpu_subtype in [
+        CPU_SUBTYPE_ARM64_V8,
+        CPU_SUBTYPE_LIB64,
+        CPU_SUBTYPE_ARM64_V8 | CPU_SUBTYPE_LIB64,
+    ] {
+        let reference = scratch(&format!("arm64-subtype-{cpu_subtype:08x}-reference.o"));
+        let definition = scratch(&format!("arm64-subtype-{cpu_subtype:08x}-definition.o"));
+        let out = scratch(&format!("arm64-subtype-{cpu_subtype:08x}.out"));
+        fs::write(
+            &reference,
+            with_cpu_subtype(
+                synthetic_got_reference_object("_main", "_absolute", false),
+                cpu_subtype,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &definition,
+            with_cpu_subtype(synthetic_absolute_object("_absolute", 42), cpu_subtype),
+        )
+        .unwrap();
+
+        let _ = fs::remove_file(&out);
+        Linker::run(&LinkOptions {
+            inputs: vec![reference.clone(), definition.clone()],
+            output: Some(out.clone()),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        assert_eq!(
+            parse_header(&fs::read(&out).unwrap()).unwrap().cpusubtype,
+            cpu_subtype
+        );
+
+        let _ = fs::remove_file(reference);
+        let _ = fs::remove_file(definition);
+        let _ = fs::remove_file(out);
+    }
+}
+
+#[test]
+fn linker_run_rejects_conflicting_arm64e_capabilities_without_replacing_output() {
+    const ARM64E_PTRAUTH_ABI_V0: u32 = 0x8000_0002;
+    const ARM64E_PTRAUTH_ABI_V1: u32 = 0x8100_0002;
+    const SENTINEL: &[u8] = b"pre-existing output\n";
+
+    let reference = scratch("arm64e-conflict-reference.o");
+    let definition = scratch("arm64e-conflict-definition.o");
+    let out = scratch("arm64e-conflict.out");
+    fs::write(
+        &reference,
+        with_cpu_subtype(
+            synthetic_got_reference_object("_main", "_absolute", false),
+            ARM64E_PTRAUTH_ABI_V0,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        with_cpu_subtype(
+            synthetic_absolute_object("_absolute", 42),
+            ARM64E_PTRAUTH_ABI_V1,
+        ),
+    )
+    .unwrap();
+    fs::write(&out, SENTINEL).unwrap();
+
+    let error = Linker::run(&LinkOptions {
+        inputs: vec![reference.clone(), definition.clone()],
+        output: Some(out.clone()),
+        ..LinkOptions::default()
+    })
+    .unwrap_err();
+
+    let diagnostic = error.to_string();
+    assert!(
+        diagnostic.contains("incompatible ARM64 CPU subtypes"),
+        "unexpected diagnostic: {diagnostic}"
+    );
+    assert!(diagnostic.contains(&reference.display().to_string()));
+    assert!(diagnostic.contains(&definition.display().to_string()));
+    assert_eq!(fs::read(&out).unwrap(), SENTINEL);
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_rejects_unknown_arm64_cpu_subtype_without_publishing_output() {
+    let object = scratch("unknown-arm64-subtype.o");
+    let out = scratch("unknown-arm64-subtype.out");
+    let _ = fs::remove_file(&out);
+    fs::write(
+        &object,
+        with_cpu_subtype(
+            synthetic_got_reference_object("_main", "_unused", false),
+            0x0000_0003,
+        ),
+    )
+    .unwrap();
+
+    let error = Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(out.clone()),
+        ..LinkOptions::default()
+    })
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported ARM64 CPU subtype 0x00000003"),
+        "unexpected diagnostic: {error}"
+    );
+    assert!(!out.exists());
+
+    let _ = fs::remove_file(object);
+}
+
+#[test]
+fn linker_run_preserves_arm64e_subtype_from_force_loaded_archive_members() {
+    const ARM64E_PTRAUTH_ABI_V0: u32 = 0x8000_0002;
+
+    let archive_path = scratch("arm64e-subtype.a");
+    let out = scratch("arm64e-subtype-archive.out");
+    let _ = fs::remove_file(&out);
+    let reference = with_cpu_subtype(
+        synthetic_got_reference_object("_main", "_absolute", false),
+        ARM64E_PTRAUTH_ABI_V0,
+    );
+    let definition = with_cpu_subtype(
+        synthetic_absolute_object("_absolute", 42),
+        ARM64E_PTRAUTH_ABI_V0,
+    );
+    fs::write(
+        &archive_path,
+        synthetic_archive(&[("main.o", &reference), ("absolute.o", &definition)]),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![archive_path.clone()],
+        output: Some(out.clone()),
+        all_load: true,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    assert_eq!(
+        parse_header(&fs::read(&out).unwrap()).unwrap().cpusubtype,
+        ARM64E_PTRAUTH_ABI_V0
+    );
+
+    let _ = fs::remove_file(archive_path);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn clang_arm64e_object_subtype_round_trips_when_available() {
+    let source = scratch("arm64e-subtype.s");
+    let object = scratch("arm64e-clang.o");
+    let out = scratch("arm64e-clang.out");
+    fs::write(
+        &source,
+        r#"
+            .section __TEXT,__text,regular,pure_instructions
+            .globl _main
+            _main:
+                mov w0, #42
+                ret
+            .subsections_via_symbols
+        "#,
+    )
+    .unwrap();
+
+    let (mut compiler, compiler_name) = if have_xcrun_tool("clang") {
+        let mut compiler = Command::new("xcrun");
+        compiler.args([
+            "--sdk",
+            "macosx",
+            "clang",
+            "-arch",
+            "arm64e",
+            "-x",
+            "assembler",
+            "-c",
+        ]);
+        (compiler, "xcrun clang")
+    } else if have_tool("clang") {
+        let targets = Command::new("clang")
+            .arg("--print-targets")
+            .output()
+            .unwrap();
+        if !targets.status.success()
+            || !String::from_utf8_lossy(&targets.stdout).contains("aarch64")
+        {
+            harness_skip!("installed clang has no AArch64 backend");
+            let _ = fs::remove_file(source);
+            return;
+        }
+        let mut compiler = Command::new("clang");
+        compiler.args(["--target=arm64e-apple-macos11", "-x", "assembler", "-c"]);
+        (compiler, "clang ARM64e cross-target")
+    } else {
+        harness_skip!("clang unavailable");
+        let _ = fs::remove_file(source);
+        return;
+    };
+    let compile = compiler
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "{compiler_name} fixture compilation failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let input_subtype = parse_header(&fs::read(&object).unwrap())
+        .unwrap()
+        .cpusubtype;
+    assert_eq!(input_subtype & 0x00ff_ffff, CPU_SUBTYPE_ARM64E);
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(out.clone()),
+        arch: Some("arm64".into()),
+        ..LinkOptions::default()
+    })
+    .unwrap();
+    assert_eq!(
+        parse_header(&fs::read(&out).unwrap()).unwrap().cpusubtype,
+        input_subtype
+    );
+
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_emits_non_empty_executable_from_real_object() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun as or codesign unavailable");
+        harness_skip!("xcrun as or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -2841,10 +4198,7 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -2932,15 +4286,15 @@ fn linker_run_emits_non_empty_executable_from_real_object() {
 #[test]
 fn linker_run_loh_executable_surfaces_match_apple_ld() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -3013,13 +4367,7 @@ fn linker_run_loh_executable_surfaces_match_apple_ld() {
         let obj = scratch(&format!("{name}.o"));
         let our_out = scratch(&format!("{name}-ours.out"));
         let apple_out = scratch(&format!("{name}-apple.out"));
-        if let Err(e) = assemble(src, &obj) {
-            eprintln!("skipping: assemble failed: {e}");
-            let _ = fs::remove_file(obj);
-            let _ = fs::remove_file(our_out);
-            let _ = fs::remove_file(apple_out);
-            return;
-        }
+        require_fixture!("assembly fixture", assemble(src, &obj));
 
         let opts = LinkOptions {
             inputs: vec![obj.clone()],
@@ -3142,15 +4490,15 @@ fn linker_run_loh_executable_surfaces_match_apple_ld() {
 #[test]
 fn linker_run_loh_dylib_surfaces_match_apple_ld() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -3173,10 +4521,7 @@ fn linker_run_loh_dylib_surfaces_match_apple_ld() {
         .loh AdrpAdd Lloh0, Lloh1
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -3230,7 +4575,7 @@ fn linker_run_loh_dylib_surfaces_match_apple_ld() {
 #[test]
 fn linker_run_emits_minimal_dylib_from_real_object() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -3243,10 +4588,7 @@ fn linker_run_emits_minimal_dylib_from_real_object() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -3287,9 +4629,57 @@ fn linker_run_emits_minimal_dylib_from_real_object() {
 }
 
 #[test]
+fn linker_run_marks_surviving_external_weak_definitions_in_the_image_header() {
+    const WEAK_VALUE: u64 = 0x1234_5678;
+
+    let obj = scratch("weak-definition.o");
+    let out = scratch("weak-definition.dylib");
+    fs::write(
+        &obj,
+        synthetic_absolute_object_with_desc("_weak_definition", WEAK_VALUE, N_WEAK_DEF),
+    )
+    .unwrap();
+
+    let mut outputs = Vec::new();
+    for jobs in [1, 4] {
+        Linker::run(&LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Dylib,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        outputs.push(fs::read(&out).unwrap());
+    }
+    assert_eq!(outputs[0], outputs[1], "-j1 and -j4 output differs");
+
+    let bytes = &outputs[0];
+    let header = parse_header(bytes).unwrap();
+    assert_eq!(
+        header.flags & (MH_WEAK_DEFINES | MH_BINDS_TO_WEAK),
+        MH_WEAK_DEFINES | MH_BINDS_TO_WEAK
+    );
+    let symbol = canonical_symbol_record_map(bytes)
+        .remove("_weak_definition")
+        .unwrap();
+    assert_eq!(symbol.n_type, N_ABS | N_EXT);
+    assert_ne!(symbol.n_desc & N_WEAK_DEF, 0);
+    let export = canonical_export_records(bytes)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.name == "_weak_definition")
+        .unwrap();
+    assert_ne!(export.flags & EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, 0);
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_uses_dylib_identity_flags() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -3302,10 +4692,7 @@ fn linker_run_uses_dylib_identity_flags() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -3345,7 +4732,7 @@ fn linker_run_uses_dylib_identity_flags() {
 #[test]
 fn linker_run_honors_exported_symbol_filters_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -3366,10 +4753,7 @@ fn linker_run_honors_exported_symbol_filters_like_ld() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
     fs::write(&list_path, "_bet?\n").unwrap();
 
     let opts = LinkOptions {
@@ -3403,8 +4787,8 @@ fn linker_run_honors_exported_symbol_filters_like_ld() {
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
     assert_eq!(
-        canonical_export_records(&our_bytes),
-        canonical_export_records(&apple_bytes)
+        canonical_export_records(&our_bytes).unwrap(),
+        canonical_export_records(&apple_bytes).unwrap()
     );
     assert_eq!(
         dyld_info_export_names(&our_bytes).unwrap(),
@@ -3432,7 +4816,7 @@ fn linker_run_honors_exported_symbol_filters_like_ld() {
 #[test]
 fn linker_run_honors_unexported_symbol_filters_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -3453,10 +4837,7 @@ fn linker_run_honors_unexported_symbol_filters_like_ld() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
     fs::write(&list_path, "_bet?\n").unwrap();
 
     let opts = LinkOptions {
@@ -3490,8 +4871,8 @@ fn linker_run_honors_unexported_symbol_filters_like_ld() {
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
     assert_eq!(
-        canonical_export_records(&our_bytes),
-        canonical_export_records(&apple_bytes)
+        canonical_export_records(&our_bytes).unwrap(),
+        canonical_export_records(&apple_bytes).unwrap()
     );
     assert_eq!(
         dyld_info_export_names(&our_bytes).unwrap(),
@@ -3521,9 +4902,74 @@ fn linker_run_honors_unexported_symbol_filters_like_ld() {
 }
 
 #[test]
+fn linker_run_dead_strip_applies_dylib_export_policy_to_roots() {
+    let obj = scratch("AFSLD-069-export-policy.o");
+    let out = scratch("AFSLD-069-export-policy.dylib");
+    let exported_list = scratch("AFSLD-069-exported.txt");
+    let unexported_list = scratch("AFSLD-069-unexported.txt");
+    let inline_keep = 0x1111_2222_3333_4444u64;
+    let listed_keep = 0x5555_6666_7777_8888u64;
+    let blocked = 0x9999_aaaa_bbbb_ccccu64;
+    let mut data = inline_keep.to_le_bytes().to_vec();
+    data.extend_from_slice(&listed_keep.to_le_bytes());
+    data.extend_from_slice(&blocked.to_le_bytes());
+    fs::write(
+        &obj,
+        synthetic_single_section_object(
+            "__DATA",
+            "__policy",
+            S_REGULAR,
+            &data,
+            &[],
+            &[
+                ("_inline_keep", N_SECT | N_EXT, 1, 0, 0),
+                ("_listed_keep", N_SECT | N_EXT, 1, 0, 8),
+                ("_blocked", N_SECT | N_EXT, 1, 0, 16),
+            ],
+        ),
+    )
+    .unwrap();
+    fs::write(&exported_list, "_listed_*\n").unwrap();
+    fs::write(&unexported_list, "_blocked\n").unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Dylib,
+        dead_strip: true,
+        exported_symbols: vec!["_inline_keep".into(), "_blocked".into()],
+        exported_symbols_lists: vec![exported_list.clone()],
+        unexported_symbols_lists: vec![unexported_list.clone()],
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    assert_eq!(
+        output_section(&bytes, "__DATA", "__policy")
+            .expect("policy fixture section must survive")
+            .1,
+        [inline_keep.to_le_bytes(), listed_keep.to_le_bytes()].concat()
+    );
+    assert_eq!(
+        dyld_info_export_names(&bytes).unwrap(),
+        vec!["_inline_keep".to_string(), "_listed_keep".to_string()]
+    );
+    let symbols = canonical_symbol_record_map(&bytes);
+    assert!(symbols.contains_key("_inline_keep"));
+    assert!(symbols.contains_key("_listed_keep"));
+    assert!(!symbols.contains_key("_blocked"));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+    let _ = fs::remove_file(exported_list);
+    let _ = fs::remove_file(unexported_list);
+}
+
+#[test]
 fn linker_run_loads_minimal_dylib_via_dlopen() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang/as or codesign unavailable");
+        harness_skip!("xcrun clang/as or codesign unavailable");
         return;
     }
 
@@ -3539,10 +4985,7 @@ fn linker_run_loads_minimal_dylib_via_dlopen() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -3607,15 +5050,15 @@ fn linker_run_loads_minimal_dylib_via_dlopen() {
 #[test]
 fn dylib_export_surfaces_match_apple_ld() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -3635,15 +5078,15 @@ fn dylib_export_surfaces_match_apple_ld() {
 #[test]
 fn dylib_export_surfaces_match_apple_ld_with_shared_prefixes() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -3669,15 +5112,15 @@ fn dylib_export_surfaces_match_apple_ld_with_shared_prefixes() {
 #[test]
 fn dylib_export_surfaces_match_apple_ld_across_fixture_matrix() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -3798,7 +5241,7 @@ fn dylib_export_surfaces_match_apple_ld_across_fixture_matrix() {
 #[test]
 fn linker_run_reports_unresolved_symbol() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -3811,10 +5254,7 @@ fn linker_run_reports_unresolved_symbol() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -3836,7 +5276,7 @@ fn linker_run_reports_unresolved_symbol() {
 #[test]
 fn linker_run_promotes_unresolved_symbol_to_dynamic_lookup() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -3855,10 +5295,7 @@ fn linker_run_promotes_unresolved_symbol_to_dynamic_lookup() {
             .quad _missing
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -3884,17 +5321,17 @@ fn linker_run_promotes_unresolved_symbol_to_dynamic_lookup() {
     let _ = fs::remove_file(out);
 }
 
-fn assert_flat_got_import(bytes: &[u8], symbol: &str, weak_import: bool) {
+fn assert_got_import(bytes: &[u8], symbol: &str, ordinal: u16, weak_import: bool) {
     let bind_records = decode_bind_records(bytes, false).unwrap();
     assert!(
         bind_records.iter().any(|record| {
             record.symbol == symbol
-                && record.ordinal == 0xFFFE
+                && record.ordinal == ordinal
                 && record.weak_import == weak_import
                 && record.segment == "__DATA_CONST"
                 && record.section == "__got"
         }),
-        "expected flat GOT bind for {symbol} with weak_import={weak_import}, got {bind_records:?}"
+        "expected GOT bind for {symbol} at ordinal {ordinal} with weak_import={weak_import}, got {bind_records:?}"
     );
     let got = output_section_header(bytes, "__DATA_CONST", "__got").unwrap();
     let got_start = got.offset as usize;
@@ -3906,6 +5343,7 @@ fn assert_flat_got_import(bytes: &[u8], symbol: &str, weak_import: bool) {
     assert_eq!(imported.n_type, N_UNDF | N_EXT);
     assert_eq!(imported.n_sect, 0);
     assert_eq!(imported.value, 0);
+    assert_eq!(imported.n_desc >> 8, ordinal & 0xff);
     assert_eq!(imported.n_desc & N_WEAK_REF != 0, weak_import);
 }
 
@@ -3963,7 +5401,12 @@ fn linker_run_emits_flat_weak_bind_for_permitted_unresolved_reference() {
     assert_eq!(outputs[0], outputs[1], "-j1 and -j4 output differs");
 
     let bytes = &outputs[0];
-    assert_flat_got_import(bytes, "_optional", true);
+    assert_got_import(bytes, "_optional", 0xFFFE, true);
+    assert_ne!(
+        parse_header(bytes).unwrap().flags & MH_BINDS_TO_WEAK,
+        0,
+        "weak import bindings must mark the image as binding to weak symbols"
+    );
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
@@ -3986,7 +5429,8 @@ fn linker_run_emits_required_flat_bind_for_strong_unresolved_reference() {
     Linker::run(&opts).unwrap();
 
     let bytes = fs::read(&out).unwrap();
-    assert_flat_got_import(&bytes, target, false);
+    assert_eq!(parse_header(&bytes).unwrap().flags & MH_BINDS_TO_WEAK, 0);
+    assert_got_import(&bytes, target, 0xFFFE, false);
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
@@ -4025,12 +5469,228 @@ fn linker_run_mixed_undefined_references_are_required_in_both_orders() {
         Linker::run(&opts).unwrap();
 
         let bytes = fs::read(&out).unwrap();
-        assert_flat_got_import(&bytes, target, false);
+        assert_got_import(&bytes, target, 0xFFFE, false);
 
         let _ = fs::remove_file(first);
         let _ = fs::remove_file(second);
         let _ = fs::remove_file(out);
     }
+}
+
+#[test]
+fn linker_run_preserves_consumer_weak_reference_after_dylib_resolution() {
+    let weak_object = scratch("dylib-weak-consumer.o");
+    let strong_object = scratch("dylib-strong-consumer.o");
+    let tbd = scratch("dylib-consumer-weakness.tbd");
+    let weak_output = scratch("dylib-weak-consumer.out");
+    let strong_output = scratch("dylib-strong-consumer.out");
+    let symbol = "_optional_from_strong_provider";
+
+    fs::write(
+        &weak_object,
+        synthetic_got_reference_object("_main", symbol, true),
+    )
+    .unwrap();
+    fs::write(
+        &strong_object,
+        synthetic_got_reference_object("_main", symbol, false),
+    )
+    .unwrap();
+    fs::write(
+        &tbd,
+        format!(
+            r#"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libconsumerweakness.dylib'
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ {symbol} ]
+...
+"#
+        ),
+    )
+    .unwrap();
+
+    let mut weak_outputs = Vec::new();
+    let mut strong_outputs = Vec::new();
+    for jobs in [1, 4] {
+        for (object, output, captures) in [
+            (&weak_object, &weak_output, &mut weak_outputs),
+            (&strong_object, &strong_output, &mut strong_outputs),
+        ] {
+            Linker::run(&LinkOptions {
+                inputs: vec![object.clone(), tbd.clone()],
+                output: Some(output.clone()),
+                kind: OutputKind::Executable,
+                jobs: Some(jobs),
+                ..LinkOptions::default()
+            })
+            .unwrap();
+            captures.push(fs::read(output).unwrap());
+        }
+    }
+
+    assert_eq!(
+        weak_outputs[0], weak_outputs[1],
+        "weak -j1/-j4 output differs"
+    );
+    assert_eq!(
+        strong_outputs[0], strong_outputs[1],
+        "strong -j1/-j4 output differs"
+    );
+    assert_got_import(&weak_outputs[0], symbol, 1, true);
+    assert_ne!(
+        parse_header(&weak_outputs[0]).unwrap().flags & MH_BINDS_TO_WEAK,
+        0,
+        "consumer weak reference must mark the output as binding weakly"
+    );
+    assert_got_import(&strong_outputs[0], symbol, 1, false);
+    assert_eq!(
+        parse_header(&strong_outputs[0]).unwrap().flags & MH_BINDS_TO_WEAK,
+        0,
+        "strong consumer of a regular export must remain a strong import"
+    );
+
+    let _ = fs::remove_file(weak_object);
+    let _ = fs::remove_file(strong_object);
+    let _ = fs::remove_file(tbd);
+    let _ = fs::remove_file(weak_output);
+    let _ = fs::remove_file(strong_output);
+}
+
+#[test]
+fn linker_run_weak_framework_marks_all_imports_weak() {
+    let syslibroot = scratch("weak-framework-import-root");
+    let framework_dir = syslibroot.join("System/Library/Frameworks/Demo.framework");
+    let tbd = framework_dir.join("Demo.tbd");
+    let object = scratch("weak-framework-import.o");
+    let weak_output = scratch("weak-framework-import-weak.out");
+    let strong_output = scratch("weak-framework-import-strong.out");
+    let install_name = "@rpath/Demo.framework/Demo";
+    let symbol = "_optional_from_weak_framework";
+
+    fs::create_dir_all(&framework_dir).unwrap();
+    fs::write(
+        &tbd,
+        format!(
+            r#"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '{install_name}'
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ {symbol} ]
+...
+"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &object,
+        synthetic_got_reference_object("_main", symbol, false),
+    )
+    .unwrap();
+
+    let mut weak_outputs = Vec::new();
+    let mut strong_outputs = Vec::new();
+    for jobs in [1, 4] {
+        for (weak, output, captures) in [
+            (true, &weak_output, &mut weak_outputs),
+            (false, &strong_output, &mut strong_outputs),
+        ] {
+            Linker::run(&LinkOptions {
+                inputs: vec![object.clone()],
+                frameworks: vec![FrameworkSpec {
+                    name: "Demo".into(),
+                    weak,
+                }],
+                syslibroot: Some(syslibroot.clone()),
+                output: Some(output.clone()),
+                kind: OutputKind::Executable,
+                jobs: Some(jobs),
+                ..LinkOptions::default()
+            })
+            .unwrap();
+            captures.push(fs::read(output).unwrap());
+        }
+    }
+
+    assert_eq!(
+        weak_outputs[0], weak_outputs[1],
+        "weak-framework -j1/-j4 output differs"
+    );
+    assert_eq!(
+        strong_outputs[0], strong_outputs[1],
+        "normal-framework -j1/-j4 output differs"
+    );
+    for (bytes, weak, expected_cmd) in [
+        (
+            &weak_outputs[0],
+            true,
+            afs_ld::macho::constants::LC_LOAD_WEAK_DYLIB,
+        ),
+        (
+            &strong_outputs[0],
+            false,
+            afs_ld::macho::constants::LC_LOAD_DYLIB,
+        ),
+    ] {
+        let header = parse_header(bytes).unwrap();
+        let commands = parse_commands(&header, bytes).unwrap();
+        assert!(commands.iter().any(|command| {
+            matches!(
+                command,
+                LoadCommand::Dylib(dylib)
+                    if dylib.cmd == expected_cmd && dylib.name == install_name
+            )
+        }));
+        assert_got_import(bytes, symbol, 1, weak);
+        assert_eq!(
+            header.flags & MH_BINDS_TO_WEAK != 0,
+            weak,
+            "image weak-bind flag must follow the framework load kind"
+        );
+    }
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(weak_output);
+    let _ = fs::remove_file(strong_output);
+    let _ = fs::remove_dir_all(syslibroot);
+}
+
+#[test]
+fn linker_run_preserves_assembler_resolved_deltas_between_subsections() {
+    let object = scratch("aligned-subsections.o");
+    let output = scratch("aligned-subsections.dylib");
+    fs::write(&object, synthetic_aligned_subsections_object()).unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let symbols = symbol_values(&bytes);
+    let linked_delta = symbols["_b"] - symbols["_a"];
+    let embedded_delta = u64::from_le_bytes(text[text.len() - 8..].try_into().unwrap());
+
+    assert_eq!(text_addr % 16, 0, "section-level alignment was lost");
+    assert_eq!(
+        linked_delta, embedded_delta,
+        "atom layout disagrees with the assembler-resolved _b-_a value"
+    );
+    assert_eq!(
+        text,
+        [0xc0, 0x03, 0x5f, 0xd6, 0xc0, 0x03, 0x5f, 0xd6, 4, 0, 0, 0, 0, 0, 0, 0,]
+    );
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(output);
 }
 
 #[test]
@@ -4320,6 +5980,86 @@ fn linker_run_resolves_external_absolute_symbols_without_atoms() {
 }
 
 #[test]
+fn linker_run_preserves_maximum_unsigned_word_relocation() {
+    const ABSOLUTE_VALUE: u64 = u32::MAX as u64;
+
+    let reference = scratch("unsigned-word-max-reference.o");
+    let definition = scratch("unsigned-word-max-definition.o");
+    let out = scratch("unsigned-word-max.out");
+    fs::write(
+        &reference,
+        synthetic_unsigned_word_reference_object("_main", "_absolute"),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        synthetic_absolute_object("_absolute", ABSOLUTE_VALUE),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![reference.clone(), definition.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let (_, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    assert_eq!(u32::from_le_bytes(text[..4].try_into().unwrap()), u32::MAX);
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_rejects_overflowing_unsigned_word_without_publishing_output() {
+    const OVERFLOWING_VALUE: u64 = u32::MAX as u64 + 1;
+    const SENTINEL: &[u8] = b"AFSLD-050 existing output";
+
+    let reference = scratch("unsigned-word-overflow-reference.o");
+    let definition = scratch("unsigned-word-overflow-definition.o");
+    let out = scratch("unsigned-word-overflow.out");
+    fs::write(
+        &reference,
+        synthetic_unsigned_word_reference_object("_main", "_absolute"),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        synthetic_absolute_object("_absolute", OVERFLOWING_VALUE),
+    )
+    .unwrap();
+    fs::write(&out, SENTINEL).unwrap();
+
+    let error = Linker::run(&LinkOptions {
+        inputs: vec![reference.clone(), definition.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap_err();
+
+    match error {
+        LinkError::Reloc(error) => {
+            assert_eq!(error.kind, RelocKind::Unsigned);
+            assert_eq!(error.referent, "_absolute");
+            assert!(error.detail.contains("32-bit"), "{error}");
+            assert!(error.detail.contains("0x100000000"), "{error}");
+            assert!(error.detail.contains("out of range"), "{error}");
+        }
+        other => panic!("expected Reloc error, got {other:?}"),
+    }
+    assert_eq!(fs::read(&out).unwrap(), SENTINEL);
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_emits_aliases_to_absolute_symbols() {
     const ABSOLUTE_VALUE: u64 = 0x1234_5678;
 
@@ -4355,7 +6095,7 @@ fn linker_run_emits_aliases_to_absolute_symbols() {
         assert_eq!(record.n_desc, 0);
         assert_eq!(record.value, ABSOLUTE_VALUE);
     }
-    let exports = canonical_export_records(&bytes);
+    let exports = canonical_export_records(&bytes).unwrap();
     for name in ["_absolute", "_absolute_alias"] {
         let export = exports.iter().find(|entry| entry.name == name).unwrap();
         assert!(matches!(
@@ -4455,7 +6195,7 @@ exports:
 
         let records = canonical_symbol_record_map(&bytes);
         let (locals, external_defineds, _) = symbol_partition_names(&bytes);
-        let exports = canonical_export_records(&bytes);
+        let exports = canonical_export_records(&bytes).unwrap();
         let alias_export = exports.iter().find(|entry| entry.name == "_alias");
         if private_alias {
             assert!(!records.contains_key("_alias"));
@@ -4566,7 +6306,7 @@ fn linker_run_reports_alias_definition_provenance_in_input_order() {
 #[test]
 fn linker_run_reports_duplicate_from_fetched_archive_member() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -4597,10 +6337,7 @@ fn linker_run_reports_duplicate_from_fetched_archive_member() {
     "#;
 
     for (src, out) in [(&main_src, &main_obj), (&dup_src, &dup_obj)] {
-        if let Err(e) = assemble(src, out) {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
+        require_fixture!("assembly fixture", assemble(src, out));
     }
 
     let ar = Command::new("ar")
@@ -4609,13 +6346,11 @@ fn linker_run_reports_duplicate_from_fetched_archive_member() {
         .arg(&dup_obj)
         .output()
         .unwrap();
-    if !ar.status.success() {
-        eprintln!(
-            "skipping: ar failed: {}",
-            String::from_utf8_lossy(&ar.stderr)
-        );
-        return;
-    }
+    assert!(
+        ar.status.success(),
+        "archive fixture failed: {}",
+        String::from_utf8_lossy(&ar.stderr)
+    );
 
     let opts = LinkOptions {
         inputs: vec![main_obj.clone(), archive.clone()],
@@ -4639,7 +6374,7 @@ fn linker_run_reports_duplicate_from_fetched_archive_member() {
 #[test]
 fn fetched_archive_member_undefined_reports_member_referrer() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -4665,10 +6400,7 @@ fn fetched_archive_member_undefined_reports_member_referrer() {
     "#;
 
     for (src, out) in [(&main_src, &main_obj), (&member_src, &member_obj)] {
-        if let Err(e) = assemble(src, out) {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
+        require_fixture!("assembly fixture", assemble(src, out));
     }
 
     let ar = Command::new("ar")
@@ -4677,13 +6409,11 @@ fn fetched_archive_member_undefined_reports_member_referrer() {
         .arg(&member_obj)
         .output()
         .unwrap();
-    if !ar.status.success() {
-        eprintln!(
-            "skipping: ar failed: {}",
-            String::from_utf8_lossy(&ar.stderr)
-        );
-        return;
-    }
+    assert!(
+        ar.status.success(),
+        "archive fixture failed: {}",
+        String::from_utf8_lossy(&ar.stderr)
+    );
 
     let opts = LinkOptions {
         inputs: vec![main_obj.clone(), archive.clone()],
@@ -4714,16 +6444,16 @@ fn fetched_archive_member_undefined_reports_member_referrer() {
 #[test]
 fn linker_run_all_load_pulls_entry_from_archive() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun as or codesign unavailable");
+        harness_skip!("xcrun as or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: no macOS SDK path");
+        harness_skip!("no macOS SDK path");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -4738,23 +6468,18 @@ fn linker_run_all_load_pulls_entry_from_archive() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &member_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &member_obj));
     let ar = Command::new("ar")
         .arg("rcs")
         .arg(&archive)
         .arg(&member_obj)
         .output()
         .unwrap();
-    if !ar.status.success() {
-        eprintln!(
-            "skipping: ar failed: {}",
-            String::from_utf8_lossy(&ar.stderr)
-        );
-        return;
-    }
+    assert!(
+        ar.status.success(),
+        "archive fixture failed: {}",
+        String::from_utf8_lossy(&ar.stderr)
+    );
 
     let opts = LinkOptions {
         inputs: vec![archive.clone(), tbd],
@@ -4790,16 +6515,16 @@ fn linker_run_all_load_pulls_entry_from_archive() {
 #[test]
 fn linker_run_force_load_pulls_entry_from_archive() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun as or codesign unavailable");
+        harness_skip!("xcrun as or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: no macOS SDK path");
+        harness_skip!("no macOS SDK path");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -4814,23 +6539,18 @@ fn linker_run_force_load_pulls_entry_from_archive() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &member_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &member_obj));
     let ar = Command::new("ar")
         .arg("rcs")
         .arg(&archive)
         .arg(&member_obj)
         .output()
         .unwrap();
-    if !ar.status.success() {
-        eprintln!(
-            "skipping: ar failed: {}",
-            String::from_utf8_lossy(&ar.stderr)
-        );
-        return;
-    }
+    assert!(
+        ar.status.success(),
+        "archive fixture failed: {}",
+        String::from_utf8_lossy(&ar.stderr)
+    );
 
     let opts = LinkOptions {
         inputs: vec![archive.clone(), tbd],
@@ -4866,11 +6586,11 @@ fn linker_run_force_load_pulls_entry_from_archive() {
 #[test]
 fn linker_run_resolves_lsystem_via_syslibroot() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun as or codesign unavailable");
+        harness_skip!("xcrun as or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: no macOS SDK path");
+        harness_skip!("no macOS SDK path");
         return;
     };
 
@@ -4884,10 +6604,7 @@ fn linker_run_resolves_lsystem_via_syslibroot() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -4931,18 +6648,18 @@ fn linker_run_resolves_lsystem_via_syslibroot() {
 #[test]
 fn linker_run_resolves_framework_via_syslibroot() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let metal = PathBuf::from(format!(
         "{sdk}/System/Library/Frameworks/Metal.framework/Metal.tbd"
     ));
     if !metal.exists() {
-        eprintln!("skipping: no Metal.tbd at {}", metal.display());
+        harness_skip!("no Metal.tbd at {}", metal.display());
         return;
     }
 
@@ -4956,10 +6673,7 @@ fn linker_run_resolves_framework_via_syslibroot() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -4991,18 +6705,18 @@ fn linker_run_resolves_framework_via_syslibroot() {
 #[test]
 fn linker_run_resolves_weak_framework_via_syslibroot() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let metal = PathBuf::from(format!(
         "{sdk}/System/Library/Frameworks/Metal.framework/Metal.tbd"
     ));
     if !metal.exists() {
-        eprintln!("skipping: no Metal.tbd at {}", metal.display());
+        harness_skip!("no Metal.tbd at {}", metal.display());
         return;
     }
 
@@ -5016,10 +6730,7 @@ fn linker_run_resolves_weak_framework_via_syslibroot() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5051,7 +6762,7 @@ fn linker_run_resolves_weak_framework_via_syslibroot() {
 #[test]
 fn linker_run_uses_platform_version_for_build_command() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5065,10 +6776,7 @@ fn linker_run_uses_platform_version_for_build_command() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5102,7 +6810,7 @@ fn linker_run_uses_platform_version_for_build_command() {
 #[test]
 fn linker_run_emits_rpath_command() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5116,10 +6824,7 @@ fn linker_run_emits_rpath_command() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5149,7 +6854,7 @@ fn linker_run_emits_rpath_command() {
 #[test]
 fn linker_run_emits_map_file() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5164,10 +6869,7 @@ fn linker_run_emits_map_file() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5198,7 +6900,7 @@ fn linker_run_emits_map_file() {
 #[test]
 fn linker_run_map_lists_dead_stripped_symbols() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5230,21 +6932,9 @@ fn linker_run_map_lists_dead_stripped_symbols() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(main_src, &main_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-    if let Err(e) = assemble(helper_src, &helper_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        return;
-    }
-    if let Err(e) = assemble(unused_src, &unused_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        let _ = fs::remove_file(helper_obj);
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(main_src, &main_obj));
+    require_fixture!("assembly fixture", assemble(helper_src, &helper_obj));
+    require_fixture!("assembly fixture", assemble(unused_src, &unused_obj));
 
     let opts = LinkOptions {
         inputs: vec![main_obj.clone(), helper_obj.clone(), unused_obj.clone()],
@@ -5272,7 +6962,7 @@ fn linker_run_map_lists_dead_stripped_symbols() {
 #[test]
 fn linker_run_map_lists_folded_symbols_under_icf_safe() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5299,10 +6989,7 @@ fn linker_run_map_lists_folded_symbols_under_icf_safe() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5327,16 +7014,16 @@ fn linker_run_map_lists_folded_symbols_under_icf_safe() {
 #[test]
 fn linker_run_carries_tbd_inputs_into_load_commands() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -5350,10 +7037,7 @@ fn linker_run_carries_tbd_inputs_into_load_commands() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone()],
@@ -5379,9 +7063,246 @@ fn linker_run_carries_tbd_inputs_into_load_commands() {
 }
 
 #[test]
+fn linker_run_resolves_reexported_inline_tbd_documents_through_the_umbrella() {
+    let object = scratch("inline-tbd-reexport.o");
+    let tbd = scratch("inline-tbd-reexport.tbd");
+    let output = scratch("inline-tbd-reexport.out");
+    let child_symbol = "_inline_child_export";
+    fs::write(
+        &object,
+        synthetic_got_reference_object("_main", child_symbol, false),
+    )
+    .unwrap();
+    fs::write(
+        &tbd,
+        format!(
+            r#"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libinline_umbrella.dylib'
+reexported-libraries:
+  - targets: [ arm64-macos ]
+    libraries: [ '/usr/lib/libinline_middle.dylib' ]
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libinline_middle.dylib'
+parent-umbrella:
+  - targets: [ arm64-macos ]
+    umbrella: inline_umbrella
+reexported-libraries:
+  - targets: [ arm64-macos ]
+    libraries: [ '/usr/lib/libinline_child.dylib' ]
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libinline_child.dylib'
+parent-umbrella:
+  - targets: [ arm64-macos ]
+    umbrella: inline_umbrella
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ {child_symbol} ]
+...
+"#
+        ),
+    )
+    .unwrap();
+
+    let mut outputs = Vec::new();
+    for jobs in [1, 4] {
+        Linker::run(&LinkOptions {
+            inputs: vec![object.clone(), tbd.clone()],
+            output: Some(output.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        outputs.push(fs::read(&output).unwrap());
+    }
+    assert_eq!(outputs[0], outputs[1], "-j1 and -j4 output differs");
+    assert_eq!(
+        load_dylib_names(&outputs[0]).unwrap(),
+        ["/usr/lib/libinline_umbrella.dylib"]
+    );
+    assert_got_import(&outputs[0], child_symbol, 1, false);
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(tbd);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn linker_run_rejects_exports_from_unrelated_inline_tbd_documents() {
+    const SENTINEL: &[u8] = b"AFSLD-057 existing output";
+
+    let object = scratch("inline-tbd-unrelated.o");
+    let tbd = scratch("inline-tbd-unrelated.tbd");
+    let output = scratch("inline-tbd-unrelated.out");
+    let unrelated_symbol = "_unrelated_inline_export";
+    fs::write(
+        &object,
+        synthetic_got_reference_object("_main", unrelated_symbol, false),
+    )
+    .unwrap();
+    fs::write(
+        &tbd,
+        format!(
+            r#"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libinline_primary.dylib'
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ _primary_export ]
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '/usr/lib/libinline_unrelated.dylib'
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ {unrelated_symbol} ]
+...
+"#
+        ),
+    )
+    .unwrap();
+
+    let mut diagnostics = Vec::new();
+    for jobs in [1, 4] {
+        fs::write(&output, SENTINEL).unwrap();
+        let error = Linker::run(&LinkOptions {
+            inputs: vec![object.clone(), tbd.clone()],
+            output: Some(output.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .expect_err("an unrelated inline TBD document must not satisfy imports");
+        diagnostics.push(error.to_string());
+        assert_eq!(fs::read(&output).unwrap(), SENTINEL);
+    }
+    assert_eq!(diagnostics[0], diagnostics[1]);
+    assert!(
+        diagnostics[0].contains(&format!("undefined symbol: {unrelated_symbol}")),
+        "unexpected diagnostic: {}",
+        diagnostics[0]
+    );
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(tbd);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn linker_run_enforces_the_macho_library_ordinal_boundary() {
+    const MAX_ORDINARY_LIBRARY_ORDINAL: usize = 0xfd;
+    const SENTINEL: &[u8] = b"previous complete Mach-O output";
+
+    let dir = scratch("library-ordinal-boundary");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let max_object = dir.join("max-ordinal.o");
+    let reserved_object = dir.join("reserved-ordinal.o");
+    fs::write(
+        &max_object,
+        synthetic_got_reference_object("_max_probe", "_max_target", false),
+    )
+    .unwrap();
+    fs::write(
+        &reserved_object,
+        synthetic_got_reference_object("_reserved_probe", "_reserved_target", false),
+    )
+    .unwrap();
+
+    let mut dependencies = Vec::new();
+    for ordinal in 1..=MAX_ORDINARY_LIBRARY_ORDINAL + 1 {
+        let path = dir.join(format!("libordinal{ordinal:03}.tbd"));
+        let exported_symbol = match ordinal {
+            MAX_ORDINARY_LIBRARY_ORDINAL => "_max_target",
+            ordinal if ordinal == MAX_ORDINARY_LIBRARY_ORDINAL + 1 => "_reserved_target",
+            _ => "",
+        };
+        let exports = if exported_symbol.is_empty() {
+            String::new()
+        } else {
+            format!("exports:\n  - targets: [ arm64-macos ]\n    symbols: [ {exported_symbol} ]\n")
+        };
+        fs::write(
+            &path,
+            format!(
+                "--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64-macos ]\ninstall-name: '/usr/lib/libordinal{ordinal:03}.dylib'\n{exports}...\n"
+            ),
+        )
+        .unwrap();
+        dependencies.push(path);
+    }
+
+    let mut max_outputs = Vec::new();
+    let max_output = dir.join("max-ordinal.dylib");
+    for jobs in [1, 4] {
+        let mut inputs = vec![max_object.clone()];
+        inputs.extend_from_slice(&dependencies[..MAX_ORDINARY_LIBRARY_ORDINAL]);
+        Linker::run(&LinkOptions {
+            inputs,
+            output: Some(max_output.clone()),
+            install_name: Some("@rpath/max-ordinal.dylib".into()),
+            kind: OutputKind::Dylib,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        max_outputs.push(fs::read(&max_output).unwrap());
+    }
+
+    assert_eq!(max_outputs[0], max_outputs[1]);
+    let max_bytes = &max_outputs[0];
+    let load_names = load_dylib_names(max_bytes).unwrap();
+    assert_eq!(load_names.len(), MAX_ORDINARY_LIBRARY_ORDINAL);
+    assert_eq!(load_names.last().unwrap(), "/usr/lib/libordinal253.dylib");
+    assert_eq!(
+        canonical_symbol_record_map(max_bytes)["_max_target"].n_desc >> 8,
+        MAX_ORDINARY_LIBRARY_ORDINAL as u16
+    );
+    assert!(decode_bind_records(max_bytes, false)
+        .unwrap()
+        .iter()
+        .any(|record| {
+            record.symbol == "_max_target" && record.ordinal == MAX_ORDINARY_LIBRARY_ORDINAL as u16
+        }));
+
+    let mut diagnostics = Vec::new();
+    for jobs in [1, 4] {
+        let output = dir.join(format!("reserved-ordinal-j{jobs}.dylib"));
+        fs::write(&output, SENTINEL).unwrap();
+        let mut inputs = vec![reserved_object.clone()];
+        inputs.extend_from_slice(&dependencies);
+        let error = Linker::run(&LinkOptions {
+            inputs,
+            output: Some(output.clone()),
+            kind: OutputKind::Dylib,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .expect_err("ordinary dylib ordinal 254 must be rejected");
+        diagnostics.push(error.to_string());
+        assert_eq!(fs::read(output).unwrap(), SENTINEL);
+    }
+    assert_eq!(diagnostics[0], diagnostics[1]);
+    assert_eq!(
+        diagnostics[0],
+        "too many dylib dependencies: Mach-O supports at most 253 ordinary library ordinals"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn linker_run_handles_non_standard_segment_without_panicking() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5400,10 +7321,7 @@ fn linker_run_handles_non_standard_segment_without_panicking() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5507,20 +7425,20 @@ fn linker_run_omits_debug_section_rebases() {
 #[test]
 fn linker_run_rebases_custom_segment_pointers_like_apple_ld() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -5550,10 +7468,7 @@ fn linker_run_rebases_custom_segment_pointers_like_apple_ld() {
             cset w0, ne
             ret
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -5627,7 +7542,7 @@ fn linker_run_rebases_custom_segment_pointers_like_apple_ld() {
 #[test]
 fn linker_run_uses_requested_entry_symbol() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5644,10 +7559,7 @@ fn linker_run_uses_requested_entry_symbol() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5716,20 +7628,20 @@ fn linker_run_dead_strip_keeps_same_address_entry_alias_bytes() {
 #[test]
 fn linker_run_dead_strip_keeps_same_address_entry_alias() {
     if !have_xcrun_tool("ld") || !have_tool("codesign") {
-        eprintln!("skipping: xcrun ld or codesign unavailable");
+        harness_skip!("xcrun ld or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -5790,7 +7702,7 @@ fn linker_run_dead_strip_keeps_same_address_entry_alias() {
 #[test]
 fn linker_run_defaults_entry_to_main_symbol() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5808,10 +7720,7 @@ fn linker_run_defaults_entry_to_main_symbol() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5835,7 +7744,7 @@ fn linker_run_defaults_entry_to_main_symbol() {
 #[test]
 fn linker_run_applies_core_arm64_relocations() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5864,10 +7773,7 @@ fn linker_run_applies_core_arm64_relocations() {
             .quad _helper - _main
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5926,7 +7832,7 @@ fn sign_extend_21(value: i64) -> i64 {
 #[test]
 fn linker_run_applies_scaled_pageoff12_for_ldr_x() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -5948,10 +7854,7 @@ fn linker_run_applies_scaled_pageoff12_for_ldr_x() {
             .quad 0x1122334455667788
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -5990,15 +7893,15 @@ fn linker_run_applies_scaled_pageoff12_for_ldr_x() {
 #[test]
 fn relocated_sections_match_apple_ld_across_fixture_matrix() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     const TEXT: SectionCase = SectionCase {
@@ -6267,7 +8170,7 @@ fn relocated_sections_match_apple_ld_across_fixture_matrix() {
 #[test]
 fn linker_run_thunks_none_rejects_out_of_range_branch26() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -6291,10 +8194,7 @@ fn linker_run_thunks_none_rejects_out_of_range_branch26() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6320,7 +8220,7 @@ fn linker_run_thunks_none_rejects_out_of_range_branch26() {
 #[test]
 fn linker_run_inserts_thunk_for_out_of_range_branch26() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
 
@@ -6345,10 +8245,7 @@ fn linker_run_inserts_thunk_for_out_of_range_branch26() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6395,7 +8292,7 @@ fn linker_run_inserts_thunk_for_out_of_range_branch26() {
 #[test]
 fn linker_run_safe_thunks_do_not_grow_small_programs() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -6413,10 +8310,7 @@ fn linker_run_safe_thunks_do_not_grow_small_programs() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6438,7 +8332,7 @@ fn linker_run_safe_thunks_do_not_grow_small_programs() {
 #[test]
 fn linker_run_thunks_all_forces_shared_thunk_for_in_range_calls() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
 
@@ -6460,10 +8354,7 @@ fn linker_run_thunks_all_forces_shared_thunk_for_in_range_calls() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6515,9 +8406,99 @@ fn linker_run_thunks_all_forces_shared_thunk_for_in_range_calls() {
 }
 
 #[test]
+fn linker_run_thunks_preserve_branch_addends_and_identity() {
+    let obj = scratch("branch26-thunk-addends.o");
+    let direct_out = scratch("branch26-direct-addends.dylib");
+    let out = scratch("branch26-thunk-addends.dylib");
+    fs::write(&obj, synthetic_branch_addend_object()).unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(direct_out.clone()),
+        kind: OutputKind::Dylib,
+        thunks: afs_ld::ThunkMode::None,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+    let direct_bytes = fs::read(&direct_out).unwrap();
+    let direct_symbols = symbol_values(&direct_bytes);
+    let (direct_text_addr, direct_text) =
+        output_section(&direct_bytes, "__TEXT", "__text").unwrap();
+    assert_eq!(
+        [
+            decode_branch_target(&direct_text, direct_text_addr, 0).unwrap(),
+            decode_branch_target(&direct_text, direct_text_addr, 4).unwrap(),
+            decode_branch_target(&direct_text, direct_text_addr, 8).unwrap(),
+        ],
+        [
+            direct_symbols["_target"] + 4,
+            direct_symbols["_target"] - 4,
+            direct_symbols["_target"] + 4,
+        ],
+        "direct branches must retain their relocation addends"
+    );
+
+    Linker::run(&LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Dylib,
+        thunks: afs_ld::ThunkMode::All,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let symbols = symbol_values(&bytes);
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    let (thunks_addr, thunks) = output_section(&bytes, "__TEXT", "__thunks").unwrap();
+    assert_eq!(
+        thunks.len(),
+        24,
+        "distinct relocation addends require distinct thunks"
+    );
+
+    let positive = decode_branch_target(&text, text_addr, 0).unwrap();
+    let negative = decode_branch_target(&text, text_addr, 4).unwrap();
+    let repeated_positive = decode_branch_target(&text, text_addr, 8).unwrap();
+    assert_eq!(
+        positive, repeated_positive,
+        "equal addends should share a thunk"
+    );
+    assert_ne!(
+        positive, negative,
+        "distinct addends must not share a thunk"
+    );
+
+    let thunk_starts = [thunks_addr, thunks_addr + 12];
+    for (caller_target, effective_target) in [
+        (positive, symbols["_target"] + 4),
+        (negative, symbols["_target"] - 4),
+    ] {
+        assert!(
+            thunk_starts.contains(&caller_target),
+            "caller landed inside a thunk instead of at its first instruction"
+        );
+        let thunk_offset = caller_target - thunks_addr;
+        assert_eq!(
+            decode_page_reference(&thunks, thunks_addr, thunk_offset, &PageRefKind::Add).unwrap(),
+            effective_target,
+            "thunk materialized the bare symbol instead of the addend-adjusted target"
+        );
+        assert_eq!(
+            read_insn(&thunks, thunk_offset as usize + 8).unwrap(),
+            0xd61f_0200
+        );
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(direct_out);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_places_thunks_in_caller_segment() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
 
@@ -6542,10 +8523,7 @@ fn linker_run_places_thunks_in_caller_segment() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6587,7 +8565,7 @@ fn linker_run_places_thunks_in_caller_segment() {
 #[test]
 fn linker_run_replans_thunks_until_layout_converges() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -6616,10 +8594,7 @@ fn linker_run_replans_thunks_until_layout_converges() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6655,7 +8630,7 @@ fn linker_run_replans_thunks_until_layout_converges() {
 #[test]
 fn linker_run_emits_multiple_thunk_islands_within_text_segment() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
 
@@ -6684,10 +8659,7 @@ fn linker_run_emits_multiple_thunk_islands_within_text_segment() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -6742,16 +8714,16 @@ fn linker_run_emits_multiple_thunk_islands_within_text_segment() {
 #[test]
 fn linker_run_routes_dylib_imports_through_synthetic_sections() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -6767,10 +8739,7 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone()],
@@ -6910,20 +8879,20 @@ fn linker_run_routes_dylib_imports_through_synthetic_sections() {
 #[test]
 fn linker_run_applies_pcrel_pointer_to_got_like_apple_ld() {
     if !have_xcrun() || !have_xcrun_tool("ld") || !have_tool("codesign") {
-        eprintln!("skipping: xcrun as/ld or codesign unavailable");
+        harness_skip!("xcrun as/ld or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7008,20 +8977,20 @@ fn linker_run_applies_pcrel_pointer_to_got_like_apple_ld() {
 #[test]
 fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7038,10 +9007,7 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -7127,15 +9093,15 @@ fn synthetic_import_surfaces_match_apple_ld_classic_lazy_model() {
 #[test]
 fn classic_lazy_surfaces_match_apple_ld_across_fixture_matrix() {
     if !have_xcrun() || !have_xcrun_tool("ld") {
-        eprintln!("skipping: xcrun as/ld unavailable");
+        harness_skip!("xcrun as/ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -7221,20 +9187,20 @@ fn classic_lazy_surfaces_match_apple_ld_across_fixture_matrix() {
 #[test]
 fn linker_run_binds_direct_dylib_import_pointers() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang or codesign unavailable");
+        harness_skip!("xcrun clang or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7258,20 +9224,17 @@ fn linker_run_binds_direct_dylib_import_pointers() {
     let obj = scratch("direct-data.o");
     let our_out = scratch("direct-data-ours.out");
 
-    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
-        eprintln!("skipping: dylib compile failed: {e}");
-        return;
-    }
+    require_fixture!(
+        "dylib fixture compilation",
+        compile_dylib_c(dylib_src, &dylib)
+    );
 
     let main_src = r#"
         extern int ext_data;
         int *p = &ext_data;
         int main(void) { return *p == 5 ? 0 : 1; }
     "#;
-    if let Err(e) = compile_c(main_src, &obj) {
-        eprintln!("skipping: compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(main_src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone(), dylib.clone()],
@@ -7316,15 +9279,15 @@ fn linker_run_binds_direct_dylib_import_pointers() {
 #[test]
 fn direct_bind_surfaces_match_apple_ld_across_fixture_matrix() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang or codesign unavailable");
+        harness_skip!("xcrun clang or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -7399,20 +9362,20 @@ fn direct_bind_surfaces_match_apple_ld_across_fixture_matrix() {
 #[test]
 fn linker_run_rebases_local_absolute_pointers_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7424,10 +9387,7 @@ fn linker_run_rebases_local_absolute_pointers_like_ld() {
         int *p = &ext;
         int main(void) { return *p == 7 ? 0 : 1; }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: clang compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -7465,20 +9425,20 @@ fn linker_run_rebases_local_absolute_pointers_like_ld() {
 #[test]
 fn linker_run_routes_local_got_loads_through_rebased_slots() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7501,10 +9461,7 @@ fn linker_run_routes_local_got_loads_through_rebased_slots() {
             .long 7
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone()],
@@ -7556,20 +9513,20 @@ fn linker_run_routes_local_got_loads_through_rebased_slots() {
 #[test]
 fn linker_run_dead_strip_prunes_synthetic_import_sections() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7590,10 +9547,7 @@ fn linker_run_dead_strip_prunes_synthetic_import_sections() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone()],
@@ -7657,20 +9611,20 @@ fn linker_run_dead_strip_prunes_synthetic_import_sections() {
 #[test]
 fn linker_run_dead_strip_keeps_and_runs_initializers() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7754,16 +9708,16 @@ fn linker_run_dead_strip_keeps_and_runs_initializers() {
 #[test]
 fn linker_run_preserves_initialized_same_name_section_data() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7862,20 +9816,20 @@ fn linker_run_preserves_initialized_same_name_section_data() {
 #[test]
 fn linker_run_relaxes_hidden_got_loads_like_apple_ld() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -7898,10 +9852,7 @@ fn linker_run_relaxes_hidden_got_loads_like_apple_ld() {
             .long 7
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone()],
@@ -7954,7 +9905,7 @@ fn linker_run_relaxes_hidden_got_loads_like_apple_ld() {
 #[test]
 fn linker_run_partitions_symtab_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
 
@@ -7966,10 +9917,10 @@ fn linker_run_partitions_symtab_like_ld() {
     let dylib_src = r#"
         int ext_data = 5;
     "#;
-    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
-        eprintln!("skipping: dylib compile failed: {e}");
-        return;
-    }
+    require_fixture!(
+        "dylib fixture compilation",
+        compile_dylib_c(dylib_src, &dylib)
+    );
 
     let asm = r#"
         .text
@@ -7990,10 +9941,7 @@ fn linker_run_partitions_symtab_like_ld() {
         .quad _ext_data
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), dylib.clone()],
@@ -8051,7 +9999,7 @@ fn linker_run_partitions_symtab_like_ld() {
 #[test]
 fn linker_run_strips_locals_with_x_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
 
@@ -8063,10 +10011,10 @@ fn linker_run_strips_locals_with_x_like_ld() {
     let dylib_src = r#"
         int ext_data = 5;
     "#;
-    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
-        eprintln!("skipping: dylib compile failed: {e}");
-        return;
-    }
+    require_fixture!(
+        "dylib fixture compilation",
+        compile_dylib_c(dylib_src, &dylib)
+    );
 
     let asm = r#"
         .text
@@ -8087,10 +10035,7 @@ fn linker_run_strips_locals_with_x_like_ld() {
         .quad _ext_data
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), dylib.clone()],
@@ -8152,15 +10097,15 @@ fn linker_run_strips_locals_with_x_like_ld() {
 #[test]
 fn linker_run_emits_leaf_unwind_info_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -8172,10 +10117,7 @@ fn linker_run_emits_leaf_unwind_info_like_ld() {
             return 0;
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: clang compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -8200,17 +10142,208 @@ fn linker_run_emits_leaf_unwind_info_like_ld() {
 }
 
 #[test]
+fn linker_run_resolves_compact_unwind_function_aliases() {
+    let obj = scratch("compact-unwind-alias.o");
+    let out = scratch("compact-unwind-alias.out");
+    let direct_fixture =
+        synthetic_compact_unwind_alias_object(Some(SyntheticUnwindReferent::Direct));
+    let alias_fixture =
+        synthetic_compact_unwind_alias_object(Some(SyntheticUnwindReferent::IndirectAlias));
+
+    let parsed = ObjectFile::parse(&obj, &alias_fixture).unwrap();
+    let compact = parsed
+        .sections
+        .iter()
+        .find(|section| section.sectname == "__compact_unwind")
+        .expect("alias fixture must contain compact unwind data");
+    let relocs =
+        parse_relocs(&parse_raw_relocs(&compact.raw_relocs, 0, compact.nreloc).unwrap()).unwrap();
+    assert_eq!(relocs.len(), 1);
+    assert_eq!(relocs[0].referent, Referent::Symbol(1));
+    assert_eq!(parsed.symbol_name(&parsed.symbols[1]).unwrap(), "_alias");
+    assert_eq!(parsed.symbols[1].kind(), SymKind::Indirect);
+
+    let link = |fixture: &[u8], jobs| {
+        fs::write(&obj, fixture).unwrap();
+        Linker::run(&LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        fs::read(&out).unwrap()
+    };
+
+    let direct_outputs = [link(&direct_fixture, 1), link(&direct_fixture, 4)];
+    assert_eq!(direct_outputs[0], direct_outputs[1]);
+    let direct_unwind = canonical_unwind_info(&direct_outputs[0]);
+    assert_eq!(direct_unwind.records.len(), 1);
+    assert_eq!(direct_unwind.records[0].function_offset, 0);
+    assert_eq!(direct_unwind.records[0].encoding, 0x0200_0000);
+
+    let alias_outputs = [link(&alias_fixture, 1), link(&alias_fixture, 4)];
+    assert_eq!(alias_outputs[0], alias_outputs[1]);
+    assert_eq!(alias_outputs[0], direct_outputs[0]);
+    assert_eq!(canonical_unwind_info(&alias_outputs[0]), direct_unwind);
+
+    let no_unwind = link(&synthetic_compact_unwind_alias_object(None), 4);
+    assert!(output_section(&no_unwind, "__TEXT", "__unwind_info").is_none());
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_dwarf_unwind_encoding_points_to_final_fde() {
+    const DWARF_MODE: u32 = 0x0300_0000;
+    const DWARF_OFFSET_MASK: u32 = 0x00ff_ffff;
+
+    let obj = scratch("dwarf-unwind-offset.o");
+    let out = scratch("dwarf-unwind-offset.out");
+    let fixture = synthetic_dwarf_unwind_object();
+    let parsed = ObjectFile::parse(&obj, &fixture).unwrap();
+    let compact = parsed
+        .sections
+        .iter()
+        .find(|section| section.sectname == "__compact_unwind")
+        .expect("fixture must contain compact unwind input");
+    assert_eq!(u32_le(&compact.data[12..16]), DWARF_MODE);
+    let input_eh_frame = parsed
+        .sections
+        .iter()
+        .find(|section| section.sectname == "__eh_frame")
+        .expect("fixture must contain an FDE");
+    assert_eq!(eh_frame_fde_offsets(&input_eh_frame.data), vec![0x14]);
+
+    let link = |jobs| {
+        fs::write(&obj, &fixture).unwrap();
+        Linker::run(&LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        fs::read(&out).unwrap()
+    };
+    let outputs = [link(1), link(4)];
+    assert_eq!(outputs[0], outputs[1]);
+    assert!(output_section(&outputs[0], "__LD", "__compact_unwind").is_none());
+
+    let decoded = canonical_unwind_info(&outputs[0]);
+    assert_eq!(decoded.records.len(), 1);
+    assert_eq!(decoded.records[0].function_offset, 0);
+    let (_, eh_frame) = output_section(&outputs[0], "__TEXT", "__eh_frame").unwrap();
+    let fde_offsets = eh_frame_fde_offsets(&eh_frame);
+    assert_eq!(fde_offsets, vec![0x14]);
+    assert_eq!(decoded.records[0].encoding & 0x0f00_0000, DWARF_MODE);
+    assert_eq!(
+        decoded.records[0].encoding & DWARF_OFFSET_MASK,
+        fde_offsets[0]
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_dwarf_unwind_distinguishes_local_functions_inside_one_atom() {
+    const DWARF_MODE: u32 = 0x0300_0000;
+    const DWARF_OFFSET_MASK: u32 = 0x00ff_ffff;
+
+    let obj = scratch("nested-local-dwarf-unwind.o");
+    let out = scratch("nested-local-dwarf-unwind.out");
+    let fixture = synthetic_nested_local_dwarf_unwind_object();
+    let link = |jobs| {
+        fs::write(&obj, &fixture).unwrap();
+        Linker::run(&LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        fs::read(&out).unwrap()
+    };
+
+    let outputs = [link(1), link(4)];
+    assert_eq!(outputs[0], outputs[1]);
+    let decoded = canonical_unwind_info(&outputs[0]);
+    assert_eq!(
+        decoded
+            .records
+            .iter()
+            .map(|record| record.function_offset)
+            .collect::<Vec<_>>(),
+        vec![8, 16]
+    );
+    let (_, eh_frame) = output_section(&outputs[0], "__TEXT", "__eh_frame").unwrap();
+    let fde_offsets = eh_frame_fde_offsets(&eh_frame);
+    assert_eq!(fde_offsets, vec![0x14, 0x30]);
+    for (record, fde_offset) in decoded.records.iter().zip(fde_offsets) {
+        assert_eq!(record.encoding & 0x0f00_0000, DWARF_MODE);
+        assert_eq!(record.encoding & DWARF_OFFSET_MASK, fde_offset);
+    }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_rejects_dwarf_unwind_without_fde_and_preserves_output() {
+    const DWARF_MODE: u32 = 0x0300_0000;
+    const SENTINEL: &[u8] = b"AFSLD-056 existing output";
+
+    let obj = scratch("dwarf-unwind-missing-fde.o");
+    let out = scratch("dwarf-unwind-missing-fde.out");
+    let mut fixture = synthetic_compact_unwind_alias_object(Some(SyntheticUnwindReferent::Direct));
+    let compact = output_section_header(&fixture, "__LD", "__compact_unwind")
+        .expect("fixture must contain compact unwind input");
+    let encoding_offset = compact.offset as usize + 12;
+    fixture[encoding_offset..encoding_offset + 4].copy_from_slice(&DWARF_MODE.to_le_bytes());
+    fs::write(&obj, fixture).unwrap();
+
+    let mut diagnostics = Vec::new();
+    for jobs in [1, 4] {
+        fs::write(&out, SENTINEL).unwrap();
+        let error = Linker::run(&LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .expect_err("DWARF-mode compact unwind without an FDE must be rejected");
+        diagnostics.push(error.to_string());
+        assert_eq!(fs::read(&out).unwrap(), SENTINEL);
+    }
+    assert_eq!(diagnostics[0], diagnostics[1]);
+    assert!(
+        diagnostics[0].contains("has no retained __eh_frame FDE"),
+        "unexpected diagnostic: {}",
+        diagnostics[0]
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_emits_multi_function_unwind_info_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -8226,10 +10359,7 @@ fn linker_run_emits_multi_function_unwind_info_like_ld() {
             return helper();
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: clang compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -8256,15 +10386,15 @@ fn linker_run_emits_multi_function_unwind_info_like_ld() {
 #[test]
 fn linker_run_dead_strip_prunes_unused_unwind_records_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -8284,10 +10414,7 @@ fn linker_run_dead_strip_prunes_unused_unwind_records_like_ld() {
             return helper();
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: clang compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -8329,7 +10456,7 @@ fn linker_run_dead_strip_prunes_unused_unwind_records_like_ld() {
 #[test]
 fn linker_run_handles_large_unwind_function_gaps() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
 
@@ -8353,10 +10480,7 @@ fn linker_run_handles_large_unwind_function_gaps() {
         .cfi_endproc
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -8384,15 +10508,15 @@ fn linker_run_handles_large_unwind_function_gaps() {
 #[test]
 fn linker_run_preserves_eh_frame_like_ld() {
     if !have_xcrun() || !have_xcrun_tool("dwarfdump") {
-        eprintln!("skipping: xcrun dwarfdump unavailable");
+        harness_skip!("xcrun dwarfdump unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -8423,10 +10547,7 @@ fn linker_run_preserves_eh_frame_like_ld() {
         .cfi_endproc
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -8470,15 +10591,15 @@ fn linker_run_preserves_eh_frame_like_ld() {
 #[test]
 fn linker_run_dead_strip_preserves_pruned_eh_frame_like_ld() {
     if !have_xcrun() || !have_xcrun_tool("dwarfdump") {
-        eprintln!("skipping: xcrun dwarfdump unavailable");
+        harness_skip!("xcrun dwarfdump unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -8528,10 +10649,7 @@ fn linker_run_dead_strip_preserves_pruned_eh_frame_like_ld() {
         .cfi_endproc
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -8576,20 +10694,20 @@ fn linker_run_dead_strip_preserves_pruned_eh_frame_like_ld() {
 #[test]
 fn linker_run_emits_backtrace_metadata_like_apple_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -8616,10 +10734,7 @@ fn linker_run_emits_backtrace_metadata_like_apple_ld() {
             return helper() > 1 ? 0 : 1;
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: clang compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -8649,22 +10764,22 @@ fn linker_run_emits_backtrace_metadata_like_apple_ld() {
 #[test]
 fn linker_run_preserves_exception_unwind_metadata_like_apple_ld() {
     if !have_xcrun() || !have_xcrun_tool("clang++") || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang++ or codesign unavailable");
+        harness_skip!("xcrun clang++ or codesign unavailable");
         return;
     }
 
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let libsystem = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     let libcxx = PathBuf::from(format!("{sdk}/usr/lib/libc++.tbd"));
     if !libsystem.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", libsystem.display());
+        harness_skip!("no libSystem.tbd at {}", libsystem.display());
         return;
     }
     if !libcxx.exists() {
-        eprintln!("skipping: no libc++.tbd at {}", libcxx.display());
+        harness_skip!("no libc++.tbd at {}", libcxx.display());
         return;
     }
 
@@ -8678,10 +10793,7 @@ fn linker_run_preserves_exception_unwind_metadata_like_apple_ld() {
             catch (...) { return 42; }
         }
     "#;
-    if let Err(e) = compile_cxx(src, &obj) {
-        eprintln!("skipping: clang++ compile failed: {e}");
-        return;
-    }
+    require_fixture!("C++ fixture compilation", compile_cxx(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), libcxx.clone(), libsystem.clone()],
@@ -8725,20 +10837,20 @@ fn linker_run_preserves_exception_unwind_metadata_like_apple_ld() {
 #[test]
 fn linker_run_resolves_backtrace_symbols_at_runtime() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -8771,10 +10883,7 @@ fn linker_run_resolves_backtrace_symbols_at_runtime() {
             return helper();
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: clang compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -8817,20 +10926,20 @@ fn linker_run_resolves_backtrace_symbols_at_runtime() {
 #[test]
 fn linker_run_emits_function_starts_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -8848,10 +10957,7 @@ fn linker_run_emits_function_starts_like_ld() {
         ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -8901,15 +11007,15 @@ fn linker_run_emits_function_starts_like_ld() {
 #[test]
 fn linker_run_emits_function_starts_for_other_text_sections_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
 
@@ -8930,10 +11036,7 @@ fn linker_run_emits_function_starts_for_other_text_sections_like_ld() {
         ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -8968,272 +11071,205 @@ fn linker_run_emits_function_starts_for_other_text_sections_like_ld() {
 }
 
 #[test]
-fn linker_run_omits_data_in_code_like_ld() {
-    if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
-        return;
-    }
-    let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
-        return;
-    };
-    let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
-        return;
-    };
-    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
-    if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
-        return;
-    }
-
-    let obj = scratch("data-in-code.o");
-    let our_out = scratch("data-in-code-ours.out");
-    let apple_out = scratch("data-in-code-apple.out");
-    let asm = r#"
-        .text
-        .globl _main
-        .p2align 2
-    _main:
-        mov w0, #0
-        b Ldispatch
-        .p2align 2
-    Ltable:
-        .data_region jt32
-        .long Lcase0-Ltable
-        .long Lcase1-Ltable
-        .end_data_region
-    Ldispatch:
-        cmp w0, #0
-        b.eq Lcase0
-        b Lcase1
-    Lcase0:
-        mov w0, #1
-        ret
-    Lcase1:
-        mov w0, #2
-        ret
-        .subsections_via_symbols
-    "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-
-    let opts = LinkOptions {
-        inputs: vec![obj.clone(), tbd],
-        output: Some(our_out.clone()),
-        kind: OutputKind::Executable,
-        ..LinkOptions::default()
-    };
-    Linker::run(&opts).unwrap();
-    apple_link_with_args(
-        &obj,
-        &apple_out,
-        "_main",
-        &sdk,
-        &sdk_ver,
-        &["-data_in_code_info"],
+fn linker_run_preserves_and_rebases_data_in_code_records_deterministically() {
+    let prefix = scratch("AFSLD-058-data-in-code-prefix.o");
+    let marked = scratch("AFSLD-058-data-in-code-marked.o");
+    let output = scratch("AFSLD-058-data-in-code.out");
+    fs::write(&prefix, synthetic_aligned_subsections_object()).unwrap();
+    fs::write(
+        &marked,
+        synthetic_data_in_code_object("_main", "__text", 0, DICE_KIND_JUMP_TABLE32, false),
     )
     .unwrap();
 
-    let our_bytes = fs::read(&our_out).unwrap();
-    let apple_bytes = fs::read(&apple_out).unwrap();
-    let our_dic = raw_linkedit_data_cmd(&our_bytes, LC_DATA_IN_CODE);
-    let apple_dic = raw_linkedit_data_cmd(&apple_bytes, LC_DATA_IN_CODE);
-    assert_eq!(our_dic.1, 0);
-    assert_eq!(our_dic.1, apple_dic.1);
-    assert!(decode_data_in_code(&our_bytes).is_empty());
-    assert!(canonical_data_in_code(&apple_bytes).is_empty());
+    let mut outputs = Vec::new();
+    for jobs in [1, 4] {
+        Linker::run(&LinkOptions {
+            inputs: vec![prefix.clone(), marked.clone()],
+            output: Some(output.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        outputs.push(fs::read(&output).unwrap());
+    }
 
-    let _ = fs::remove_file(obj);
-    let _ = fs::remove_file(our_out);
-    let _ = fs::remove_file(apple_out);
+    let [serial, parallel] = outputs.as_slice() else {
+        unreachable!()
+    };
+    assert_eq!(serial, parallel, "-j1 and -j4 output differs");
+    let image_base = segment_vmaddr(serial, "__TEXT").unwrap();
+    let main_offset = u32::try_from(symbol_values(serial)["_main"] - image_base).unwrap();
+    assert_eq!(
+        decode_data_in_code(serial),
+        vec![DataInCodeRecord {
+            offset: main_offset + 4,
+            length: 4,
+            kind: DICE_KIND_JUMP_TABLE32,
+        }]
+    );
+
+    let _ = fs::remove_file(prefix);
+    let _ = fs::remove_file(marked);
+    let _ = fs::remove_file(output);
 }
 
 #[test]
-fn linker_run_omits_data_in_code_in_later_text_section_like_ld() {
-    if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
-        return;
-    }
-    let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
-        return;
-    };
-    let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
-        return;
-    };
-    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
-    if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
-        return;
-    }
-
-    let obj = scratch("data-in-code-late.o");
-    let our_out = scratch("data-in-code-late-ours.out");
-    let apple_out = scratch("data-in-code-late-apple.out");
-    let asm = r#"
-        .text
-        .globl _main
-        .p2align 2
-    _main:
-        ret
-
-        .section __TEXT,__text2,regular,pure_instructions
-        .globl _helper
-        .p2align 2
-    _helper:
-        b Ldispatch
-        .p2align 2
-    Ltable:
-        .data_region jt32
-        .long Lcase0-Ltable
-        .long Lcase1-Ltable
-        .end_data_region
-    Ldispatch:
-        ret
-    Lcase0:
-        ret
-    Lcase1:
-        ret
-        .subsections_via_symbols
-    "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-
-    let opts = LinkOptions {
-        inputs: vec![obj.clone(), tbd],
-        output: Some(our_out.clone()),
-        kind: OutputKind::Executable,
-        ..LinkOptions::default()
-    };
-    Linker::run(&opts).unwrap();
-    apple_link_with_args(
-        &obj,
-        &apple_out,
-        "_main",
-        &sdk,
-        &sdk_ver,
-        &["-data_in_code_info"],
+fn linker_run_sorts_rebased_data_in_code_across_output_sections() {
+    let later = scratch("AFSLD-058-data-in-code-later.o");
+    let main = scratch("AFSLD-058-data-in-code-main.o");
+    let output = scratch("AFSLD-058-data-in-code-sections.out");
+    fs::write(
+        &later,
+        synthetic_data_in_code_object("_helper", "__text2", 0x80, DICE_KIND_DATA, false),
+    )
+    .unwrap();
+    fs::write(
+        &main,
+        synthetic_data_in_code_object("_main", "__text", 0, DICE_KIND_JUMP_TABLE32, false),
     )
     .unwrap();
 
-    let our_bytes = fs::read(&our_out).unwrap();
-    let apple_bytes = fs::read(&apple_out).unwrap();
-    assert!(canonical_data_in_code(&our_bytes).is_empty());
-    assert!(canonical_data_in_code(&apple_bytes).is_empty());
+    Linker::run(&LinkOptions {
+        // Input order intentionally disagrees with final section order.
+        inputs: vec![later.clone(), main.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
 
-    let _ = fs::remove_file(obj);
-    let _ = fs::remove_file(our_out);
-    let _ = fs::remove_file(apple_out);
+    let bytes = fs::read(&output).unwrap();
+    let image_base = segment_vmaddr(&bytes, "__TEXT").unwrap();
+    let symbols = symbol_values(&bytes);
+    let main_offset = u32::try_from(symbols["_main"] - image_base).unwrap() + 4;
+    let helper_offset = u32::try_from(symbols["_helper"] - image_base).unwrap() + 4;
+    assert!(main_offset < helper_offset);
+    assert_eq!(
+        decode_data_in_code(&bytes),
+        vec![
+            DataInCodeRecord {
+                offset: main_offset,
+                length: 4,
+                kind: DICE_KIND_JUMP_TABLE32,
+            },
+            DataInCodeRecord {
+                offset: helper_offset,
+                length: 4,
+                kind: DICE_KIND_DATA,
+            },
+        ]
+    );
+
+    let _ = fs::remove_file(later);
+    let _ = fs::remove_file(main);
+    let _ = fs::remove_file(output);
 }
 
 #[test]
-fn linker_run_omits_data_in_code_after_large_first_text_section_like_ld() {
-    if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
-        return;
-    }
-    let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
-        return;
-    };
-    let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
-        return;
-    };
-    let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
-    if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
-        return;
-    }
-
-    let obj = scratch("data-in-code-large-first.o");
-    let our_out = scratch("data-in-code-large-first-ours.out");
-    let apple_out = scratch("data-in-code-large-first-apple.out");
-    let asm = r#"
-        .text
-        .globl _main
-        .p2align 2
-    _main:
-        nop
-        nop
-        nop
-        nop
-        nop
-        ret
-
-        .section __TEXT,__text2,regular,pure_instructions
-        .globl _helper
-    _helper:
-        b Ldispatch
-        .p2align 2
-    Ltable:
-        .data_region jt32
-        .long Lcase0-Ltable
-        .long Lcase1-Ltable
-        .end_data_region
-    Ldispatch:
-        ret
-    Lcase0:
-        ret
-    Lcase1:
-        ret
-        .subsections_via_symbols
-    "#;
-    if let Err(e) = assemble(asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-
-    let opts = LinkOptions {
-        inputs: vec![obj.clone(), tbd],
-        output: Some(our_out.clone()),
-        kind: OutputKind::Executable,
-        ..LinkOptions::default()
-    };
-    Linker::run(&opts).unwrap();
-    apple_link_with_args(
-        &obj,
-        &apple_out,
-        "_main",
-        &sdk,
-        &sdk_ver,
-        &["-data_in_code_info"],
+fn linker_run_omits_data_in_code_for_dead_stripped_atoms() {
+    let main = scratch("AFSLD-058-data-in-code-live.o");
+    let unused = scratch("AFSLD-058-data-in-code-dead.o");
+    let output = scratch("AFSLD-058-data-in-code-dead-strip.out");
+    fs::write(
+        &main,
+        synthetic_data_in_code_object("_main", "__text", 0, DICE_KIND_JUMP_TABLE32, false),
+    )
+    .unwrap();
+    fs::write(
+        &unused,
+        synthetic_data_in_code_object("_unused", "__text", 0, DICE_KIND_DATA, false),
     )
     .unwrap();
 
-    let our_bytes = fs::read(&our_out).unwrap();
-    let apple_bytes = fs::read(&apple_out).unwrap();
-    assert!(canonical_data_in_code(&our_bytes).is_empty());
-    assert!(canonical_data_in_code(&apple_bytes).is_empty());
+    Linker::run(&LinkOptions {
+        inputs: vec![main.clone(), unused.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Executable,
+        dead_strip: true,
+        ..LinkOptions::default()
+    })
+    .unwrap();
 
-    let _ = fs::remove_file(obj);
-    let _ = fs::remove_file(our_out);
-    let _ = fs::remove_file(apple_out);
+    let bytes = fs::read(&output).unwrap();
+    let image_base = segment_vmaddr(&bytes, "__TEXT").unwrap();
+    let symbols = symbol_values(&bytes);
+    assert!(!symbols.contains_key("_unused"));
+    assert_eq!(
+        decode_data_in_code(&bytes),
+        vec![DataInCodeRecord {
+            offset: u32::try_from(symbols["_main"] - image_base).unwrap() + 4,
+            length: 4,
+            kind: DICE_KIND_JUMP_TABLE32,
+        }]
+    );
+
+    let _ = fs::remove_file(main);
+    let _ = fs::remove_file(unused);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn linker_run_emits_data_in_code_for_one_surviving_icf_atom() {
+    let first = scratch("AFSLD-058-data-in-code-icf-first.o");
+    let second = scratch("AFSLD-058-data-in-code-icf-second.o");
+    let output = scratch("AFSLD-058-data-in-code-icf.dylib");
+    fs::write(
+        &first,
+        synthetic_data_in_code_object("_first", "__text", 0, DICE_KIND_JUMP_TABLE32, true),
+    )
+    .unwrap();
+    fs::write(
+        &second,
+        synthetic_data_in_code_object("_second", "__text", 0, DICE_KIND_JUMP_TABLE32, true),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![first.clone(), second.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        icf_mode: IcfMode::Safe,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    let image_base = segment_vmaddr(&bytes, "__TEXT").unwrap();
+    let symbols = symbol_values(&bytes);
+    assert_eq!(symbols["_first"], symbols["_second"]);
+    assert_eq!(
+        decode_data_in_code(&bytes),
+        vec![DataInCodeRecord {
+            offset: u32::try_from(symbols["_first"] - image_base).unwrap() + 4,
+            length: 4,
+            kind: DICE_KIND_JUMP_TABLE32,
+        }]
+    );
+
+    let _ = fs::remove_file(first);
+    let _ = fs::remove_file(second);
+    let _ = fs::remove_file(output);
 }
 
 #[test]
 fn linker_run_dedups_output_strtab_like_ld() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9255,10 +11291,7 @@ fn linker_run_dedups_output_strtab_like_ld() {
     }
     asm.push_str("    _main:\n        bl _afs_array_sum\n        ret\n");
     asm.push_str("        .subsections_via_symbols\n");
-    if let Err(e) = assemble(&asm, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(&asm, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -9296,16 +11329,16 @@ fn linker_run_dedups_output_strtab_like_ld() {
 #[test]
 fn linker_run_launches_with_classic_lazy_dylib_import() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang or codesign unavailable");
+        harness_skip!("xcrun clang or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9316,19 +11349,16 @@ fn linker_run_launches_with_classic_lazy_dylib_import() {
     let dylib_src = r#"
         int ext_fn(void) { return 7; }
     "#;
-    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
-        eprintln!("skipping: dylib compile failed: {e}");
-        return;
-    }
+    require_fixture!(
+        "dylib fixture compilation",
+        compile_dylib_c(dylib_src, &dylib)
+    );
 
     let main_src = r#"
         int ext_fn(void);
         int main(void) { return ext_fn() == 7 ? 0 : 1; }
     "#;
-    if let Err(e) = compile_c(main_src, &obj) {
-        eprintln!("skipping: compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(main_src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd, dylib.clone()],
@@ -9363,16 +11393,16 @@ fn linker_run_launches_with_classic_lazy_dylib_import() {
 #[test]
 fn linker_run_handles_local_tlv_descriptors() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang or codesign unavailable");
+        harness_skip!("xcrun clang or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9390,10 +11420,7 @@ fn linker_run_handles_local_tlv_descriptors() {
             return tls_sum() == 7 ? 0 : 1;
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd],
@@ -9465,20 +11492,20 @@ fn linker_run_handles_local_tlv_descriptors() {
 #[test]
 fn linker_run_routes_imported_tlv_through_thread_pointers() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun clang or codesign unavailable");
+        harness_skip!("xcrun clang or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9491,19 +11518,16 @@ fn linker_run_routes_imported_tlv_through_thread_pointers() {
         __thread long ext_tls = 5;
         long read_lib_tls(void) { return ext_tls; }
     "#;
-    if let Err(e) = compile_dylib_c(dylib_src, &dylib) {
-        eprintln!("skipping: dylib compile failed: {e}");
-        return;
-    }
+    require_fixture!(
+        "dylib fixture compilation",
+        compile_dylib_c(dylib_src, &dylib)
+    );
 
     let main_src = r#"
         extern __thread long ext_tls;
         int main(void) { return ext_tls == 5 ? 0 : 1; }
     "#;
-    if let Err(e) = compile_c(main_src, &obj) {
-        eprintln!("skipping: compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(main_src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), tbd.clone(), dylib.clone()],
@@ -9606,24 +11630,24 @@ fn linker_run_routes_imported_tlv_through_thread_pointers() {
 #[test]
 fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(runtime) = workspace_artifact("libarmfortas_rt.a") else {
-        eprintln!("skipping: libarmfortas_rt.a not built");
+        harness_skip!("libarmfortas_rt.a not built");
         return;
     };
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: no macOS SDK path");
+        harness_skip!("no macOS SDK path");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: no macOS SDK version");
+        harness_skip!("no macOS SDK version");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9644,10 +11668,7 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
             return 0;
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), runtime.clone(), tbd],
@@ -9791,24 +11812,24 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
 #[test]
 fn linker_run_rebases_runtime_init_metadata_like_apple_ld() {
     if !have_xcrun() || !have_tool("codesign") {
-        eprintln!("skipping: xcrun or codesign unavailable");
+        harness_skip!("xcrun or codesign unavailable");
         return;
     }
     let Some(runtime) = workspace_artifact("libarmfortas_rt.a") else {
-        eprintln!("skipping: libarmfortas_rt.a not built");
+        harness_skip!("libarmfortas_rt.a not built");
         return;
     };
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: no macOS SDK path");
+        harness_skip!("no macOS SDK path");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: no macOS SDK version");
+        harness_skip!("no macOS SDK version");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -9823,10 +11844,7 @@ fn linker_run_rebases_runtime_init_metadata_like_apple_ld() {
             return 0;
         }
     "#;
-    if let Err(e) = compile_c(src, &obj) {
-        eprintln!("skipping: compile failed: {e}");
-        return;
-    }
+    require_fixture!("C fixture compilation", compile_c(src, &obj));
 
     let opts = LinkOptions {
         inputs: vec![obj.clone(), runtime.clone(), tbd],
@@ -9923,22 +11941,328 @@ fn synthetic_icf_fixture_uses_section_relocation() {
 }
 
 #[test]
+fn linker_run_icf_safe_preserves_const_output_protection_domains() {
+    let object = scratch("icf-protection-domains.o");
+    let output = scratch("icf-protection-domains.dylib");
+    fs::write(
+        &object,
+        synthetic_icf_const_domains_object("__TEXT", "__DATA"),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        icf_mode: afs_ld::IcfMode::Safe,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    assert_eq!(
+        output_section(&bytes, "__TEXT", "__const")
+            .expect("safe ICF erased __TEXT,__const")
+            .1
+            .len(),
+        8
+    );
+    assert_eq!(
+        output_section(&bytes, "__DATA_CONST", "__const")
+            .expect("safe ICF erased __DATA_CONST,__const")
+            .1
+            .len(),
+        8
+    );
+    assert_ne!(
+        segment_protections(&bytes, "__TEXT"),
+        segment_protections(&bytes, "__DATA_CONST"),
+        "fixture must exercise distinct output protection domains"
+    );
+    let symbols = canonical_symbol_record_map(&bytes);
+    assert_ne!(
+        symbols["_first_const"].n_sect, symbols["_second_const"].n_sect,
+        "safe ICF rebound symbols across output sections"
+    );
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn linker_run_icf_safe_folds_const_sections_mapped_to_same_output_domain() {
+    let object = scratch("icf-mapped-domain.o");
+    let output = scratch("icf-mapped-domain.dylib");
+    fs::write(
+        &object,
+        synthetic_icf_const_domains_object("__DATA", "__DATA_CONST"),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        icf_mode: afs_ld::IcfMode::Safe,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    assert_eq!(
+        output_section(&bytes, "__DATA_CONST", "__const")
+            .expect("mapped const output section")
+            .1
+            .len(),
+        8,
+        "same-domain constants should still fold"
+    );
+    let symbols = canonical_symbol_record_map(&bytes);
+    assert_eq!(
+        symbols["_first_const"].n_sect, symbols["_second_const"].n_sect,
+        "same-domain folded symbols should share one output section"
+    );
+    assert_eq!(
+        symbols["_first_const"].value, symbols["_second_const"].value,
+        "same-domain folded symbols should share one output address"
+    );
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn linker_run_icf_safe_preserves_cross_object_subtractor_difference() {
+    let first = scratch("AFSLD-065-subtractor-first.o");
+    let second = scratch("AFSLD-065-subtractor-second.o");
+    let difference = scratch("AFSLD-065-subtractor-difference.o");
+    let baseline_output = scratch("AFSLD-065-subtractor-baseline.dylib");
+    let icf_output = scratch("AFSLD-065-subtractor-icf.dylib");
+    fs::write(&first, synthetic_icf_const_object("_first")).unwrap();
+    fs::write(&second, synthetic_icf_const_object("_second")).unwrap();
+    fs::write(
+        &difference,
+        synthetic_subtractor_difference_object("_second", "_first"),
+    )
+    .unwrap();
+
+    let inputs = vec![first.clone(), second.clone(), difference.clone()];
+    Linker::run(&LinkOptions {
+        inputs: inputs.clone(),
+        output: Some(baseline_output.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+    Linker::run(&LinkOptions {
+        inputs,
+        output: Some(icf_output.clone()),
+        kind: OutputKind::Dylib,
+        icf_mode: IcfMode::Safe,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let difference_value = |path: &PathBuf| {
+        let bytes = fs::read(path).unwrap();
+        let data = output_section(&bytes, "__DATA", "__data")
+            .expect("SUBTRACTOR fixture must retain __DATA,__data")
+            .1;
+        u64::from_le_bytes(data[..8].try_into().unwrap())
+    };
+    assert_eq!(
+        difference_value(&baseline_output),
+        8,
+        "fixture must materialize the cross-object address difference"
+    );
+    assert_eq!(
+        difference_value(&icf_output),
+        8,
+        "safe ICF must not collapse either operand of a SUBTRACTOR relocation"
+    );
+    let icf_symbols = symbol_values(&fs::read(&icf_output).unwrap());
+    assert_ne!(
+        icf_symbols.get("_first"),
+        icf_symbols.get("_second"),
+        "safe ICF must preserve distinct addresses observed by SUBTRACTOR"
+    );
+
+    let _ = fs::remove_file(first);
+    let _ = fs::remove_file(second);
+    let _ = fs::remove_file(difference);
+    let _ = fs::remove_file(baseline_output);
+    let _ = fs::remove_file(icf_output);
+}
+
+#[test]
+fn linker_run_dead_strip_omits_private_symbols_from_removed_atoms() {
+    let object = scratch("AFSLD-066-dead-private.o");
+    let output = scratch("AFSLD-066-dead-private.dylib");
+    fs::write(
+        &object,
+        synthetic_single_section_object(
+            "__TEXT",
+            "__const",
+            S_REGULAR,
+            &[0x11; 16],
+            &[],
+            &[
+                ("_live", N_SECT | N_EXT, 1, 0, 0),
+                ("_dead_private", N_SECT | N_EXT | N_PEXT, 1, 0, 8),
+            ],
+        ),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        dead_strip: true,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    assert_eq!(
+        output_section(&bytes, "__TEXT", "__const")
+            .expect("live public atom must retain __TEXT,__const")
+            .1
+            .len(),
+        8,
+        "dead stripping must remove the unreferenced private atom"
+    );
+    let symbols = canonical_symbol_record_map(&bytes);
+    assert!(symbols.contains_key("_live"));
+    assert!(
+        !symbols.contains_key("_dead_private"),
+        "a symbol whose atom was dead stripped must not be emitted"
+    );
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn linker_run_icf_safe_preserves_section_relative_literal_pointers() {
+    let object = scratch("AFSLD-067-local-literal-pointers.o");
+    let baseline_output = scratch("AFSLD-067-local-literal-pointers-baseline.dylib");
+    let icf_output = scratch("AFSLD-067-local-literal-pointers-icf.dylib");
+    fs::write(&object, synthetic_icf_local_literal_pointer_object()).unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(baseline_output.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(icf_output.clone()),
+        kind: OutputKind::Dylib,
+        icf_mode: IcfMode::Safe,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let assert_valid_literal_pointers = |path: &PathBuf| {
+        let bytes = fs::read(path).unwrap();
+        let (cstring_addr, cstrings) = output_section(&bytes, "__TEXT", "__cstring")
+            .expect("literal pointer fixture must retain __TEXT,__cstring");
+        let (_, pointers) = output_section(&bytes, "__DATA_CONST", "__const")
+            .expect("literal pointer fixture must retain __DATA_CONST,__const");
+        assert_eq!(cstrings, b"dup\0dup\0");
+        assert_eq!(pointers.len(), 16);
+        let first = u64::from_le_bytes(pointers[..8].try_into().unwrap());
+        let second = u64::from_le_bytes(pointers[8..16].try_into().unwrap());
+        assert_eq!(first, cstring_addr);
+        assert_eq!(second, cstring_addr + 4);
+        assert!(first < cstring_addr + cstrings.len() as u64);
+        assert!(second < cstring_addr + cstrings.len() as u64);
+    };
+    assert_valid_literal_pointers(&baseline_output);
+    assert_valid_literal_pointers(&icf_output);
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(baseline_output);
+    let _ = fs::remove_file(icf_output);
+}
+
+#[test]
+fn linker_run_preserves_local_symbol_identity_on_global_name_collision() {
+    let local_object = scratch("AFSLD-068-local-reference.o");
+    let global_object = scratch("AFSLD-068-global-target.o");
+    let output = scratch("AFSLD-068-local-symbol-collision.dylib");
+    fs::write(
+        &local_object,
+        synthetic_local_symbol_collision_reference_object(),
+    )
+    .unwrap();
+    fs::write(
+        &global_object,
+        synthetic_single_section_object(
+            "__DATA",
+            "__global",
+            S_REGULAR,
+            &0xaaaa_bbbb_cccc_ddddu64.to_le_bytes(),
+            &[],
+            &[("_same", N_SECT | N_EXT, 1, 0, 0)],
+        ),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![local_object.clone(), global_object.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    let (local_addr, local_data) = output_section(&bytes, "__DATA", "__localref")
+        .expect("local collision fixture must retain __DATA,__localref");
+    let (global_addr, global_data) = output_section(&bytes, "__DATA", "__global")
+        .expect("local collision fixture must retain __DATA,__global");
+    assert_eq!(&local_data[8..], &0x1111_2222_3333_4444u64.to_le_bytes());
+    assert_eq!(global_data, 0xaaaa_bbbb_cccc_ddddu64.to_le_bytes());
+    assert_ne!(local_addr + 8, global_addr);
+    let emitted_pointer = u64::from_le_bytes(local_data[..8].try_into().unwrap());
+    assert_eq!(emitted_pointer, local_addr + 8);
+    assert_ne!(emitted_pointer, global_addr);
+    assert_eq!(
+        decode_rebase_records(&bytes).unwrap(),
+        vec![RebaseRecord {
+            segment: "__DATA".into(),
+            section: "__localref".into(),
+            section_offset: 0,
+            rebase_type: REBASE_TYPE_POINTER,
+        }]
+    );
+
+    let _ = fs::remove_file(local_object);
+    let _ = fs::remove_file(global_object);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
 fn linker_run_icf_safe_keeps_cross_object_section_targets_distinct() {
     if !have_xcrun() || !have_xcrun_tool("ld") || !have_tool("codesign") {
-        eprintln!("skipping: xcrun as/ld or codesign unavailable");
+        harness_skip!("xcrun as/ld or codesign unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
     let Some(sdk_ver) = sdk_version() else {
-        eprintln!("skipping: xcrun --show-sdk-version unavailable");
+        harness_skip!("xcrun --show-sdk-version unavailable");
         return;
     };
     let tbd = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
     if !tbd.exists() {
-        eprintln!("skipping: no libSystem.tbd at {}", tbd.display());
+        harness_skip!("no libSystem.tbd at {}", tbd.display());
         return;
     }
 
@@ -10080,7 +12404,7 @@ fn linker_run_icf_safe_keeps_cross_object_section_targets_distinct() {
 #[test]
 fn linker_run_icf_safe_folds_identical_private_text() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10109,10 +12433,7 @@ fn linker_run_icf_safe_folds_identical_private_text() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -10168,7 +12489,7 @@ fn linker_run_icf_safe_folds_identical_private_text() {
 #[test]
 fn linker_run_icf_safe_keeps_address_taken_functions_distinct() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10203,10 +12524,7 @@ fn linker_run_icf_safe_keeps_address_taken_functions_distinct() {
             .quad _helper2
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -10263,7 +12581,7 @@ fn linker_run_icf_safe_keeps_address_taken_functions_distinct() {
 #[test]
 fn linker_run_icf_safe_keeps_adrp_add_address_taken_functions_distinct() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10301,10 +12619,7 @@ fn linker_run_icf_safe_keeps_adrp_add_address_taken_functions_distinct() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -10361,7 +12676,7 @@ fn linker_run_icf_safe_keeps_adrp_add_address_taken_functions_distinct() {
 #[test]
 fn linker_run_icf_safe_folds_matching_branch_relocs() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10396,10 +12711,7 @@ fn linker_run_icf_safe_folds_matching_branch_relocs() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -10455,7 +12767,7 @@ fn linker_run_icf_safe_folds_matching_branch_relocs() {
 #[test]
 fn linker_run_icf_safe_keeps_distinct_branch_targets_unfolded() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10495,10 +12807,7 @@ fn linker_run_icf_safe_keeps_distinct_branch_targets_unfolded() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -10555,7 +12864,7 @@ fn linker_run_icf_safe_keeps_distinct_branch_targets_unfolded() {
 #[test]
 fn linker_run_icf_safe_folds_identical_private_const_data() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10580,10 +12889,7 @@ fn linker_run_icf_safe_folds_identical_private_const_data() {
             .quad 0x1122334455667788
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -10634,7 +12940,7 @@ fn linker_run_icf_safe_folds_identical_private_const_data() {
 #[test]
 fn linker_run_icf_safe_folds_identical_private_cstrings() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10657,10 +12963,7 @@ fn linker_run_icf_safe_folds_identical_private_cstrings() {
             .asciz "fold me"
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -10711,7 +13014,7 @@ fn linker_run_icf_safe_folds_identical_private_cstrings() {
 #[test]
 fn linker_run_icf_safe_folds_identical_private_literal16() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10736,10 +13039,7 @@ fn linker_run_icf_safe_folds_identical_private_literal16() {
             .quad 0x99aabbccddeeff00
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -10792,7 +13092,7 @@ fn linker_run_icf_safe_folds_identical_private_literal16() {
 #[test]
 fn linker_run_icf_safe_folds_identical_private_data_const_atoms() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10817,10 +13117,7 @@ fn linker_run_icf_safe_folds_identical_private_data_const_atoms() {
             .quad 0x0123456789abcdef
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -10873,7 +13170,7 @@ fn linker_run_icf_safe_folds_identical_private_data_const_atoms() {
 #[test]
 fn linker_run_icf_safe_reaches_fixed_point_through_folded_targets() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -10913,10 +13210,7 @@ fn linker_run_icf_safe_reaches_fixed_point_through_folded_targets() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let baseline_opts = LinkOptions {
         inputs: vec![obj.clone()],
@@ -10982,7 +13276,7 @@ fn linker_run_icf_safe_reaches_fixed_point_through_folded_targets() {
 #[test]
 fn linker_run_icf_safe_prefers_earlier_input_order_winner() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun unavailable");
+        harness_skip!("xcrun unavailable");
         return;
     };
 
@@ -11024,21 +13318,9 @@ fn linker_run_icf_safe_prefers_earlier_input_order_winner() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(main_src, &main_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-    if let Err(e) = assemble(helper_a_src, &first_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        return;
-    }
-    if let Err(e) = assemble(helper_b_src, &second_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        let _ = fs::remove_file(first_obj);
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(main_src, &main_obj));
+    require_fixture!("assembly fixture", assemble(helper_a_src, &first_obj));
+    require_fixture!("assembly fixture", assemble(helper_b_src, &second_obj));
 
     let opts = LinkOptions {
         inputs: vec![main_obj.clone(), first_obj.clone(), second_obj.clone()],
@@ -11074,4 +13356,145 @@ fn linker_run_icf_safe_prefers_earlier_input_order_winner() {
     let _ = fs::remove_file(second_obj);
     let _ = fs::remove_file(our_out);
     let _ = fs::remove_file(map);
+}
+
+#[test]
+fn linker_run_rejects_link_map_alias_of_unpublished_output() {
+    let directory = scratch("AFSLD-071-map-output-alias");
+    let nested = directory.join("nested");
+    let object = directory.join("input.o");
+    let output = directory.join("linked.dylib");
+    let map_alias = nested.join("..").join("linked.dylib");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(
+        &object,
+        synthetic_single_section_object(
+            "__TEXT",
+            "__const",
+            S_REGULAR,
+            &[0x71; 8],
+            &[],
+            &[("_value", N_SECT | N_EXT, 1, 0, 0)],
+        ),
+    )
+    .unwrap();
+
+    let result = Linker::run(&LinkOptions {
+        inputs: vec![object],
+        output: Some(output.clone()),
+        map: Some(map_alias.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    });
+    let output_exists = output.exists();
+    let _ = fs::remove_dir_all(&directory);
+
+    assert!(
+        matches!(
+            result,
+            Err(LinkError::LinkMapAliasesOutput {
+                map,
+                output: rejected_output,
+            }) if map == map_alias && rejected_output == output
+        ),
+        "a link map must report its conflict with the primary output"
+    );
+    assert!(
+        !output_exists,
+        "path-alias rejection must happen before publishing the primary output"
+    );
+}
+
+#[test]
+fn linker_run_preserves_existing_output_when_link_map_aliases_it() {
+    const SENTINEL: &[u8] = b"previous complete executable";
+    let directory = scratch("AFSLD-071-existing-output-alias");
+    let object = directory.join("input.o");
+    let output = directory.join("linked.dylib");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        &object,
+        synthetic_single_section_object(
+            "__TEXT",
+            "__const",
+            S_REGULAR,
+            &[0x71; 8],
+            &[],
+            &[("_value", N_SECT | N_EXT, 1, 0, 0)],
+        ),
+    )
+    .unwrap();
+    fs::write(&output, SENTINEL).unwrap();
+
+    let result = Linker::run(&LinkOptions {
+        inputs: vec![object],
+        output: Some(output.clone()),
+        map: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    });
+    let output_after = fs::read(&output).unwrap();
+    let _ = fs::remove_dir_all(&directory);
+
+    assert!(matches!(
+        result,
+        Err(LinkError::LinkMapAliasesOutput { .. })
+    ));
+    assert_eq!(
+        output_after, SENTINEL,
+        "alias rejection must preserve the previously published output"
+    );
+}
+
+#[test]
+fn linker_run_rejects_link_map_filesystem_aliases_of_inputs() {
+    for alias_kind in ["symlink", "hardlink"] {
+        let directory = scratch(&format!("AFSLD-071-map-input-{alias_kind}"));
+        let object = directory.join("input.o");
+        let output = directory.join("linked.dylib");
+        let map_alias = directory.join("linked.map");
+        fs::create_dir_all(&directory).unwrap();
+        let object_bytes = synthetic_single_section_object(
+            "__TEXT",
+            "__const",
+            S_REGULAR,
+            &[0x71; 8],
+            &[],
+            &[("_value", N_SECT | N_EXT, 1, 0, 0)],
+        );
+        fs::write(&object, &object_bytes).unwrap();
+        match alias_kind {
+            "symlink" => std::os::unix::fs::symlink(&object, &map_alias).unwrap(),
+            "hardlink" => fs::hard_link(&object, &map_alias).unwrap(),
+            _ => unreachable!(),
+        }
+
+        let result = Linker::run(&LinkOptions {
+            inputs: vec![object.clone()],
+            output: Some(output.clone()),
+            map: Some(map_alias.clone()),
+            kind: OutputKind::Dylib,
+            ..LinkOptions::default()
+        });
+        let object_after = fs::read(&object).unwrap();
+        let output_exists = output.exists();
+        let _ = fs::remove_dir_all(&directory);
+
+        assert!(
+            matches!(
+                result,
+                Err(LinkError::LinkMapAliasesInput { map, input })
+                    if map == map_alias && input == object
+            ),
+            "a {alias_kind} link map alias must identify the protected input"
+        );
+        assert_eq!(
+            object_after, object_bytes,
+            "a rejected {alias_kind} map alias must leave the input byte-exact"
+        );
+        assert!(
+            !output_exists,
+            "input-alias rejection must happen before publishing the primary output"
+        );
+    }
 }

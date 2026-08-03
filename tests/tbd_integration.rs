@@ -19,6 +19,10 @@
 //!
 //! Skipped if `xcrun` or `libSystem.tbd` aren't present.
 
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use afs_ld::macho::dylib::{DylibFile, DylibLoadKind};
 use afs_ld::macho::tbd::{parse_tbd, parse_tbd_for_target, Arch, Platform, Target};
 
@@ -36,12 +40,12 @@ fn sdk_path() -> Option<String> {
 #[test]
 fn libsystem_tbd_materializes_into_dylib_file() {
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: SDK path unavailable");
+        harness_skip!("SDK path unavailable");
         return;
     };
     let path = format!("{sdk}/usr/lib/libSystem.tbd");
     let Ok(src) = std::fs::read_to_string(&path) else {
-        eprintln!("skipping: libSystem.tbd not found at {path}");
+        harness_skip!("libSystem.tbd not found at {path}");
         return;
     };
     let docs = parse_tbd(&src).unwrap_or_else(|e| panic!("libSystem.tbd failed to parse: {e}"));

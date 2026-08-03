@@ -1,12 +1,12 @@
-//! x86_64 ELF linking (x16 arc): ET_REL reader and a static ET_EXEC
-//! writer. Rung 1 scope: freestanding executables from relocatable
-//! objects — no libc, no dynamic section, no TLS. The reader/writer
-//! discipline mirrors the Mach-O side: hand-rolled wire structs,
-//! loud errors, byte-deterministic output.
+//! x86_64 ELF final linking: `ET_REL`, archive, linker-script, and `ET_DYN`
+//! readers plus writers for static and dynamically linked `ET_EXEC` images.
+//! The implemented path includes ordered archive selection, section garbage
+//! collection, GOT/PLT synthesis, TLS models and relaxation, IFUNC/IPLT,
+//! init/fini arrays, unwind headers, and symbol versioning. PIE and shared-object
+//! output remain unsupported and are rejected explicitly.
 //!
-//! Relocation set (measured against the armfortas corpus): R_X86_64_
-//! 64/32/32S/PC32/PLT32. PLT32 in a static link with the target
-//! defined resolves exactly like PC32 — there is no PLT.
+//! The reader/writer discipline mirrors the Mach-O side: hand-rolled wire
+//! structs, loud errors, and byte-deterministic output.
 
 use std::collections::{HashMap, HashSet};
 
@@ -39,6 +39,7 @@ const VERSYM_HIDDEN: u16 = 0x8000;
 const VER_NDX_GLOBAL: u16 = 1;
 
 pub const ET_DYN: u16 = 3;
+pub const STT_NOTYPE: u8 = 0;
 pub const STT_OBJECT: u8 = 1;
 pub const STT_FUNC: u8 = 2;
 /// `.dynamic` tag: shared-object name.
@@ -52,6 +53,7 @@ pub const R_X86_64_IRELATIVE: u32 = 37;
 pub const SHF_WRITE: u64 = 0x1;
 pub const SHF_ALLOC: u64 = 0x2;
 pub const SHF_EXECINSTR: u64 = 0x4;
+pub const SHF_MERGE: u64 = 0x10;
 pub const SHF_INFO_LINK: u64 = 0x40;
 pub const SHF_TLS: u64 = 0x400;
 const SHF_GNU_RETAIN: u64 = 0x20_0000;
@@ -59,6 +61,11 @@ const SHF_GNU_RETAIN: u64 = 0x20_0000;
 pub const STB_LOCAL: u8 = 0;
 pub const STB_GLOBAL: u8 = 1;
 pub const STB_WEAK: u8 = 2;
+
+pub const STV_DEFAULT: u8 = 0;
+pub const STV_INTERNAL: u8 = 1;
+pub const STV_HIDDEN: u8 = 2;
+pub const STV_PROTECTED: u8 = 3;
 
 pub const SHN_UNDEF: u16 = 0;
 pub const SHN_ABS: u16 = 0xfff1;
@@ -134,6 +141,9 @@ const LINKER_SYMS: &[&str] = &[
     "_edata",
     "_end",
 ];
+/// Linker-provided symbols that GNU-compatible executables publish for
+/// runtime references from retained shared objects.
+const DYNAMIC_LINKER_SYMS: &[&str] = &["__bss_start", "_edata", "_end"];
 /// Sentinel object index marking a linker-provided pseudo definition;
 /// the paired symbol index is an offset into [`LINKER_SYMS`].
 const LINKER_MARK: usize = usize::MAX;
@@ -148,6 +158,15 @@ const PAGE: u64 = 0x1000;
 
 #[derive(Debug)]
 pub struct ElfError(pub String);
+
+/// ELF output policies selected by command-line options rather than input
+/// metadata. The defaults match GNU ld: input notes determine stack
+/// executability and dynamic function binding is lazy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ElfLinkPolicy {
+    pub executable_stack: Option<bool>,
+    pub bind_now: bool,
+}
 
 impl std::fmt::Display for ElfError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -235,6 +254,7 @@ pub struct Section {
     pub sh_type: u32,
     pub sh_flags: u64,
     pub sh_addralign: u64,
+    pub sh_entsize: u64,
     pub data: Vec<u8>,
     pub nobits_size: u64,
     pub relas: Vec<Rela>,
@@ -246,6 +266,9 @@ pub struct Symbol {
     pub bind: u8,
     /// `st_info & 0xf`: STT_FUNC, STT_OBJECT, STT_GNU_IFUNC, ...
     pub typ: u8,
+    /// `st_other & 0x3`: STV_DEFAULT, STV_INTERNAL, STV_HIDDEN, or
+    /// STV_PROTECTED.
+    pub visibility: u8,
     pub shndx: u16,
     /// Object-local section index remapped to `sections` index for
     /// ordinary sections; SHN_* specials keep their meaning via shndx.
@@ -407,6 +430,7 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
             sh_type: r.sh_type,
             sh_flags: r.flags,
             sh_addralign: r.align,
+            sh_entsize: r.entsize as u64,
             data: if r.sh_type == SHT_NOBITS {
                 Vec::new()
             } else {
@@ -468,6 +492,7 @@ pub fn parse_rel(name: &str, bytes: &[u8]) -> Result<ElfObject, ElfError> {
                 name: cstr(strdat, ru32(e, 0) as usize, name, &strtab.name)?,
                 bind: e[4] >> 4,
                 typ: e[4] & 0xf,
+                visibility: e[5] & 0x3,
                 shndx,
                 section: remap.get(&(shndx as usize)).copied(),
                 value: ru64(e, 8),
@@ -826,6 +851,7 @@ struct OutSec {
     name: String,
     flags: u64,
     align: u64,
+    entsize: u64,
     data: Vec<u8>,
     bss_size: u64,
     vaddr: u64,
@@ -833,13 +859,19 @@ struct OutSec {
     is_bss: bool,
 }
 
-type OutputSectionIndex = HashMap<(String, u64), usize>;
+type OutputSectionIndex = HashMap<(String, u64, u64), usize>;
 
-fn validate_special_output_section_flags(
+fn validate_output_section_metadata(
     outs: &[OutSec],
     object: &str,
     section: &Section,
 ) -> Result<(), ElfError> {
+    if section.sh_flags & SHF_MERGE != 0 && section.sh_entsize == 0 {
+        return err(format!(
+            "{}: mergeable section '{}' has zero entry size",
+            object, section.name
+        ));
+    }
     if section.name != ".eh_frame" {
         return Ok(());
     }
@@ -867,10 +899,7 @@ fn output_section_type(section: &OutSec) -> u32 {
 }
 
 fn output_section_entsize(section: &OutSec) -> u64 {
-    match section.name.as_str() {
-        ".preinit_array" | ".init_array" | ".fini_array" => 8,
-        _ => 0,
-    }
+    section.entsize
 }
 
 /// (object index, section index) -> (output section, offset within it)
@@ -898,6 +927,21 @@ enum GotSlot {
     Defined(usize, usize),
     TpOff(usize, usize),
     Zero,
+}
+
+#[derive(Clone, Copy)]
+enum DynamicExportDef {
+    Object { object: usize, symbol: usize },
+    Linker { symbol: usize },
+}
+
+impl DynamicExportDef {
+    fn address_target(self) -> (usize, usize) {
+        match self {
+            Self::Object { object, symbol } => (object, symbol),
+            Self::Linker { symbol } => (LINKER_MARK, symbol),
+        }
+    }
 }
 
 fn output_rank(flags: u64, is_bss: bool) -> u32 {
@@ -1205,6 +1249,13 @@ fn defined_names(obj: &ElfObject, out: &mut HashSet<String>) {
     }
 }
 
+fn dynamic_linker_symbol_index(name: &str) -> Option<usize> {
+    if !DYNAMIC_LINKER_SYMS.contains(&name) {
+        return None;
+    }
+    LINKER_SYMS.iter().position(|candidate| *candidate == name)
+}
+
 /// Resolve a symbol name to its defining member's header offset in an
 /// archive, tolerant of symbol versioning: an exact hit wins, else a
 /// default-version (`name@@V`) entry, else any versioned (`name@V`).
@@ -1227,22 +1278,35 @@ fn armap_offset(ar: &crate::archive::Archive, name: &str) -> Option<u64> {
     any
 }
 
-/// Strong-undefined names an object references, in first-seen order,
-/// skipping any already defined. Weak-undefined does not pull archive
-/// members (it resolves to 0 if left unsatisfied).
+/// Strong-undefined names an object references, in first-seen order.
+/// Default-visible references may be satisfied by any selected definition;
+/// non-default references remain demand until this output's objects define
+/// them. Weak-undefined does not pull archive members (it resolves to 0 if
+/// left unsatisfied).
 fn undefined_demand(
     objects: &[ElfObject],
     additional: &[String],
     defined: &HashSet<String>,
 ) -> Vec<String> {
+    let mut object_definitions = HashSet::new();
+    for object in objects {
+        defined_names(object, &mut object_definitions);
+    }
     let mut seen: HashSet<String> = HashSet::new();
     let mut demand = Vec::new();
     for obj in objects {
         for sym in &obj.symbols {
+            let already_defined = if sym.visibility == STV_DEFAULT {
+                defined.contains(&sym.name)
+            } else {
+                // A non-default undefined symbol may be satisfied only by
+                // the output component itself, never by a selected DSO.
+                object_definitions.contains(&sym.name)
+            };
             if sym.shndx != SHN_UNDEF
                 || sym.bind != STB_GLOBAL
                 || sym.name.is_empty()
-                || defined.contains(&sym.name)
+                || already_defined
                 || LINKER_SYMS.contains(&sym.name.as_str())
             {
                 continue;
@@ -1263,6 +1327,57 @@ fn undefined_demand(
         demand.push(name.clone());
     }
     demand
+}
+
+fn shared_satisfies_default_visible_demand(
+    objects: &[ElfObject],
+    defined: &HashSet<String>,
+    exports: &HashMap<String, Export>,
+) -> bool {
+    objects.iter().flat_map(|obj| &obj.symbols).any(|sym| {
+        sym.shndx == SHN_UNDEF
+            && sym.bind == STB_GLOBAL
+            && sym.visibility == STV_DEFAULT
+            && !sym.name.is_empty()
+            && !defined.contains(&sym.name)
+            && !LINKER_SYMS.contains(&sym.name.as_str())
+            && exports.contains_key(&sym.name)
+    })
+}
+
+fn visibility_name(visibility: u8) -> &'static str {
+    match visibility {
+        STV_INTERNAL => "internal",
+        STV_HIDDEN => "hidden",
+        STV_PROTECTED => "protected",
+        _ => "default-visible",
+    }
+}
+
+fn validate_nondefault_undefineds(
+    objects: &[ElfObject],
+    globals: &HashMap<String, (usize, usize)>,
+) -> Result<(), ElfError> {
+    for object in objects {
+        for symbol in &object.symbols {
+            if symbol.shndx != SHN_UNDEF
+                || symbol.bind != STB_GLOBAL
+                || symbol.visibility == STV_DEFAULT
+                || symbol.name.is_empty()
+                || globals.contains_key(&symbol.name)
+                || LINKER_SYMS.contains(&symbol.name.as_str())
+            {
+                continue;
+            }
+            return err(format!(
+                "{} symbol '{}' isn't defined (referenced from {})",
+                visibility_name(symbol.visibility),
+                symbol.name,
+                object.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn uncovered_shared_demand(
@@ -1327,7 +1442,7 @@ fn ensure_common_bss(
     outs: &mut Vec<OutSec>,
     out_index: &mut OutputSectionIndex,
 ) -> Result<usize, ElfError> {
-    let key = (".bss".to_string(), SHF_ALLOC | SHF_WRITE);
+    let key = (".bss".to_string(), SHF_ALLOC | SHF_WRITE, 0);
     if let Some(&idx) = out_index.get(&key) {
         if !outs[idx].is_bss {
             return err("section '.bss' is PROGBITS but COMMON allocation needs NOBITS .bss");
@@ -1338,6 +1453,7 @@ fn ensure_common_bss(
         name: ".bss".to_string(),
         flags: SHF_ALLOC | SHF_WRITE,
         align: 1,
+        entsize: 0,
         data: Vec::new(),
         bss_size: 0,
         vaddr: 0,
@@ -1563,16 +1679,13 @@ fn validate_object_relocations(objects: &[ElfObject]) -> Result<(), ElfError> {
     Ok(())
 }
 
-fn gnu_stack_flags(objects: &[ElfObject]) -> u32 {
-    PF_R | PF_W
-        | if objects
+fn gnu_stack_flags(objects: &[ElfObject], executable_stack: Option<bool>) -> u32 {
+    let executable_stack = executable_stack.unwrap_or_else(|| {
+        objects
             .iter()
             .any(|object| object.requires_executable_stack)
-        {
-            PF_X
-        } else {
-            0
-        }
+    });
+    PF_R | PF_W | if executable_stack { PF_X } else { 0 }
 }
 
 fn parse_eh_frame_gc(section: &Section, object: &str) -> Result<EhFrameGc, ElfError> {
@@ -2285,6 +2398,23 @@ pub fn link_static_with_gc(
     eh_frame_hdr: bool,
     gc_sections: bool,
 ) -> Result<Vec<u8>, ElfError> {
+    link_static_with_gc_and_policy(
+        inputs,
+        entry,
+        eh_frame_hdr,
+        gc_sections,
+        ElfLinkPolicy::default(),
+    )
+}
+
+#[doc(hidden)]
+pub fn link_static_with_gc_and_policy(
+    inputs: Vec<LinkInput>,
+    entry: &str,
+    eh_frame_hdr: bool,
+    gc_sections: bool,
+    policy: ElfLinkPolicy,
+) -> Result<Vec<u8>, ElfError> {
     let mut inputs: Vec<StaticInput> = inputs.into_iter().map(static_state).collect();
     let mut objects = Vec::new();
     let mut defined = HashSet::new();
@@ -2295,7 +2425,7 @@ pub fn link_static_with_gc(
         apply_gc_sections(&mut objects, &analysis)?;
     }
 
-    link_static_exec(&objects, entry, eh_frame_hdr)
+    link_static_exec_with_policy(&objects, entry, eh_frame_hdr, policy)
 }
 
 /// Link relocatable objects into a static ET_EXEC image. Explicit
@@ -2308,6 +2438,15 @@ pub fn link_static_exec(
     objects: &[ElfObject],
     entry: &str,
     eh_frame_hdr: bool,
+) -> Result<Vec<u8>, ElfError> {
+    link_static_exec_with_policy(objects, entry, eh_frame_hdr, ElfLinkPolicy::default())
+}
+
+fn link_static_exec_with_policy(
+    objects: &[ElfObject],
+    entry: &str,
+    eh_frame_hdr: bool,
+    policy: ElfLinkPolicy,
 ) -> Result<Vec<u8>, ElfError> {
     validate_object_relocations(objects)?;
 
@@ -2329,14 +2468,15 @@ pub fn link_static_exec(
             if array_kind(&sec.name).is_some() {
                 continue;
             }
-            validate_special_output_section_flags(&outs, &obj.name, sec)?;
+            validate_output_section_metadata(&outs, &obj.name, sec)?;
             let is_bss = sec.sh_type == SHT_NOBITS;
-            let key = (sec.name.clone(), sec.sh_flags);
+            let key = (sec.name.clone(), sec.sh_flags, sec.sh_entsize);
             let idx = *out_index.entry(key).or_insert_with(|| {
                 outs.push(OutSec {
                     name: sec.name.clone(),
                     flags: sec.sh_flags,
                     align: 1,
+                    entsize: sec.sh_entsize,
                     data: Vec::new(),
                     bss_size: 0,
                     vaddr: 0,
@@ -2401,6 +2541,7 @@ pub fn link_static_exec(
             name: base.to_string(),
             flags: SHF_ALLOC | SHF_WRITE,
             align,
+            entsize: 8,
             data: Vec::new(),
             bss_size: 0,
             vaddr: 0,
@@ -2466,6 +2607,7 @@ pub fn link_static_exec(
             name: name.to_string(),
             flags: SHF_ALLOC | SHF_WRITE | SHF_TLS,
             align: tls_align,
+            entsize: 0,
             data: std::mem::take(&mut tls_data),
             bss_size: 0,
             vaddr: 0,
@@ -2578,6 +2720,7 @@ pub fn link_static_exec(
             name: ".got".to_string(),
             flags: SHF_ALLOC | SHF_WRITE,
             align: 8,
+            entsize: 0,
             data: vec![0u8; got_entries.len() * 8],
             bss_size: 0,
             vaddr: 0,
@@ -2622,6 +2765,7 @@ pub fn link_static_exec(
             name: ".iplt".to_string(),
             flags: SHF_ALLOC | SHF_EXECINSTR,
             align: 16,
+            entsize: 0,
             data: vec![0u8; n_iplt * 16],
             bss_size: 0,
             vaddr: 0,
@@ -2633,6 +2777,7 @@ pub fn link_static_exec(
             name: ".got.plt".to_string(),
             flags: SHF_ALLOC | SHF_WRITE,
             align: 8,
+            entsize: 0,
             data: vec![0u8; n_iplt * 8],
             bss_size: 0,
             vaddr: 0,
@@ -2644,6 +2789,7 @@ pub fn link_static_exec(
             name: ".rela.plt".to_string(),
             flags: SHF_ALLOC,
             align: 8,
+            entsize: 0,
             data: vec![0u8; n_iplt * 24],
             bss_size: 0,
             vaddr: 0,
@@ -2671,6 +2817,7 @@ pub fn link_static_exec(
                 name: ".eh_frame_hdr".to_string(),
                 flags: SHF_ALLOC,
                 align: 4,
+                entsize: 0,
                 data: vec![0u8; 12 + n_fde * 8],
                 bss_size: 0,
                 vaddr: 0,
@@ -3170,9 +3317,17 @@ pub fn link_static_exec(
             4,
         ));
     }
-    // Missing notes keep the secure non-executable default; an executable
-    // `.note.GNU-stack` in any selected input requests PF_X.
-    ph.extend(phdr(PT_GNU_STACK, gnu_stack_flags(objects), 0, 0, 0, 0, 0));
+    // Command-line policy overrides input notes. Otherwise missing notes keep
+    // the secure non-executable default and any executable note requests PF_X.
+    ph.extend(phdr(
+        PT_GNU_STACK,
+        gnu_stack_flags(objects, policy.executable_stack),
+        0,
+        0,
+        0,
+        0,
+        0,
+    ));
     image[64..64 + ph.len()].copy_from_slice(&ph);
 
     // Section bytes.
@@ -3350,9 +3505,11 @@ fn process_dynamic_range(
                 let candidate_soname = candidate.soname.clone();
                 let candidate_exports: HashSet<String> =
                     candidate.exports.keys().cloned().collect();
-                let regular_select = undefined_demand(&state.objects, &[], &state.defined)
-                    .iter()
-                    .any(|name| candidate.exports.contains_key(name));
+                let regular_select = shared_satisfies_default_visible_demand(
+                    &state.objects,
+                    &state.defined,
+                    &candidate.exports,
+                );
                 let shared_select = state.shared_metadata.iter().any(|details| {
                     details.complete
                         && !details.needed.contains(&candidate.soname)
@@ -3508,6 +3665,25 @@ pub fn link_dynamic_with_as_needed_and_gc(
     eh_frame_hdr: bool,
     gc_sections: bool,
 ) -> Result<Vec<u8>, ElfError> {
+    link_dynamic_with_as_needed_gc_and_policy(
+        inputs,
+        entry,
+        interp,
+        eh_frame_hdr,
+        gc_sections,
+        ElfLinkPolicy::default(),
+    )
+}
+
+#[doc(hidden)]
+pub fn link_dynamic_with_as_needed_gc_and_policy(
+    inputs: Vec<(DynamicLinkInput, bool, Option<SharedLinkMetadata>)>,
+    entry: &str,
+    interp: &str,
+    eh_frame_hdr: bool,
+    gc_sections: bool,
+    policy: ElfLinkPolicy,
+) -> Result<Vec<u8>, ElfError> {
     let mut inputs: Vec<DynamicInput> = inputs
         .into_iter()
         .map(|(input, as_needed, metadata)| dynamic_state(input, as_needed, metadata))
@@ -3533,6 +3709,7 @@ pub fn link_dynamic_with_as_needed_and_gc(
                     .iter()
                     .find(|name| {
                         !state.defined.contains(*name)
+                            && dynamic_linker_symbol_index(name).is_none()
                             && !dependency_covers(details, name, &state.dependency_exports)
                     })
                     .map(|name| (lib, name))
@@ -3544,7 +3721,14 @@ pub fn link_dynamic_with_as_needed_and_gc(
         ));
     }
 
-    link_dynamic_exec(&state.objects, &state.shared, entry, interp, eh_frame_hdr)
+    link_dynamic_exec_with_policy(
+        &state.objects,
+        &state.shared,
+        entry,
+        interp,
+        eh_frame_hdr,
+        policy,
+    )
 }
 
 pub fn link_dynamic_exec(
@@ -3553,6 +3737,24 @@ pub fn link_dynamic_exec(
     entry: &str,
     interp: &str,
     eh_frame_hdr: bool,
+) -> Result<Vec<u8>, ElfError> {
+    link_dynamic_exec_with_policy(
+        objects,
+        shared,
+        entry,
+        interp,
+        eh_frame_hdr,
+        ElfLinkPolicy::default(),
+    )
+}
+
+fn link_dynamic_exec_with_policy(
+    objects: &[ElfObject],
+    shared: &[SharedLib],
+    entry: &str,
+    interp: &str,
+    eh_frame_hdr: bool,
+    policy: ElfLinkPolicy,
 ) -> Result<Vec<u8>, ElfError> {
     validate_object_relocations(objects)?;
 
@@ -3569,14 +3771,15 @@ pub fn link_dynamic_exec(
             if sec.sh_flags & SHF_TLS != 0 || array_kind(&sec.name).is_some() {
                 continue;
             }
-            validate_special_output_section_flags(&outs, &obj.name, sec)?;
+            validate_output_section_metadata(&outs, &obj.name, sec)?;
             let is_bss = sec.sh_type == SHT_NOBITS;
-            let key = (sec.name.clone(), sec.sh_flags);
+            let key = (sec.name.clone(), sec.sh_flags, sec.sh_entsize);
             let idx = *out_index.entry(key).or_insert_with(|| {
                 outs.push(OutSec {
                     name: sec.name.clone(),
                     flags: sec.sh_flags,
                     align: 1,
+                    entsize: sec.sh_entsize,
                     data: Vec::new(),
                     bss_size: 0,
                     vaddr: 0,
@@ -3611,6 +3814,7 @@ pub fn link_dynamic_exec(
     // deterministic version aliasing (see resolve_globals), then allocate
     // coalesced COMMON storage into .bss before layout.
     let globals = resolve_globals(objects)?;
+    validate_nondefault_undefineds(objects, &globals)?;
     let common_place = place_common_symbols(objects, &globals, &mut outs, &mut out_index)?;
 
     for base in [".preinit_array", ".init_array", ".fini_array"] {
@@ -3637,6 +3841,7 @@ pub fn link_dynamic_exec(
             name: base.to_string(),
             flags: SHF_ALLOC | SHF_WRITE,
             align,
+            entsize: 8,
             data: Vec::new(),
             bss_size: 0,
             vaddr: 0,
@@ -3692,6 +3897,7 @@ pub fn link_dynamic_exec(
             name: name.to_string(),
             flags: SHF_ALLOC | SHF_WRITE | SHF_TLS,
             align: tls_align,
+            entsize: 0,
             data: std::mem::take(&mut tls_data),
             bss_size: tls_bss,
             vaddr: 0,
@@ -3934,7 +4140,7 @@ pub fn link_dynamic_exec(
     // the executable (e.g. crt1.o's `environ`/`__progname`, which libc
     // needs). Driven by library-undef order for determinism.
     let mut export_names: Vec<String> = Vec::new();
-    let mut export_def: Vec<(usize, usize)> = Vec::new(); // (obj, sym) of the definition
+    let mut export_def: Vec<DynamicExportDef> = Vec::new();
     {
         let mut seen: HashSet<String> = HashSet::new();
         for lib in shared {
@@ -3945,16 +4151,26 @@ pub fn link_dynamic_exec(
                 if let Some(&(doi, dsi)) = globals.get(u) {
                     seen.insert(u.clone());
                     export_names.push(u.clone());
-                    export_def.push((doi, dsi));
+                    export_def.push(DynamicExportDef::Object {
+                        object: doi,
+                        symbol: dsi,
+                    });
+                } else if let Some(symbol) = dynamic_linker_symbol_index(u) {
+                    seen.insert(u.clone());
+                    export_names.push(u.clone());
+                    export_def.push(DynamicExportDef::Linker { symbol });
                 }
             }
         }
     }
     let n_exp = export_names.len();
-    for &(doi, dsi) in &export_def {
-        if objects[doi].symbols[dsi].typ == STT_GNU_IFUNC {
+    for definition in &export_def {
+        let DynamicExportDef::Object { object, symbol } = *definition else {
+            continue;
+        };
+        if objects[object].symbols[symbol].typ == STT_GNU_IFUNC {
             let next = local_ifunc_slot.len();
-            local_ifunc_slot.entry((doi, dsi)).or_insert(next);
+            local_ifunc_slot.entry((object, symbol)).or_insert(next);
         }
     }
     let n_local_ifunc = local_ifunc_slot.len();
@@ -4011,18 +4227,26 @@ pub fn link_dynamic_exec(
         dynsym[e + 4] = (STB_GLOBAL << 4) | styp;
         // st_other=0, st_shndx=0 (UND), value/size=0 already zeroed.
     }
-    for (j, &(doi, dsi)) in export_def.iter().enumerate() {
+    for (j, definition) in export_def.iter().enumerate() {
         let e = (1 + n_imp + j) * 24;
-        let sym = &objects[doi].symbols[dsi];
         dynsym[e..e + 4].copy_from_slice(&export_name_off[j].to_le_bytes());
-        if sym.typ == STT_GNU_IFUNC {
-            dynsym[e + 4] = (STB_GLOBAL << 4) | STT_FUNC;
-            // st_shndx is patched to .plt after section headers are built;
-            // canonical PLT exports have st_size=0.
-        } else {
-            dynsym[e + 4] = (STB_GLOBAL << 4) | sym.typ;
-            dynsym[e + 6..e + 8].copy_from_slice(&SHN_ABS.to_le_bytes());
-            dynsym[e + 16..e + 24].copy_from_slice(&sym.size.to_le_bytes());
+        match *definition {
+            DynamicExportDef::Object { object, symbol } => {
+                let sym = &objects[object].symbols[symbol];
+                if sym.typ == STT_GNU_IFUNC {
+                    dynsym[e + 4] = (STB_GLOBAL << 4) | STT_FUNC;
+                    // st_shndx is patched to .plt after section headers are built;
+                    // canonical PLT exports have st_size=0.
+                } else {
+                    dynsym[e + 4] = (STB_GLOBAL << 4) | sym.typ;
+                    dynsym[e + 6..e + 8].copy_from_slice(&SHN_ABS.to_le_bytes());
+                    dynsym[e + 16..e + 24].copy_from_slice(&sym.size.to_le_bytes());
+                }
+            }
+            DynamicExportDef::Linker { .. } => {
+                dynsym[e + 4] = (STB_GLOBAL << 4) | STT_NOTYPE;
+                dynsym[e + 6..e + 8].copy_from_slice(&SHN_ABS.to_le_bytes());
+            }
         }
         // st_value (e+8..e+16) is patched post-layout.
     }
@@ -4126,10 +4350,11 @@ pub fn link_dynamic_exec(
     let has_init_array = outs.iter().any(|section| section.name == ".init_array");
     let has_fini_array = outs.iter().any(|section| section.name == ".fini_array");
     // .dynamic entry count: NEEDED* + base tags (HASH/STRTAB/SYMTAB/STRSZ/
-    // SYMENT/FLAGS) + PLT tags (PLTGOT/PLTRELSZ/PLTREL/JMPREL, only with a
+    // SYMENT, plus FLAGS for eager binding) + PLT tags
+    // (PLTGOT/PLTRELSZ/PLTREL/JMPREL, only with a
     // PLT) + versioning tags (VERSYM/VERNEED/VERNEEDNUM) + .rela.dyn tags
     // (RELA/RELASZ/RELAENT) + array address/size pairs + NULL.
-    let n_base_dyn = 6;
+    let n_base_dyn = 5 + usize::from(policy.bind_now);
     let n_plt_dyn = if has_plt { 4 } else { 0 };
     let n_ver_dyn = if versioned { 3 } else { 0 };
     let n_reladyn_dyn = if reladyn_size > 0 { 3 } else { 0 };
@@ -4249,6 +4474,9 @@ pub fn link_dynamic_exec(
     let bss_order: Vec<usize> = (0..outs.len()).filter(|&i| outs[i].is_bss).collect();
     for &i in &bss_order {
         outs[i].vaddr = next_multiple(v, outs[i].align.max(1));
+        // NOBITS occupies no bytes, but its section header still carries
+        // the conceptual file position defined by the containing LOAD.
+        outs[i].file_off = rw_start_fo + (outs[i].vaddr - rw_start_v);
         v = outs[i].vaddr + outs[i].bss_size;
     }
     let rw_mem_end_v = v;
@@ -4603,12 +4831,13 @@ pub fn link_dynamic_exec(
     }
 
     // Patch exported symbols' st_value now that addresses are resolved.
-    for (j, &(doi, dsi)) in export_def.iter().enumerate() {
+    for (j, definition) in export_def.iter().enumerate() {
         let e = (1 + n_imp + j) * 24;
         // Executable IFUNC exports are canonical functions: DSOs bind to the
         // same PLT address used by in-image references instead of asking the
         // loader to invoke the resolver independently.
-        let addr = sym_vaddr(doi, dsi)?;
+        let (object, symbol) = definition.address_target();
+        let addr = sym_vaddr(object, symbol)?;
         dynsym[e + 8..e + 16].copy_from_slice(&addr.to_le_bytes());
     }
 
@@ -4647,7 +4876,9 @@ pub fn link_dynamic_exec(
         dyn_push(DT_PLTREL, DT_RELA as u64, &mut dynamic);
         dyn_push(DT_JMPREL, relaplt_v, &mut dynamic);
     }
-    dyn_push(DT_FLAGS, DF_BIND_NOW, &mut dynamic);
+    if policy.bind_now {
+        dyn_push(DT_FLAGS, DF_BIND_NOW, &mut dynamic);
+    }
     if reladyn_size > 0 {
         dyn_push(DT_RELA, reladyn_v, &mut dynamic);
         dyn_push(DT_RELASZ, reladyn_size, &mut dynamic);
@@ -4764,7 +4995,15 @@ pub fn link_dynamic_exec(
         let len = eh_hdr_bytes.len() as u64;
         phdr(PT_GNU_EH_FRAME, PF_R, hfo, hv, len, len, 4);
     }
-    phdr(PT_GNU_STACK, gnu_stack_flags(objects), 0, 0, 0, 0, 0);
+    phdr(
+        PT_GNU_STACK,
+        gnu_stack_flags(objects, policy.executable_stack),
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
     image[64..64 + ph.len()].copy_from_slice(&ph);
 
     // Write metadata sections.
@@ -5039,8 +5278,11 @@ pub fn link_dynamic_exec(
     if let Some(plt_idx) = plt_idx {
         let plt_shndx = u16::try_from(plt_idx)
             .map_err(|_| ElfError("too many ELF sections for a symbol section index".into()))?;
-        for (j, &(doi, dsi)) in export_def.iter().enumerate() {
-            if objects[doi].symbols[dsi].typ == STT_GNU_IFUNC {
+        for (j, definition) in export_def.iter().enumerate() {
+            let DynamicExportDef::Object { object, symbol } = *definition else {
+                continue;
+            };
+            if objects[object].symbols[symbol].typ == STT_GNU_IFUNC {
                 let e = (1 + n_imp + j) * 24;
                 dynsym[e + 6..e + 8].copy_from_slice(&plt_shndx.to_le_bytes());
             }
@@ -5122,7 +5364,7 @@ pub fn link_dynamic_exec(
             SHT_NOBITS,
             o.flags,
             o.vaddr,
-            o.vaddr,
+            o.file_off,
             o.bss_size,
             0,
             0,
@@ -5305,6 +5547,7 @@ mod resolve_globals_tests {
             name: name.to_string(),
             bind,
             typ: 0,
+            visibility: STV_DEFAULT,
             shndx,
             section: if shndx == DEF { Some(0) } else { None },
             value: 0,
@@ -5317,6 +5560,7 @@ mod resolve_globals_tests {
             name: name.to_string(),
             bind: STB_GLOBAL,
             typ: STT_OBJECT,
+            visibility: STV_DEFAULT,
             shndx: SHN_COMMON,
             section: None,
             value: align,
@@ -5439,6 +5683,7 @@ mod output_section_tests {
             sh_type: SHT_PROGBITS,
             sh_flags: flags,
             sh_addralign: 1,
+            sh_entsize: 0,
             data,
             nobits_size: 0,
             relas: Vec::new(),
@@ -5457,6 +5702,7 @@ mod output_section_tests {
                     name: "_start".to_string(),
                     bind: STB_GLOBAL,
                     typ: STT_FUNC,
+                    visibility: STV_DEFAULT,
                     shndx: 1,
                     section: Some(0),
                     value: 0,
@@ -5495,6 +5741,117 @@ mod output_section_tests {
         )
         .unwrap_err();
         assert_eq!(dynamic_error.to_string(), static_error.to_string());
+    }
+}
+
+#[cfg(test)]
+mod dynamic_nobits_header_tests {
+    use super::*;
+
+    fn section_header(image: &[u8], name: &str) -> (u32, u64, u64, u64) {
+        let shoff = ru64(image, 40) as usize;
+        let shentsize = ru16(image, 58) as usize;
+        let shnum = ru16(image, 60) as usize;
+        let shstrndx = ru16(image, 62) as usize;
+        let shstr = shoff + shstrndx * shentsize;
+        let shstr_off = ru64(image, shstr + 24) as usize;
+
+        for index in 0..shnum {
+            let header = shoff + index * shentsize;
+            let name_offset = shstr_off + ru32(image, header) as usize;
+            let name_end = image[name_offset..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .expect("section name must terminate");
+            if &image[name_offset..name_offset + name_end] == name.as_bytes() {
+                return (
+                    ru32(image, header + 4),
+                    ru64(image, header + 16),
+                    ru64(image, header + 24),
+                    ru64(image, header + 32),
+                );
+            }
+        }
+        panic!("missing section {name}");
+    }
+
+    fn load_segment(image: &[u8], address: u64) -> (u64, u64, u64, u64) {
+        let phoff = ru64(image, 32) as usize;
+        let phentsize = ru16(image, 54) as usize;
+        let phnum = ru16(image, 56) as usize;
+
+        for index in 0..phnum {
+            let header = phoff + index * phentsize;
+            if ru32(image, header) != PT_LOAD {
+                continue;
+            }
+            let vaddr = ru64(image, header + 16);
+            let memsz = ru64(image, header + 40);
+            if (vaddr..vaddr + memsz).contains(&address) {
+                return (
+                    ru64(image, header + 8),
+                    vaddr,
+                    ru64(image, header + 32),
+                    memsz,
+                );
+            }
+        }
+        panic!("no PT_LOAD contains address {address:#x}");
+    }
+
+    #[test]
+    fn dynamic_nobits_offset_follows_writable_load_mapping() {
+        let object = ElfObject {
+            name: "nobits.o".to_string(),
+            sections: vec![
+                Section {
+                    name: ".text".to_string(),
+                    sh_type: SHT_PROGBITS,
+                    sh_flags: SHF_ALLOC | SHF_EXECINSTR,
+                    sh_addralign: 16,
+                    sh_entsize: 0,
+                    data: vec![0xc3],
+                    nobits_size: 0,
+                    relas: Vec::new(),
+                },
+                Section {
+                    name: ".bss".to_string(),
+                    sh_type: SHT_NOBITS,
+                    sh_flags: SHF_ALLOC | SHF_WRITE,
+                    sh_addralign: 64,
+                    sh_entsize: 0,
+                    data: Vec::new(),
+                    nobits_size: 96,
+                    relas: Vec::new(),
+                },
+            ],
+            symbols: vec![Symbol {
+                name: "_start".to_string(),
+                bind: STB_GLOBAL,
+                typ: STT_FUNC,
+                visibility: STV_DEFAULT,
+                shndx: 1,
+                section: Some(0),
+                value: 0,
+                size: 1,
+            }],
+            requires_executable_stack: false,
+        };
+
+        let image = link_dynamic_exec(&[object], &[], "_start", "/unused/interp", false)
+            .expect("dynamic link");
+        let (section_type, address, offset, size) = section_header(&image, ".bss");
+        assert_eq!(section_type, SHT_NOBITS);
+
+        let (segment_offset, segment_vaddr, segment_filesz, segment_memsz) =
+            load_segment(&image, address);
+        assert_eq!(
+            offset - segment_offset,
+            address - segment_vaddr,
+            "NOBITS sh_offset must use the containing PT_LOAD's file mapping"
+        );
+        assert!(offset >= segment_offset + segment_filesz);
+        assert!(address + size <= segment_vaddr + segment_memsz);
     }
 }
 
@@ -5576,6 +5933,7 @@ mod eh_frame_hdr_tests {
             sh_type: SHT_PROGBITS,
             sh_flags: SHF_ALLOC,
             sh_addralign: 8,
+            sh_entsize: 0,
             data,
             nobits_size: 0,
             relas: vec![Rela {
@@ -5608,6 +5966,7 @@ mod eh_frame_hdr_tests {
                     sh_type: SHT_PROGBITS,
                     sh_flags: SHF_ALLOC | SHF_EXECINSTR,
                     sh_addralign: 1,
+                    sh_entsize: 0,
                     data: vec![0xc3],
                     nobits_size: 0,
                     relas: Vec::new(),
@@ -5617,6 +5976,7 @@ mod eh_frame_hdr_tests {
                     sh_type: SHT_PROGBITS,
                     sh_flags: SHF_ALLOC,
                     sh_addralign: 8,
+                    sh_entsize: 0,
                     data: eh_frame,
                     nobits_size: 0,
                     relas: Vec::new(),
@@ -5626,6 +5986,7 @@ mod eh_frame_hdr_tests {
                 name: "_start".to_string(),
                 bind: STB_GLOBAL,
                 typ: STT_FUNC,
+                visibility: STV_DEFAULT,
                 shndx: 1,
                 section: Some(0),
                 value: 0,

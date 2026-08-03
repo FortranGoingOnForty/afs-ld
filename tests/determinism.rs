@@ -6,6 +6,10 @@
 
 mod common;
 
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,7 +26,7 @@ const DEFAULT_RUNS: usize = 100;
 #[test]
 fn repeated_parallel_links_are_byte_identical() {
     if !have_xcrun() || !have_xcrun_tool("as") {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -78,7 +82,7 @@ fn repeated_parallel_links_are_byte_identical() {
 #[test]
 fn repeated_parallel_archive_fetches_are_byte_identical() {
     if !have_xcrun() || !have_xcrun_tool("as") {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -136,11 +140,10 @@ fn repeated_parallel_archive_fetches_are_byte_identical() {
     .expect("assemble archive determinism unused fixture");
 
     let archive_path = root.join("libhelpers.a");
-    if let Err(error) = archive(&[helper_a_obj, helper_b_obj, unused_obj], &archive_path) {
-        eprintln!("skipping: archive failed: {error}");
-        let _ = fs::remove_dir_all(root);
-        return;
-    }
+    require_fixture!(
+        "archive fixture",
+        archive(&[helper_a_obj, helper_b_obj, unused_obj], &archive_path)
+    );
 
     assert_repeated_links_identical(vec![main_obj, archive_path], &root, "archive");
 
@@ -150,7 +153,7 @@ fn repeated_parallel_archive_fetches_are_byte_identical() {
 #[test]
 fn relocation_workers_match_single_worker_for_many_atoms() {
     if !have_xcrun() || !have_xcrun_tool("as") {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 

@@ -4,7 +4,10 @@
 Sprints 1–3 — Mach-O reading complete.
 
 ## Goals
-Parse binary dylibs (`MH_DYLIB`). Extract exported symbols via the export trie or `LC_DYLD_CHAINED_FIXUPS` exports, resolve re-exports through umbrella frameworks, and expose a linkable `DylibFile` surface.
+Parse binary dylibs (`MH_DYLIB`). Extract exported symbols from the export trie
+located by classic `LC_DYLD_INFO_ONLY` or modern `LC_DYLD_EXPORTS_TRIE`, resolve
+re-exports through umbrella frameworks, and expose a linkable `DylibFile`
+surface.
 
 ## Deliverables
 
@@ -35,7 +38,11 @@ pub enum DylibLoadKind { Normal, Weak, Reexport, Upward }
 - `LC_LOAD_UPWARD_DYLIB`: cyclic dependency escape hatch.
 
 ### 3. Export trie decoder
-Export trie lives in `__LINKEDIT` pointed at by either `LC_DYLD_INFO_ONLY.export_off/export_size` (classic) or `LC_DYLD_CHAINED_FIXUPS.exports_trie_offset` (modern). Trie format:
+Export trie lives in `__LINKEDIT` pointed at by either
+`LC_DYLD_INFO_ONLY.export_off/export_size` (classic) or a separate
+`LC_DYLD_EXPORTS_TRIE` load command (modern). `LC_DYLD_CHAINED_FIXUPS` points
+only to fixup starts/import data; it does not contain an exports-trie locator.
+Trie format:
 
 - Each node: ULEB128 terminal-size, optional terminal payload (flags ULEB + address ULEB, plus re-export or resolver data), then child count, then `(edge_string, child_offset_ULEB)` pairs.
 - Terminal flags: `EXPORT_SYMBOL_FLAGS_KIND_REGULAR`/`_THREAD_LOCAL`/`_ABSOLUTE`, `EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION`, `EXPORT_SYMBOL_FLAGS_REEXPORT`, `EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER`.

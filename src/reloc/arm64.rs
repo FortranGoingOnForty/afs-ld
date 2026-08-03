@@ -110,10 +110,16 @@ enum BranchTargetKey {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ThunkTarget {
+    key: BranchTargetKey,
+    addend: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ThunkBucketKey {
     island: usize,
-    target: BranchTargetKey,
+    target: ThunkTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +132,7 @@ struct ThunkIsland {
 struct ThunkEntry {
     island: usize,
     slot_in_island: usize,
-    target: BranchTargetKey,
+    target: ThunkTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -578,7 +584,12 @@ pub fn plan_thunks(
         parsed_relocs,
     } = ctx;
 
-    if opts.thunks == ThunkMode::Safe && layout_fits_branch26_span(layout) {
+    let has_branch26_addends = parsed_relocs
+        .values()
+        .flatten()
+        .any(|reloc| reloc.kind == RelocKind::Branch26 && reloc.addend != 0);
+    if opts.thunks == ThunkMode::Safe && !has_branch26_addends && layout_fits_branch26_span(layout)
+    {
         return Ok(None);
     }
 
@@ -635,10 +646,16 @@ pub fn plan_thunks(
             };
             let place = place + local_offset as u64;
             let target_key = resolve_branch_target_key(obj, atom, reloc, &resolve)?;
-            let target = resolve_branch_target_from_key(obj, atom, reloc, target_key, &resolve)?;
+            let target = ThunkTarget {
+                key: target_key,
+                addend: reloc.addend,
+            };
+            let effective_target =
+                resolve_branch_target_from_key(obj, atom, reloc, target.key, &resolve)?
+                    .wrapping_add_signed(target.addend);
             let needs_thunk = match opts.thunks {
                 ThunkMode::None => false,
-                ThunkMode::Safe => !branch26_in_range(place, target),
+                ThunkMode::Safe => !branch26_in_range(place, effective_target),
                 ThunkMode::All => true,
             };
             if !needs_thunk {
@@ -655,10 +672,7 @@ pub fn plan_thunks(
                 island_index.insert(atom_id, next);
                 next
             };
-            let bucket_key = ThunkBucketKey {
-                island,
-                target: target_key,
-            };
+            let bucket_key = ThunkBucketKey { island, target };
             let thunk_index = if let Some(&existing) = index.get(&bucket_key) {
                 existing
             } else {
@@ -670,7 +684,7 @@ pub fn plan_thunks(
                 entries.push(ThunkEntry {
                     island,
                     slot_in_island,
-                    target: target_key,
+                    target,
                 });
                 index.insert(bucket_key, next);
                 next
@@ -772,9 +786,10 @@ fn apply_one(
                         })?
                 } else {
                     resolve_branch_target(obj, atom, reloc, resolve)?
+                        .wrapping_add_signed(reloc.addend)
                 }
             } else {
-                resolve_branch_target(obj, atom, reloc, resolve)?
+                resolve_branch_target(obj, atom, reloc, resolve)?.wrapping_add_signed(reloc.addend)
             };
             patch_branch26(bytes, atom, obj, local_offset, reloc, place, target)
         }
@@ -885,9 +900,11 @@ fn resolve_branch_target_key(
                     "symbol index is out of range".to_string(),
                 )
             })?;
-            if let Ok(name) = obj.symbol_name(input_sym) {
-                if let Some(symbol_id) = resolve.symbol_name_index.get(name).copied() {
-                    return Ok(BranchTargetKey::Symbol(symbol_id));
+            if input_sym.participates_in_global_resolution() {
+                if let Ok(name) = obj.symbol_name(input_sym) {
+                    if let Some(symbol_id) = resolve.symbol_name_index.get(name).copied() {
+                        return Ok(BranchTargetKey::Symbol(symbol_id));
+                    }
                 }
             }
             match input_sym.kind() {
@@ -1074,7 +1091,7 @@ fn synthesize_thunk_section(
         })?;
         let section = &mut layout.sections[section_idx];
         let thunk_addr = section.addr + (entry.slot_in_island as u64) * THUNK_SIZE;
-        let target = match entry.target {
+        let target = match entry.target.key {
             BranchTargetKey::Symbol(symbol_id) => match resolve.sym_table.get(symbol_id) {
                 Symbol::Defined { atom, value, .. } => resolve
                     .atom_addrs
@@ -1098,7 +1115,18 @@ fn synthesize_thunk_section(
             kind: RelocKind::Branch26,
             referent: "thunk target".to_string(),
             detail: "missing final target address".to_string(),
-        })?;
+        })?
+        .wrapping_add_signed(entry.target.addend);
+        if target & 0b11 != 0 {
+            return Err(RelocError {
+                input: PathBuf::from("<synthetic thunks>"),
+                atom: crate::resolve::AtomId(0),
+                atom_offset: (idx as u32) * THUNK_SIZE as u32,
+                kind: RelocKind::Branch26,
+                referent: "thunk target".to_string(),
+                detail: format!("branch target address 0x{target:x} is not 4-byte aligned"),
+            });
+        }
         let adrp = encode_adrp_reg(16, thunk_addr, target, "thunk target")?;
         let add = encode_add_x_reg_pageoff(16, target, "thunk target")?;
         let start = entry.slot_in_island * THUNK_SIZE as usize;
@@ -1251,16 +1279,18 @@ fn resolve_symbol_referent(
         )
     })?;
 
-    if let Ok(name) = obj.symbol_name(input_sym) {
-        if let Some(symbol_id) = resolve.symbol_name_index.get(name).copied() {
-            return resolve_global_symbol(
-                obj,
-                atom,
-                kind,
-                name,
-                resolve.sym_table.get(symbol_id),
-                resolve,
-            );
+    if input_sym.participates_in_global_resolution() {
+        if let Ok(name) = obj.symbol_name(input_sym) {
+            if let Some(symbol_id) = resolve.symbol_name_index.get(name).copied() {
+                return resolve_global_symbol(
+                    obj,
+                    atom,
+                    kind,
+                    name,
+                    resolve.sym_table.get(symbol_id),
+                    resolve,
+                );
+            }
         }
     }
 
@@ -1285,6 +1315,9 @@ fn symbol_referent_id(
         return None;
     };
     let input_sym = obj.symbols.get(sym_idx as usize)?;
+    if !input_sym.participates_in_global_resolution() {
+        return None;
+    }
     let name = obj.symbol_name(input_sym).ok()?;
     resolve.symbol_name_index.get(name).copied()
 }
@@ -1543,37 +1576,60 @@ fn patch_unsigned(
         reloc.kind,
         reloc.referent,
     )?;
-    let value = target
-        .wrapping_add_signed(reloc.addend)
-        .wrapping_add_signed(implicit_addend);
+    let referent = describe_referent(obj, reloc.referent);
     match reloc.length {
-        RelocLength::Word => write_u32(
-            bytes,
-            local_offset,
-            value as u32,
-            atom,
-            obj,
-            reloc.kind,
-            &describe_referent(obj, reloc.referent),
-        ),
+        RelocLength::Word => {
+            let value = i128::from(target) + i128::from(reloc.addend) + i128::from(implicit_addend);
+            let encoded = encode_unsigned_word_value(value).ok_or_else(|| {
+                reloc_error(
+                    atom,
+                    &obj.path,
+                    local_offset,
+                    reloc.kind,
+                    &referent,
+                    format!(
+                        "32-bit UNSIGNED relocation value is out of range ({value:#x}); expected -0x80000000..=0xffffffff"
+                    ),
+                )
+            })?;
+            write_u32(
+                bytes,
+                local_offset,
+                encoded,
+                atom,
+                obj,
+                reloc.kind,
+                &referent,
+            )
+        }
         RelocLength::Quad => write_u64(
             bytes,
             local_offset,
-            value,
+            target
+                .wrapping_add_signed(reloc.addend)
+                .wrapping_add_signed(implicit_addend),
             atom,
             obj,
             reloc.kind,
-            &describe_referent(obj, reloc.referent),
+            &referent,
         ),
         other => Err(reloc_error(
             atom,
             &obj.path,
             local_offset,
             reloc.kind,
-            &describe_referent(obj, reloc.referent),
+            &referent,
             format!("unsupported UNSIGNED width {:?}", other),
         )),
     }
+}
+
+fn encode_unsigned_word_value(value: i128) -> Option<u32> {
+    u32::try_from(value).ok().or_else(|| {
+        i32::try_from(value)
+            .ok()
+            .map(|signed| u32::from_ne_bytes(signed.to_ne_bytes()))
+    })
 }
 
 fn patch_pointer_to_got(
@@ -1735,7 +1791,7 @@ fn patch_branch26(
     place: u64,
     target: u64,
 ) -> Result<(), RelocError> {
-    let delta = target.wrapping_add_signed(reloc.addend).wrapping_sub(place) as i64;
+    let delta = target.wrapping_sub(place) as i64;
     if delta & 0b11 != 0 {
         return Err(reloc_error(
             atom,
@@ -2745,6 +2801,34 @@ mod tests {
     use crate::symbol::{InputSymbol, RawNlist};
     use crate::OutputKind;
 
+    fn apply_unsigned_word_fixture(
+        target: u64,
+        explicit_addend: i64,
+        implicit_addend: i32,
+    ) -> Result<Vec<u8>, RelocError> {
+        let object = thunk_test_object(Vec::new(), 0, 4);
+        let atom = test_atom(0, 4);
+        let mut bytes = implicit_addend.to_le_bytes().to_vec();
+
+        patch_unsigned(
+            &mut bytes,
+            &atom,
+            &object,
+            0,
+            Reloc {
+                offset: 0,
+                kind: RelocKind::Unsigned,
+                length: RelocLength::Word,
+                pcrel: false,
+                referent: Referent::Section(0),
+                addend: explicit_addend,
+                subtrahend: None,
+            },
+            target,
+        )?;
+        Ok(bytes)
+    }
+
     fn apply_pointer_to_got_fixture(
         place: u64,
         got: u64,
@@ -2886,6 +2970,88 @@ mod tests {
     }
 
     #[test]
+    fn local_symbol_referent_ignores_same_named_global() {
+        let mut object = thunk_test_object(Vec::new(), 4, 8);
+        object.symbols[0].raw.n_type = N_SECT;
+        let caller = test_atom(0, 4);
+
+        let mut atoms = AtomTable::new();
+        let local_target = atoms.push(test_atom(4, 4));
+        let mut global_atom = test_atom(0, 4);
+        global_atom.origin = InputId(1);
+        let global_target = atoms.push(global_atom);
+
+        let mut symbols = SymbolTable::new();
+        let name = symbols.intern("_target");
+        symbols
+            .insert(Symbol::Defined {
+                name,
+                origin: InputId(1),
+                atom: global_target,
+                value: 0,
+                weak: false,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap();
+        let symbol_name_index = build_symbol_name_index(&symbols);
+        let atom_addrs = HashMap::from([(local_target, 0x1000), (global_target, 0x2000)]);
+        let atoms_by_input_section = atoms.by_input_section();
+        let section_addrs = HashMap::new();
+        let empty_symbol_addrs = HashMap::new();
+        let resolve = ResolveView {
+            sym_table: &symbols,
+            symbol_name_index: &symbol_name_index,
+            atom_table: &atoms,
+            atom_addrs: &atom_addrs,
+            atoms_by_input_section: &atoms_by_input_section,
+            section_addrs: &section_addrs,
+            stub_addrs: &empty_symbol_addrs,
+            got_addrs: &empty_symbol_addrs,
+            thread_pointer_addrs: &empty_symbol_addrs,
+            lazy_pointer_addrs: &empty_symbol_addrs,
+            stub_helper_entry_addrs: &empty_symbol_addrs,
+            stub_helper_header_addr: None,
+            dyld_private_addr: None,
+            icf_redirects: None,
+        };
+
+        assert!(!object.symbols[0].is_ext());
+        assert!(!object.symbols[0].is_private_ext());
+        assert!(symbol_name_index.contains_key("_target"));
+        assert_eq!(
+            symbol_referent_id(&object, Referent::Symbol(0), &resolve),
+            None
+        );
+        assert_eq!(
+            resolve_branch_target_key(
+                &object,
+                &caller,
+                Reloc {
+                    offset: 0,
+                    kind: RelocKind::Branch26,
+                    length: RelocLength::Word,
+                    pcrel: true,
+                    referent: Referent::Symbol(0),
+                    addend: 0,
+                    subtrahend: None,
+                },
+                &resolve,
+            )
+            .unwrap(),
+            BranchTargetKey::InputSectionOffset {
+                origin: InputId(0),
+                input_section: 1,
+                input_offset: 4,
+            }
+        );
+        assert_eq!(
+            resolve_symbol_referent(&object, &caller, RelocKind::Unsigned, 0, &resolve).unwrap(),
+            0x1000
+        );
+    }
+
+    #[test]
     fn pointer_to_got_word_uses_place_and_addends() {
         let place = 0x1_0000_5000;
         let got = 0x1_0000_1000;
@@ -2894,6 +3060,35 @@ mod tests {
             apply_pointer_to_got_fixture(place, got, RelocLength::Word, true, 12, -4).unwrap();
 
         assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), -0x3ff8);
+    }
+
+    #[test]
+    fn unsigned_word_accepts_signed_and_unsigned_32_bit_values() {
+        for (target, explicit_addend, implicit_addend, expected) in [
+            (u32::MAX as u64, 0, 0, u32::MAX),
+            (0, 0, -1, u32::MAX),
+            (0, 0, i32::MIN, 0x8000_0000),
+        ] {
+            let bytes =
+                apply_unsigned_word_fixture(target, explicit_addend, implicit_addend).unwrap();
+
+            assert_eq!(u32::from_le_bytes(bytes.try_into().unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn unsigned_word_rejects_values_that_require_truncation_or_wrapping() {
+        for (target, explicit_addend, implicit_addend) in [
+            (u32::MAX as u64 + 1, 0, 0),
+            (u64::MAX, 1, 0),
+            (0, i64::MIN, -1),
+        ] {
+            let error =
+                apply_unsigned_word_fixture(target, explicit_addend, implicit_addend).unwrap_err();
+
+            assert!(error.detail.contains("32-bit"), "{error}");
+            assert!(error.detail.contains("out of range"), "{error}");
+        }
     }
 
     #[test]
@@ -3159,17 +3354,115 @@ mod tests {
         );
     }
 
+    #[test]
+    fn safe_thunk_planning_accounts_for_addends_at_range_boundaries() {
+        let cases = [
+            ("forward", 0, BRANCH26_MAX_FORWARD_DELTA_BYTES - 4, 8),
+            ("backward", BRANCH26_MAX_FORWARD_DELTA_BYTES - 4, 0, -12),
+        ];
+
+        for (name, caller_offset, target_offset, addend) in cases {
+            let raw_relocs = branch26_raw_relocs_with_addends(&[(0, addend)]);
+            let object = thunk_test_object(raw_relocs, 4, 8);
+
+            let mut atoms = AtomTable::new();
+            let caller = atoms.push(test_atom(0, 4));
+            let target = atoms.push(test_atom(4, 4));
+
+            let mut sym_table = SymbolTable::new();
+            let target_name = sym_table.intern("_target");
+            sym_table
+                .insert(Symbol::Defined {
+                    name: target_name,
+                    origin: InputId(0),
+                    atom: target,
+                    value: 0,
+                    weak: false,
+                    private_extern: false,
+                    no_dead_strip: false,
+                })
+                .unwrap();
+
+            let inputs = [LayoutInput {
+                id: InputId(0),
+                object: &object,
+                load_order: 0,
+                archive_member_offset: None,
+            }];
+            let mut section = output_section(
+                "__TEXT",
+                "__text",
+                0x1_0000_0000,
+                BRANCH26_MAX_FORWARD_DELTA_BYTES,
+            );
+            let mut output_atoms = vec![
+                crate::section::OutputAtom {
+                    atom: caller,
+                    offset: caller_offset,
+                    size: 4,
+                    data: Vec::new(),
+                },
+                crate::section::OutputAtom {
+                    atom: target,
+                    offset: target_offset,
+                    size: 4,
+                    data: Vec::new(),
+                },
+            ];
+            output_atoms.sort_by_key(|atom| atom.offset);
+            section.atoms = output_atoms;
+            let layout = Layout {
+                kind: OutputKind::Executable,
+                segments: Vec::new(),
+                sections: vec![section],
+            };
+            assert!(layout_fits_branch26_span(&layout));
+            let parsed_relocs = crate::macho::writer::build_parsed_reloc_cache(&inputs).unwrap();
+            let opts = LinkOptions {
+                kind: OutputKind::Executable,
+                thunks: ThunkMode::Safe,
+                ..LinkOptions::default()
+            };
+
+            let plan = plan_thunks(
+                &opts,
+                ThunkPlanningContext {
+                    layout: &layout,
+                    inputs: &inputs,
+                    atoms: &atoms,
+                    sym_table: &sym_table,
+                    synthetic_plan: None,
+                    icf_redirects: None,
+                    parsed_relocs: &parsed_relocs,
+                },
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name} addend overflow was skipped by the safe fast path"));
+
+            assert_eq!(
+                plan.redirect_for(caller, 0),
+                Some(0),
+                "{name} addend overflow should be redirected through a thunk"
+            );
+        }
+    }
+
     fn branch26_raw_relocs(offsets: &[u32]) -> Vec<u8> {
-        let relocs: Vec<_> = offsets
+        let relocs: Vec<_> = offsets.iter().copied().map(|offset| (offset, 0)).collect();
+        branch26_raw_relocs_with_addends(&relocs)
+    }
+
+    fn branch26_raw_relocs_with_addends(relocs: &[(u32, i64)]) -> Vec<u8> {
+        let relocs: Vec<_> = relocs
             .iter()
             .copied()
-            .map(|offset| crate::reloc::Reloc {
+            .map(|(offset, addend)| crate::reloc::Reloc {
                 offset,
                 kind: RelocKind::Branch26,
                 length: RelocLength::Word,
                 pcrel: true,
                 referent: Referent::Symbol(0),
-                addend: 0,
+                addend,
                 subtrahend: None,
             })
             .collect();

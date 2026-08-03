@@ -116,6 +116,13 @@ impl InputSymbol {
         self.raw.n_type & N_PEXT != 0
     }
 
+    /// Whether this symbol participates in link-wide name resolution.
+    /// Private externs remain globally resolvable even when `N_EXT` is
+    /// cleared to keep them out of the output's external-symbol partition.
+    pub fn participates_in_global_resolution(&self) -> bool {
+        self.is_ext() || self.is_private_ext()
+    }
+
     pub fn weak_ref(&self) -> bool {
         self.raw.n_desc & N_WEAK_REF != 0
     }
@@ -249,6 +256,7 @@ mod tests {
         assert_eq!(sym.kind(), SymKind::Sect);
         assert!(sym.is_ext());
         assert!(!sym.is_private_ext());
+        assert!(sym.participates_in_global_resolution());
         assert!(!sym.is_common());
         assert_eq!(sym.library_ordinal(), None);
     }
@@ -258,6 +266,7 @@ mod tests {
         let sym = InputSymbol::from_raw(nlist(20, N_SECT, 2, 0, 0x200));
         assert_eq!(sym.kind(), SymKind::Sect);
         assert!(!sym.is_ext());
+        assert!(!sym.participates_in_global_resolution());
     }
 
     #[test]
@@ -300,6 +309,12 @@ mod tests {
         let sym = InputSymbol::from_raw(nlist(70, N_SECT | N_EXT | N_PEXT, 1, 0, 0x800));
         assert!(sym.is_ext());
         assert!(sym.is_private_ext());
+        assert!(sym.participates_in_global_resolution());
+
+        let hidden = InputSymbol::from_raw(nlist(71, N_SECT | N_PEXT, 1, 0, 0x808));
+        assert!(!hidden.is_ext());
+        assert!(hidden.is_private_ext());
+        assert!(hidden.participates_in_global_resolution());
     }
 
     #[test]

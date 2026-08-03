@@ -1,4 +1,8 @@
 use std::fs;
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -162,11 +166,11 @@ fn normalize(ids: &[u32]) -> Vec<&'static str> {
 #[test]
 fn executable_load_command_order_matches_apple_for_common_surface() {
     if !have_xcrun() || !have_ld() {
-        eprintln!("skipping: xcrun as / ld unavailable");
+        harness_skip!("xcrun as / ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
 
@@ -223,11 +227,11 @@ fn executable_load_command_order_matches_apple_for_common_surface() {
 #[test]
 fn dylib_load_command_order_matches_apple_for_common_surface() {
     if !have_xcrun() || !have_ld() {
-        eprintln!("skipping: xcrun as / ld unavailable");
+        harness_skip!("xcrun as / ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
 
@@ -286,11 +290,11 @@ fn dylib_load_command_order_matches_apple_for_common_surface() {
 #[test]
 fn executable_load_command_order_with_dependency_and_rpath_matches_common_surface() {
     if !have_xcrun() || !have_clang() || !have_ld() {
-        eprintln!("skipping: xcrun as / clang / ld unavailable");
+        harness_skip!("xcrun as / clang / ld unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
 

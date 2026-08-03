@@ -22,7 +22,8 @@ use std::thread;
 
 use crate::archive::{Archive, ArchiveError, ArchiveMetadata, MemberLoadError};
 use crate::input::ObjectFile;
-use crate::macho::dylib::DylibFile;
+use crate::macho::constants::MAX_LIBRARY_ORDINAL;
+use crate::macho::dylib::{DylibFile, DylibLoadKind};
 use crate::macho::reader::ReadError;
 
 // ---------------------------------------------------------------------------
@@ -181,18 +182,21 @@ pub struct DylibInput {
     pub file: DylibFile,
     /// Install name surfaced in the output's `LC_LOAD_DYLIB` list.
     ///
-    /// Multi-document TBD inputs may seed exports from several sibling
-    /// documents while still canonicalizing them back to one umbrella load
-    /// command (e.g. `libSystem.tbd`).
+    /// Multi-document TBD inputs may seed exports from the top-level document
+    /// and its reachable inline re-exports while still canonicalizing them to
+    /// one umbrella load command (e.g. `libSystem.tbd`).
     pub load_install_name: String,
     /// Current-version field surfaced in the output `LC_LOAD_DYLIB`.
     pub load_current_version: u32,
     /// Compatibility-version field surfaced in the output `LC_LOAD_DYLIB`.
     pub load_compatibility_version: u32,
     /// 1-based two-level-namespace ordinal encoded into undefined symbols and
-    /// bind opcodes. Matches the output's `LC_LOAD_DYLIB` ordering, so several
-    /// parsed TBD documents from one umbrella input may legitimately share it.
+    /// bind opcodes. Matches the output's `LC_LOAD_DYLIB` ordering, so the
+    /// reachable re-export graph from one umbrella input legitimately shares it.
     pub ordinal: u16,
+    /// How the output loads this dependency. Weak loads make every import from
+    /// the dependency weak, independently of provider or consumer symbol bits.
+    pub load_kind: DylibLoadKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +249,7 @@ pub struct DylibLoadMeta {
     pub current_version: u32,
     pub compatibility_version: u32,
     pub ordinal: u16,
+    pub load_kind: DylibLoadKind,
 }
 
 #[derive(Debug, Default)]
@@ -258,6 +263,7 @@ pub struct Inputs {
 pub enum InputAddError {
     Read(ReadError),
     Archive(ArchiveError),
+    TooManyDylibDependencies,
 }
 
 impl std::fmt::Display for InputAddError {
@@ -265,6 +271,10 @@ impl std::fmt::Display for InputAddError {
         match self {
             InputAddError::Read(e) => write!(f, "{e}"),
             InputAddError::Archive(e) => write!(f, "{e}"),
+            InputAddError::TooManyDylibDependencies => write!(
+                f,
+                "too many dylib dependencies: Mach-O supports at most 253 ordinary library ordinals"
+            ),
         }
     }
 }
@@ -367,30 +377,43 @@ impl Inputs {
     /// Register a `.dylib`. TBD-backed dylibs go through
     /// [`Inputs::add_dylib_from_tbd`].
     pub fn add_dylib(&mut self, path: PathBuf, bytes: Vec<u8>) -> Result<DylibId, InputAddError> {
+        self.add_dylib_with_kind(path, bytes, DylibLoadKind::Normal)
+    }
+
+    pub fn add_dylib_with_kind(
+        &mut self,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        load_kind: DylibLoadKind,
+    ) -> Result<DylibId, InputAddError> {
         let file = DylibFile::parse(&path, &bytes)?;
-        let ordinal = self.next_dylib_ordinal();
-        let id = DylibId(self.dylibs.len() as u32);
-        self.dylibs.push(DylibInput {
-            path,
-            load_install_name: file.install_name.clone(),
-            load_current_version: file.current_version,
-            load_compatibility_version: file.compatibility_version,
-            file,
-            ordinal,
-        });
-        Ok(id)
+        self.add_dylib_from_file_with_kind(path, file, load_kind)
     }
 
     /// Register a TBD-backed dylib. The caller materializes the `DylibFile`
     /// via `DylibFile::from_tbd(path, tbd, target)` so the target filter
     /// is explicit.
-    pub fn add_dylib_from_file(&mut self, path: PathBuf, file: DylibFile) -> DylibId {
-        let ordinal = self.next_dylib_ordinal();
+    pub fn add_dylib_from_file(
+        &mut self,
+        path: PathBuf,
+        file: DylibFile,
+    ) -> Result<DylibId, InputAddError> {
+        self.add_dylib_from_file_with_kind(path, file, DylibLoadKind::Normal)
+    }
+
+    pub fn add_dylib_from_file_with_kind(
+        &mut self,
+        path: PathBuf,
+        file: DylibFile,
+        load_kind: DylibLoadKind,
+    ) -> Result<DylibId, InputAddError> {
+        let ordinal = self.next_dylib_ordinal()?;
         let load = DylibLoadMeta {
             install_name: file.install_name.clone(),
             current_version: file.current_version,
             compatibility_version: file.compatibility_version,
             ordinal,
+            load_kind,
         };
         self.add_dylib_from_file_with_meta(path, file, load)
     }
@@ -400,7 +423,10 @@ impl Inputs {
         path: PathBuf,
         file: DylibFile,
         load: DylibLoadMeta,
-    ) -> DylibId {
+    ) -> Result<DylibId, InputAddError> {
+        if load.ordinal > MAX_LIBRARY_ORDINAL {
+            return Err(InputAddError::TooManyDylibDependencies);
+        }
         let id = DylibId(self.dylibs.len() as u32);
         self.dylibs.push(DylibInput {
             path,
@@ -409,17 +435,24 @@ impl Inputs {
             load_compatibility_version: load.compatibility_version,
             file,
             ordinal: load.ordinal,
+            load_kind: load.load_kind,
         });
-        id
+        Ok(id)
     }
 
-    pub fn next_dylib_ordinal(&self) -> u16 {
-        self.dylibs
+    pub fn next_dylib_ordinal(&self) -> Result<u16, InputAddError> {
+        let ordinal = self
+            .dylibs
             .iter()
             .map(|dylib| dylib.ordinal)
             .max()
             .unwrap_or(0)
-            + 1
+            .checked_add(1)
+            .ok_or(InputAddError::TooManyDylibDependencies)?;
+        if ordinal > MAX_LIBRARY_ORDINAL {
+            return Err(InputAddError::TooManyDylibDependencies);
+        }
+        Ok(ordinal)
     }
 
     // ---- accessors ----
@@ -901,6 +934,16 @@ impl SymbolTable {
                 InsertOutcome::Kept(id)
             }
             Action::Replace => {
+                let mut sym = sym;
+                if let (
+                    Symbol::Undefined { weak_ref, .. },
+                    Symbol::DylibImport { weak_import, .. },
+                ) = (&self.symbols[id.0 as usize], &mut sym)
+                {
+                    // Provider weakness and consumer weakness independently
+                    // require weak-import metadata in the linked image.
+                    *weak_import |= *weak_ref;
+                }
                 self.symbols[id.0 as usize] = sym;
                 self.transitions.push(Transition {
                     id,
@@ -1271,7 +1314,7 @@ pub fn seed_object(
             continue;
         }
         // Only externals and private-externals participate.
-        if !input_sym.is_ext() && !input_sym.is_private_ext() {
+        if !input_sym.participates_in_global_resolution() {
             continue;
         }
         let Ok(name_str) = obj.symbol_name(input_sym) else {
@@ -1336,7 +1379,7 @@ pub fn seed_dylib(
             name,
             dylib: dylib_id,
             ordinal: di.ordinal,
-            weak_import: entry.weak_def(),
+            weak_import: entry.weak_def() || di.load_kind == DylibLoadKind::Weak,
         };
         match table.insert(sym) {
             Ok(outcome) => report.record_outcome(outcome),
@@ -1478,6 +1521,10 @@ pub(crate) fn resolve_inputs_in_order(
 #[derive(Debug)]
 pub enum FetchError {
     Read(ReadError),
+    MachOParse {
+        path: PathBuf,
+        source: ReadError,
+    },
     Archive(ArchiveError),
     MemberLoad(MemberLoadError),
     MemberNotFound {
@@ -1490,6 +1537,9 @@ impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FetchError::Read(e) => write!(f, "{e}"),
+            FetchError::MachOParse { path, source } => {
+                write!(f, "{}: {source}", path.display())
+            }
             FetchError::Archive(e) => write!(f, "{e}"),
             FetchError::MemberLoad(e) => write!(f, "{e}"),
             FetchError::MemberNotFound { archive, member } => write!(
@@ -1505,6 +1555,7 @@ impl std::error::Error for FetchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             FetchError::Read(error) => Some(error),
+            FetchError::MachOParse { source, .. } => Some(source),
             FetchError::Archive(error) => Some(error),
             FetchError::MemberLoad(error) => Some(error),
             FetchError::MemberNotFound { .. } => None,
@@ -1663,7 +1714,11 @@ fn load_archive_member_job(
                 .load_member(job.archive_path, job.archive_bytes, member)?;
         let logical_path = loaded.logical_path;
         let bytes = loaded.bytes.into_owned();
-        let parsed = ObjectFile::parse(&logical_path, &bytes)?;
+        let parsed =
+            ObjectFile::parse(&logical_path, &bytes).map_err(|source| FetchError::MachOParse {
+                path: logical_path.clone(),
+                source,
+            })?;
         Ok(LoadedArchiveMember {
             key: job.key,
             archive_load_order: job.archive_load_order,
@@ -2485,6 +2540,76 @@ mod tests {
         DylibFile::from_tbd("libChoice.tbd", &document, &target)
     }
 
+    #[test]
+    fn dylib_registry_rejects_reserved_ordinals_without_mutating() {
+        let mut inputs = Inputs::new();
+        for ordinal in 1..=MAX_LIBRARY_ORDINAL {
+            let id = inputs
+                .add_dylib_from_file(
+                    PathBuf::from(format!("libordinal{ordinal:03}.tbd")),
+                    dylib_exporting("_target"),
+                )
+                .unwrap();
+            assert_eq!(id, DylibId(u32::from(ordinal - 1)));
+        }
+
+        let accepted = inputs.dylibs.len();
+        let error = inputs
+            .add_dylib_from_file(
+                PathBuf::from("libordinal254.tbd"),
+                dylib_exporting("_reserved"),
+            )
+            .unwrap_err();
+        assert!(matches!(error, InputAddError::TooManyDylibDependencies));
+        assert_eq!(inputs.dylibs.len(), accepted);
+
+        let error = inputs
+            .add_dylib_from_file_with_meta(
+                PathBuf::from("libexplicit254.tbd"),
+                dylib_exporting("_reserved"),
+                DylibLoadMeta {
+                    install_name: "/usr/lib/libexplicit254.dylib".into(),
+                    current_version: 0,
+                    compatibility_version: 0,
+                    ordinal: MAX_LIBRARY_ORDINAL + 1,
+                    load_kind: DylibLoadKind::Normal,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, InputAddError::TooManyDylibDependencies));
+        assert_eq!(inputs.dylibs.len(), accepted);
+    }
+
+    #[test]
+    fn weak_loaded_dylib_seeds_every_export_as_a_weak_import() {
+        for (load_kind, expected_weak_import) in
+            [(DylibLoadKind::Weak, true), (DylibLoadKind::Normal, false)]
+        {
+            let mut inputs = Inputs::new();
+            let dylib = inputs
+                .add_dylib_from_file_with_kind(
+                    PathBuf::from("Demo.tbd"),
+                    dylib_exporting("_optional"),
+                    load_kind,
+                )
+                .unwrap();
+            let mut table = SymbolTable::new();
+            let mut report = SeedReport::default();
+
+            seed_dylib(&inputs, dylib, &mut table, &mut report).unwrap();
+
+            let symbol = table.lookup_str("_optional").unwrap();
+            assert!(matches!(
+                table.get(symbol),
+                Symbol::DylibImport {
+                    ordinal: 1,
+                    weak_import,
+                    ..
+                } if *weak_import == expected_weak_import
+            ));
+        }
+    }
+
     fn resolve_first_archive_value(first: u64, second: u64) -> u64 {
         use crate::macho::constants::{N_EXT, N_UNDF};
 
@@ -2586,16 +2711,19 @@ mod tests {
                     archive_order,
                 )
                 .unwrap();
-            let dylib = inputs.add_dylib_from_file_with_meta(
-                PathBuf::from("libChoice.tbd"),
-                dylib_exporting("_choice"),
-                DylibLoadMeta {
-                    install_name: "/usr/lib/libChoice.dylib".into(),
-                    current_version: 0,
-                    compatibility_version: 0,
-                    ordinal: 1,
-                },
-            );
+            let dylib = inputs
+                .add_dylib_from_file_with_meta(
+                    PathBuf::from("libChoice.tbd"),
+                    dylib_exporting("_choice"),
+                    DylibLoadMeta {
+                        install_name: "/usr/lib/libChoice.dylib".into(),
+                        current_version: 0,
+                        compatibility_version: 0,
+                        ordinal: 1,
+                        load_kind: DylibLoadKind::Normal,
+                    },
+                )
+                .unwrap();
             let order = [
                 OrderedInputEntry::object(0, main),
                 OrderedInputEntry::archive(archive_order, archive),
@@ -2699,7 +2827,7 @@ mod tests {
             let mut table = SymbolTable::new();
             let error =
                 resolve_inputs_in_order(&mut inputs, &order, &mut table, jobs, false).unwrap_err();
-            assert!(matches!(error.error, FetchError::Read(_)));
+            assert!(matches!(error.error, FetchError::MachOParse { .. }));
             assert_eq!(
                 error.report.loaded_paths,
                 vec![PathBuf::from("main.o"), PathBuf::from("libMalformed.a")]
@@ -3301,6 +3429,30 @@ mod tests {
         let di = dylib_import(&mut t, "_x", 1);
         let out = t.insert(di).unwrap();
         assert!(matches!(out, InsertOutcome::Replaced { .. }));
+    }
+
+    #[test]
+    fn dylib_resolution_preserves_consumer_weak_reference() {
+        let mut table = SymbolTable::new();
+        let weak_reference = weak_undef(&mut table, "_optional");
+        let id = match table.insert(weak_reference).unwrap() {
+            InsertOutcome::Inserted(id) => id,
+            other => panic!("unexpected insert outcome: {other:?}"),
+        };
+        let strong_provider = dylib_import(&mut table, "_optional", 1);
+
+        assert!(matches!(
+            table.insert(strong_provider),
+            Ok(InsertOutcome::Replaced { .. })
+        ));
+        assert!(matches!(
+            table.get(id),
+            Symbol::DylibImport {
+                ordinal: 1,
+                weak_import: true,
+                ..
+            }
+        ));
     }
 
     #[test]

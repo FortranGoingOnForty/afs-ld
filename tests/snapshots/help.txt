@@ -36,13 +36,17 @@ Options:
   -dead_strip                     Dead-strip unreferenced code/data
   --gc-sections                   Discard unreachable ELF input sections
   --no-gc-sections                Keep all ELF input sections
+  -z execstack | -z noexecstack   Override ELF stack executability
+  -z lazy | -z now                Select lazy or eager ELF symbol binding
   -icf=safe | -icf=none | -icf=all
                                   Configure identical code folding (`all` currently errors)
-  -fixup_chains | -no_fixup_chains
-                                  Select chained fixups vs classic dyld info
+  -no_fixup_chains                Emit classic dyld info (default)
+  -fixup_chains                   Chained-fixup output is unsupported; errors
   -all_load                       Force-load every archive member
   -force_load <archive>           Force-load one archive
   -j <jobs>                       Limit parallel worker jobs (`1` disables parallelism)
+  @<file>                         Read additional arguments from <file>
+  @@<path>                        Treat @<path> as a literal input path
   -Wl,<arg,arg,...>               Normalize comma-separated driver flags
   --dump <path>                   Dump a Mach-O file summary
   --dump-archive <path>           Dump an archive summary

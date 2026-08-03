@@ -13,6 +13,10 @@
 //!
 //! Skipped if `xcrun as` is unavailable.
 
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -56,7 +60,7 @@ fn assemble(src: &str, out: &PathBuf) -> Result<(), String> {
 #[test]
 fn atomize_splits_text_at_symbol_boundaries_and_backpatches_symbols() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -90,10 +94,7 @@ fn atomize_splits_text_at_symbol_boundaries_and_backpatches_symbols() {
     "#;
 
     let obj_path = std::env::temp_dir().join(format!("afs-ld-atom-{}-test.o", std::process::id()));
-    if let Err(e) = assemble(src, &obj_path) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj_path));
 
     let bytes = fs::read(&obj_path).unwrap();
     let mut inputs = Inputs::new();
@@ -171,7 +172,7 @@ fn atomize_splits_text_at_symbol_boundaries_and_backpatches_symbols() {
 #[test]
 fn atomize_cstring_splits_at_null_terminators() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -191,10 +192,7 @@ fn atomize_cstring_splits_at_null_terminators() {
 
     let obj_path =
         std::env::temp_dir().join(format!("afs-ld-atom-{}-cstrings.o", std::process::id()));
-    if let Err(e) = assemble(src, &obj_path) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj_path));
 
     let bytes = fs::read(&obj_path).unwrap();
     let mut inputs = Inputs::new();

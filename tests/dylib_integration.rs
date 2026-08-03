@@ -6,7 +6,12 @@
 //! - at least one `LC_LOAD_DYLIB` dependency is present (every clang-linked
 //!   dylib picks up libSystem).
 //!
-//! Skipped if `xcrun clang` isn't available or fails for any reason.
+//! Skipped only if `xcrun clang` isn't available. Once discovered, fixture
+//! compilation failures are test failures.
+
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -49,7 +54,7 @@ fn build_test_dylib(src: &str, out: &PathBuf) -> Result<(), String> {
 fn small_clang_dylib_parses_and_exports_function() {
     let which = Command::new("xcrun").arg("-f").arg("clang").output();
     if !matches!(which, Ok(o) if o.status.success()) {
-        eprintln!("skipping: xcrun clang unavailable");
+        harness_skip!("xcrun clang unavailable");
         return;
     }
 
@@ -64,10 +69,7 @@ fn small_clang_dylib_parses_and_exports_function() {
     let src = r#"
         int afsld_answer(int x) { return x + 42; }
     "#;
-    if let Err(e) = build_test_dylib(src, &out_path) {
-        eprintln!("skipping: clang could not build test dylib: {e}");
-        return;
-    }
+    require_fixture!("test dylib compilation", build_test_dylib(src, &out_path));
 
     let bytes = std::fs::read(&out_path).expect("read test dylib");
     let dy = DylibFile::parse(&out_path, &bytes).expect("parse test dylib");

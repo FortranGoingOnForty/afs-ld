@@ -4,12 +4,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::atom::{AtomFlags, AtomSection, AtomTable};
-use crate::input::ObjectFile;
+use crate::input::{DataInCodeEntry, ObjectFile};
 use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
 use crate::leb::write_uleb;
 use crate::macho::constants::*;
@@ -28,6 +27,7 @@ use crate::resolve::{Symbol, SymbolId, SymbolTable};
 use crate::section::{is_executable, SectionKind};
 use crate::string_table::StringTableBuilder;
 use crate::symbol::{write_nlist_table, InputSymbol, RawNlist, SymKind, NLIST_SIZE};
+use crate::symbol_visibility::{SymbolVisibilityError, SymbolVisibilityPolicy};
 use crate::synth::tlv::THREAD_VARIABLE_DESCRIPTOR_SIZE;
 use crate::synth::{
     code_sig::{sha256, CodeSignatureError, CodeSignaturePlan},
@@ -104,6 +104,7 @@ pub enum WriteError {
     DirectBindSectionMissing(crate::resolve::AtomId),
     ImportSymbolMissing(SymbolId),
     ImportSymbolWrongKind(SymbolId),
+    UnrepresentableLibraryOrdinal(u16),
     MalformedRelocations(PathBuf, u8, String),
     MalformedLoh(PathBuf, String),
     SymbolListRead(PathBuf, String),
@@ -157,6 +158,10 @@ impl fmt::Display for WriteError {
                     symbol
                 )
             }
+            WriteError::UnrepresentableLibraryOrdinal(ordinal) => write!(
+                f,
+                "dylib ordinal {ordinal} cannot be encoded in Mach-O n_desc; maximum ordinary library ordinal is 253"
+            ),
             WriteError::MalformedRelocations(path, section, detail) => write!(
                 f,
                 "failed to parse relocations in {} section {}: {detail}",
@@ -182,6 +187,13 @@ impl fmt::Display for WriteError {
 }
 
 impl std::error::Error for WriteError {}
+
+impl From<SymbolVisibilityError> for WriteError {
+    fn from(error: SymbolVisibilityError) -> Self {
+        let (path, detail) = error.into_parts();
+        Self::SymbolListRead(path, detail)
+    }
+}
 
 pub fn write(
     layout: &Layout,
@@ -220,7 +232,25 @@ pub fn finalize_layout_with_linkedit(
     dylibs: &[DylibDependency],
     context: LinkEditContext<'_>,
 ) -> Result<(Layout, LinkEditPlan, LinkEditBuildTimings), WriteError> {
-    finalize_with_linkedit(layout, kind, opts, dylibs, Some(LinkEditInputs(context)))
+    let visibility = SymbolVisibilityPolicy::from_opts(opts)?;
+    finalize_layout_with_linkedit_and_visibility(layout, kind, opts, dylibs, context, &visibility)
+}
+
+pub(crate) fn finalize_layout_with_linkedit_and_visibility(
+    layout: &Layout,
+    kind: OutputKind,
+    opts: &LinkOptions,
+    dylibs: &[DylibDependency],
+    context: LinkEditContext<'_>,
+    visibility: &SymbolVisibilityPolicy,
+) -> Result<(Layout, LinkEditPlan, LinkEditBuildTimings), WriteError> {
+    finalize_with_linkedit(
+        layout,
+        kind,
+        opts,
+        dylibs,
+        Some(LinkEditInputs(context, visibility)),
+    )
 }
 
 pub fn build_parsed_reloc_cache(
@@ -323,6 +353,39 @@ pub fn write_finalized_with_linkedit(
     linkedit_plan: &LinkEditPlan,
     out: &mut Vec<u8>,
 ) -> Result<(), WriteError> {
+    write_finalized_with_linkedit_for_header(
+        layout,
+        OutputHeaderSpec::new(kind, CPU_SUBTYPE_ARM64_ALL),
+        opts,
+        entry_point,
+        dylibs,
+        linkedit_plan,
+        out,
+    )
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct OutputHeaderSpec {
+    kind: OutputKind,
+    cpu_subtype: u32,
+}
+
+impl OutputHeaderSpec {
+    pub(crate) const fn new(kind: OutputKind, cpu_subtype: u32) -> Self {
+        Self { kind, cpu_subtype }
+    }
+}
+
+pub(crate) fn write_finalized_with_linkedit_for_header(
+    layout: &Layout,
+    header_spec: OutputHeaderSpec,
+    opts: &LinkOptions,
+    entry_point: Option<EntryPoint>,
+    dylibs: &[DylibDependency],
+    linkedit_plan: &LinkEditPlan,
+    out: &mut Vec<u8>,
+) -> Result<(), WriteError> {
+    let OutputHeaderSpec { kind, cpu_subtype } = header_spec;
     let _linkedit_segment = layout
         .segment("__LINKEDIT")
         .cloned()
@@ -334,14 +397,14 @@ pub fn write_finalized_with_linkedit(
     let header = MachHeader64 {
         magic: MH_MAGIC_64,
         cputype: CPU_TYPE_ARM64,
-        cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+        cpusubtype: cpu_subtype,
         filetype: match kind {
             OutputKind::Executable => MH_EXECUTE,
             OutputKind::Dylib => MH_DYLIB,
         },
         ncmds: commands.len() as u32,
         sizeofcmds,
-        flags: header_flags(layout, kind),
+        flags: header_flags(layout, kind, linkedit_plan),
         reserved: 0,
     };
 
@@ -746,11 +809,17 @@ fn build_version_command(opts: &LinkOptions) -> BuildVersionCmd {
     }
 }
 
-fn header_flags(layout: &Layout, kind: OutputKind) -> u32 {
+fn header_flags(layout: &Layout, kind: OutputKind, linkedit_plan: &LinkEditPlan) -> u32 {
     let mut flags = match kind {
         OutputKind::Executable => MH_DYLDLINK | MH_NOUNDEFS | MH_TWOLEVEL | MH_PIE,
         OutputKind::Dylib => MH_DYLDLINK | MH_TWOLEVEL | MH_NOUNDEFS,
     };
+    if linkedit_plan.defines_weak_symbols {
+        flags |= MH_WEAK_DEFINES;
+    }
+    if linkedit_plan.binds_to_weak_symbols {
+        flags |= MH_BINDS_TO_WEAK;
+    }
     if layout
         .sections
         .iter()
@@ -808,6 +877,8 @@ pub struct LinkEditPlan {
     indirect_starts: HashMap<(String, String), u32>,
     lazy_bind_offsets: HashMap<SymbolId, u32>,
     pub map_symbols: Vec<LinkMapSymbol>,
+    defines_weak_symbols: bool,
+    binds_to_weak_symbols: bool,
 }
 
 impl LinkEditPlan {
@@ -901,6 +972,8 @@ fn build_linkedit_plan_profiled(
                 indirect_starts: HashMap::new(),
                 lazy_bind_offsets: HashMap::new(),
                 map_symbols: Vec::new(),
+                defines_weak_symbols: false,
+                binds_to_weak_symbols: false,
             },
             timings,
         ));
@@ -914,13 +987,12 @@ fn build_linkedit_plan_profiled(
         .iter()
         .map(|record| (record.symbol, record))
         .collect();
-    let visibility = SymbolVisibilityPolicy::from_opts(opts)?;
     let (symbol_plan, symbol_plan_timings) = build_output_symbols_profiled(
         layout,
         kind,
         opts.dead_strip,
         opts.strip_locals,
-        &visibility,
+        inputs.1,
         inputs,
         &imports,
     )?;
@@ -928,6 +1000,16 @@ fn build_linkedit_plan_profiled(
     timings.symbol_plan_locals += symbol_plan_timings.locals;
     timings.symbol_plan_globals += symbol_plan_timings.globals;
     timings.symbol_plan_strtab += symbol_plan_timings.strtab;
+    let external_defined_start = symbol_plan.dysymtab.iextdefsym as usize;
+    let external_defined_end = external_defined_start + symbol_plan.dysymtab.nextdefsym as usize;
+    let defines_weak_symbols = symbol_plan
+        .exports
+        .iter()
+        .any(|export| export.flags & EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION != 0);
+    let uses_external_weak_definition = symbol_plan.symbols
+        [external_defined_start..external_defined_end]
+        .iter()
+        .any(InputSymbol::weak_def);
     let mut symtab_bytes = Vec::with_capacity(symbol_plan.symbols.len() * NLIST_SIZE);
     write_nlist_table(&symbol_plan.symbols, &mut symtab_bytes);
 
@@ -974,6 +1056,7 @@ fn build_linkedit_plan_profiled(
     let dyld_started = std::time::Instant::now();
     let phase_started = std::time::Instant::now();
     let bind_streams = build_bind_streams(layout, synthetic_plan, &import_lookup)?;
+    let binds_to_weak_symbols = uses_external_weak_definition || bind_streams.binds_to_weak_symbols;
     let bind_bytes = pad_dyld_info_stream(bind_streams.bind);
     let weak_bind_bytes = pad_dyld_info_stream(bind_streams.weak_bind);
     let lazy_bind_bytes = pad_dyld_info_stream(bind_streams.lazy_bind);
@@ -995,8 +1078,8 @@ fn build_linkedit_plan_profiled(
     )?;
     let function_starts_bytes =
         build_function_starts(layout, inputs.0.layout_inputs, inputs.0.atom_table)?;
-    // Current Apple ld keeps the command but omits the final metadata payload.
-    let data_in_code_bytes = Vec::new();
+    let data_in_code_bytes =
+        build_data_in_code(layout, inputs.0.layout_inputs, inputs.0.atom_table)?;
     timings.metadata_tables += phase_started.elapsed();
 
     let mut cursor = base_off as u64;
@@ -1080,6 +1163,8 @@ fn build_linkedit_plan_profiled(
             indirect_starts,
             lazy_bind_offsets: bind_streams.lazy_offsets,
             map_symbols: symbol_plan.map_symbols,
+            defines_weak_symbols,
+            binds_to_weak_symbols,
         },
         timings,
     ))
@@ -1118,7 +1203,7 @@ struct ImportSymbolRecord {
 }
 
 #[derive(Clone, Copy)]
-struct LinkEditInputs<'a>(LinkEditContext<'a>);
+struct LinkEditInputs<'a>(LinkEditContext<'a>, &'a SymbolVisibilityPolicy);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputSymbolPartition {
@@ -1144,43 +1229,6 @@ struct OutputSymbolSpec {
 }
 
 #[derive(Debug, Clone)]
-struct SymbolVisibilityPolicy {
-    exported: Vec<String>,
-    unexported: Vec<String>,
-}
-
-impl SymbolVisibilityPolicy {
-    fn from_opts(opts: &LinkOptions) -> Result<Self, WriteError> {
-        let mut exported = opts.exported_symbols.clone();
-        let mut unexported = opts.unexported_symbols.clone();
-        for path in &opts.exported_symbols_lists {
-            exported.extend(read_symbol_patterns(path)?);
-        }
-        for path in &opts.unexported_symbols_lists {
-            unexported.extend(read_symbol_patterns(path)?);
-        }
-        Ok(Self {
-            exported,
-            unexported,
-        })
-    }
-
-    fn hides(&self, name: &str) -> bool {
-        if !self.exported.is_empty()
-            && !self
-                .exported
-                .iter()
-                .any(|pattern| wildcard_matches(pattern, name))
-        {
-            return true;
-        }
-        self.unexported
-            .iter()
-            .any(|pattern| wildcard_matches(pattern, name))
-    }
-}
-
-#[derive(Debug, Clone)]
 struct SymbolTablePlan {
     symbols: Vec<InputSymbol>,
     map_symbols: Vec<LinkMapSymbol>,
@@ -1195,6 +1243,7 @@ struct BindStreams {
     weak_bind: Vec<u8>,
     lazy_bind: Vec<u8>,
     lazy_offsets: HashMap<SymbolId, u32>,
+    binds_to_weak_symbols: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1430,6 +1479,9 @@ fn symbol_referent_id(
         return None;
     };
     let input_sym = obj.symbols.get(sym_idx as usize)?;
+    if !input_sym.participates_in_global_resolution() {
+        return None;
+    }
     let name = obj.symbol_name(input_sym).ok()?;
     symbol_name_index.get(name).copied()
 }
@@ -1490,6 +1542,80 @@ fn build_function_starts(
     out.push(0);
     while !out.len().is_multiple_of(8) {
         out.push(0);
+    }
+    Ok(out)
+}
+
+fn build_data_in_code(
+    layout: &Layout,
+    inputs: &[LayoutInput<'_>],
+    atom_table: &AtomTable,
+) -> Result<Vec<u8>, WriteError> {
+    let image_base = layout
+        .segment("__TEXT")
+        .ok_or(WriteError::MissingSegment("__TEXT"))?
+        .vm_addr;
+    let atoms_by_input_section = atom_table.by_input_section();
+    // Keep original atom identities here. Folded and dead-stripped atoms are
+    // absent from the final layout, so their source metadata must disappear
+    // instead of being redirected onto a surviving atom.
+    let atom_ranges = build_atom_range_index(atom_table, &atoms_by_input_section, None);
+    let atom_addrs = atom_addresses(layout);
+    let mut entries = Vec::new();
+
+    for input in inputs {
+        for entry in &input.object.data_in_code {
+            let entry_start = u64::from(entry.offset);
+            let entry_end = entry_start + u64::from(entry.length);
+
+            for (section_index, section) in input.object.sections.iter().enumerate() {
+                let Some(section_end) = section.addr.checked_add(section.size) else {
+                    continue;
+                };
+                if !is_executable(section.kind)
+                    || entry_start < section.addr
+                    || entry_end > section_end
+                {
+                    continue;
+                }
+                let Ok(input_section) = u8::try_from(section_index + 1) else {
+                    continue;
+                };
+                let section_offset = (entry_start - section.addr) as u32;
+                let Some((atom, delta)) = find_containing_atom_range(
+                    &atom_ranges,
+                    input.id,
+                    input_section,
+                    section_offset,
+                    u32::from(entry.length),
+                ) else {
+                    break;
+                };
+                let Some(&atom_addr) = atom_addrs.get(&atom) else {
+                    break;
+                };
+                let output_addr = atom_addr
+                    .checked_add(u64::from(delta))
+                    .ok_or(WriteError::OffsetTooLarge("data-in-code entry offset"))?;
+                let output_offset = output_addr
+                    .checked_sub(image_base)
+                    .ok_or(WriteError::OffsetTooLarge("data-in-code entry offset"))?;
+                entries.push(DataInCodeEntry {
+                    offset: u32_fit(output_offset, "data-in-code entry offset")?,
+                    length: entry.length,
+                    kind: entry.kind,
+                });
+                break;
+            }
+        }
+    }
+
+    entries.sort_unstable_by_key(|entry| (entry.offset, entry.length, entry.kind));
+    let mut out = Vec::with_capacity(entries.len() * 8);
+    for entry in entries {
+        out.extend_from_slice(&entry.offset.to_le_bytes());
+        out.extend_from_slice(&entry.length.to_le_bytes());
+        out.extend_from_slice(&entry.kind.to_le_bytes());
     }
     Ok(out)
 }
@@ -1593,6 +1719,19 @@ fn collect_imports(
     Ok(out)
 }
 
+fn encode_n_desc_library_ordinal(ordinal: u16) -> Result<u16, WriteError> {
+    let encoded = if ordinal <= MAX_LIBRARY_ORDINAL {
+        ordinal
+    } else if ordinal == (0xff00 | DYNAMIC_LOOKUP_ORDINAL) {
+        DYNAMIC_LOOKUP_ORDINAL
+    } else if ordinal == (0xff00 | EXECUTABLE_ORDINAL) {
+        EXECUTABLE_ORDINAL
+    } else {
+        return Err(WriteError::UnrepresentableLibraryOrdinal(ordinal));
+    };
+    Ok(encoded << 8)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SymbolPlanBuildTimings {
     locals: Duration,
@@ -1671,6 +1810,7 @@ fn build_output_symbols_profiled(
             atom_ranges: &atom_ranges,
             atom_sections: &atom_sections,
             atom_addrs: &atom_addrs,
+            dead_strip,
             input_id: input.id,
             file_index: file_index_by_input[&input.id],
         };
@@ -1877,7 +2017,7 @@ fn build_output_symbols_profiled(
     sort_local_symbols(&mut locals);
     external_defineds.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
     for import in imports {
-        let mut n_desc = import.ordinal << 8;
+        let mut n_desc = encode_n_desc_library_ordinal(import.ordinal)?;
         if import.weak_import {
             n_desc |= N_WEAK_REF;
         }
@@ -2061,9 +2201,16 @@ fn collect_local_symbols(
                     offset,
                 )
                 .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
-                let addr = ctx.atom_addrs.get(&atom_id).copied().ok_or(
-                    WriteError::DefinedSymbolAtomMissing(SymbolId(u32::MAX), atom_id),
-                )? + delta as u64;
+                let Some(addr) = ctx.atom_addrs.get(&atom_id).copied() else {
+                    if ctx.dead_strip {
+                        continue;
+                    }
+                    return Err(WriteError::DefinedSymbolAtomMissing(
+                        SymbolId(u32::MAX),
+                        atom_id,
+                    ));
+                };
+                let addr = addr + delta as u64;
                 let n_sect = *ctx.atom_sections.get(&atom_id).ok_or(
                     WriteError::DefinedSymbolSectionMissing(SymbolId(u32::MAX), atom_id),
                 )?;
@@ -2129,7 +2276,7 @@ fn last_section_symbol_at_each_location(object: &ObjectFile) -> HashMap<(u8, u64
             symbol.stab_kind().is_none()
                 && symbol.kind() == SymKind::Sect
                 && !symbol.alt_entry()
-                && (symbol.is_ext() || symbol.is_private_ext())
+                && symbol.participates_in_global_resolution()
         })
         .map(|(index, symbol)| ((symbol.sect_idx(), symbol.value()), index))
         .collect()
@@ -2142,7 +2289,7 @@ fn is_overlapping_section_alias(
 ) -> bool {
     if symbol.kind() != SymKind::Sect
         || symbol.alt_entry()
-        || !(symbol.is_ext() || symbol.is_private_ext())
+        || !symbol.participates_in_global_resolution()
     {
         return false;
     }
@@ -2157,6 +2304,7 @@ struct LocalSymbolContext<'a> {
     atom_ranges: &'a AtomRangeIndex,
     atom_sections: &'a HashMap<crate::resolve::AtomId, u8>,
     atom_addrs: &'a HashMap<crate::resolve::AtomId, u64>,
+    dead_strip: bool,
     input_id: InputId,
     file_index: usize,
 }
@@ -2341,48 +2489,6 @@ fn absolute_symbol_type(private_extern: bool) -> u8 {
     }
 }
 
-fn read_symbol_patterns(path: &PathBuf) -> Result<Vec<String>, WriteError> {
-    let contents = fs::read_to_string(path)
-        .map_err(|err| WriteError::SymbolListRead(path.clone(), err.to_string()))?;
-    Ok(contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect())
-}
-
-fn wildcard_matches(pattern: &str, value: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let value = value.as_bytes();
-    let mut p = 0usize;
-    let mut v = 0usize;
-    let mut star = None;
-    let mut backtrack = 0usize;
-
-    while v < value.len() {
-        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == value[v]) {
-            p += 1;
-            v += 1;
-        } else if p < pattern.len() && pattern[p] == b'*' {
-            star = Some(p);
-            p += 1;
-            backtrack = v;
-        } else if let Some(star_idx) = star {
-            p = star_idx + 1;
-            backtrack += 1;
-            v = backtrack;
-        } else {
-            return false;
-        }
-    }
-
-    while p < pattern.len() && pattern[p] == b'*' {
-        p += 1;
-    }
-    p == pattern.len()
-}
-
 fn place_optional_block(
     cursor: &mut u64,
     size: usize,
@@ -2471,6 +2577,7 @@ fn build_bind_streams(
     let weak_bind = Vec::new();
     let mut lazy_bind = OpcodeStream::new();
     let mut lazy_offsets = HashMap::new();
+    let mut binds_to_weak_symbols = false;
     let layout_index = BindLayoutIndex::build(layout)?;
 
     if let Some(tlv_bootstrap) = synthetic_plan.tlv_bootstrap_symbol {
@@ -2588,6 +2695,7 @@ fn build_bind_streams(
     if let Some(last) = bind_specs.last_mut() {
         last.terminate = true;
     }
+    binds_to_weak_symbols |= bind_specs.iter().any(|spec| spec.weak_import);
 
     if !synthetic_plan.lazy_pointers.entries.is_empty() {
         let segment_index = segment_index(layout, "__DATA")?;
@@ -2602,6 +2710,7 @@ fn build_bind_streams(
                 .get(&entry.symbol)
                 .copied()
                 .ok_or(WriteError::ImportSymbolMissing(entry.symbol))?;
+            binds_to_weak_symbols |= import.weak_import;
             let slot_addr = section.addr + section.synthetic_offset + (idx as u64) * 8;
             lazy_offsets.insert(entry.symbol, lazy_bind.len() as u32);
             emit_lazy_bind_record(
@@ -2620,6 +2729,7 @@ fn build_bind_streams(
         weak_bind,
         lazy_bind: lazy_bind.into_vec(),
         lazy_offsets,
+        binds_to_weak_symbols,
     })
 }
 
@@ -2776,6 +2886,27 @@ mod tests {
     use crate::string_table::StringTable;
 
     use super::*;
+
+    #[test]
+    fn n_desc_library_ordinals_preserve_defined_boundaries_and_specials() {
+        assert_eq!(encode_n_desc_library_ordinal(0).unwrap(), 0);
+        assert_eq!(
+            encode_n_desc_library_ordinal(MAX_LIBRARY_ORDINAL).unwrap(),
+            0xfd00
+        );
+        assert!(matches!(
+            encode_n_desc_library_ordinal(MAX_LIBRARY_ORDINAL + 1),
+            Err(WriteError::UnrepresentableLibraryOrdinal(0xfe))
+        ));
+        assert_eq!(
+            encode_n_desc_library_ordinal(0xff00 | DYNAMIC_LOOKUP_ORDINAL).unwrap(),
+            0xfe00
+        );
+        assert_eq!(
+            encode_n_desc_library_ordinal(0xff00 | EXECUTABLE_ORDINAL).unwrap(),
+            0xff00
+        );
+    }
 
     fn decode_function_starts_blob(blob: &[u8]) -> Vec<u64> {
         let mut out = Vec::new();
@@ -3340,6 +3471,24 @@ mod tests {
             loh: Vec::new(),
             data_in_code: Vec::new(),
         }
+    }
+
+    #[test]
+    fn rebase_symbol_lookup_preserves_local_identity_on_name_collision() {
+        let mut object = object_with_text_symbols(&[("_same", 0x1000, 0)]);
+        let global = SymbolId(9);
+        let symbols = HashMap::from([("_same".to_string(), global)]);
+
+        assert_eq!(
+            symbol_referent_id(&object, Referent::Symbol(0), &symbols),
+            None
+        );
+
+        object.symbols[0].raw.n_type = N_SECT | N_PEXT;
+        assert_eq!(
+            symbol_referent_id(&object, Referent::Symbol(0), &symbols),
+            Some(global)
+        );
     }
 
     #[test]

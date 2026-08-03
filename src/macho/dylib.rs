@@ -12,9 +12,11 @@ use std::path::PathBuf;
 use super::constants::*;
 use super::exports::{ExportEntry, ExportKind, Exports};
 use super::reader::{
-    parse_commands, parse_header, LoadCommand, MachHeader64, ReadError, SymtabCmd,
+    parse_commands, parse_header, DysymtabCmd, LoadCommand, MachHeader64, ReadError, SymtabCmd,
 };
-use super::tbd::{parse_version, SymbolLists, Target, Tbd};
+use super::tbd::{SymbolLists, Target, Tbd};
+use crate::string_table::StringTable;
+use crate::symbol::parse_nlist_table;
 
 const DEFAULT_TBD_VERSION: u32 = 1 << 16;
 
@@ -83,18 +85,14 @@ impl DylibFile {
         let path = path.into();
         let header = parse_header(file_bytes)?;
         if header.filetype != MH_DYLIB {
-            return Err(ReadError::BadCmdsize {
-                cmd: 0,
-                cmdsize: header.filetype,
-                at_offset: 0,
-                reason: "DylibFile::parse expects MH_DYLIB filetype",
+            return Err(ReadError::UnexpectedFiletype {
+                got: header.filetype,
+                expected: MH_DYLIB,
             });
         }
         let commands = parse_commands(&header, file_bytes)?;
 
-        let mut install_name = String::new();
-        let mut current_version = 0u32;
-        let mut compatibility_version = 0u32;
+        let mut identity = None;
         let mut dependencies: Vec<DylibDependency> = Vec::new();
         let mut rpaths: Vec<String> = Vec::new();
         let mut symtab: Option<SymtabCmd> = None;
@@ -102,9 +100,17 @@ impl DylibFile {
         for cmd in &commands {
             match cmd {
                 LoadCommand::Dylib(d) if d.cmd == LC_ID_DYLIB => {
-                    install_name = d.name.clone();
-                    current_version = d.current_version;
-                    compatibility_version = d.compatibility_version;
+                    if identity.is_some() {
+                        return Err(ReadError::BadDylibIdentity {
+                            reason: "multiple LC_ID_DYLIB load commands",
+                        });
+                    }
+                    if d.name.is_empty() {
+                        return Err(ReadError::BadDylibIdentity {
+                            reason: "LC_ID_DYLIB install name is empty",
+                        });
+                    }
+                    identity = Some(d);
                 }
                 LoadCommand::Dylib(d) => {
                     if let Some(kind) = DylibLoadKind::from_cmd(d.cmd) {
@@ -124,6 +130,12 @@ impl DylibFile {
             }
         }
 
+        let identity = identity.ok_or(ReadError::BadDylibIdentity {
+            reason: "missing LC_ID_DYLIB load command",
+        })?;
+        let install_name = identity.name.clone();
+        let current_version = identity.current_version;
+        let compatibility_version = identity.compatibility_version;
         let exports = locate_exports(&commands, file_bytes)?;
 
         Ok(DylibFile {
@@ -141,23 +153,90 @@ impl DylibFile {
     }
 }
 
-/// Locate the export-trie bytes in either `LC_DYLD_INFO_ONLY.export_*` or
-/// `LC_DYLD_EXPORTS_TRIE` (chained-fixups era). Dylibs built by older
-/// toolchains may have no export trie; in that case return an empty
-/// `Exports::Flat(vec![])` so downstream `entries()` works uniformly.
+/// Locate exports from an explicit export-trie command, or from the external
+/// definitions partition of the legacy symbol table when no trie command is
+/// present. An explicit zero-sized trie locator is authoritative: it describes
+/// an empty export set and must not be replaced with legacy symbol-table data.
 fn locate_exports(commands: &[LoadCommand], file_bytes: &[u8]) -> Result<Exports, ReadError> {
+    let mut saw_export_locator = false;
     for cmd in commands {
         match cmd {
-            LoadCommand::DyldInfoOnly(d) if d.export_size != 0 => {
-                return trie_slice(file_bytes, d.export_off, d.export_size);
+            LoadCommand::DyldInfoOnly(d) => {
+                saw_export_locator = true;
+                if d.export_size != 0 {
+                    return trie_slice(file_bytes, d.export_off, d.export_size);
+                }
             }
-            LoadCommand::DyldExportsTrie(l) if l.datasize != 0 => {
-                return trie_slice(file_bytes, l.dataoff, l.datasize);
+            LoadCommand::DyldExportsTrie(l) => {
+                saw_export_locator = true;
+                if l.datasize != 0 {
+                    return trie_slice(file_bytes, l.dataoff, l.datasize);
+                }
             }
             _ => {}
         }
     }
-    Ok(Exports::empty())
+    if saw_export_locator {
+        return Ok(Exports::empty());
+    }
+
+    locate_legacy_exports(commands, file_bytes)
+}
+
+fn locate_legacy_exports(
+    commands: &[LoadCommand],
+    file_bytes: &[u8],
+) -> Result<Exports, ReadError> {
+    let symtab = commands.iter().rev().find_map(|command| match command {
+        LoadCommand::Symtab(symtab) => Some(*symtab),
+        _ => None,
+    });
+    let dysymtab = commands.iter().rev().find_map(|command| match command {
+        LoadCommand::Dysymtab(dysymtab) => Some(*dysymtab),
+        _ => None,
+    });
+    let (Some(symtab), Some(dysymtab)) = (symtab, dysymtab) else {
+        return Ok(Exports::empty());
+    };
+
+    let extdef_end =
+        dysymtab
+            .iextdefsym
+            .checked_add(dysymtab.nextdefsym)
+            .ok_or(ReadError::BadCmdsize {
+                cmd: LC_DYSYMTAB,
+                cmdsize: DysymtabCmd::WIRE_SIZE,
+                at_offset: dysymtab.iextdefsym as usize,
+                reason: "LC_DYSYMTAB external-definition range overflows",
+            })?;
+    if extdef_end > symtab.nsyms {
+        return Err(ReadError::BadCmdsize {
+            cmd: LC_DYSYMTAB,
+            cmdsize: DysymtabCmd::WIRE_SIZE,
+            at_offset: dysymtab.iextdefsym as usize,
+            reason: "LC_DYSYMTAB external-definition range exceeds LC_SYMTAB nsyms",
+        });
+    }
+
+    let symbols = parse_nlist_table(file_bytes, symtab.symoff, symtab.nsyms)?;
+    let strings = StringTable::from_file(file_bytes, symtab.stroff, symtab.strsize)?;
+    let entries = symbols[dysymtab.iextdefsym as usize..extdef_end as usize]
+        .iter()
+        .map(|symbol| {
+            Ok(ExportEntry {
+                name: strings.get(symbol.strx())?.to_owned(),
+                flags: if symbol.weak_def() {
+                    EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION
+                } else {
+                    0
+                },
+                kind: ExportKind::Regular {
+                    address: symbol.value(),
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, ReadError>>()?;
+    Ok(Exports::from_entries(entries))
 }
 
 fn trie_slice(file_bytes: &[u8], off: u32, size: u32) -> Result<Exports, ReadError> {
@@ -229,16 +308,8 @@ impl DylibFile {
             header: synthetic_header(),
             commands: Vec::new(),
             install_name: tbd.install_name.clone(),
-            current_version: tbd
-                .current_version
-                .as_deref()
-                .map(parse_version)
-                .unwrap_or(DEFAULT_TBD_VERSION),
-            compatibility_version: tbd
-                .compatibility_version
-                .as_deref()
-                .map(parse_version)
-                .unwrap_or(DEFAULT_TBD_VERSION),
+            current_version: tbd.current_version.unwrap_or(DEFAULT_TBD_VERSION),
+            compatibility_version: tbd.compatibility_version.unwrap_or(DEFAULT_TBD_VERSION),
             dependencies,
             rpaths: Vec::new(),
             symtab: None,
@@ -325,7 +396,11 @@ pub fn dependency_ordinal(deps: &[DylibDependency], install_name: &str) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::macho::reader::{write_commands, write_header, DylibCmd, RpathCmd};
+    use crate::macho::reader::{
+        write_commands, write_header, DyldInfoCmd, DylibCmd, DysymtabCmd, RpathCmd, SymtabCmd,
+        HEADER_SIZE,
+    };
+    use crate::symbol::{RawNlist, NLIST_SIZE};
 
     fn make_dylib_image(commands: Vec<LoadCommand>) -> Vec<u8> {
         let sizeofcmds: u32 = commands.iter().map(|c| c.cmdsize()).sum();
@@ -356,6 +431,51 @@ mod tests {
         }
     }
 
+    fn make_legacy_dylib_image(
+        symbols: &[(&str, u8, u16, u64)],
+        dysymtab: DysymtabCmd,
+        export_locator: Option<LoadCommand>,
+    ) -> Vec<u8> {
+        let mut strings = vec![0];
+        let mut raw_symbols = Vec::with_capacity(symbols.len());
+        for &(name, n_type, n_desc, n_value) in symbols {
+            let strx = strings.len() as u32;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            raw_symbols.push(RawNlist {
+                strx,
+                n_type,
+                n_sect: u8::from(n_type & N_TYPE != N_UNDF),
+                n_desc,
+                n_value,
+            });
+        }
+
+        let identity =
+            LoadCommand::Dylib(dylib_cmd(LC_ID_DYLIB, "/usr/lib/liblegacy-exports.dylib"));
+        let mut commands = vec![identity];
+        commands.extend(export_locator);
+        let sizeofcmds = commands.iter().map(LoadCommand::cmdsize).sum::<u32>()
+            + SymtabCmd::WIRE_SIZE
+            + DysymtabCmd::WIRE_SIZE;
+        let symoff = HEADER_SIZE as u32 + sizeofcmds;
+        let stroff = symoff + (raw_symbols.len() * NLIST_SIZE) as u32;
+        commands.push(LoadCommand::Symtab(SymtabCmd {
+            symoff,
+            nsyms: raw_symbols.len() as u32,
+            stroff,
+            strsize: strings.len() as u32,
+        }));
+        commands.push(LoadCommand::Dysymtab(dysymtab));
+
+        let mut image = make_dylib_image(commands);
+        for symbol in raw_symbols {
+            symbol.write(&mut image);
+        }
+        image.extend_from_slice(&strings);
+        image
+    }
+
     #[test]
     fn parse_dylib_extracts_install_name_and_versions() {
         let image = make_dylib_image(vec![LoadCommand::Dylib(DylibCmd {
@@ -369,6 +489,34 @@ mod tests {
         assert_eq!(dy.install_name, "@rpath/libfoo.dylib");
         assert_eq!(dy.current_version, (1 << 16) | (2 << 8) | 3);
         assert_eq!(dy.compatibility_version, 1 << 16);
+    }
+
+    #[test]
+    fn parse_dylib_requires_exactly_one_nonempty_identity() {
+        let cases = [
+            (
+                Vec::new(),
+                "malformed MH_DYLIB identity: missing LC_ID_DYLIB load command",
+            ),
+            (
+                vec![LoadCommand::Dylib(dylib_cmd(LC_ID_DYLIB, ""))],
+                "malformed MH_DYLIB identity: LC_ID_DYLIB install name is empty",
+            ),
+            (
+                vec![
+                    LoadCommand::Dylib(dylib_cmd(LC_ID_DYLIB, "@rpath/libfirst.dylib")),
+                    LoadCommand::Dylib(dylib_cmd(LC_ID_DYLIB, "@rpath/libsecond.dylib")),
+                ],
+                "malformed MH_DYLIB identity: multiple LC_ID_DYLIB load commands",
+            ),
+        ];
+
+        for (commands, expected) in cases {
+            let image = make_dylib_image(commands);
+            let error = DylibFile::parse("/tmp/invalid.dylib", &image)
+                .expect_err("malformed dylib identity must be rejected");
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]
@@ -413,6 +561,88 @@ mod tests {
         ]);
         let dy = DylibFile::parse("/tmp/x.dylib", &image).unwrap();
         assert_eq!(dy.rpaths, vec!["@executable_path/../lib", "/opt/local/lib"]);
+    }
+
+    #[test]
+    fn parse_dylib_falls_back_to_dysymtab_external_definitions() {
+        let image = make_legacy_dylib_image(
+            &[
+                ("_local", N_SECT, 0, 0x1000),
+                ("_legacy_export", N_SECT | N_EXT, 0, 0x1010),
+                ("_legacy_weak", N_SECT | N_EXT, N_WEAK_DEF, 0x1020),
+                ("_dependency", N_UNDF | N_EXT, 0, 0),
+            ],
+            DysymtabCmd {
+                ilocalsym: 0,
+                nlocalsym: 1,
+                iextdefsym: 1,
+                nextdefsym: 2,
+                iundefsym: 3,
+                nundefsym: 1,
+                ..DysymtabCmd::default()
+            },
+            None,
+        );
+
+        let dylib = DylibFile::parse("/tmp/liblegacy-exports.dylib", &image).unwrap();
+        assert_eq!(
+            dylib.exports.entries().unwrap(),
+            vec![
+                ExportEntry {
+                    name: "_legacy_export".into(),
+                    flags: 0,
+                    kind: ExportKind::Regular { address: 0x1010 },
+                },
+                ExportEntry {
+                    name: "_legacy_weak".into(),
+                    flags: EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION,
+                    kind: ExportKind::Regular { address: 0x1020 },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_dylib_rejects_invalid_dysymtab_external_definition_ranges() {
+        for (iextdefsym, nextdefsym, expected_reason) in
+            [(u32::MAX, 1, "overflows"), (1, 1, "exceeds")]
+        {
+            let image = make_legacy_dylib_image(
+                &[("_legacy_export", N_SECT | N_EXT, 0, 0x1010)],
+                DysymtabCmd {
+                    iextdefsym,
+                    nextdefsym,
+                    ..DysymtabCmd::default()
+                },
+                None,
+            );
+
+            let error = DylibFile::parse("/tmp/liblegacy-exports.dylib", &image).unwrap_err();
+            assert!(matches!(
+                error,
+                ReadError::BadCmdsize {
+                    cmd: LC_DYSYMTAB,
+                    reason,
+                    ..
+                } if reason.contains(expected_reason)
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_dylib_does_not_override_an_explicit_empty_export_locator() {
+        let image = make_legacy_dylib_image(
+            &[("_legacy_export", N_SECT | N_EXT, 0, 0x1010)],
+            DysymtabCmd {
+                iextdefsym: 0,
+                nextdefsym: 1,
+                ..DysymtabCmd::default()
+            },
+            Some(LoadCommand::DyldInfoOnly(DyldInfoCmd::default())),
+        );
+
+        let dylib = DylibFile::parse("/tmp/liblegacy-exports.dylib", &image).unwrap();
+        assert!(dylib.exports.entries().unwrap().is_empty());
     }
 
     // ----- DylibFile::from_tbd tests -----
@@ -548,6 +778,12 @@ mod tests {
         let mut image = Vec::new();
         write_header(&hdr, &mut image);
         let err = DylibFile::parse("/tmp/obj.o", &image).unwrap_err();
-        assert!(matches!(err, ReadError::BadCmdsize { reason, .. } if reason.contains("MH_DYLIB")));
+        assert!(matches!(
+            err,
+            ReadError::UnexpectedFiletype {
+                got: MH_OBJECT,
+                expected: MH_DYLIB
+            }
+        ));
     }
 }

@@ -1,17 +1,25 @@
 use std::fs;
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::Command;
 
 use afs_ld::macho::constants::{
-    CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_ID_DYLIB, LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_MAIN,
-    LC_UUID, MH_DYLIB, MH_EXECUTE, MH_MAGIC_64, MH_OBJECT, N_ABS, N_EXT, N_NO_DEAD_STRIP, N_PEXT,
-    N_SECT, N_UNDF, SECTION_TYPE_MASK, S_REGULAR, S_ZEROFILL,
+    ARM64_RELOC_ADDEND, CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64, LC_ID_DYLIB, LC_LOAD_DYLIB,
+    LC_LOAD_WEAK_DYLIB, LC_MAIN, LC_UUID, MH_BUNDLE, MH_DYLDLINK, MH_DYLIB, MH_DYLINKER,
+    MH_EXECUTE, MH_MAGIC_64, MH_OBJECT, MH_TWOLEVEL, N_ABS, N_EXT, N_NO_DEAD_STRIP, N_PEXT, N_SECT,
+    N_UNDF, SECTION_TYPE_MASK, S_REGULAR, S_ZEROFILL,
 };
 use afs_ld::macho::dylib::DylibFile;
 use afs_ld::macho::reader::{
-    parse_commands, parse_header, write_header, DylibCmd, LoadCommand, MachHeader64,
-    Section64Header, Segment64, SymtabCmd,
+    parse_commands, parse_header, write_commands, write_header, DyldInfoCmd, DylibCmd, DysymtabCmd,
+    LoadCommand, MachHeader64, Section64Header, Segment64, SymtabCmd, HEADER_SIZE,
 };
+use afs_ld::reloc::{write_raw_relocs, RawRelocation};
 use afs_ld::string_table::StringTable;
 use afs_ld::symbol::{parse_nlist_table, RawNlist, SymKind, NLIST_SIZE};
 use afs_ld::{InputSpec, LinkError, LinkOptions, Linker, OutputKind};
@@ -77,8 +85,115 @@ fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afs-ld-cli-diag-{}-{name}", std::process::id()))
 }
 
+#[cfg(unix)]
+fn link_with_small_file_limit(args: &[&OsStr]) -> std::process::Output {
+    Command::new("/bin/sh")
+        .args([
+            "-c",
+            "trap '' 25; ulimit -f 1; exec \"$@\"",
+            "afs-ld-file-limit",
+        ])
+        .arg(env!("CARGO_BIN_EXE_afs-ld"))
+        .args(args)
+        .output()
+        .expect("run afs-ld with a small file-size limit")
+}
+
 fn synthetic_undefined_object(name: &str) -> Vec<u8> {
     synthetic_symbol_object(&[(name, N_UNDF | N_EXT, 0)])
+}
+
+fn synthetic_legacy_dylib(name: &str, install_name: &str) -> Vec<u8> {
+    let mut strings = vec![0];
+    let strx = strings.len() as u32;
+    strings.extend_from_slice(name.as_bytes());
+    strings.push(0);
+    let identity = LoadCommand::Dylib(DylibCmd {
+        cmd: LC_ID_DYLIB,
+        name: install_name.into(),
+        timestamp: 2,
+        current_version: 1 << 16,
+        compatibility_version: 1 << 16,
+    });
+    let sizeofcmds = identity.cmdsize() + SymtabCmd::WIRE_SIZE + DysymtabCmd::WIRE_SIZE;
+    let symoff = HEADER_SIZE as u32 + sizeofcmds;
+    let stroff = symoff + NLIST_SIZE as u32;
+    let commands = vec![
+        identity,
+        LoadCommand::Symtab(SymtabCmd {
+            symoff,
+            nsyms: 1,
+            stroff,
+            strsize: strings.len() as u32,
+        }),
+        LoadCommand::Dysymtab(DysymtabCmd {
+            iextdefsym: 0,
+            nextdefsym: 1,
+            iundefsym: 1,
+            ..DysymtabCmd::default()
+        }),
+    ];
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_DYLIB,
+            ncmds: commands.len() as u32,
+            sizeofcmds,
+            flags: MH_DYLDLINK | MH_TWOLEVEL,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    write_commands(&commands, &mut bytes);
+    RawNlist {
+        strx,
+        n_type: N_SECT | N_EXT,
+        n_sect: 1,
+        n_desc: 0,
+        n_value: 0x1000,
+    }
+    .write(&mut bytes);
+    bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_export_trie_dylib(install_name: &str, trie: &[u8]) -> Vec<u8> {
+    let identity = LoadCommand::Dylib(DylibCmd {
+        cmd: LC_ID_DYLIB,
+        name: install_name.into(),
+        timestamp: 2,
+        current_version: 1 << 16,
+        compatibility_version: 1 << 16,
+    });
+    let sizeofcmds = identity.cmdsize() + DyldInfoCmd::WIRE_SIZE;
+    let commands = vec![
+        identity,
+        LoadCommand::DyldInfoOnly(DyldInfoCmd {
+            export_off: HEADER_SIZE as u32 + sizeofcmds,
+            export_size: trie.len() as u32,
+            ..DyldInfoCmd::default()
+        }),
+    ];
+    let mut bytes = Vec::new();
+    write_header(
+        &MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            filetype: MH_DYLIB,
+            ncmds: commands.len() as u32,
+            sizeofcmds,
+            flags: MH_DYLDLINK | MH_TWOLEVEL,
+            reserved: 0,
+        },
+        &mut bytes,
+    );
+    write_commands(&commands, &mut bytes);
+    bytes.extend_from_slice(trie);
+    bytes
 }
 
 fn synthetic_symbol_object(symbols: &[(&str, u8, u64)]) -> Vec<u8> {
@@ -136,7 +251,16 @@ fn synthetic_symbol_object_with_desc(symbols: &[(&str, u8, u16, u64)]) -> Vec<u8
 }
 
 fn synthetic_text_object(symbol_name: &str) -> Vec<u8> {
+    synthetic_text_object_with_relocations(symbol_name, &[])
+}
+
+fn synthetic_text_object_with_relocations(
+    symbol_name: &str,
+    relocations: &[RawRelocation],
+) -> Vec<u8> {
     let text = [0xc0, 0x03, 0x5f, 0xd6]; // ret
+    let mut relocation_bytes = Vec::new();
+    write_raw_relocs(relocations, &mut relocation_bytes);
     let mut strings = vec![0];
     let strx = strings.len() as u32;
     strings.extend_from_slice(symbol_name.as_bytes());
@@ -176,7 +300,9 @@ fn synthetic_text_object(symbol_name: &str) -> Vec<u8> {
     let data_offset = afs_ld::macho::reader::HEADER_SIZE as u32 + sizeofcmds;
     segment.fileoff = data_offset as u64;
     segment.sections[0].offset = data_offset;
-    let symoff = data_offset + text.len() as u32;
+    segment.sections[0].reloff = data_offset + text.len() as u32;
+    segment.sections[0].nreloc = relocations.len() as u32;
+    let symoff = segment.sections[0].reloff + relocation_bytes.len() as u32;
     let stroff = symoff + NLIST_SIZE as u32;
 
     let mut bytes = Vec::new();
@@ -202,8 +328,25 @@ fn synthetic_text_object(symbol_name: &str) -> Vec<u8> {
     }
     .write(&mut bytes);
     bytes.extend_from_slice(&text);
+    bytes.extend_from_slice(&relocation_bytes);
     symbol.write(&mut bytes);
     bytes.extend_from_slice(&strings);
+    bytes
+}
+
+fn synthetic_text_object_with_invalid_symbol_name() -> Vec<u8> {
+    let mut bytes = synthetic_text_object("_main");
+    let header = parse_header(&bytes).unwrap();
+    let symtab = parse_commands(&header, &bytes)
+        .unwrap()
+        .into_iter()
+        .find_map(|command| match command {
+            LoadCommand::Symtab(symtab) => Some(symtab),
+            _ => None,
+        })
+        .unwrap();
+    bytes[symtab.symoff as usize..symtab.symoff as usize + 4]
+        .copy_from_slice(&symtab.strsize.to_le_bytes());
     bytes
 }
 
@@ -281,14 +424,17 @@ fn synthetic_common_with_regular_common_section() -> Vec<u8> {
     bytes
 }
 
-fn synthetic_dylib(install_name: &str) -> Vec<u8> {
-    let id = DylibCmd {
-        cmd: LC_ID_DYLIB,
-        name: install_name.to_string(),
-        timestamp: 2,
-        current_version: 1 << 16,
-        compatibility_version: 1 << 16,
-    };
+fn synthetic_dylib_with_ids(install_names: &[&str]) -> Vec<u8> {
+    let commands = install_names
+        .iter()
+        .map(|install_name| DylibCmd {
+            cmd: LC_ID_DYLIB,
+            name: (*install_name).to_string(),
+            timestamp: 2,
+            current_version: 1 << 16,
+            compatibility_version: 1 << 16,
+        })
+        .collect::<Vec<_>>();
     let mut bytes = Vec::new();
     write_header(
         &MachHeader64 {
@@ -296,15 +442,21 @@ fn synthetic_dylib(install_name: &str) -> Vec<u8> {
             cputype: CPU_TYPE_ARM64,
             cpusubtype: CPU_SUBTYPE_ARM64_ALL,
             filetype: MH_DYLIB,
-            ncmds: 1,
-            sizeofcmds: id.wire_size(),
+            ncmds: commands.len() as u32,
+            sizeofcmds: commands.iter().map(DylibCmd::wire_size).sum(),
             flags: 0,
             reserved: 0,
         },
         &mut bytes,
     );
-    id.write(&mut bytes);
+    for command in commands {
+        command.write(&mut bytes);
+    }
     bytes
+}
+
+fn synthetic_dylib(install_name: &str) -> Vec<u8> {
+    synthetic_dylib_with_ids(&[install_name])
 }
 
 fn synthetic_macho_with_truncated_commands(filetype: u32) -> Vec<u8> {
@@ -322,6 +474,12 @@ fn synthetic_macho_with_truncated_commands(filetype: u32) -> Vec<u8> {
         },
         &mut bytes,
     );
+    bytes
+}
+
+fn synthetic_text_macho_with_filetype(symbol: &str, filetype: u32) -> Vec<u8> {
+    let mut bytes = synthetic_text_object(symbol);
+    bytes[12..16].copy_from_slice(&filetype.to_le_bytes());
     bytes
 }
 
@@ -424,17 +582,14 @@ fn assemble_minimal_main(name: &str) -> Result<PathBuf, String> {
 
 fn assert_flag_errors(flag: &str, expected: &str, name: &str) {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
     let exe = env!("CARGO_BIN_EXE_afs-ld");
-    let obj = match assemble_minimal_main(&format!("{name}.o")) {
-        Ok(obj) => obj,
-        Err(e) => {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
-    };
+    let obj = require_fixture!(
+        "assembly fixture",
+        assemble_minimal_main(&format!("{name}.o"))
+    );
     let out_path = scratch(&format!("{name}.out"));
     let out = Command::new(exe)
         .arg(flag)
@@ -523,20 +678,61 @@ fn version_flag_prints_version_and_exits_successfully() {
 }
 
 #[test]
+fn overflowing_macho_versions_are_rejected_before_output_publication() {
+    let output = scratch("AFSLD-073-version-overflow.out");
+    let sentinel = b"previously-published-output";
+    fs::write(&output, sentinel).unwrap();
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["-platform_version", "macos", "65536.0.0", "1.0"],
+            "major component must be at most 65535",
+        ),
+        (
+            &["-platform_version", "macos", "1.0", "1.256.0"],
+            "minor component must be at most 255",
+        ),
+        (
+            &["-current_version", "1.0.256"],
+            "patch component must be at most 255",
+        ),
+        (
+            &["-compatibility_version", "65536.0.0"],
+            "major component must be at most 65535",
+        ),
+    ];
+
+    for (args, expected) in cases {
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-o")
+            .arg(&output)
+            .args(*args)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(2), "args: {args:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(expected),
+            "args: {args:?}; stderr: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            fs::read(&output).unwrap(),
+            sentinel,
+            "args: {args:?} must not replace an existing output"
+        );
+    }
+
+    let _ = fs::remove_file(output);
+}
+
+#[test]
 fn no_uuid_flag_omits_uuid_load_command() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let exe = env!("CARGO_BIN_EXE_afs-ld");
-    let obj = match assemble_minimal_main("no-uuid-main.o") {
-        Ok(obj) => obj,
-        Err(e) => {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
-    };
+    let obj = require_fixture!("assembly fixture", assemble_minimal_main("no-uuid-main.o"));
     let out_path = scratch("no-uuid.out");
     let out = Command::new(exe)
         .arg("-no_uuid")
@@ -569,18 +765,12 @@ fn no_uuid_flag_omits_uuid_load_command() {
 #[test]
 fn no_loh_flag_warns_but_links_successfully() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let exe = env!("CARGO_BIN_EXE_afs-ld");
-    let obj = match assemble_minimal_main("no-loh-main.o") {
-        Ok(obj) => obj,
-        Err(e) => {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
-    };
+    let obj = require_fixture!("assembly fixture", assemble_minimal_main("no-loh-main.o"));
     let out_path = scratch("no-loh.out");
     let out = Command::new(exe)
         .arg("-no_loh")
@@ -612,18 +802,15 @@ fn no_loh_flag_warns_but_links_successfully() {
 #[test]
 fn strip_debug_flag_warns_but_links_successfully() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let exe = env!("CARGO_BIN_EXE_afs-ld");
-    let obj = match assemble_minimal_main("strip-debug-main.o") {
-        Ok(obj) => obj,
-        Err(e) => {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
-    };
+    let obj = require_fixture!(
+        "assembly fixture",
+        assemble_minimal_main("strip-debug-main.o")
+    );
     let out_path = scratch("strip-debug.out");
     let out = Command::new(exe)
         .arg("-S")
@@ -650,18 +837,12 @@ fn strip_debug_flag_warns_but_links_successfully() {
 #[test]
 fn objc_flag_warns_but_links_successfully() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let exe = env!("CARGO_BIN_EXE_afs-ld");
-    let obj = match assemble_minimal_main("objc-main.o") {
-        Ok(obj) => obj,
-        Err(e) => {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
-    };
+    let obj = require_fixture!("assembly fixture", assemble_minimal_main("objc-main.o"));
     let out_path = scratch("objc.out");
     let out = Command::new(exe)
         .arg("-ObjC")
@@ -788,6 +969,40 @@ fn executable_accepts_default_and_explicit_entries() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn primary_macho_output_preserves_previous_file_after_write_failure() {
+    const SENTINEL: &[u8] = b"previous complete Mach-O output";
+
+    let dir = scratch("atomic-primary-output");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let object = dir.join("main.o");
+    let output = dir.join("linked");
+    fs::write(&object, synthetic_text_object("_main")).unwrap();
+    fs::write(&output, SENTINEL).unwrap();
+
+    let result =
+        link_with_small_file_limit(&[OsStr::new("-o"), output.as_os_str(), object.as_os_str()]);
+
+    assert!(!result.status.success(), "file-limited link must fail");
+    assert_eq!(
+        fs::read(&output).unwrap(),
+        SENTINEL,
+        "failed Mach-O publication replaced the previous complete output"
+    );
+    assert!(
+        fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("afs-ld-tmp")),
+        "failed Mach-O publication leaked a temporary output"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
 #[test]
 fn dylib_does_not_require_an_executable_entry() {
     let object = scratch("dylib-without-entry.o");
@@ -872,7 +1087,7 @@ fn bundle_flag_errors_loudly() {
 #[test]
 fn dead_strip_removes_unreferenced_symbols_and_reports_why_live() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -904,21 +1119,9 @@ fn dead_strip_removes_unreferenced_symbols_and_reports_why_live() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(main_src, &main_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-    if let Err(e) = assemble(helper_src, &helper_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        return;
-    }
-    if let Err(e) = assemble(unused_src, &unused_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        let _ = fs::remove_file(helper_obj);
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(main_src, &main_obj));
+    require_fixture!("assembly fixture", assemble(helper_src, &helper_obj));
+    require_fixture!("assembly fixture", assemble(unused_src, &unused_obj));
 
     let out = Command::new(exe)
         .arg("-dead_strip")
@@ -967,7 +1170,7 @@ fn dead_strip_removes_unreferenced_symbols_and_reports_why_live() {
 #[test]
 fn dead_strip_keeps_no_dead_strip_roots() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -991,10 +1194,7 @@ fn dead_strip_keeps_no_dead_strip_roots() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let out = Command::new(exe)
         .arg("-dead_strip")
@@ -1038,18 +1238,12 @@ fn dead_strip_keeps_no_dead_strip_roots() {
 #[test]
 fn icf_safe_flag_links_successfully() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
     let exe = env!("CARGO_BIN_EXE_afs-ld");
-    let obj = match assemble_minimal_main("icf-safe-main.o") {
-        Ok(obj) => obj,
-        Err(e) => {
-            eprintln!("skipping: assemble failed: {e}");
-            return;
-        }
-    };
+    let obj = require_fixture!("assembly fixture", assemble_minimal_main("icf-safe-main.o"));
     let out_path = scratch("icf-safe.out");
     let out = Command::new(exe)
         .arg("-icf=safe")
@@ -1083,18 +1277,37 @@ fn icf_all_flag_errors_loudly() {
 }
 
 #[test]
-fn fixup_chains_flag_errors_loudly() {
-    assert_flag_errors(
-        "-fixup_chains",
-        "`-fixup_chains` is not yet supported",
-        "fixup-chains",
+fn fixup_chains_flag_errors_loudly_and_preserves_existing_output() {
+    const SENTINEL: &[u8] = b"AFSLD-075 existing output";
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let out_path = scratch("fixup-chains-existing.out");
+    fs::write(&out_path, SENTINEL).unwrap();
+    let out = Command::new(exe)
+        .arg("-fixup_chains")
+        .arg("-o")
+        .arg(&out_path)
+        .arg("missing-input.o")
+        .output()
+        .expect("afs-ld should run");
+
+    assert!(!out.status.success(), "-fixup_chains should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "`-fixup_chains` is unsupported: afs-ld emits classic `LC_DYLD_INFO_ONLY`; use `-no_fixup_chains` or omit the flag"
+        ),
+        "unexpected stderr:\n{stderr}"
     );
+    assert_eq!(fs::read(&out_path).unwrap(), SENTINEL);
+
+    let _ = fs::remove_file(out_path);
 }
 
 #[test]
 fn undefined_symbol_diagnostic_is_not_double_prefixed() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -1108,10 +1321,7 @@ fn undefined_symbol_diagnostic_is_not_double_prefixed() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let out = Command::new(exe)
         .arg("-o")
@@ -1135,11 +1345,11 @@ fn undefined_symbol_diagnostic_is_not_double_prefixed() {
 #[test]
 fn undefined_warning_mode_links_and_warns_once() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
 
@@ -1153,10 +1363,7 @@ fn undefined_warning_mode_links_and_warns_once() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let out_path = scratch("missing-warning.out");
     let out = Command::new(exe)
@@ -1193,11 +1400,11 @@ fn undefined_warning_mode_links_and_warns_once() {
 #[test]
 fn undefined_suppress_mode_links_silently() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
 
@@ -1211,10 +1418,7 @@ fn undefined_suppress_mode_links_silently() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let out_path = scratch("missing-suppress.out");
     let out = Command::new(exe)
@@ -1247,7 +1451,7 @@ fn undefined_suppress_mode_links_silently() {
 #[test]
 fn trace_flag_prints_loaded_inputs_and_archive_members() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -1280,27 +1484,10 @@ fn trace_flag_prints_loaded_inputs_and_archive_members() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(main_src, &main_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-    if let Err(e) = assemble(helper_src, &helper_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-    if let Err(e) = assemble(tail_src, &tail_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        let _ = fs::remove_file(helper_obj);
-        return;
-    }
-    if let Err(e) = archive(&[&helper_obj], &archive_path) {
-        eprintln!("skipping: archive failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        let _ = fs::remove_file(helper_obj);
-        let _ = fs::remove_file(tail_obj);
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(main_src, &main_obj));
+    require_fixture!("assembly fixture", assemble(helper_src, &helper_obj));
+    require_fixture!("assembly fixture", assemble(tail_src, &tail_obj));
+    require_fixture!("archive fixture", archive(&[&helper_obj], &archive_path));
 
     let out = Command::new(exe)
         .arg("-t")
@@ -1341,11 +1528,11 @@ fn trace_flag_prints_loaded_inputs_and_archive_members() {
 #[test]
 fn mixed_library_and_positional_inputs_follow_command_line_order() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: xcrun --show-sdk-path unavailable");
+        harness_skip!("xcrun --show-sdk-path unavailable");
         return;
     };
 
@@ -1386,22 +1573,10 @@ fn mixed_library_and_positional_inputs_follow_command_line_order() {
     "#;
 
     for (src, object) in [(main_src, &main_obj), (a_src, &a_obj), (b_src, &b_obj)] {
-        if let Err(e) = assemble(src, object) {
-            eprintln!("skipping: assemble failed: {e}");
-            let _ = fs::remove_dir_all(root);
-            return;
-        }
+        require_fixture!("assembly fixture", assemble(src, object));
     }
-    if let Err(e) = archive(&[&a_obj], &lib_a) {
-        eprintln!("skipping: archive failed: {e}");
-        let _ = fs::remove_dir_all(root);
-        return;
-    }
-    if let Err(e) = archive(&[&b_obj], &lib_b) {
-        eprintln!("skipping: archive failed: {e}");
-        let _ = fs::remove_dir_all(root);
-        return;
-    }
+    require_fixture!("archive fixture", archive(&[&a_obj], &lib_a));
+    require_fixture!("archive fixture", archive(&[&b_obj], &lib_b));
 
     let link = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
         .arg("-arch")
@@ -1597,6 +1772,540 @@ fn macho_parse_diagnostics_include_input_paths() {
     }
 
     let _ = fs::remove_file(valid);
+}
+
+#[test]
+fn malformed_dylib_identities_are_rejected_without_output() {
+    let cases = [
+        ("missing", Vec::new(), "missing LC_ID_DYLIB load command"),
+        ("empty", vec![""], "LC_ID_DYLIB install name is empty"),
+        (
+            "duplicate",
+            vec!["@rpath/libfirst.dylib", "@rpath/libsecond.dylib"],
+            "multiple LC_ID_DYLIB load commands",
+        ),
+    ];
+
+    for (case, install_names, expected) in cases {
+        let input = scratch(&format!("invalid-dylib-id-{case}.dylib"));
+        fs::write(&input, synthetic_dylib_with_ids(&install_names)).unwrap();
+
+        for jobs in [1, 4] {
+            let output = scratch(&format!("invalid-dylib-id-{case}-{jobs}.dylib"));
+            let _ = fs::remove_file(&output);
+            let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+                .arg("-dylib")
+                .arg("-j")
+                .arg(jobs.to_string())
+                .arg(&input)
+                .arg("-o")
+                .arg(&output)
+                .output()
+                .expect("afs-ld should run");
+            let stderr = String::from_utf8_lossy(&result.stderr);
+
+            assert!(
+                !result.status.success(),
+                "malformed {case} identity was accepted with -j{jobs}"
+            );
+            assert!(
+                stderr.contains(&input.display().to_string()),
+                "missing malformed dylib path with -j{jobs}:\n{stderr}"
+            );
+            assert!(
+                stderr.contains(expected),
+                "unexpected malformed {case} diagnostic with -j{jobs}:\n{stderr}"
+            );
+            assert!(
+                !output.exists(),
+                "rejected {case} identity left an output with -j{jobs}"
+            );
+        }
+
+        let _ = fs::remove_file(input);
+    }
+}
+
+#[test]
+fn malformed_tbd_versions_are_rejected_without_output() {
+    let cases = [
+        ("nondigit", "current-version", "1.x.3"),
+        ("empty", "compatibility-version", ""),
+        ("extra-component", "current-version", "1.2.3.4"),
+        ("major-overflow", "compatibility-version", "65536"),
+        ("minor-overflow", "current-version", "1.256"),
+        ("patch-overflow", "compatibility-version", "1.2.256"),
+        ("integer-overflow", "current-version", "4294967296"),
+    ];
+
+    for (case, field, value) in cases {
+        let input = scratch(&format!("invalid-tbd-version-{case}.tbd"));
+        fs::write(
+            &input,
+            format!(
+                "--- !tapi-tbd\n\
+                 tbd-version: 4\n\
+                 targets: [ arm64-macos ]\n\
+                 install-name: '/usr/lib/libbad.dylib'\n\
+                 {field}: '{value}'\n\
+                 ...\n"
+            ),
+        )
+        .unwrap();
+
+        for jobs in [1, 4] {
+            let output = scratch(&format!("invalid-tbd-version-{case}-{jobs}.dylib"));
+            let _ = fs::remove_file(&output);
+            let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+                .arg("-dylib")
+                .arg("-j")
+                .arg(jobs.to_string())
+                .arg(&input)
+                .arg("-o")
+                .arg(&output)
+                .output()
+                .expect("afs-ld should run");
+            let stderr = String::from_utf8_lossy(&result.stderr);
+
+            assert!(
+                !result.status.success(),
+                "{case} {field} {value:?} was accepted with -j{jobs}"
+            );
+            assert!(
+                stderr.contains(&input.display().to_string()),
+                "missing malformed TBD path with -j{jobs}:\n{stderr}"
+            );
+            assert!(
+                stderr.contains(field) && stderr.contains(&format!("{value:?}")),
+                "unexpected {case} {field} diagnostic with -j{jobs}:\n{stderr}"
+            );
+            assert!(
+                !output.exists(),
+                "rejected {case} {field} left an output with -j{jobs}"
+            );
+        }
+
+        let _ = fs::remove_file(input);
+    }
+}
+
+#[test]
+fn maximum_tbd_versions_are_preserved_deterministically() {
+    let input = scratch("maximum-tbd-version.tbd");
+    let install_name = "/usr/lib/libmaximum-version.dylib";
+    fs::write(
+        &input,
+        format!(
+            "--- !tapi-tbd\n\
+             tbd-version: 4\n\
+             targets: [ arm64-macos ]\n\
+             install-name: '{install_name}'\n\
+             current-version: 65535.255.255\n\
+             compatibility-version: 65535.255\n\
+             ...\n"
+        ),
+    )
+    .unwrap();
+
+    let mut images = Vec::new();
+    let output = scratch("maximum-tbd-version-output.dylib");
+    for jobs in [1, 4] {
+        let _ = fs::remove_file(&output);
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        assert!(
+            result.status.success(),
+            "maximum legal TBD version failed with -j{jobs}:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+
+        let image = fs::read(&output).unwrap();
+        let header = parse_header(&image).unwrap();
+        let commands = parse_commands(&header, &image).unwrap();
+        let load = commands
+            .iter()
+            .find_map(|command| match command {
+                LoadCommand::Dylib(dylib)
+                    if dylib.cmd == LC_LOAD_DYLIB && dylib.name == install_name =>
+                {
+                    Some(dylib)
+                }
+                _ => None,
+            })
+            .expect("linked image must load the TBD install name");
+        assert_eq!(load.current_version, u32::MAX);
+        assert_eq!(load.compatibility_version, 0xffff_ff00);
+        images.push(image);
+        let _ = fs::remove_file(&output);
+    }
+    assert!(images[0] == images[1], "-j1 and -j4 outputs differ");
+
+    let _ = fs::remove_file(input);
+}
+
+#[test]
+fn double_quoted_utf8_tbd_symbol_resolves_deterministically() {
+    let object = scratch("utf8-tbd-symbol.o");
+    let tbd = scratch("utf8-tbd-symbol.tbd");
+    let output = scratch("utf8-tbd-symbol.dylib");
+    let symbol = "_café";
+    fs::write(&object, synthetic_undefined_object(symbol)).unwrap();
+    fs::write(
+        &tbd,
+        format!(
+            "--- !tapi-tbd\n\
+             tbd-version: 4\n\
+             targets: [ arm64-macos ]\n\
+             install-name: '/usr/lib/libutf8-symbol.dylib'\n\
+             exports:\n\
+             \x20 - targets: [ arm64-macos ]\n\
+             \x20   symbols: [ \"{symbol}\" ]\n\
+             ...\n"
+        ),
+    )
+    .unwrap();
+
+    let mut images = Vec::new();
+    for jobs in [1, 4] {
+        let _ = fs::remove_file(&output);
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&object)
+            .arg(&tbd)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        assert!(
+            result.status.success(),
+            "double-quoted UTF-8 TBD symbol failed with -j{jobs}:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let image = fs::read(&output).unwrap();
+        let header = parse_header(&image).unwrap();
+        let commands = parse_commands(&header, &image).unwrap();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            LoadCommand::Dylib(dylib)
+                if dylib.cmd == LC_LOAD_DYLIB
+                    && dylib.name == "/usr/lib/libutf8-symbol.dylib"
+        )));
+        images.push(image);
+    }
+    assert_eq!(images[0], images[1], "-j1 and -j4 outputs differ");
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(tbd);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn legacy_dysymtab_dylib_symbol_resolves_deterministically() {
+    let object = scratch("legacy-dysymtab-symbol.o");
+    let dylib = scratch("legacy-dysymtab-symbol.dylib");
+    let output = scratch("legacy-dysymtab-consumer.dylib");
+    let symbol = "_legacy_export";
+    let install_name = "/usr/lib/liblegacy-dysymtab.dylib";
+    fs::write(&object, synthetic_undefined_object(symbol)).unwrap();
+    fs::write(&dylib, synthetic_legacy_dylib(symbol, install_name)).unwrap();
+
+    let mut images = Vec::new();
+    for jobs in [1, 4] {
+        let _ = fs::remove_file(&output);
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&object)
+            .arg(&dylib)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        assert!(
+            result.status.success(),
+            "legacy LC_DYSYMTAB export failed with -j{jobs}:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let image = fs::read(&output).unwrap();
+        let header = parse_header(&image).unwrap();
+        let commands = parse_commands(&header, &image).unwrap();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            LoadCommand::Dylib(dylib)
+                if dylib.cmd == LC_LOAD_DYLIB && dylib.name == install_name
+        )));
+        images.push(image);
+    }
+    assert_eq!(images[0], images[1], "-j1 and -j4 outputs differ");
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(dylib);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn short_export_terminal_is_rejected_without_replacing_output() {
+    const SENTINEL: &[u8] = b"previous complete Mach-O output";
+
+    let dir = scratch("short-export-terminal");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let object = dir.join("consumer.o");
+    let dylib = dir.join("malformed.dylib");
+    let output = dir.join("consumer.dylib");
+    let symbol = "_forged";
+
+    // Root edge `_forged` points to a leaf whose one-byte payload contains
+    // only flags. The final zero belongs to child_count, not the address.
+    let mut trie = vec![0, 1];
+    trie.extend_from_slice(symbol.as_bytes());
+    trie.push(0);
+    let leaf_offset = trie.len() + 1;
+    assert!(leaf_offset < 0x80);
+    trie.push(leaf_offset as u8);
+    trie.extend_from_slice(&[1, 0, 0]);
+
+    fs::write(&object, synthetic_undefined_object(symbol)).unwrap();
+    fs::write(
+        &dylib,
+        synthetic_export_trie_dylib("/usr/lib/libmalformed-export.dylib", &trie),
+    )
+    .unwrap();
+
+    for jobs in [1, 4] {
+        fs::write(&output, SENTINEL).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg(&object)
+            .arg(&dylib)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .expect("afs-ld should run");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+
+        assert!(
+            !result.status.success(),
+            "short export terminal was accepted with -j{jobs}"
+        );
+        assert!(
+            stderr.contains("truncated input while reading ULEB128 (unterminated)"),
+            "missing terminal-payload diagnostic with -j{jobs}:\n{stderr}"
+        );
+        assert_eq!(
+            fs::read(&output).unwrap(),
+            SENTINEL,
+            "rejected export terminal replaced prior output with -j{jobs}"
+        );
+        assert!(
+            fs::read_dir(&dir).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("afs-ld-tmp")),
+            "rejected export terminal leaked a temporary output with -j{jobs}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn linker_rejects_non_linkable_macho_filetypes() {
+    for (stem, filetype, filetype_name) in [
+        ("execute", MH_EXECUTE, "MH_EXECUTE"),
+        ("dylinker", MH_DYLINKER, "MH_DYLINKER"),
+        ("bundle", MH_BUNDLE, "MH_BUNDLE"),
+    ] {
+        let input = scratch(&format!("non-linkable-{stem}"));
+        fs::write(
+            &input,
+            synthetic_text_macho_with_filetype("_not_an_object", filetype),
+        )
+        .unwrap();
+
+        for jobs in [1, 4] {
+            let output = scratch(&format!("non-linkable-{stem}-{jobs}.dylib"));
+            let _ = fs::remove_file(&output);
+            let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+                .arg("-dylib")
+                .arg("-j")
+                .arg(jobs.to_string())
+                .arg("-o")
+                .arg(&output)
+                .arg(&input)
+                .output()
+                .expect("afs-ld should run");
+            let stderr = String::from_utf8_lossy(&result.stderr);
+
+            assert!(
+                !result.status.success(),
+                "{filetype_name} input was accepted with -j{jobs}"
+            );
+            assert!(
+                stderr.contains(&input.display().to_string()),
+                "missing input path with -j{jobs}:\n{stderr}"
+            );
+            assert!(
+                stderr.contains(filetype_name) && stderr.contains("expected MH_OBJECT or MH_DYLIB"),
+                "unexpected {filetype_name} diagnostic with -j{jobs}:\n{stderr}"
+            );
+            assert!(
+                !output.exists(),
+                "rejected {filetype_name} input left an output with -j{jobs}"
+            );
+        }
+
+        let _ = fs::remove_file(input);
+    }
+}
+
+#[test]
+fn archive_members_must_be_relocatable_macho_objects() {
+    let archive = scratch("non-object-member.a");
+    let member_name = "final-image.o/";
+    fs::write(
+        &archive,
+        synthetic_indexed_archive(
+            "_final_image",
+            member_name,
+            &synthetic_text_macho_with_filetype("_final_image", MH_EXECUTE),
+        ),
+    )
+    .unwrap();
+
+    for jobs in [1, 4] {
+        let output = scratch(&format!("non-object-member-{jobs}.dylib"));
+        let _ = fs::remove_file(&output);
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-dylib")
+            .arg("-all_load")
+            .arg("-j")
+            .arg(jobs.to_string())
+            .arg("-o")
+            .arg(&output)
+            .arg(&archive)
+            .output()
+            .expect("afs-ld should run");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+
+        assert!(
+            !result.status.success(),
+            "MH_EXECUTE archive member was accepted with -j{jobs}"
+        );
+        assert!(
+            stderr.contains(&archive.display().to_string()) && stderr.contains("final-image.o"),
+            "missing archive-member path with -j{jobs}:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("MH_EXECUTE") && stderr.contains("expected MH_OBJECT"),
+            "unexpected archive-member diagnostic with -j{jobs}:\n{stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "rejected archive member left an output with -j{jobs}"
+        );
+    }
+
+    let _ = fs::remove_file(archive);
+}
+
+#[test]
+fn dump_still_inspects_final_macho_images() {
+    let input = scratch("dump-final-image");
+    fs::write(
+        &input,
+        synthetic_text_macho_with_filetype("_main", MH_EXECUTE),
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("--dump")
+        .arg(&input)
+        .output()
+        .expect("afs-ld should run");
+    assert!(
+        result.status.success(),
+        "dump rejected a final Mach-O image:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("MH_EXECUTE"));
+
+    let _ = fs::remove_file(input);
+}
+
+fn assert_dump_rejects(
+    name: &str,
+    bytes: Vec<u8>,
+    expected_error: &str,
+    forbidden_placeholder: &str,
+) {
+    let input = scratch(name);
+    fs::write(&input, bytes).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("--dump")
+        .arg(&input)
+        .output()
+        .expect("afs-ld should run");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success(),
+        "dump accepted malformed input {name}:\n{stdout}"
+    );
+    assert!(
+        stderr.contains(expected_error),
+        "dump diagnostic for {name} omitted {expected_error:?}:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains(forbidden_placeholder),
+        "dump reduced malformed input {name} to placeholder output:\n{stdout}"
+    );
+
+    let _ = fs::remove_file(input);
+}
+
+#[test]
+fn dump_rejects_malformed_relocations() {
+    assert_dump_rejects(
+        "dump-malformed-relocation.o",
+        synthetic_text_object_with_relocations(
+            "_main",
+            &[RawRelocation {
+                r_address: 0,
+                r_symbolnum: 1,
+                r_pcrel: false,
+                r_length: 2,
+                r_extern: false,
+                r_type: ARM64_RELOC_ADDEND,
+            }],
+        ),
+        "trailing ARM64_RELOC_ADDEND with no following primary",
+        "<parse error:",
+    );
+}
+
+#[test]
+fn dump_rejects_invalid_symbol_names() {
+    assert_dump_rejects(
+        "dump-malformed-symbol.o",
+        synthetic_text_object_with_invalid_symbol_name(),
+        "strx out of bounds",
+        "<unresolved>",
+    );
 }
 
 #[test]
@@ -2281,7 +2990,7 @@ fn ordered_api_applies_configured_force_load_archives() {
 #[test]
 fn why_live_reports_root_entry_symbol() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -2296,10 +3005,7 @@ fn why_live_reports_root_entry_symbol() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &main_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &main_obj));
 
     let out = Command::new(exe)
         .arg("-why_live")
@@ -2326,7 +3032,7 @@ fn why_live_reports_root_entry_symbol() {
 #[test]
 fn why_live_reports_transitive_symbol_chain() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -2359,21 +3065,9 @@ fn why_live_reports_transitive_symbol_chain() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(main_src, &main_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
-    if let Err(e) = assemble(helper_src, &helper_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        return;
-    }
-    if let Err(e) = assemble(leaf_src, &leaf_obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        let _ = fs::remove_file(main_obj);
-        let _ = fs::remove_file(helper_obj);
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(main_src, &main_obj));
+    require_fixture!("assembly fixture", assemble(helper_src, &helper_obj));
+    require_fixture!("assembly fixture", assemble(leaf_src, &leaf_obj));
 
     let out = Command::new(exe)
         .arg("-why_live")
@@ -2406,7 +3100,7 @@ fn why_live_reports_transitive_symbol_chain() {
 #[test]
 fn why_live_reports_folded_symbol_winner_chain() {
     if !have_xcrun() {
-        eprintln!("skipping: xcrun as unavailable");
+        harness_skip!("xcrun as unavailable");
         return;
     }
 
@@ -2436,10 +3130,7 @@ fn why_live_reports_folded_symbol_winner_chain() {
             ret
         .subsections_via_symbols
     "#;
-    if let Err(e) = assemble(src, &obj) {
-        eprintln!("skipping: assemble failed: {e}");
-        return;
-    }
+    require_fixture!("assembly fixture", assemble(src, &obj));
 
     let out = Command::new(exe)
         .arg("-icf=safe")

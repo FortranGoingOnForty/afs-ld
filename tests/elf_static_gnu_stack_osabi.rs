@@ -42,9 +42,13 @@ fn ru64(b: &[u8], o: usize) -> u64 {
 }
 
 const PT_GNU_STACK: u32 = 0x6474_e551;
+const PT_DYNAMIC: u32 = 2;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
+const DT_NULL: u64 = 0;
+const DT_FLAGS: u64 = 30;
+const DF_BIND_NOW: u64 = 0x8;
 
 fn temp_dir(label: &str) -> PathBuf {
     let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -86,6 +90,36 @@ fn gnu_stack_flags(elf: &[u8]) -> u32 {
         .collect();
     assert_eq!(flags.len(), 1, "expected exactly one PT_GNU_STACK");
     flags[0]
+}
+
+fn binds_now(elf: &[u8]) -> bool {
+    let phoff = ru64(elf, 32) as usize;
+    let phentsize = ru16(elf, 54) as usize;
+    let phnum = ru16(elf, 56) as usize;
+    let (offset, size) = (0..phnum)
+        .find_map(|index| {
+            let header = phoff + index * phentsize;
+            (ru32(elf, header) == PT_DYNAMIC).then(|| {
+                (
+                    ru64(elf, header + 8) as usize,
+                    ru64(elf, header + 32) as usize,
+                )
+            })
+        })
+        .expect("expected PT_DYNAMIC");
+    let dynamic = elf
+        .get(offset..offset + size)
+        .expect("PT_DYNAMIC must be in the file");
+    for entry in dynamic.chunks_exact(16) {
+        let tag = ru64(entry, 0);
+        if tag == DT_NULL {
+            break;
+        }
+        if tag == DT_FLAGS {
+            return ru64(entry, 8) & DF_BIND_NOW != 0;
+        }
+    }
+    false
 }
 
 /// The OSABI the output should carry: FreeBSD (9) on a FreeBSD host (the
@@ -212,6 +246,125 @@ fn executable_stack_requests_are_aggregated_across_objects() {
                 "{case} {mode} stack flags"
             );
         }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explicit_stack_policy_overrides_inputs_and_last_option_wins() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_static_gnu_stack_osabi test=explicit_stack_policy_overrides_inputs_and_last_option_wins count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = temp_dir("stack_policy");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let safe = assemble(
+        &gas,
+        &dir,
+        "policy_safe",
+        ".text\n.globl _start\n.type _start,@function\n_start:\n    ret\n.size _start,.-_start\n.section .note.GNU-stack,\"\",@progbits\n",
+    );
+    let executable = assemble(
+        &gas,
+        &dir,
+        "policy_executable",
+        ".text\n.globl _start\n.type _start,@function\n_start:\n    ret\n.size _start,.-_start\n.section .note.GNU-stack,\"x\",@progbits\n",
+    );
+
+    let cases = [
+        (
+            "separated_execstack",
+            safe.clone(),
+            vec!["-z", "execstack"],
+            PF_R | PF_W | PF_X,
+        ),
+        (
+            "separated_noexecstack",
+            executable.clone(),
+            vec!["-z", "noexecstack"],
+            PF_R | PF_W,
+        ),
+        (
+            "joined_last_noexecstack",
+            executable,
+            vec!["-zexecstack", "-znoexecstack"],
+            PF_R | PF_W,
+        ),
+        (
+            "joined_last_execstack",
+            safe,
+            vec!["-znoexecstack", "-zexecstack"],
+            PF_R | PF_W | PF_X,
+        ),
+    ];
+
+    for (case, object, policy_args, expected_flags) in cases {
+        for dynamic in [false, true] {
+            let mode = if dynamic { "dynamic" } else { "static" };
+            let output = dir.join(format!("{case}_{mode}"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_afs-ld"));
+            command.arg("-o").arg(&output).args(&policy_args);
+            if dynamic {
+                command.args(["--dynamic-linker", "/nonexistent/ld.so"]);
+            }
+            let result = command.arg(&object).output().expect("run afs-ld");
+            assert!(
+                result.status.success(),
+                "{case} {mode}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let elf = std::fs::read(&output).expect("read linked ELF");
+            assert_eq!(
+                gnu_stack_flags(&elf),
+                expected_flags,
+                "{case} {mode} stack flags"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dynamic_binding_policy_defaults_to_lazy_and_last_option_wins() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_static_gnu_stack_osabi test=dynamic_binding_policy_defaults_to_lazy_and_last_option_wins count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = temp_dir("binding_policy");
+    std::fs::create_dir_all(&dir).unwrap();
+    let object = assemble(
+        &gas,
+        &dir,
+        "binding",
+        ".text\n.globl _start\n.type _start,@function\n_start:\n    ret\n.size _start,.-_start\n.section .note.GNU-stack,\"\",@progbits\n",
+    );
+
+    let cases = [
+        ("default_lazy", Vec::new(), false),
+        ("separated_now", vec!["-z", "now"], true),
+        ("joined_last_lazy", vec!["-znow", "-zlazy"], false),
+        ("joined_last_now", vec!["-zlazy", "-znow"], true),
+    ];
+    for (case, policy_args, expected_bind_now) in cases {
+        let output = dir.join(case);
+        let result = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+            .arg("-o")
+            .arg(&output)
+            .args(&policy_args)
+            .args(["--dynamic-linker", "/nonexistent/ld.so"])
+            .arg(&object)
+            .output()
+            .expect("run afs-ld");
+        assert!(
+            result.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let elf = std::fs::read(&output).expect("read linked ELF");
+        assert_eq!(binds_now(&elf), expected_bind_now, "{case} binding mode");
     }
 
     let _ = std::fs::remove_dir_all(&dir);

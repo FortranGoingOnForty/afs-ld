@@ -26,6 +26,12 @@ pub enum ReadError {
     BadMagic { got: u32 },
     /// CPU type is not `CPU_TYPE_ARM64`.
     UnsupportedCpu { got: u32 },
+    /// ARM64 subtype or its capability encoding is unsupported.
+    UnsupportedCpuSubtype { got: u32 },
+    /// A parser was given a different kind of Mach-O image than it accepts.
+    UnexpectedFiletype { got: u32, expected: u32 },
+    /// An `MH_DYLIB` does not carry exactly one usable `LC_ID_DYLIB`.
+    BadDylibIdentity { reason: &'static str },
     /// A load command's `cmdsize` field is malformed.
     BadCmdsize {
         cmd: u32,
@@ -55,6 +61,19 @@ impl fmt::Display for ReadError {
                 f,
                 "unsupported cpu type 0x{got:08x} (afs-ld requires arm64 / 0x{CPU_TYPE_ARM64:08x})"
             ),
+            ReadError::UnsupportedCpuSubtype { got } => write!(
+                f,
+                "unsupported ARM64 CPU subtype 0x{got:08x} (afs-ld supports ARM64_ALL, ARM64_V8, and ARM64E with defined capability bits)"
+            ),
+            ReadError::UnexpectedFiletype { got, expected } => write!(
+                f,
+                "unexpected Mach-O filetype {} (0x{got:08x}); expected {} (0x{expected:08x})",
+                macho_filetype_name(*got).unwrap_or("unknown"),
+                macho_filetype_name(*expected).unwrap_or("unknown")
+            ),
+            ReadError::BadDylibIdentity { reason } => {
+                write!(f, "malformed MH_DYLIB identity: {reason}")
+            }
             ReadError::BadCmdsize { cmd, cmdsize, at_offset, reason } => write!(
                 f,
                 "load command 0x{cmd:x} at offset 0x{at_offset:x}: cmdsize {cmdsize} invalid ({reason})"
@@ -101,10 +120,14 @@ pub fn parse_header(bytes: &[u8]) -> Result<MachHeader64, ReadError> {
     if cputype != CPU_TYPE_ARM64 {
         return Err(ReadError::UnsupportedCpu { got: cputype });
     }
+    let cpusubtype = u32_le(&bytes[8..12]);
+    if !is_supported_arm64_cpu_subtype(cpusubtype) {
+        return Err(ReadError::UnsupportedCpuSubtype { got: cpusubtype });
+    }
     Ok(MachHeader64 {
         magic,
         cputype,
-        cpusubtype: u32_le(&bytes[8..12]),
+        cpusubtype,
         filetype: u32_le(&bytes[12..16]),
         ncmds: u32_le(&bytes[16..20]),
         sizeofcmds: u32_le(&bytes[20..24]),
@@ -1119,6 +1142,42 @@ mod tests {
         assert!(matches!(
             err,
             ReadError::UnsupportedCpu { got: 0x0100_0007 }
+        ));
+    }
+
+    #[test]
+    fn arm64e_subtype_preserves_capability_bits() {
+        let mut bytes = minimal_object_header_bytes();
+        bytes[8..12].copy_from_slice(&0x8000_0002u32.to_le_bytes());
+        assert_eq!(parse_header(&bytes).unwrap().cpusubtype, 0x8000_0002);
+    }
+
+    #[test]
+    fn unknown_arm64_subtype_errors() {
+        let mut bytes = minimal_object_header_bytes();
+        bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+        assert!(matches!(
+            parse_header(&bytes).unwrap_err(),
+            ReadError::UnsupportedCpuSubtype { got: 3 }
+        ));
+    }
+
+    #[test]
+    fn defined_non_arm64e_subtypes_preserve_the_lib64_feature_bit() {
+        for cpu_subtype in [CPU_SUBTYPE_ARM64_V8, CPU_SUBTYPE_LIB64] {
+            let mut bytes = minimal_object_header_bytes();
+            bytes[8..12].copy_from_slice(&cpu_subtype.to_le_bytes());
+            assert_eq!(parse_header(&bytes).unwrap().cpusubtype, cpu_subtype);
+        }
+    }
+
+    #[test]
+    fn arm64e_rejects_undefined_capability_bits() {
+        let mut bytes = minimal_object_header_bytes();
+        bytes[8..12].copy_from_slice(&0x1000_0002u32.to_le_bytes());
+        assert!(matches!(
+            parse_header(&bytes).unwrap_err(),
+            ReadError::UnsupportedCpuSubtype { got: 0x1000_0002 }
         ));
     }
 

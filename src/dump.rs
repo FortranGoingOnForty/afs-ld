@@ -87,8 +87,12 @@ pub fn dump_tbd_file(path: &Path) -> io::Result<()> {
             "  [{i}] install_name={:?} targets=[{}] current={} compat={}",
             tbd.install_name,
             targets.join(", "),
-            tbd.current_version.as_deref().unwrap_or("-"),
-            tbd.compatibility_version.as_deref().unwrap_or("-")
+            tbd.current_version
+                .map(version_str)
+                .unwrap_or_else(|| "-".to_string()),
+            tbd.compatibility_version
+                .map(version_str)
+                .unwrap_or_else(|| "-".to_string())
         )?;
         if !tbd.reexported_libraries.is_empty() {
             let total: usize = tbd.reexported_libraries.iter().map(|s| s.value.len()).sum();
@@ -173,7 +177,7 @@ pub fn dump_dylib_file(path: &Path) -> io::Result<()> {
 
 pub fn dump_file(path: &Path) -> io::Result<()> {
     let bytes = std::fs::read(path)?;
-    let obj = ObjectFile::parse(path, &bytes)
+    let obj = ObjectFile::parse_for_inspection(path, &bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let out = io::stdout();
     let mut h = out.lock();
@@ -351,14 +355,19 @@ fn write_sections(w: &mut impl Write, secs: &[InputSection]) -> io::Result<()> {
         }
         if s.nreloc > 0 {
             writeln!(w, "      relocs ({}):", s.nreloc)?;
-            match parse_raw_relocs(&s.raw_relocs, 0, s.nreloc).and_then(|raws| parse_relocs(&raws))
-            {
-                Ok(fused) => {
-                    for (ri, r) in fused.iter().enumerate() {
-                        writeln!(w, "        [{ri}] {}", describe_reloc(r))?;
-                    }
-                }
-                Err(e) => writeln!(w, "        <parse error: {e}>")?,
+            let fused = parse_raw_relocs(&s.raw_relocs, 0, s.nreloc)
+                .and_then(|raws| parse_relocs(&raws))
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "section {i} ({},{}): invalid relocation table: {error}",
+                            s.segname, s.sectname
+                        ),
+                    )
+                })?;
+            for (ri, r) in fused.iter().enumerate() {
+                writeln!(w, "        [{ri}] {}", describe_reloc(r))?;
             }
         }
     }
@@ -371,7 +380,12 @@ fn write_symbols(w: &mut impl Write, obj: &ObjectFile) -> io::Result<()> {
     }
     writeln!(w, "Symbols ({}):", obj.symbols.len())?;
     for (i, sym) in obj.symbols.iter().enumerate() {
-        let name = obj.symbol_name(sym).unwrap_or("<unresolved>");
+        let name = obj.symbol_name(sym).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("symbol {i} has invalid name offset {}: {error}", sym.strx()),
+            )
+        })?;
         writeln!(w, "  [{i}] {:<32} {}", name, describe_symbol(sym))?;
     }
     Ok(())
@@ -486,12 +500,7 @@ fn cpu_name(ct: u32) -> &'static str {
 }
 
 fn filetype_name(ft: u32) -> &'static str {
-    match ft {
-        MH_OBJECT => "MH_OBJECT",
-        MH_EXECUTE => "MH_EXECUTE",
-        MH_DYLIB => "MH_DYLIB",
-        _ => "??",
-    }
+    macho_filetype_name(ft).unwrap_or("??")
 }
 
 fn cmd_name(cmd: u32) -> String {

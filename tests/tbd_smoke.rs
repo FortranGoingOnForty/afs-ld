@@ -3,17 +3,21 @@
 //! parses to more than one document (libSystem re-exports ~40 sub-dylibs
 //! in this file).
 
+#[macro_use]
+#[path = "common/skip.rs"]
+mod test_skip;
+
 use afs_ld::macho::tbd_yaml::parse_documents;
 
 #[test]
 fn libsystem_tbd_parses_to_many_documents() {
     let Some(sdk) = sdk_path() else {
-        eprintln!("skipping: SDK path unavailable");
+        harness_skip!("SDK path unavailable");
         return;
     };
     let tbd_path = format!("{sdk}/usr/lib/libSystem.tbd");
     let Ok(bytes) = std::fs::read_to_string(&tbd_path) else {
-        eprintln!("skipping: no libSystem.tbd at {tbd_path}");
+        harness_skip!("no libSystem.tbd at {tbd_path}");
         return;
     };
     let docs = parse_documents(&bytes).unwrap_or_else(|e| {

@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use crate::atom::{Atom, AtomSection, AtomTable};
 use crate::layout::{Layout, LayoutInput};
 use crate::macho::constants::S_REGULAR;
-use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc};
+use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocKind, RelocLength};
 use crate::resolve::{AtomId, InputId, Symbol, SymbolTable};
 use crate::section::{OutputSection, SectionKind};
+use crate::symbol::SymKind;
 use crate::synth::SyntheticPlan;
 
 const PAGE_SIZE: usize = 4096;
@@ -197,7 +198,7 @@ fn collect_records(
         .iter()
         .map(|input| (input.id, input.object))
         .collect();
-    let dwarf_fde_hints = collect_dwarf_fde_hints(layout, atoms);
+    let dwarf_fde_hints = collect_dwarf_fde_hints(layout, &input_map, atoms, sym_table)?;
     let compact_unwind_sections: HashSet<(InputId, u8)> = atoms
         .iter()
         .filter(|(_, atom)| atom.section == AtomSection::CompactUnwind)
@@ -326,21 +327,21 @@ fn collect_records(
                 detail: "DWARF-mode unwind function does not resolve to an output atom".to_string(),
             })?;
             let fde_hint = dwarf_fde_hints
-                .get(&function_atom)
+                .get(&function.address)
                 .ok_or_else(|| UnwindError {
                     input: obj.path.clone(),
                     atom: atom_id,
                     detail: format!(
-                        "DWARF-mode unwind function atom {:?} has no retained __eh_frame FDE",
-                        function_atom
+                        "DWARF-mode unwind function atom {:?} at {:#x} has no retained __eh_frame FDE",
+                        function_atom, function.address
                     ),
                 })?
                 .ok_or_else(|| UnwindError {
                     input: obj.path.clone(),
                     atom: atom_id,
                     detail: format!(
-                        "DWARF-mode unwind function atom {:?} has multiple retained __eh_frame FDEs",
-                        function_atom
+                        "DWARF-mode unwind function atom {:?} at {:#x} has multiple retained __eh_frame FDEs",
+                        function_atom, function.address
                     ),
                 })?;
             encoding = (encoding & !UNWIND_ARM64_DWARF_SECTION_OFFSET_MASK) | fde_hint;
@@ -358,20 +359,81 @@ fn collect_records(
     Ok(records)
 }
 
-fn collect_dwarf_fde_hints(layout: &Layout, atoms: &AtomTable) -> HashMap<AtomId, Option<u32>> {
+fn collect_dwarf_fde_hints(
+    layout: &Layout,
+    input_map: &HashMap<InputId, &crate::input::ObjectFile>,
+    atoms: &AtomTable,
+    sym_table: &SymbolTable,
+) -> Result<HashMap<u64, Option<u32>>, UnwindError> {
     let mut hints = HashMap::new();
     let Some(eh_frame) = layout
         .sections
         .iter()
         .find(|section| section.segment == "__TEXT" && section.name == "__eh_frame")
     else {
-        return hints;
+        return Ok(hints);
     };
+
+    let eh_frame_sections: HashSet<(InputId, u8)> = eh_frame
+        .atoms
+        .iter()
+        .map(|placed| {
+            let atom = atoms.get(placed.atom);
+            (atom.origin, atom.input_section)
+        })
+        .collect();
+    let mut reloc_cache = HashMap::<(InputId, u8), Vec<Reloc>>::new();
+    for (input_id, section_idx) in eh_frame_sections {
+        let obj = input_map.get(&input_id).ok_or_else(|| UnwindError {
+            input: PathBuf::from("<missing object>"),
+            atom: AtomId(0),
+            detail: "missing parsed object".to_string(),
+        })?;
+        let section = obj
+            .sections
+            .get((section_idx as usize).saturating_sub(1))
+            .ok_or_else(|| UnwindError {
+                input: obj.path.clone(),
+                atom: AtomId(0),
+                detail: format!("__eh_frame section {} is out of range", section_idx),
+            })?;
+        let raws = parse_raw_relocs(&section.raw_relocs, 0, section.nreloc).map_err(|err| {
+            UnwindError {
+                input: obj.path.clone(),
+                atom: AtomId(0),
+                detail: err.to_string(),
+            }
+        })?;
+        let relocs = parse_relocs(&raws).map_err(|err| UnwindError {
+            input: obj.path.clone(),
+            atom: AtomId(0),
+            detail: err.to_string(),
+        })?;
+        reloc_cache.insert((input_id, section_idx), relocs);
+    }
+
     for placed in &eh_frame.atoms {
         let fde = atoms.get(placed.atom);
-        let Some(function_atom) = fde.parent_of else {
+        if fde.data.len() < 8 || u32::from_le_bytes(fde.data[4..8].try_into().unwrap()) == 0 {
+            continue;
+        }
+        let obj = input_map.get(&fde.origin).ok_or_else(|| UnwindError {
+            input: PathBuf::from("<missing object>"),
+            atom: placed.atom,
+            detail: "missing parsed object".to_string(),
+        })?;
+        let Some(reloc) = reloc_cache
+            .get(&(fde.origin, fde.input_section))
+            .and_then(|relocs| {
+                relocs
+                    .iter()
+                    .find(|reloc| reloc.offset == fde.input_offset + 8)
+            })
+        else {
             continue;
         };
+        let function =
+            resolve_fde_function(placed.atom, fde, obj, *reloc, atoms, sym_table, layout)?;
         let hint = if placed.offset <= u64::from(UNWIND_ARM64_DWARF_SECTION_OFFSET_MASK) {
             placed.offset as u32
         } else {
@@ -380,11 +442,11 @@ fn collect_dwarf_fde_hints(layout: &Layout, atoms: &AtomTable) -> HashMap<AtomId
             0
         };
         hints
-            .entry(function_atom)
+            .entry(function.address)
             .and_modify(|entry| *entry = None)
             .or_insert(Some(hint));
     }
-    hints
+    Ok(hints)
 }
 
 fn resolve_function(
@@ -396,23 +458,23 @@ fn resolve_function(
     sym_table: &SymbolTable,
     layout: &Layout,
 ) -> Result<ResolvedReference, UnwindError> {
-    if let Some(parent) = atom.parent_of {
-        return layout
-            .atom_addr(parent)
-            .map(|address| ResolvedReference {
-                address,
-                atom: Some(parent),
-            })
-            .ok_or_else(|| UnwindError {
-                input: obj.path.clone(),
-                atom: atom_id,
-                detail: format!("function atom {:?} missing from final layout", parent),
-            });
-    }
     let Some(reloc) = relocs
         .iter()
         .find(|reloc| reloc.offset == atom.input_offset)
     else {
+        if let Some(parent) = atom.parent_of {
+            return layout
+                .atom_addr(parent)
+                .map(|address| ResolvedReference {
+                    address,
+                    atom: Some(parent),
+                })
+                .ok_or_else(|| UnwindError {
+                    input: obj.path.clone(),
+                    atom: atom_id,
+                    detail: format!("function atom {:?} missing from final layout", parent),
+                });
+        }
         return Err(UnwindError {
             input: obj.path.clone(),
             atom: atom_id,
@@ -432,6 +494,117 @@ fn resolve_function(
         "function_start",
         false,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_fde_function(
+    fde_id: AtomId,
+    fde: &Atom,
+    obj: &crate::input::ObjectFile,
+    reloc: Reloc,
+    atoms: &AtomTable,
+    sym_table: &SymbolTable,
+    layout: &Layout,
+) -> Result<ResolvedReference, UnwindError> {
+    if reloc.kind != RelocKind::Subtractor || reloc.length != RelocLength::Quad {
+        return Err(UnwindError {
+            input: obj.path.clone(),
+            atom: fde_id,
+            detail: format!(
+                "__eh_frame FDE initial location needs a 64-bit SUBTRACTOR relocation, got {:?}/{:?}",
+                reloc.kind, reloc.length
+            ),
+        });
+    }
+    let minuend = resolve_reference(
+        fde_id,
+        fde,
+        obj,
+        atoms,
+        sym_table,
+        layout,
+        None,
+        reloc.referent,
+        referent_section_base(fde_id, obj, reloc.referent)?,
+        "FDE initial-location minuend",
+        false,
+    )?;
+    let subtrahend_referent = reloc.subtrahend.ok_or_else(|| UnwindError {
+        input: obj.path.clone(),
+        atom: fde_id,
+        detail: "__eh_frame FDE SUBTRACTOR relocation has no subtrahend".to_string(),
+    })?;
+    let subtrahend = resolve_reference(
+        fde_id,
+        fde,
+        obj,
+        atoms,
+        sym_table,
+        layout,
+        None,
+        subtrahend_referent,
+        referent_section_base(fde_id, obj, subtrahend_referent)?,
+        "FDE initial-location subtrahend",
+        false,
+    )?;
+    let field_address = layout
+        .atom_addr(fde_id)
+        .and_then(|address| address.checked_add(8))
+        .ok_or_else(|| UnwindError {
+            input: obj.path.clone(),
+            atom: fde_id,
+            detail: "__eh_frame FDE is missing from the final layout".to_string(),
+        })?;
+    let implicit_addend = i64::from_le_bytes(
+        fde.data
+            .get(8..16)
+            .ok_or_else(|| UnwindError {
+                input: obj.path.clone(),
+                atom: fde_id,
+                detail: "__eh_frame FDE initial location is truncated".to_string(),
+            })?
+            .try_into()
+            .unwrap(),
+    );
+    let address = i128::from(minuend.address) - i128::from(subtrahend.address)
+        + i128::from(reloc.addend)
+        + i128::from(implicit_addend)
+        + i128::from(field_address);
+    let address = u64::try_from(address).map_err(|_| UnwindError {
+        input: obj.path.clone(),
+        atom: fde_id,
+        detail: format!("__eh_frame FDE resolves outside the address space ({address:#x})"),
+    })?;
+    Ok(ResolvedReference {
+        address,
+        atom: minuend.atom,
+    })
+}
+
+fn referent_section_base(
+    atom_id: AtomId,
+    obj: &crate::input::ObjectFile,
+    referent: Referent,
+) -> Result<u32, UnwindError> {
+    let Referent::Section(section_idx) = referent else {
+        return Ok(0);
+    };
+    let section = obj
+        .sections
+        .get((section_idx as usize).saturating_sub(1))
+        .ok_or_else(|| UnwindError {
+            input: obj.path.clone(),
+            atom: atom_id,
+            detail: format!("referenced section {} is out of range", section_idx),
+        })?;
+    u32::try_from(section.addr).map_err(|_| UnwindError {
+        input: obj.path.clone(),
+        atom: atom_id,
+        detail: format!(
+            "referenced section {} address {:#x} exceeds the 32-bit object address space",
+            section_idx, section.addr
+        ),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -495,44 +668,16 @@ fn resolve_reference(
     allow_import_got: bool,
 ) -> Result<ResolvedReference, UnwindError> {
     match referent {
-        Referent::Section(section_idx) => {
-            let input_section = obj
-                .sections
-                .get((section_idx as usize).saturating_sub(1))
-                .ok_or_else(|| UnwindError {
-                    input: obj.path.clone(),
-                    atom: atom_id,
-                    detail: format!("{label} section {} is out of range", section_idx),
-                })?;
-            let Some((candidate_id, candidate)) = atoms.iter().find(|(_, candidate)| {
-                candidate.origin == atom.origin
-                    && candidate.input_section == section_idx
-                    && input_section.addr + candidate.input_offset as u64 <= target_offset as u64
-                    && (target_offset as u64)
-                        < input_section.addr + candidate.input_offset as u64 + candidate.size as u64
-            }) else {
-                return Err(UnwindError {
-                    input: obj.path.clone(),
-                    atom: atom_id,
-                    detail: format!(
-                        "{label} points at missing input atom section {} offset 0x{:x}",
-                        section_idx, target_offset
-                    ),
-                });
-            };
-            let Some(base_addr) = layout.atom_addr(candidate_id) else {
-                return Err(UnwindError {
-                    input: obj.path.clone(),
-                    atom: atom_id,
-                    detail: format!("{label} atom {:?} missing from final layout", candidate_id),
-                });
-            };
-            let atom_input_addr = input_section.addr + candidate.input_offset as u64;
-            Ok(ResolvedReference {
-                address: base_addr + (target_offset as u64 - atom_input_addr),
-                atom: Some(candidate_id),
-            })
-        }
+        Referent::Section(section_idx) => resolve_input_section_reference(
+            atom_id,
+            atom,
+            obj,
+            atoms,
+            layout,
+            section_idx,
+            u64::from(target_offset),
+            label,
+        ),
         Referent::Symbol(sym_idx) => {
             let input_symbol = obj
                 .symbols
@@ -542,6 +687,20 @@ fn resolve_reference(
                     atom: atom_id,
                     detail: format!("{label} symbol {} is out of range", sym_idx),
                 })?;
+            if input_symbol.kind() == SymKind::Sect
+                && !input_symbol.participates_in_global_resolution()
+            {
+                return resolve_input_section_reference(
+                    atom_id,
+                    atom,
+                    obj,
+                    atoms,
+                    layout,
+                    input_symbol.sect_idx(),
+                    input_symbol.value(),
+                    label,
+                );
+            }
             let name = obj.symbol_name(input_symbol).map_err(|err| UnwindError {
                 input: obj.path.clone(),
                 atom: atom_id,
@@ -599,6 +758,77 @@ fn resolve_reference(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_input_section_reference(
+    atom_id: AtomId,
+    source: &Atom,
+    obj: &crate::input::ObjectFile,
+    atoms: &AtomTable,
+    layout: &Layout,
+    section_idx: u8,
+    target_address: u64,
+    label: &str,
+) -> Result<ResolvedReference, UnwindError> {
+    let input_section = obj
+        .sections
+        .get((section_idx as usize).saturating_sub(1))
+        .ok_or_else(|| UnwindError {
+            input: obj.path.clone(),
+            atom: atom_id,
+            detail: format!("{label} section {} is out of range", section_idx),
+        })?;
+    let Some((candidate_id, candidate)) = atoms.iter().find(|(_, candidate)| {
+        let Some(start) = input_section
+            .addr
+            .checked_add(u64::from(candidate.input_offset))
+        else {
+            return false;
+        };
+        let Some(end) = start.checked_add(u64::from(candidate.size)) else {
+            return false;
+        };
+        candidate.origin == source.origin
+            && candidate.input_section == section_idx
+            && start <= target_address
+            && target_address < end
+    }) else {
+        return Err(UnwindError {
+            input: obj.path.clone(),
+            atom: atom_id,
+            detail: format!(
+                "{label} points at missing input atom section {} address 0x{:x}",
+                section_idx, target_address
+            ),
+        });
+    };
+    let Some(base_addr) = layout.atom_addr(candidate_id) else {
+        return Err(UnwindError {
+            input: obj.path.clone(),
+            atom: atom_id,
+            detail: format!("{label} atom {:?} missing from final layout", candidate_id),
+        });
+    };
+    let atom_input_addr = input_section
+        .addr
+        .checked_add(u64::from(candidate.input_offset))
+        .ok_or_else(|| UnwindError {
+            input: obj.path.clone(),
+            atom: atom_id,
+            detail: format!("{label} input atom address overflows"),
+        })?;
+    let address = base_addr
+        .checked_add(target_address - atom_input_addr)
+        .ok_or_else(|| UnwindError {
+            input: obj.path.clone(),
+            atom: atom_id,
+            detail: format!("{label} final address overflows"),
+        })?;
+    Ok(ResolvedReference {
+        address,
+        atom: Some(candidate_id),
+    })
 }
 
 fn personality_got_addr(

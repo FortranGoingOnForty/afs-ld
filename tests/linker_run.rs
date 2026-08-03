@@ -1454,41 +1454,79 @@ fn synthetic_compact_unwind_alias_object(
 }
 
 fn synthetic_dwarf_unwind_object() -> Vec<u8> {
-    let text = [
-        0x1f, 0x20, 0x03, 0xd5, // _main: nop
-        0xc0, 0x03, 0x5f, 0xd6, // ret
-    ];
-    let mut compact_unwind = vec![0u8; 32];
-    compact_unwind[8..12].copy_from_slice(&(text.len() as u32).to_le_bytes());
-    compact_unwind[12..16].copy_from_slice(&0x0300_0000u32.to_le_bytes());
+    synthetic_dwarf_unwind_object_for(8, &[("_main", 0, true)], &[(0, 8)])
+}
 
-    // This is the canonical CIE/FDE shape emitted by LLVM's Mach-O assembler
-    // for an arm64 function whose CFI cannot be represented compactly. The FDE
-    // starts at section offset 0x14 and has an initial-location relocation to
-    // _main relative to the start of __eh_frame.
+fn synthetic_nested_local_dwarf_unwind_object() -> Vec<u8> {
+    synthetic_dwarf_unwind_object_for(
+        24,
+        &[
+            ("L_local_one", 8, false),
+            ("L_local_two", 16, false),
+            ("_main", 0, true),
+        ],
+        &[(0, 8), (1, 8)],
+    )
+}
+
+/// Build LLVM-shaped compact-unwind and CFI records. `unwind_functions`
+/// indexes `text_symbols`, allowing local function entries to live inside a
+/// larger atom owned by an external symbol at a different offset.
+fn synthetic_dwarf_unwind_object_for(
+    text_len: usize,
+    text_symbols: &[(&str, u64, bool)],
+    unwind_functions: &[(usize, u32)],
+) -> Vec<u8> {
+    assert!(text_len >= 4 && text_len.is_multiple_of(4));
+    let mut text = [0x1f, 0x20, 0x03, 0xd5].repeat(text_len / 4);
+    text[text_len - 4..].copy_from_slice(&[0xc0, 0x03, 0x5f, 0xd6]);
+
+    let mut compact_unwind = vec![0u8; 32 * unwind_functions.len()];
+    for (record_index, (_, code_len)) in unwind_functions.iter().enumerate() {
+        let record = &mut compact_unwind[record_index * 32..(record_index + 1) * 32];
+        record[8..12].copy_from_slice(&code_len.to_le_bytes());
+        record[12..16].copy_from_slice(&0x0300_0000u32.to_le_bytes());
+    }
+
+    // Canonical CIE/FDE shape emitted by LLVM's Mach-O assembler for arm64
+    // functions whose CFI cannot be represented compactly.
     let mut eh_frame = vec![
         0x10, 0x00, 0x00, 0x00, // CIE payload length
         0x00, 0x00, 0x00, 0x00, // CIE id
         0x01, 0x7a, 0x52, 0x00, // version 1, augmentation "zR"
         0x01, 0x78, 0x1e, 0x01, // code/data alignment, return register, aug len
         0x10, 0x0c, 0x1f, 0x00, // pcrel pointer encoding, CFA=WSP
-        0x18, 0x00, 0x00, 0x00, // FDE payload length
-        0x18, 0x00, 0x00, 0x00, // CIE back-pointer
     ];
-    eh_frame.extend_from_slice(&(-28i64).to_le_bytes());
-    eh_frame.extend_from_slice(&(text.len() as u64).to_le_bytes());
-    eh_frame.extend_from_slice(&[0x00, 0x0f, 0x01, 0x9c]);
-    assert_eq!(eh_frame.len(), 0x30);
+    let mut fde_field_offsets = Vec::with_capacity(unwind_functions.len());
+    for (_, code_len) in unwind_functions {
+        let fde_offset = eh_frame.len() as u32;
+        eh_frame.extend_from_slice(&0x18u32.to_le_bytes());
+        eh_frame.extend_from_slice(&(fde_offset + 4).to_le_bytes());
+        let field_offset = fde_offset + 8;
+        eh_frame.extend_from_slice(&(-i64::from(field_offset)).to_le_bytes());
+        eh_frame.extend_from_slice(&u64::from(*code_len).to_le_bytes());
+        eh_frame.extend_from_slice(&[0x00, 0x0f, 0x01, 0x9c]);
+        fde_field_offsets.push(field_offset);
+    }
 
-    let compact_relocs = write_relocs(&[Reloc {
-        offset: 0,
-        kind: RelocKind::Unsigned,
-        length: RelocLength::Quad,
-        pcrel: false,
-        referent: Referent::Section(1),
-        addend: 0,
-        subtrahend: None,
-    }])
+    let compact_relocs = write_relocs(
+        &unwind_functions
+            .iter()
+            .enumerate()
+            .map(|(record_index, (symbol_index, _))| {
+                assert!(*symbol_index < text_symbols.len());
+                Reloc {
+                    offset: (record_index * 32) as u32,
+                    kind: RelocKind::Unsigned,
+                    length: RelocLength::Quad,
+                    pcrel: false,
+                    referent: Referent::Symbol((*symbol_index + 1) as u32),
+                    addend: 0,
+                    subtrahend: None,
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
     .unwrap();
     let mut compact_reloc_bytes = Vec::new();
     write_raw_relocs(&compact_relocs, &mut compact_reloc_bytes);
@@ -1501,33 +1539,42 @@ fn synthetic_dwarf_unwind_object() -> Vec<u8> {
         strx
     };
     let eh_base_strx = add_string("L_eh_base");
-    let main_strx = add_string("_main");
+    let text_symbol_strx: Vec<u32> = text_symbols
+        .iter()
+        .map(|(name, _, _)| add_string(name))
+        .collect();
     let eh_frame_addr = (text.len() + compact_unwind.len()) as u64;
-    let symbols = [
-        RawNlist {
-            strx: eh_base_strx,
-            n_type: N_SECT,
-            n_sect: 3,
-            n_desc: 0,
-            n_value: eh_frame_addr,
-        },
-        RawNlist {
-            strx: main_strx,
-            n_type: N_SECT | N_EXT,
+    let mut symbols = vec![RawNlist {
+        strx: eh_base_strx,
+        n_type: N_SECT,
+        n_sect: 3,
+        n_desc: 0,
+        n_value: eh_frame_addr,
+    }];
+    symbols.extend(text_symbols.iter().zip(text_symbol_strx).map(
+        |((_, value, external), strx)| RawNlist {
+            strx,
+            n_type: N_SECT | if *external { N_EXT } else { 0 },
             n_sect: 1,
             n_desc: 0,
-            n_value: 0,
+            n_value: *value,
         },
-    ];
-    let eh_frame_relocs = write_relocs(&[Reloc {
-        offset: 0x1c,
-        kind: RelocKind::Subtractor,
-        length: RelocLength::Quad,
-        pcrel: false,
-        referent: Referent::Symbol(1),
-        addend: 0,
-        subtrahend: Some(Referent::Symbol(0)),
-    }])
+    ));
+    let eh_frame_relocs = write_relocs(
+        &unwind_functions
+            .iter()
+            .zip(fde_field_offsets)
+            .map(|((symbol_index, _), field_offset)| Reloc {
+                offset: field_offset,
+                kind: RelocKind::Subtractor,
+                length: RelocLength::Quad,
+                pcrel: false,
+                referent: Referent::Symbol((*symbol_index + 1) as u32),
+                addend: 0,
+                subtrahend: Some(Referent::Symbol(0)),
+            })
+            .collect::<Vec<_>>(),
+    )
     .unwrap();
     let mut eh_frame_reloc_bytes = Vec::new();
     write_raw_relocs(&eh_frame_relocs, &mut eh_frame_reloc_bytes);
@@ -10197,6 +10244,50 @@ fn linker_run_dwarf_unwind_encoding_points_to_final_fde() {
         decoded.records[0].encoding & DWARF_OFFSET_MASK,
         fde_offsets[0]
     );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_dwarf_unwind_distinguishes_local_functions_inside_one_atom() {
+    const DWARF_MODE: u32 = 0x0300_0000;
+    const DWARF_OFFSET_MASK: u32 = 0x00ff_ffff;
+
+    let obj = scratch("nested-local-dwarf-unwind.o");
+    let out = scratch("nested-local-dwarf-unwind.out");
+    let fixture = synthetic_nested_local_dwarf_unwind_object();
+    let link = |jobs| {
+        fs::write(&obj, &fixture).unwrap();
+        Linker::run(&LinkOptions {
+            inputs: vec![obj.clone()],
+            output: Some(out.clone()),
+            kind: OutputKind::Executable,
+            jobs: Some(jobs),
+            ..LinkOptions::default()
+        })
+        .unwrap();
+        fs::read(&out).unwrap()
+    };
+
+    let outputs = [link(1), link(4)];
+    assert_eq!(outputs[0], outputs[1]);
+    let decoded = canonical_unwind_info(&outputs[0]);
+    assert_eq!(
+        decoded
+            .records
+            .iter()
+            .map(|record| record.function_offset)
+            .collect::<Vec<_>>(),
+        vec![8, 16]
+    );
+    let (_, eh_frame) = output_section(&outputs[0], "__TEXT", "__eh_frame").unwrap();
+    let fde_offsets = eh_frame_fde_offsets(&eh_frame);
+    assert_eq!(fde_offsets, vec![0x14, 0x30]);
+    for (record, fde_offset) in decoded.records.iter().zip(fde_offsets) {
+        assert_eq!(record.encoding & 0x0f00_0000, DWARF_MODE);
+        assert_eq!(record.encoding & DWARF_OFFSET_MASK, fde_offset);
+    }
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);

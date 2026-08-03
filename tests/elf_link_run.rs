@@ -4167,3 +4167,86 @@ fn eh_frame_hdr_emitted_only_when_requested() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A signal-frame CIE (gas `.cfi_signal_frame` -> augmentation "zRS")
+/// must parse: 'S' carries no augmentation data. glibc's static libc.a
+/// ships exactly one such CIE (the signal restorer), so before this
+/// arm every static link against system glibc died at the merge.
+#[test]
+fn eh_frame_signal_frame_cie_links() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=eh_frame_signal_frame_cie_links count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_sigframe_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    let asm = format!(
+        ".text\n.globl _start\n.type _start,@function\n_start:\n    .cfi_startproc\n    .cfi_signal_frame\n    movl $42, %edi\n    movl ${exit_nr}, %eax\n    syscall\n    .cfi_endproc\n.size _start,.-_start\n"
+    );
+    let s = dir.join("sig.s");
+    let obj = dir.join("sig.o");
+    assemble(&gas, &asm, &s, &obj);
+
+    let out = dir.join("sig");
+    let res = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("--eh-frame-hdr")
+        .arg("-o")
+        .arg(&out)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "signal-frame CIE must link: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert_eq!(Command::new(&out).output().unwrap().status.code(), Some(42));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An undefined WEAK TLS symbol referenced through initial-exec
+/// (`R_X86_64_GOTTPOFF`) gets a zero-tpoff GOT slot, exactly as the
+/// local-exec form resolves to zero. glibc's static locale state uses
+/// this shape (Ubuntu's libc.a(setlocale.o) reaches it), so without it
+/// static links against some distros' glibc fail outright.
+#[test]
+fn tls_ie_weak_undefined_resolves_to_zero() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_link_run test=tls_ie_weak_undefined_resolves_to_zero count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("afs_ld_tlsie_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exit_nr = if cfg!(target_os = "freebsd") { 1 } else { 60 };
+    // `weak_tls` is declared weak and never defined: the GOT slot must
+    // hold 0, and the program observes that (exit 42 when the loaded
+    // tpoff is zero, 1 otherwise).
+    let asm = format!(
+        ".text\n.globl _start\n.weak weak_tls\n_start:\n    movq weak_tls@gottpoff(%rip), %rax\n    testq %rax, %rax\n    jne 1f\n    movl $42, %edi\n    jmp 2f\n1:  movl $1, %edi\n2:  movl ${exit_nr}, %eax\n    syscall\n"
+    );
+    let s = dir.join("tlsie.s");
+    let obj = dir.join("tlsie.o");
+    assemble(&gas, &asm, &s, &obj);
+
+    let out = dir.join("tlsie");
+    let res = Command::new(env!("CARGO_BIN_EXE_afs-ld"))
+        .arg("-o")
+        .arg(&out)
+        .arg(&obj)
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "weak-undefined TLS IE must link: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert_eq!(
+        Command::new(&out).output().unwrap().status.code(),
+        Some(42),
+        "the IE GOT slot must read back as zero"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

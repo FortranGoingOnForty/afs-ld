@@ -914,7 +914,7 @@ type CommonPlacement = HashMap<(usize, usize), (usize, u64)>;
 /// TLS symbol's TP-relative offset for the initial-exec model.
 enum GotEntry {
     Addr(Option<(usize, usize)>),
-    TpOff((usize, usize)),
+    TpOff(Option<(usize, usize)>),
 }
 
 /// A `.got` slot in a dynamic executable, sized before layout and filled
@@ -1135,6 +1135,12 @@ fn cie_fde_encoding(eh: &[u8], content: usize, rec_end: usize) -> Result<u8, Elf
                     return err(".eh_frame: CIE personality pointer is truncated");
                 }
             }
+            // 'S' marks a signal frame (gas `.cfi_signal_frame`); it
+            // carries NO augmentation data and does not affect the FDE
+            // encoding. glibc's static libc.a ships exactly one "zRS"
+            // CIE (the signal restorer), so a static link against it
+            // dies here without this arm.
+            b'S' => {}
             _ => return err(".eh_frame: unsupported CIE augmentation char"),
         }
     }
@@ -2663,6 +2669,7 @@ fn link_static_exec_with_policy(
     let mut got_addr_of: HashMap<(usize, usize), usize> = HashMap::new();
     let mut got_addr_weak0: Option<usize> = None;
     let mut got_tpoff_of: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut got_tpoff_weak0: Option<usize> = None;
     for (oi, obj) in objects.iter().enumerate() {
         for sec in &obj.sections {
             for r in &sec.relas {
@@ -2682,16 +2689,26 @@ fn link_static_exec_with_policy(
                         }
                     }
                 } else if r.r_type == R_X86_64_GOTTPOFF {
-                    let d = resolve_def(oi, r.sym as usize)?.ok_or_else(|| {
-                        ElfError(format!(
-                            "TLS IE relocation against undefined symbol in {}",
-                            obj.name
-                        ))
-                    })?;
-                    got_tpoff_of.entry(d).or_insert_with(|| {
-                        got_entries.push(GotEntry::TpOff(d));
-                        got_entries.len() - 1
-                    });
+                    // An undefined WEAK TLS symbol gets a zero tpoff slot,
+                    // exactly as `tls_offset` resolves the local-exec form
+                    // to zero (GNU ld's behavior; glibc's static locale
+                    // state depends on it — Ubuntu's libc.a(setlocale.o)
+                    // reaches this path where Arch's does not). A strong
+                    // undefined symbol already errored inside resolve_def.
+                    match resolve_def(oi, r.sym as usize)? {
+                        Some(d) => {
+                            got_tpoff_of.entry(d).or_insert_with(|| {
+                                got_entries.push(GotEntry::TpOff(Some(d)));
+                                got_entries.len() - 1
+                            });
+                        }
+                        None => {
+                            if got_tpoff_weak0.is_none() {
+                                got_entries.push(GotEntry::TpOff(None));
+                                got_tpoff_weak0 = Some(got_entries.len() - 1);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2997,7 +3014,8 @@ fn link_static_exec_with_policy(
             let val: u64 = match entry {
                 GotEntry::Addr(Some((doi, dsi))) => sym_vaddr(*doi, *dsi)?,
                 GotEntry::Addr(None) => 0,
-                GotEntry::TpOff((doi, dsi)) => tls_offset(*doi, *dsi)? as u64,
+                GotEntry::TpOff(Some((doi, dsi))) => tls_offset(*doi, *dsi)? as u64,
+                GotEntry::TpOff(None) => 0,
             };
             let off = slot * 8;
             outs[gi].data[off..off + 8].copy_from_slice(&val.to_le_bytes());
@@ -3126,9 +3144,12 @@ fn link_static_exec_with_policy(
                     }
                     // TLS initial-exec: load the tpoff from a GOT slot.
                     R_X86_64_GOTTPOFF => {
-                        let d = resolve_def(oi, r.sym as usize)?
-                            .ok_or_else(|| ElfError("TLS IE against undefined symbol".into()))?;
-                        let ga = out_vaddrs[got_out.unwrap()] + (got_tpoff_of[&d] * 8) as u64;
+                        // Undefined weak: the shared zero-tpoff slot.
+                        let slot = match resolve_def(oi, r.sym as usize)? {
+                            Some(d) => got_tpoff_of[&d],
+                            None => got_tpoff_weak0.unwrap(),
+                        };
+                        let ga = out_vaddrs[got_out.unwrap()] + (slot * 8) as u64;
                         let v = ga as i64 + r.addend - p as i64;
                         if v < i32::MIN as i64 || v > i32::MAX as i64 {
                             return err(format!("GOTTPOFF displacement overflow at {:#x}", p));

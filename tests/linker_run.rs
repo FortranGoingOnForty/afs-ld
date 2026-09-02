@@ -5838,6 +5838,51 @@ fn linker_run_marks_section_alias_descriptors() {
 }
 
 #[test]
+fn linker_run_omits_relaxed_defined_got_slots() {
+    let reference = scratch("defined-got-reference.o");
+    let definition = scratch("defined-got-definition.o");
+    let out = scratch("defined-got-reference.out");
+    fs::write(
+        &reference,
+        synthetic_got_reference_object("_main", "_value", false),
+    )
+    .unwrap();
+    fs::write(
+        &definition,
+        synthetic_single_section_object(
+            "__DATA",
+            "__data",
+            S_REGULAR,
+            &7u64.to_le_bytes(),
+            &[],
+            &[("_value", N_SECT | N_EXT, 1, 0, 0)],
+        ),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![reference.clone(), definition.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    assert!(output_section(&bytes, "__DATA_CONST", "__got").is_none());
+    let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
+    assert!(is_add_imm_64(read_insn(&text, 4).unwrap()));
+    assert_eq!(
+        decode_page_reference(&text, text_addr, 0, &PageRefKind::Add).unwrap(),
+        symbol_values(&bytes)["_value"]
+    );
+
+    let _ = fs::remove_file(reference);
+    let _ = fs::remove_file(definition);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
 fn linker_run_routes_far_absolute_got_loads_through_unrebased_slot() {
     const ABSOLUTE_VALUE: u64 = 0x1234_5678_9abc_def0;
 

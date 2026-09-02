@@ -194,7 +194,7 @@ impl SyntheticPlan {
                                 !matches!(sym_table.get(symbol_id), Symbol::LazyArchive { .. })
                             }
                             RelocKind::GotLoadPage21 | RelocKind::GotLoadPageOff12 => {
-                                got_page_symbol_needs_slot(sym_table, atoms, symbol_id)
+                                got_page_symbol_needs_slot(sym_table, symbol_id)
                             }
                             _ => false,
                         };
@@ -588,22 +588,11 @@ fn tlv_symbol_needs_thread_pointer(sym_table: &SymbolTable, symbol_id: SymbolId)
     matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. })
 }
 
-fn got_page_symbol_needs_slot(
-    sym_table: &SymbolTable,
-    atoms: &AtomTable,
-    symbol_id: SymbolId,
-) -> bool {
-    match sym_table.get(symbol_id) {
-        Symbol::DylibImport { .. } | Symbol::Absolute { .. } => true,
-        Symbol::Defined {
-            atom,
-            private_extern,
-            ..
-        } => {
-            atom.0 != 0 && !*private_extern && matches!(atoms.get(*atom).section, AtomSection::Data)
-        }
-        _ => false,
-    }
+fn got_page_symbol_needs_slot(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
+    matches!(
+        sym_table.get(symbol_id),
+        Symbol::DylibImport { .. } | Symbol::Absolute { .. }
+    )
 }
 
 fn direct_import_bind_supported(reloc: Reloc) -> bool {

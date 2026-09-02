@@ -25,7 +25,7 @@ use crate::macho::constants::{
     MH_SUBSECTIONS_VIA_SYMBOLS, SECTION_TYPE_MASK, S_ATTR_LIVE_SUPPORT, S_ATTR_NO_DEAD_STRIP,
     S_MOD_INIT_FUNC_POINTERS, S_MOD_TERM_FUNC_POINTERS,
 };
-use crate::reloc::{parse_raw_relocs, parse_relocs, Referent};
+use crate::reloc::{parse_raw_relocs, parse_relocs, Referent, Reloc, RelocLength};
 use crate::resolve::{AtomId, InputId, Symbol, SymbolId, SymbolTable};
 use crate::section::{InputSection, SectionKind};
 use crate::symbol::{InputSymbol, SymKind};
@@ -431,7 +431,7 @@ fn link_unwind_parents(
         let Some(r) = fused.iter().find(|r| r.offset == record_start) else {
             continue;
         };
-        let parent = resolve_function_parent(obj, atom, *r, &atom_index, 0);
+        let parent = resolve_function_parent(obj, atom, *r, &atom_index, 0, false);
         if let Some(parent_id) = parent {
             table.get_mut(*id).parent_of = Some(parent_id);
         }
@@ -962,31 +962,73 @@ fn eh_frame_cie_pointer(atom: &Atom) -> Option<u32> {
 fn resolve_function_parent(
     obj: &ObjectFile,
     atom: &Atom,
-    reloc: crate::reloc::Reloc,
+    reloc: Reloc,
     atom_index: &ObjectAtomOffsetIndex,
     field_offset: usize,
+    field_is_pcrel: bool,
 ) -> Option<AtomId> {
-    match reloc.referent {
-        Referent::Section(sect_idx) => {
-            let end = field_offset.checked_add(8)?;
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(atom.data.get(field_offset..end)?);
-            let target_offset = u32::try_from(u64::from_le_bytes(buf)).ok()?;
-            atom_index.find(sect_idx, target_offset)
+    let (target_section_idx, target_offset) =
+        resolve_input_function_target(obj, atom, reloc, field_offset, field_is_pcrel)?;
+    atom_index.find(target_section_idx, target_offset)
+}
+
+pub(crate) fn resolve_input_function_target(
+    obj: &ObjectFile,
+    atom: &Atom,
+    reloc: Reloc,
+    field_offset: usize,
+    field_is_pcrel: bool,
+) -> Option<(u8, u32)> {
+    let (minuend, target_section_idx) = input_referent_address(obj, reloc.referent)?;
+    let implicit_addend = metadata_implicit_addend(atom, field_offset, reloc.length)?;
+    let mut target = minuend
+        .checked_add(i128::from(reloc.addend))?
+        .checked_add(implicit_addend)?;
+    if let Some(subtrahend) = reloc.subtrahend {
+        target = target.checked_sub(input_referent_address(obj, subtrahend)?.0)?;
+    }
+    if field_is_pcrel {
+        let source_section = obj
+            .sections
+            .get(atom.input_section.saturating_sub(1) as usize)?;
+        let place = i128::from(source_section.addr).checked_add(i128::from(reloc.offset))?;
+        target = target.checked_add(place)?;
+    }
+
+    let target_section = obj
+        .sections
+        .get(target_section_idx.saturating_sub(1) as usize)?;
+    let target_offset = u32::try_from(target.checked_sub(i128::from(target_section.addr))?).ok()?;
+    Some((target_section_idx, target_offset))
+}
+
+fn input_referent_address(obj: &ObjectFile, referent: Referent) -> Option<(i128, u8)> {
+    match referent {
+        Referent::Section(section_idx) => {
+            let section = obj.sections.get(section_idx.saturating_sub(1) as usize)?;
+            Some((i128::from(section.addr), section_idx))
         }
-        Referent::Symbol(sym_idx) => {
-            let input_sym = obj.symbols.get(sym_idx as usize)?;
-            (input_sym.kind() == SymKind::Sect)
-                .then(|| {
-                    let section = obj
-                        .sections
-                        .get(input_sym.sect_idx().saturating_sub(1) as usize)?;
-                    let target_offset =
-                        u32::try_from(input_sym.value().checked_sub(section.addr)?).ok()?;
-                    atom_index.find(input_sym.sect_idx(), target_offset)
-                })
-                .flatten()
+        Referent::Symbol(symbol_idx) => {
+            let symbol = obj.symbols.get(symbol_idx as usize)?;
+            (symbol.kind() == SymKind::Sect)
+                .then_some((i128::from(symbol.value()), symbol.sect_idx()))
         }
+    }
+}
+
+fn metadata_implicit_addend(atom: &Atom, field_offset: usize, length: RelocLength) -> Option<i128> {
+    let bytes = atom.data.get(field_offset..)?;
+    match length {
+        RelocLength::Byte => Some(i128::from(i8::from_le_bytes([*bytes.first()?]))),
+        RelocLength::Half => Some(i128::from(i16::from_le_bytes(
+            bytes.get(..2)?.try_into().ok()?,
+        ))),
+        RelocLength::Word => Some(i128::from(i32::from_le_bytes(
+            bytes.get(..4)?.try_into().ok()?,
+        ))),
+        RelocLength::Quad => Some(i128::from(i64::from_le_bytes(
+            bytes.get(..8)?.try_into().ok()?,
+        ))),
     }
 }
 
@@ -1105,7 +1147,7 @@ fn link_eh_frame_parents(
         let Some(reloc) = fused.iter().find(|r| r.offset == atom.input_offset + 8) else {
             continue;
         };
-        if let Some(parent_id) = resolve_function_parent(obj, atom, *reloc, &atom_index, 8) {
+        if let Some(parent_id) = resolve_function_parent(obj, atom, *reloc, &atom_index, 8, true) {
             table.get_mut(*id).parent_of = Some(parent_id);
         }
     }

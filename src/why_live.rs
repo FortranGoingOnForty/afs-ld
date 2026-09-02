@@ -913,6 +913,18 @@ fn target_atoms_for_reloc(
     resolved_by_name: &HashMap<String, SymbolId>,
     atom_index: &AtomOffsetIndex,
 ) -> Vec<AtomId> {
+    if source_atom.section == AtomSection::EhFrame
+        && reloc.offset == source_atom.input_offset.saturating_add(8)
+    {
+        // The FDE initial-location field is a PC-relative relocation. LLVM
+        // may spell an interior function as a base symbol plus an implicit
+        // addend, so following the named referent would retain the wrong atom.
+        // Atomization has already evaluated that expression into parent_of.
+        if let Some(parent) = source_atom.parent_of {
+            return vec![parent];
+        }
+    }
+
     let mut out = referent_atoms(
         input_id,
         object,

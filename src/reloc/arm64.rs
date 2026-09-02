@@ -760,6 +760,9 @@ fn apply_one(
                 )
             }
         }
+        RelocKind::Subtractor if atom.section == AtomSection::EhFrame && local_offset == 8 => {
+            patch_eh_frame_function_pointer(bytes, atom, obj, local_offset, reloc, place, resolve)
+        }
         RelocKind::Subtractor => patch_subtractor(
             bytes,
             atom,
@@ -1459,18 +1462,9 @@ fn resolve_input_section_offset(
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
     if let Some(atom_ids) = resolve.atoms_by_input_section.get(&(origin, input_section)) {
-        if let Some((target_atom, delta)) = atom_ids.iter().find_map(|atom_id| {
-            let candidate = resolve.atom_table.get(*atom_id);
-            let start = candidate.input_offset;
-            let end = candidate.input_offset.saturating_add(candidate.size);
-            if start <= input_offset && input_offset < end {
-                Some((*atom_id, input_offset - start))
-            } else if input_offset == end {
-                Some((*atom_id, candidate.size))
-            } else {
-                None
-            }
-        }) {
+        if let Some((target_atom, delta)) =
+            input_atom_at_offset(atom_ids, input_offset, resolve.atom_table)
+        {
             let target_atom = canonical_atom(target_atom, resolve.icf_redirects);
             let atom_addr = resolve
                 .atom_addrs
@@ -1515,18 +1509,9 @@ fn resolve_input_section_offset_simple(
     resolve: &ResolveView<'_>,
 ) -> Option<u64> {
     if let Some(atom_ids) = resolve.atoms_by_input_section.get(&(origin, input_section)) {
-        if let Some((target_atom, delta)) = atom_ids.iter().find_map(|atom_id| {
-            let candidate = resolve.atom_table.get(*atom_id);
-            let start = candidate.input_offset;
-            let end = candidate.input_offset.saturating_add(candidate.size);
-            if start <= input_offset && input_offset < end {
-                Some((*atom_id, input_offset - start))
-            } else if input_offset == end {
-                Some((*atom_id, candidate.size))
-            } else {
-                None
-            }
-        }) {
+        if let Some((target_atom, delta)) =
+            input_atom_at_offset(atom_ids, input_offset, resolve.atom_table)
+        {
             let target_atom = canonical_atom(target_atom, resolve.icf_redirects);
             return resolve
                 .atom_addrs
@@ -1540,6 +1525,29 @@ fn resolve_input_section_offset_simple(
         .get(&(origin, input_section))
         .copied()
         .map(|section_addr| section_addr + input_offset as u64)
+}
+
+fn input_atom_at_offset(
+    atom_ids: &[crate::resolve::AtomId],
+    input_offset: u32,
+    atoms: &AtomTable,
+) -> Option<(crate::resolve::AtomId, u32)> {
+    atom_ids
+        .iter()
+        .find_map(|atom_id| {
+            let candidate = atoms.get(*atom_id);
+            let start = candidate.input_offset;
+            let end = start.saturating_add(candidate.size);
+            (start <= input_offset && input_offset < end)
+                .then_some((*atom_id, input_offset - start))
+        })
+        .or_else(|| {
+            atom_ids.iter().find_map(|atom_id| {
+                let candidate = atoms.get(*atom_id);
+                let end = candidate.input_offset.saturating_add(candidate.size);
+                (input_offset == end).then_some((*atom_id, candidate.size))
+            })
+        })
 }
 
 fn canonical_atom(
@@ -1780,6 +1788,51 @@ fn patch_subtractor(
             format!("unsupported SUBTRACTOR width {:?}", other),
         )),
     }
+}
+
+fn patch_eh_frame_function_pointer(
+    bytes: &mut [u8],
+    atom: &Atom,
+    obj: &ObjectFile,
+    local_offset: u32,
+    reloc: Reloc,
+    place: u64,
+    resolve: &ResolveView<'_>,
+) -> Result<(), RelocError> {
+    let (section_idx, input_offset) =
+        crate::atom::resolve_input_function_target(obj, atom, reloc, local_offset as usize, true)
+            .ok_or_else(|| {
+            reloc_error(
+                atom,
+                &obj.path,
+                local_offset,
+                reloc.kind,
+                &describe_referent(obj, reloc.referent),
+                "FDE initial-location relocation does not resolve to an input function".to_string(),
+            )
+        })?;
+    let referent = describe_referent(obj, reloc.referent);
+    let target = resolve_input_section_offset(
+        atom.origin,
+        section_idx,
+        input_offset,
+        InputSectionResolveCtx {
+            obj,
+            atom,
+            kind: reloc.kind,
+            referent: &referent,
+        },
+        resolve,
+    )?;
+    write_u64(
+        bytes,
+        local_offset,
+        target.wrapping_sub(place),
+        atom,
+        obj,
+        reloc.kind,
+        &referent,
+    )
 }
 
 fn patch_branch26(

@@ -516,6 +516,43 @@ fn resolve_fde_function(
             ),
         });
     }
+    if reloc.subtrahend.is_none() {
+        return Err(UnwindError {
+            input: obj.path.clone(),
+            atom: fde_id,
+            detail: "__eh_frame FDE SUBTRACTOR relocation has no subtrahend".to_string(),
+        });
+    }
+    if let Some((section_idx, target_offset)) =
+        crate::atom::resolve_input_function_target(obj, fde, reloc, 8, true)
+    {
+        let section = obj
+            .sections
+            .get(section_idx.saturating_sub(1) as usize)
+            .ok_or_else(|| UnwindError {
+                input: obj.path.clone(),
+                atom: fde_id,
+                detail: format!("FDE function section {section_idx} is out of range"),
+            })?;
+        let target_address = section
+            .addr
+            .checked_add(u64::from(target_offset))
+            .ok_or_else(|| UnwindError {
+                input: obj.path.clone(),
+                atom: fde_id,
+                detail: "FDE function input address overflows".to_string(),
+            })?;
+        return resolve_input_section_reference(
+            fde_id,
+            fde,
+            obj,
+            atoms,
+            layout,
+            section_idx,
+            target_address,
+            "FDE initial-location",
+        );
+    }
     let minuend = resolve_reference(
         fde_id,
         fde,
@@ -529,11 +566,7 @@ fn resolve_fde_function(
         "FDE initial-location minuend",
         false,
     )?;
-    let subtrahend_referent = reloc.subtrahend.ok_or_else(|| UnwindError {
-        input: obj.path.clone(),
-        atom: fde_id,
-        detail: "__eh_frame FDE SUBTRACTOR relocation has no subtrahend".to_string(),
-    })?;
+    let subtrahend_referent = reloc.subtrahend.expect("validated above");
     let subtrahend = resolve_reference(
         fde_id,
         fde,

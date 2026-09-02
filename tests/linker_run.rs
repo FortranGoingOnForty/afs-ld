@@ -1469,6 +1469,15 @@ fn synthetic_nested_local_dwarf_unwind_object() -> Vec<u8> {
     )
 }
 
+fn synthetic_dwarf_unwind_fde_addend_object() -> Vec<u8> {
+    synthetic_dwarf_unwind_object_for_with_fde_referents(
+        16,
+        &[("_dead_base", 0, true), ("_main", 8, true)],
+        &[(1, 8)],
+        &[(0, 8)],
+    )
+}
+
 /// Build LLVM-shaped compact-unwind and CFI records. `unwind_functions`
 /// indexes `text_symbols`, allowing local function entries to live inside a
 /// larger atom owned by an external symbol at a different offset.
@@ -1477,7 +1486,26 @@ fn synthetic_dwarf_unwind_object_for(
     text_symbols: &[(&str, u64, bool)],
     unwind_functions: &[(usize, u32)],
 ) -> Vec<u8> {
+    let fde_referents = unwind_functions
+        .iter()
+        .map(|(symbol_index, _)| (*symbol_index, 0))
+        .collect::<Vec<_>>();
+    synthetic_dwarf_unwind_object_for_with_fde_referents(
+        text_len,
+        text_symbols,
+        unwind_functions,
+        &fde_referents,
+    )
+}
+
+fn synthetic_dwarf_unwind_object_for_with_fde_referents(
+    text_len: usize,
+    text_symbols: &[(&str, u64, bool)],
+    unwind_functions: &[(usize, u32)],
+    fde_referents: &[(usize, i64)],
+) -> Vec<u8> {
     assert!(text_len >= 4 && text_len.is_multiple_of(4));
+    assert_eq!(unwind_functions.len(), fde_referents.len());
     let mut text = [0x1f, 0x20, 0x03, 0xd5].repeat(text_len / 4);
     text[text_len - 4..].copy_from_slice(&[0xc0, 0x03, 0x5f, 0xd6]);
 
@@ -1498,12 +1526,12 @@ fn synthetic_dwarf_unwind_object_for(
         0x10, 0x0c, 0x1f, 0x00, // pcrel pointer encoding, CFA=WSP
     ];
     let mut fde_field_offsets = Vec::with_capacity(unwind_functions.len());
-    for (_, code_len) in unwind_functions {
+    for ((_, code_len), (_, target_addend)) in unwind_functions.iter().zip(fde_referents) {
         let fde_offset = eh_frame.len() as u32;
         eh_frame.extend_from_slice(&0x18u32.to_le_bytes());
         eh_frame.extend_from_slice(&(fde_offset + 4).to_le_bytes());
         let field_offset = fde_offset + 8;
-        eh_frame.extend_from_slice(&(-i64::from(field_offset)).to_le_bytes());
+        eh_frame.extend_from_slice(&(target_addend - i64::from(field_offset)).to_le_bytes());
         eh_frame.extend_from_slice(&u64::from(*code_len).to_le_bytes());
         eh_frame.extend_from_slice(&[0x00, 0x0f, 0x01, 0x9c]);
         fde_field_offsets.push(field_offset);
@@ -1561,7 +1589,7 @@ fn synthetic_dwarf_unwind_object_for(
         },
     ));
     let eh_frame_relocs = write_relocs(
-        &unwind_functions
+        &fde_referents
             .iter()
             .zip(fde_field_offsets)
             .map(|((symbol_index, _), field_offset)| Reloc {
@@ -10288,6 +10316,35 @@ fn linker_run_dwarf_unwind_distinguishes_local_functions_inside_one_atom() {
         assert_eq!(record.encoding & 0x0f00_0000, DWARF_MODE);
         assert_eq!(record.encoding & DWARF_OFFSET_MASK, fde_offset);
     }
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn linker_run_dead_strip_preserves_fde_for_symbol_plus_addend() {
+    let obj = scratch("dwarf-unwind-symbol-addend.o");
+    let out = scratch("dwarf-unwind-symbol-addend.out");
+    fs::write(&obj, synthetic_dwarf_unwind_fde_addend_object()).unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![obj.clone()],
+        output: Some(out.clone()),
+        kind: OutputKind::Executable,
+        dead_strip: true,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&out).unwrap();
+    let symbols = canonical_symbol_record_map(&bytes);
+    assert!(!symbols.contains_key("_dead_base"));
+    assert!(symbols.contains_key("_main"));
+    assert_eq!(
+        eh_frame_fde_offsets(&output_section(&bytes, "__TEXT", "__eh_frame").unwrap().1),
+        vec![0x14]
+    );
+    assert_eq!(canonical_unwind_info(&bytes).records.len(), 1);
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);

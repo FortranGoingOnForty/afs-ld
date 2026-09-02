@@ -798,7 +798,9 @@ fn gc_sections_removes_dead_dynamic_import() {
     let dynstr = section_bytes(&collected_image, ".dynstr").unwrap();
     let has_dead_import = section_bytes(&collected_image, ".dynsym")
         .unwrap()
-        .chunks_exact(24)
+        .as_chunks::<24>()
+        .0
+        .iter()
         .any(|symbol| {
             let offset = u32::from_le_bytes(symbol[0..4].try_into().unwrap()) as usize;
             let Some(length) = dynstr[offset..].iter().position(|&byte| byte == 0) else {
@@ -2013,7 +2015,7 @@ fn versioned_dynamic_import_binds_explicit_non_default_version() {
     let mixed_versym = section_bytes(&mixed, ".gnu.version").expect("version symbol table");
     assert_eq!(mixed_versym.len(), mixed_dynsym.len() / 12);
     let mut imported_versions = Vec::new();
-    for (index, symbol) in mixed_dynsym.chunks_exact(24).enumerate() {
+    for (index, symbol) in mixed_dynsym.as_chunks::<24>().0.iter().enumerate() {
         let name_offset = u32::from_le_bytes(symbol[0..4].try_into().unwrap()) as usize;
         let section_index = u16::from_le_bytes(symbol[6..8].try_into().unwrap());
         if name_offset == 0 || section_index != 0 {
@@ -2669,7 +2671,9 @@ fn shared_object_undefined_end_binds_to_the_executable_linker_symbol() {
     let dynstr = section_bytes(&image, ".dynstr").expect("dynamic string table");
     let end_symbol = section_bytes(&image, ".dynsym")
         .expect("dynamic symbol table")
-        .chunks_exact(24)
+        .as_chunks::<24>()
+        .0
+        .iter()
         .find(|symbol| {
             let offset = u32::from_le_bytes(symbol[0..4].try_into().unwrap()) as usize;
             let Some(length) = dynstr[offset..].iter().position(|&byte| byte == 0) else {
@@ -3431,7 +3435,9 @@ fn dynamic_executable_resolves_local_ifunc_before_entry() {
     let dynstr = section_bytes(&image, ".dynstr").unwrap();
     let pick_export = section_bytes(&image, ".dynsym")
         .unwrap()
-        .chunks_exact(24)
+        .as_chunks::<24>()
+        .0
+        .iter()
         .find_map(|symbol| {
             let name_offset = u32::from_le_bytes(symbol[0..4].try_into().unwrap()) as usize;
             let name_len = dynstr[name_offset..].iter().position(|&byte| byte == 0)?;
@@ -4086,7 +4092,7 @@ fn needed_libraries(img: &[u8]) -> Vec<String> {
 fn dynamic_entries(img: &[u8]) -> Vec<(i64, u64)> {
     let dynamic = section_bytes(img, ".dynamic").expect("linked image must have .dynamic");
     let mut entries = Vec::new();
-    for entry in dynamic.chunks_exact(16) {
+    for entry in dynamic.as_chunks::<16>().0 {
         let tag = i64::from_le_bytes(entry[0..8].try_into().unwrap());
         let value = u64::from_le_bytes(entry[8..16].try_into().unwrap());
         if tag == 0 {

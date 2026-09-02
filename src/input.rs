@@ -47,7 +47,9 @@ impl DataInCodeEntry {
 
     fn parse_payload(payload: &[u8]) -> Vec<Self> {
         payload
-            .chunks_exact(Self::SIZE)
+            .as_chunks::<{ Self::SIZE }>()
+            .0
+            .iter()
             .map(|chunk| DataInCodeEntry {
                 offset: u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
                 length: u16::from_le_bytes(chunk[4..6].try_into().unwrap()),

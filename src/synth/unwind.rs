@@ -1447,8 +1447,10 @@ mod tests {
         }])
         .unwrap();
         let words: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(
             words,
@@ -1509,8 +1511,10 @@ mod tests {
         ])
         .unwrap();
         let words: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(
             words,
@@ -1586,8 +1590,10 @@ mod tests {
         ])
         .unwrap();
         let words: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(words[2], 1, "expected one promoted common encoding");
         assert_eq!(words[7], 0x0400_0000);
@@ -1632,8 +1638,10 @@ mod tests {
         ])
         .unwrap();
         let words: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(words[6], 3, "expected two pages plus the sentinel index");
         let decoded = decode_unwind_info(&bytes).unwrap();
@@ -1665,8 +1673,10 @@ mod tests {
             .collect::<Vec<_>>();
         let bytes = serialize_unwind_info(&records).unwrap();
         let words: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(
             words[2], 0,

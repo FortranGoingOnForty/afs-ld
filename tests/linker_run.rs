@@ -2528,8 +2528,10 @@ fn indirect_symbol_table(bytes: &[u8]) -> Vec<u32> {
     let start = dysymtab.indirectsymoff as usize;
     let end = start + dysymtab.nindirectsyms as usize * 4;
     bytes[start..end]
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
         .collect()
 }
 
@@ -2801,7 +2803,9 @@ fn rebase_hex_addresses(line: &str, text_base: u64) -> String {
 fn decode_data_in_code(bytes: &[u8]) -> Vec<DataInCodeRecord> {
     let payload = linkedit_payload(bytes, LC_DATA_IN_CODE);
     payload
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|chunk| DataInCodeRecord {
             offset: u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
             length: u16::from_le_bytes(chunk[4..6].try_into().unwrap()),

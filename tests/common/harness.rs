@@ -2031,8 +2031,10 @@ fn indirect_symbol_table(bytes: &[u8]) -> Result<Vec<u32>, String> {
     let start = dysymtab.indirectsymoff as usize;
     let end = start + dysymtab.nindirectsyms as usize * 4;
     Ok(bytes[start..end]
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -2130,7 +2132,9 @@ struct DataInCodeRecord {
 fn decode_data_in_code(bytes: &[u8]) -> Result<Vec<DataInCodeRecord>, String> {
     let payload = linkedit_payload(bytes, LC_DATA_IN_CODE)?;
     Ok(payload
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|chunk| DataInCodeRecord {
             offset: u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
             length: u16::from_le_bytes(chunk[4..6].try_into().unwrap()),
@@ -2653,7 +2657,9 @@ fn canonical_stub_helper(bytes: &[u8]) -> Result<CanonicalStubHelper, String> {
 
     let mut lazy_bind_offsets = Vec::new();
     for (idx, chunk) in entry_bytes
-        .chunks_exact(STUB_HELPER_ENTRY_SIZE as usize)
+        .as_chunks::<{ STUB_HELPER_ENTRY_SIZE as usize }>()
+        .0
+        .iter()
         .enumerate()
     {
         let entry_addr = section_addr

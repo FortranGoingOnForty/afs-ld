@@ -110,7 +110,7 @@ fn binds_now(elf: &[u8]) -> bool {
     let dynamic = elf
         .get(offset..offset + size)
         .expect("PT_DYNAMIC must be in the file");
-    for entry in dynamic.chunks_exact(16) {
+    for entry in dynamic.as_chunks::<16>().0 {
         let tag = ru64(entry, 0);
         if tag == DT_NULL {
             break;

@@ -9500,7 +9500,7 @@ fn linker_run_rebases_local_absolute_pointers_like_ld() {
 }
 
 #[test]
-fn linker_run_routes_local_got_loads_through_rebased_slots() {
+fn linker_run_relaxes_local_got_loads_like_apple_ld() {
     if !have_xcrun() || !have_tool("codesign") {
         harness_skip!("xcrun or codesign unavailable");
         return;
@@ -9558,13 +9558,8 @@ fn linker_run_routes_local_got_loads_through_rebased_slots() {
         our_binds.iter().all(|record| record.symbol != "_value"),
         "local GOT target should not be emitted as a dylib bind: {our_binds:#?}"
     );
-    assert_eq!(
-        output_section(&our_bytes, "__DATA_CONST", "__got")
-            .expect("missing __got section")
-            .1
-            .len(),
-        8
-    );
+    assert!(output_section(&our_bytes, "__DATA_CONST", "__got").is_none());
+    assert!(output_section(&apple_bytes, "__DATA_CONST", "__got").is_none());
     let verify = Command::new("codesign")
         .arg("-v")
         .arg(&our_out)

@@ -3210,7 +3210,9 @@ fn decode_rebase_records(bytes: &[u8]) -> Result<Vec<RebaseRecord>, String> {
 /// Apple linker releases disagree about where the private dyld scratch word
 /// lives inside `__DATA,__data`. It is linker-owned bookkeeping, not an input
 /// atom, so its rebase offset is not a stable user-visible parity surface.
-/// Remove exactly that record while leaving every input/runtime rebase intact.
+/// Remove exactly that record, then compare any remaining input rebases in
+/// that section relative to the first one. Their spacing remains exact while
+/// ignoring a scratch prefix or suffix chosen by a particular Apple linker.
 fn decode_input_rebase_records(bytes: &[u8]) -> Result<Vec<RebaseRecord>, String> {
     let mut records = decode_rebase_records(bytes)?;
     let Some(private_addr) = symbol_values(bytes).get("__dyld_private").copied() else {
@@ -3228,6 +3230,18 @@ fn decode_input_rebase_records(bytes: &[u8]) -> Result<Vec<RebaseRecord>, String
             && record.section == "__data"
             && record.section_offset == private_offset)
     });
+    let input_base = records
+        .iter()
+        .filter(|record| record.segment == "__DATA" && record.section == "__data")
+        .map(|record| record.section_offset)
+        .min();
+    if let Some(input_base) = input_base {
+        for record in &mut records {
+            if record.segment == "__DATA" && record.section == "__data" {
+                record.section_offset -= input_base;
+            }
+        }
+    }
     Ok(records)
 }
 

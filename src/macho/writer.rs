@@ -100,6 +100,7 @@ pub enum WriteError {
     EntryAtomMissing(crate::resolve::AtomId),
     DefinedSymbolAtomMissing(SymbolId, crate::resolve::AtomId),
     DefinedSymbolSectionMissing(SymbolId, crate::resolve::AtomId),
+    LocalSymbolAtomMissing(PathBuf, String, u8, u32),
     DirectBindAtomMissing(crate::resolve::AtomId),
     DirectBindSectionMissing(crate::resolve::AtomId),
     ImportSymbolMissing(SymbolId),
@@ -133,6 +134,11 @@ impl fmt::Display for WriteError {
                 f,
                 "defined symbol {:?} points at atom {:?} outside any output section",
                 symbol, atom
+            ),
+            WriteError::LocalSymbolAtomMissing(path, name, section, offset) => write!(
+                f,
+                "local symbol `{name}` in {} section {section} at offset {offset:#x} is outside the atomized section contents",
+                path.display()
             ),
             WriteError::DirectBindAtomMissing(atom) => {
                 write!(f, "direct bind atom {:?} missing from layout", atom)
@@ -2194,13 +2200,20 @@ fn collect_local_symbols(
                     .section_for_symbol(input_sym)
                     .expect("section symbol without section");
                 let offset = input_sym.value().saturating_sub(section.addr) as u32;
-                let (atom_id, delta) = find_containing_atom(
+                let (atom_id, delta) = find_atom_at_symbol_position(
                     ctx.atom_ranges,
                     ctx.input_id,
                     input_sym.sect_idx(),
                     offset,
                 )
-                .ok_or(WriteError::MissingSegment("__UNKNOWN"))?;
+                .ok_or_else(|| {
+                    WriteError::LocalSymbolAtomMissing(
+                        object.path.clone(),
+                        name.clone(),
+                        input_sym.sect_idx(),
+                        offset,
+                    )
+                })?;
                 let Some(addr) = ctx.atom_addrs.get(&atom_id).copied() else {
                     if ctx.dead_strip {
                         continue;
@@ -2348,13 +2361,16 @@ fn build_atom_range_index(
     out
 }
 
-fn find_containing_atom(
+fn find_atom_at_symbol_position(
     atom_ranges: &AtomRangeIndex,
     input_id: InputId,
     input_section: u8,
     offset: u32,
 ) -> Option<(crate::resolve::AtomId, u32)> {
-    find_containing_atom_range(atom_ranges, input_id, input_section, offset, 1)
+    // A zero-size local label may legally sit one byte past the section's data.
+    // Keep byte/range lookups strict while allowing that symbol position to map
+    // to the preceding atom with a delta equal to its size.
+    find_containing_atom_range(atom_ranges, input_id, input_section, offset, 0)
 }
 
 fn find_containing_atom_range(
@@ -3526,12 +3542,24 @@ mod tests {
         let by_input_section = atoms.by_input_section();
         let atom_ranges = build_atom_range_index(&atoms, &by_input_section, None);
         assert_eq!(
-            find_containing_atom(&atom_ranges, InputId(7), 3, 4),
+            find_containing_atom_range(&atom_ranges, InputId(7), 3, 4, 1),
             Some((first, 4))
         );
         assert_eq!(
             find_containing_atom_range(&atom_ranges, InputId(7), 3, 10, 2),
             Some((second, 2))
+        );
+        assert_eq!(
+            find_atom_at_symbol_position(&atom_ranges, InputId(7), 3, 8),
+            Some((second, 0))
+        );
+        assert_eq!(
+            find_atom_at_symbol_position(&atom_ranges, InputId(7), 3, 20),
+            Some((second, 12))
+        );
+        assert_eq!(
+            find_containing_atom_range(&atom_ranges, InputId(7), 3, 20, 1),
+            None
         );
     }
 }

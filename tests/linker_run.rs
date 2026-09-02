@@ -12247,6 +12247,51 @@ fn linker_run_preserves_local_symbol_identity_on_global_name_collision() {
 }
 
 #[test]
+fn linker_run_preserves_local_symbol_at_input_section_end() {
+    let object = scratch("local-symbol-at-section-end.o");
+    let output = scratch("local-symbol-at-section-end.dylib");
+    fs::write(
+        &object,
+        synthetic_single_section_object(
+            "__DATA",
+            "__const",
+            S_REGULAR,
+            &[0x5a; 8],
+            &[],
+            &[
+                ("_anchor", N_SECT | N_EXT, 1, 0, 0),
+                ("_section_end", N_SECT, 1, 0, 8),
+            ],
+        ),
+    )
+    .unwrap();
+
+    Linker::run(&LinkOptions {
+        inputs: vec![object.clone()],
+        output: Some(output.clone()),
+        kind: OutputKind::Dylib,
+        ..LinkOptions::default()
+    })
+    .unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    let (_, data) = output_section(&bytes, "__DATA_CONST", "__const")
+        .expect("const fixture must be retained in __DATA_CONST,__const");
+    assert_eq!(data, vec![0x5a; 8]);
+    let symbols = canonical_symbol_record_map(&bytes);
+    let anchor = symbols.get("_anchor").expect("external anchor symbol");
+    let section_end = symbols
+        .get("_section_end")
+        .expect("local section-end symbol");
+    assert_eq!(section_end.n_type, N_SECT);
+    assert_eq!(section_end.n_sect, anchor.n_sect);
+    assert_eq!(section_end.value, 8);
+
+    let _ = fs::remove_file(object);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
 fn linker_run_icf_safe_keeps_cross_object_section_targets_distinct() {
     if !have_xcrun() || !have_xcrun_tool("ld") || !have_tool("codesign") {
         harness_skip!("xcrun as/ld or codesign unavailable");

@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_LOG_ID: AtomicU64 = AtomicU64::new(0);
 
 fn script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ci/check_skips.sh")
@@ -12,8 +15,9 @@ fn run(log: &str, profile: &str) -> Output {
         .duration_since(UNIX_EPOCH)
         .expect("clock before Unix epoch")
         .as_nanos();
+    let log_id = NEXT_LOG_ID.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "afs-ld-check-skips-{}-{nonce}.log",
+        "afs-ld-check-skips-{}-{nonce}-{log_id}.log",
         std::process::id()
     ));
     fs::write(&path, log).expect("write skip-gate fixture");

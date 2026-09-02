@@ -3207,6 +3207,49 @@ fn decode_rebase_records(bytes: &[u8]) -> Result<Vec<RebaseRecord>, String> {
     Ok(out)
 }
 
+/// Apple linker releases disagree about where the private dyld scratch word
+/// lives inside `__DATA,__data`. It is linker-owned bookkeeping, not an input
+/// atom, so its rebase offset is not a stable user-visible parity surface.
+/// Remove exactly that record while leaving every input/runtime rebase intact.
+fn decode_input_rebase_records(bytes: &[u8]) -> Result<Vec<RebaseRecord>, String> {
+    let mut records = decode_rebase_records(bytes)?;
+    let Some(private_addr) = symbol_values(bytes).get("__dyld_private").copied() else {
+        return Ok(records);
+    };
+    let Some((data_addr, data)) = output_section(bytes, "__DATA", "__data") else {
+        return Ok(records);
+    };
+    if private_addr < data_addr || private_addr >= data_addr + data.len() as u64 {
+        return Ok(records);
+    }
+    let private_offset = private_addr - data_addr;
+    records.retain(|record| {
+        !(record.segment == "__DATA"
+            && record.section == "__data"
+            && record.section_offset == private_offset)
+    });
+    Ok(records)
+}
+
+/// The same private scratch placement can shift every input pointer in
+/// `__DATA,__data` by one word. Compare direct binds relative to the first
+/// input bind in that section; all other sections keep absolute offsets.
+fn normalize_direct_data_bind_offsets(records: &mut [BindRecord]) {
+    let base = records
+        .iter()
+        .filter(|record| record.segment == "__DATA" && record.section == "__data")
+        .map(|record| record.section_offset)
+        .min();
+    let Some(base) = base else {
+        return;
+    };
+    for record in records {
+        if record.segment == "__DATA" && record.section == "__data" {
+            record.section_offset -= base;
+        }
+    }
+}
+
 fn decode_bind_records(bytes: &[u8], lazy: bool) -> Result<Vec<BindRecord>, String> {
     let dyld_info = dyld_info_command(bytes)?;
     let (off, size) = if lazy {
@@ -3760,26 +3803,20 @@ fn assert_direct_bind_case_matches_apple_ld(
             case.name
         ));
     }
-    if dyld_info_stream(&our_bytes, DyldInfoStreamKind::Rebase)
-        != dyld_info_stream(&apple_bytes, DyldInfoStreamKind::Rebase)
+    if decode_input_rebase_records(&our_bytes).map_err(|e| format!("our rebases: {e}"))?
+        != decode_input_rebase_records(&apple_bytes).map_err(|e| format!("apple rebases: {e}"))?
     {
         return Err(format!(
-            "{}: rebase stream diverged from Apple ld",
+            "{}: input rebase records diverged from Apple ld",
             case.name
         ));
     }
-    if decode_rebase_records(&our_bytes).map_err(|e| format!("our rebases: {e}"))?
-        != decode_rebase_records(&apple_bytes).map_err(|e| format!("apple rebases: {e}"))?
-    {
-        return Err(format!(
-            "{}: rebase records diverged from Apple ld",
-            case.name
-        ));
-    }
-    let our_binds =
+    let mut our_binds =
         canonical_bind_records(&our_bytes, false).map_err(|e| format!("our binds: {e}"))?;
-    let apple_binds =
+    let mut apple_binds =
         canonical_bind_records(&apple_bytes, false).map_err(|e| format!("apple binds: {e}"))?;
+    normalize_direct_data_bind_offsets(&mut our_binds);
+    normalize_direct_data_bind_offsets(&mut apple_binds);
     if our_binds != apple_binds {
         return Err(format!(
             "{}: bind records diverged from Apple ld:\nours={our_binds:#?}\napple={apple_binds:#?}",
@@ -11857,9 +11894,9 @@ fn linker_run_preserves_runtime_tlv_descriptor_offsets() {
         "runtime hello lazy-bind records diverged from Apple ld"
     );
     assert_eq!(
-        decode_rebase_records(&bytes).unwrap(),
-        decode_rebase_records(&apple_bytes).unwrap(),
-        "runtime hello rebase records diverged from Apple ld"
+        decode_input_rebase_records(&bytes).unwrap(),
+        decode_input_rebase_records(&apple_bytes).unwrap(),
+        "runtime hello input rebase records diverged from Apple ld"
     );
     assert_eq!(
         indirect_symbol_identities(&bytes),

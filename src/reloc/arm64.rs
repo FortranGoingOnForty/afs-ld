@@ -1653,17 +1653,10 @@ fn patch_pointer_to_got(
         return patch_unsigned(bytes, atom, obj, local_offset, reloc, target);
     }
 
-    let implicit_addend = read_implicit_addend(
-        bytes,
-        local_offset,
-        reloc.length,
-        atom,
-        obj,
-        reloc.kind,
-        reloc.referent,
-    )?;
-    let delta = i128::from(target) + i128::from(reloc.addend) + i128::from(implicit_addend)
-        - i128::from(place);
+    // ARM64_RELOC_POINTER_TO_GOT overwrites the field. Unlike UNSIGNED and
+    // SUBTRACTOR relocations, its input bytes are not an embedded addend; C++
+    // LSDAs use those bits for DWARF-encoded placeholder values.
+    let delta = i128::from(target) + i128::from(reloc.addend) - i128::from(place);
     let referent = describe_referent(obj, reloc.referent);
     match reloc.length {
         RelocLength::Word => {
@@ -3105,14 +3098,16 @@ mod tests {
     }
 
     #[test]
-    fn pointer_to_got_word_uses_place_and_addends() {
+    fn pointer_to_got_word_overwrites_input_field() {
         let place = 0x1_0000_5000;
         let got = 0x1_0000_1000;
 
+        let placeholder = 0xbfff_ffec_u32 as i32 as i64;
         let bytes =
-            apply_pointer_to_got_fixture(place, got, RelocLength::Word, true, 12, -4).unwrap();
+            apply_pointer_to_got_fixture(place, got, RelocLength::Word, true, 12, placeholder)
+                .unwrap();
 
-        assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), -0x3ff8);
+        assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), -0x3ff4);
     }
 
     #[test]

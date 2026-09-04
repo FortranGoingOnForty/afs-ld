@@ -170,6 +170,78 @@ fn atomize_splits_text_at_symbol_boundaries_and_backpatches_symbols() {
 }
 
 #[test]
+fn atomize_splits_regular_sections_at_local_symbol_boundaries() {
+    if !have_xcrun() {
+        harness_skip!("xcrun as unavailable");
+        return;
+    }
+
+    // Clang and rustc describe each LSDA in __gcc_except_tab with a local
+    // `GCC_except_table*` symbol. Under MH_SUBSECTIONS_VIA_SYMBOLS those local
+    // definitions are subsection boundaries even though they do not
+    // participate in link-wide name resolution.
+    let src = r#"
+        .section __TEXT,__gcc_except_tab
+    GCC_except_table0:
+        .quad 0x1111111111111111
+    GCC_except_table1:
+        .quad 0x2222222222222222
+        .subsections_via_symbols
+    "#;
+
+    let obj_path = std::env::temp_dir().join(format!(
+        "afs-ld-atom-{}-local-subsections.o",
+        std::process::id()
+    ));
+    require_fixture!("assembly fixture", assemble(src, &obj_path));
+
+    let bytes = fs::read(&obj_path).unwrap();
+    let mut inputs = Inputs::new();
+    let input_id = inputs.add_object(obj_path.clone(), bytes, 0).unwrap();
+    let obj = inputs.object_file(input_id).unwrap();
+    let section_idx = obj
+        .sections
+        .iter()
+        .position(|section| section.segname == "__TEXT" && section.sectname == "__gcc_except_tab")
+        .map(|index| (index + 1) as u8)
+        .expect("fixture should contain __TEXT,__gcc_except_tab");
+    let local_symbols = obj
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.sect_idx() == section_idx)
+        .collect::<Vec<_>>();
+    let local_names = local_symbols
+        .iter()
+        .map(|symbol| obj.symbol_name(symbol).unwrap())
+        .collect::<Vec<_>>();
+    assert!(local_names.contains(&"GCC_except_table0"));
+    assert!(local_names.contains(&"GCC_except_table1"));
+    assert!(local_symbols
+        .iter()
+        .all(|symbol| !symbol.participates_in_global_resolution()));
+
+    let mut atom_table = AtomTable::new();
+    let atomization = atomize_object(input_id, obj, &mut atom_table);
+    let atoms = atom_table
+        .iter()
+        .filter(|(_, atom)| atom.input_section == section_idx)
+        .map(|(_, atom)| (atom.input_offset, atom.size, atom.data.clone()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        atoms,
+        vec![
+            (0, 8, 0x1111111111111111_u64.to_le_bytes().to_vec()),
+            (8, 8, 0x2222222222222222_u64.to_le_bytes().to_vec()),
+        ]
+    );
+    assert!(atomization.owner_by_sym.is_empty());
+    assert!(atomization.alt_entries_by_sym.is_empty());
+
+    let _ = fs::remove_file(&obj_path);
+}
+
+#[test]
 fn atomize_cstring_splits_at_null_terminators() {
     if !have_xcrun() {
         harness_skip!("xcrun as unavailable");

@@ -347,12 +347,18 @@ pub fn atomize_object(
         // `n_value` (absolute address in the object's layout) into
         // in-section offsets by subtracting the section's `addr`.
         //
-        // Only external / private-extern / alt-entry symbols count as
-        // subsection boundaries. Locals like `ltmp0` often sit at the
-        // same offset as an adjacent external (they're compiler-generated
-        // anchors for PC-relative addressing); splitting at them would
-        // produce zero-size atoms. This matches ld64's pragmatic reading
-        // of MH_SUBSECTIONS_VIA_SYMBOLS.
+        // Every non-alt section symbol starts a normal subsection when the
+        // object carries MH_SUBSECTIONS_VIA_SYMBOLS. Local labels are just as
+        // significant as external definitions here: clang and rustc use local
+        // `GCC_except_table*` symbols to delimit independently-live LSDAs.
+        // Specialized literal and unwind sections have content-defined record
+        // boundaries, so their local labels do not need to enter this list.
+        let atom_section = AtomSection::from_section_kind(sect.kind);
+        let uses_symbol_boundaries = subsections_via_symbols
+            && !atom_section.is_zerofill()
+            && !atom_section.is_literal()
+            && atom_section != AtomSection::CompactUnwind
+            && atom_section != AtomSection::EhFrame;
         let mut syms: Vec<(usize, &InputSymbol, u32)> = obj
             .symbols
             .iter()
@@ -361,7 +367,8 @@ pub fn atomize_object(
                 s.stab_kind().is_none()
                     && s.kind() == SymKind::Sect
                     && s.sect_idx() == sect_idx_one
-                    && (s.participates_in_global_resolution() || s.alt_entry())
+                    && (s.participates_in_global_resolution()
+                        || (uses_symbol_boundaries && !s.alt_entry()))
             })
             .map(|(i, s)| {
                 let offset = s.value().saturating_sub(sect.addr) as u32;
@@ -568,6 +575,7 @@ fn atomize_regular_section(
     let Some((first_boundary, first_offset)) = find_next_atom_boundary(syms, 0) else {
         let alts: Vec<_> = syms
             .iter()
+            .filter(|(_, symbol, _)| symbol.participates_in_global_resolution())
             .map(|(symbol_idx, _, offset)| AltEntry {
                 symbol: SymbolId(*symbol_idx as u32),
                 offset_within_atom: *offset,
@@ -585,8 +593,10 @@ fn atomize_regular_section(
         );
         let id = table.push(atom);
         out.atoms.push(id);
-        for (symbol_idx, _, offset) in syms {
-            out.alt_entries_by_sym.push((*symbol_idx, id, *offset));
+        for (symbol_idx, symbol, offset) in syms {
+            if symbol.participates_in_global_resolution() {
+                out.alt_entries_by_sym.push((*symbol_idx, id, *offset));
+            }
         }
         return;
     };
@@ -596,6 +606,7 @@ fn atomize_regular_section(
     if first_offset > 0 {
         let alts: Vec<_> = syms[..first_boundary]
             .iter()
+            .filter(|(_, symbol, _)| symbol.participates_in_global_resolution())
             .map(|(symbol_idx, _, offset)| AltEntry {
                 symbol: SymbolId(*symbol_idx as u32),
                 offset_within_atom: *offset,
@@ -613,8 +624,10 @@ fn atomize_regular_section(
         );
         let head_id = table.push(head);
         out.atoms.push(head_id);
-        for (symbol_idx, _, offset) in &syms[..first_boundary] {
-            out.alt_entries_by_sym.push((*symbol_idx, head_id, *offset));
+        for (symbol_idx, symbol, offset) in &syms[..first_boundary] {
+            if symbol.participates_in_global_resolution() {
+                out.alt_entries_by_sym.push((*symbol_idx, head_id, *offset));
+            }
         }
     }
 
@@ -652,7 +665,9 @@ fn atomize_regular_section(
             }
             let same_address_alias =
                 *offset == atom_offset && !symbol.alt_entry() && index != canonical;
-            if !symbol.alt_entry() && !same_address_alias {
+            if !symbol.participates_in_global_resolution()
+                || (!symbol.alt_entry() && !same_address_alias)
+            {
                 continue;
             }
             let local = *offset - atom_offset;
@@ -681,7 +696,7 @@ fn atomize_regular_section(
         let id = table.push(atom);
         out.atoms.push(id);
         for (symbol_idx, symbol, _) in &syms[i..same_offset_end] {
-            if !symbol.alt_entry() {
+            if !symbol.alt_entry() && symbol.participates_in_global_resolution() {
                 out.owner_by_sym.push((*symbol_idx, id));
             }
         }

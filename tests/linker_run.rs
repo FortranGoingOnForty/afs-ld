@@ -11068,6 +11068,8 @@ fn linker_run_dead_strip_prunes_unreferenced_exception_tables_like_apple_ld() {
     let dead_name = "__Z11dead_helperi";
     assert!(!our_symbols.contains_key(dead_name));
     assert!(!apple_symbols.contains_key(dead_name));
+    assert_eq!(Command::new(&our_out).status().unwrap().code(), Some(0));
+    assert_eq!(Command::new(&apple_out).status().unwrap().code(), Some(0));
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);

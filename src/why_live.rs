@@ -995,9 +995,14 @@ fn referent_atoms(
             }
         }
         Referent::Section(section_index) => {
-            if let Some(atom_id) =
-                section_referent_atom(input_id, source_atom, reloc, section_index, atom_index)
-            {
+            if let Some(atom_id) = section_referent_atom(
+                input_id,
+                object,
+                source_atom,
+                reloc,
+                section_index,
+                atom_index,
+            ) {
                 vec![atom_id]
             } else {
                 atom_index.atom_ids(input_id, section_index)
@@ -1008,18 +1013,26 @@ fn referent_atoms(
 
 fn section_referent_atom(
     input_id: InputId,
+    object: &ObjectFile,
     source_atom: &Atom,
     reloc: crate::reloc::Reloc,
     section_index: u8,
     atom_index: &AtomOffsetIndex,
 ) -> Option<AtomId> {
-    if source_atom.section == AtomSection::CompactUnwind
-        && reloc.offset == source_atom.input_offset
-        && source_atom.data.len() >= 8
-    {
+    if source_atom.section == AtomSection::CompactUnwind {
+        // Compact-unwind records store their function, personality, and LSDA
+        // addresses inline. Local relocations name only the target section,
+        // so recover the precise subsection from the field's embedded input
+        // address instead of conservatively retaining the whole section.
+        let field_offset = reloc.offset.checked_sub(source_atom.input_offset)? as usize;
+        let field_end = field_offset.checked_add(8)?;
         let mut buf = [0u8; 8];
-        buf.copy_from_slice(&source_atom.data[..8]);
-        let target_offset = u64::from_le_bytes(buf) as u32;
+        buf.copy_from_slice(source_atom.data.get(field_offset..field_end)?);
+        let target_address = u64::from_le_bytes(buf);
+        let target_section = object
+            .sections
+            .get(section_index.saturating_sub(1) as usize)?;
+        let target_offset = u32::try_from(target_address.checked_sub(target_section.addr)?).ok()?;
         return atom_index.find(input_id, section_index, target_offset);
     }
     None

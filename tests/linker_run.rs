@@ -2940,6 +2940,14 @@ fn apple_link_dylib_classic(
 }
 
 fn apple_link_cxx_classic(obj: &PathBuf, out: &PathBuf) -> Result<(), String> {
+    apple_link_cxx_classic_with_args(obj, out, &[])
+}
+
+fn apple_link_cxx_classic_with_args(
+    obj: &PathBuf,
+    out: &PathBuf,
+    extra_args: &[&str],
+) -> Result<(), String> {
     let output = Command::new("xcrun")
         .args([
             "--sdk",
@@ -2952,6 +2960,7 @@ fn apple_link_cxx_classic(obj: &PathBuf, out: &PathBuf) -> Result<(), String> {
         ])
         .arg(out)
         .arg(obj)
+        .args(extra_args)
         .output()
         .map_err(|e| format!("spawn xcrun clang++ link: {e}"))?;
     if !output.status.success() {
@@ -10980,6 +10989,85 @@ fn linker_run_preserves_exception_unwind_metadata_like_apple_ld() {
     let apple_status = Command::new(&apple_out).status().unwrap();
     assert_eq!(our_status.code(), Some(42));
     assert_eq!(apple_status.code(), Some(42));
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(our_out);
+    let _ = fs::remove_file(apple_out);
+}
+
+#[test]
+fn linker_run_dead_strip_prunes_unreferenced_exception_tables_like_apple_ld() {
+    if !have_xcrun() || !have_xcrun_tool("clang++") || !have_tool("codesign") {
+        harness_skip!("xcrun clang++ or codesign unavailable");
+        return;
+    }
+
+    let Some(sdk) = sdk_path() else {
+        harness_skip!("xcrun --show-sdk-path unavailable");
+        return;
+    };
+    let libsystem = PathBuf::from(format!("{sdk}/usr/lib/libSystem.tbd"));
+    let libcxx = PathBuf::from(format!("{sdk}/usr/lib/libc++.tbd"));
+    if !libsystem.exists() || !libcxx.exists() {
+        harness_skip!("C++ SDK text stubs unavailable");
+        return;
+    }
+
+    let obj = scratch("cxx-exc-dead-strip.o");
+    let our_out = scratch("cxx-exc-dead-strip-ours.out");
+    let apple_out = scratch("cxx-exc-dead-strip-apple.out");
+    let src = r#"
+        __attribute__((noinline)) int live_helper(int value) {
+            try { throw value; }
+            catch (int caught) { return caught; }
+        }
+
+        __attribute__((noinline)) int dead_helper(int value) {
+            try { throw value + 1; }
+            catch (int caught) { return caught; }
+        }
+
+        int main() {
+            return live_helper(7) == 7 ? 0 : 1;
+        }
+    "#;
+    require_fixture!("C++ fixture compilation", compile_cxx(src, &obj));
+
+    let opts = LinkOptions {
+        inputs: vec![obj.clone(), libcxx.clone(), libsystem.clone()],
+        output: Some(our_out.clone()),
+        kind: OutputKind::Executable,
+        dead_strip: true,
+        ..LinkOptions::default()
+    };
+    Linker::run(&opts).unwrap();
+    apple_link_cxx_classic_with_args(&obj, &apple_out, &["-Wl,-dead_strip"]).unwrap();
+
+    let our_bytes = fs::read(&our_out).unwrap();
+    let apple_bytes = fs::read(&apple_out).unwrap();
+    for (segment, section) in [
+        ("__TEXT", "__text"),
+        ("__TEXT", "__gcc_except_tab"),
+        ("__TEXT", "__eh_frame"),
+        ("__TEXT", "__unwind_info"),
+    ] {
+        let our_size = output_section(&our_bytes, segment, section)
+            .map(|(_, data)| data.len())
+            .unwrap_or(0);
+        let apple_size = output_section(&apple_bytes, segment, section)
+            .map(|(_, data)| data.len())
+            .unwrap_or(0);
+        assert_eq!(
+            our_size, apple_size,
+            "{segment},{section} size should match Apple ld after dead stripping"
+        );
+    }
+
+    let our_symbols = symbol_values(&our_bytes);
+    let apple_symbols = symbol_values(&apple_bytes);
+    let dead_name = "__Z11dead_helperi";
+    assert!(!our_symbols.contains_key(dead_name));
+    assert!(!apple_symbols.contains_key(dead_name));
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(our_out);

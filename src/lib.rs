@@ -141,6 +141,9 @@ pub struct LinkOptions {
     pub emit_uuid: bool,
     /// Free bytes reserved after the load-command region for later growth.
     pub header_pad: u64,
+    /// Reserve MAXPATHLEN bytes for each dylib load command so install names
+    /// can grow in place after linking.
+    pub header_pad_max_install_names: bool,
     pub dead_strip: bool,
     pub no_loh: bool,
     pub icf_mode: IcfMode,
@@ -194,6 +197,7 @@ impl Default for LinkOptions {
             strip_debug: false,
             emit_uuid: true,
             header_pad: 32,
+            header_pad_max_install_names: false,
             dead_strip: false,
             no_loh: false,
             icf_mode: IcfMode::None,

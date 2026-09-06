@@ -38,6 +38,8 @@ Options:
   -x                              Strip local symbols
   -S                              Strip debug symbols (currently a no-op warning)
   -no_uuid                        Omit LC_UUID
+  -headerpad <hex>                Reserve bytes after the load commands
+  -headerpad_max_install_names    Reserve MAXPATHLEN per dylib load command
   -no_loh                         Accepted for compatibility (currently warns; no effect)
   -thunks=<none|safe|all>         Configure branch thunks
   -dead_strip                     Dead-strip unreferenced code/data

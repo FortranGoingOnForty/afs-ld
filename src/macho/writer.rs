@@ -39,6 +39,8 @@ use crate::synth::{
 };
 use crate::{LinkOptions, OutputKind};
 
+const MACOS_MAXPATHLEN: u64 = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntryPoint {
     pub atom: crate::resolve::AtomId,
@@ -299,7 +301,8 @@ fn finalize_with_linkedit(
     let mut layout = layout.clone();
     let (mut linkedit, mut timings) = build_linkedit_plan_profiled(&layout, kind, opts, inputs)?;
     apply_indirect_starts(&mut layout, &linkedit);
-    let header_size = estimate_header_size(&layout, kind, opts, dylibs, &linkedit)?;
+    let header_pad = effective_header_pad(kind, opts, dylibs)?;
+    let header_size = estimate_header_size(&layout, kind, opts, dylibs, &linkedit, header_pad)?;
     layout.relayout(header_size);
 
     let (next_linkedit, next_timings) = build_linkedit_plan_profiled(&layout, kind, opts, inputs)?;
@@ -308,7 +311,7 @@ fn finalize_with_linkedit(
     apply_indirect_starts(&mut layout, &linkedit);
     let exact_header_size = padded_header_size(
         exact_sizeofcmds(&layout, kind, opts, dylibs, &linkedit)? as u64,
-        opts.header_pad,
+        header_pad,
     )?;
     if exact_header_size != header_size {
         layout.relayout(exact_header_size);
@@ -325,6 +328,30 @@ fn finalize_with_linkedit(
     linkedit_seg.file_size = linkedit.total_size().max(1);
     linkedit_seg.vm_size = align_up(linkedit.total_size().max(1), PAGE_SIZE);
     Ok((layout, linkedit, timings))
+}
+
+fn effective_header_pad(
+    kind: OutputKind,
+    opts: &LinkOptions,
+    dylibs: &[DylibDependency],
+) -> Result<u64, WriteError> {
+    if !opts.header_pad_max_install_names {
+        return Ok(opts.header_pad);
+    }
+
+    let dylib_commands = u64::try_from(dylibs.len())
+        .ok()
+        .and_then(|count| count.checked_add(u64::from(kind == OutputKind::Dylib)))
+        .ok_or(WriteError::OffsetTooLarge(
+            "Mach-O maximum install-name header padding",
+        ))?;
+    let max_install_name_pad =
+        dylib_commands
+            .checked_mul(MACOS_MAXPATHLEN)
+            .ok_or(WriteError::OffsetTooLarge(
+                "Mach-O maximum install-name header padding",
+            ))?;
+    Ok(opts.header_pad.max(max_install_name_pad))
 }
 
 fn exact_sizeofcmds(
@@ -627,6 +654,7 @@ fn estimate_header_size(
     opts: &LinkOptions,
     dylibs: &[DylibDependency],
     linkedit: &LinkEditPlan,
+    header_pad: u64,
 ) -> Result<u64, WriteError> {
     let mut size = HEADER_SIZE as u64;
     for segment in &layout.segments {
@@ -677,7 +705,7 @@ fn estimate_header_size(
         size += 16;
     }
     size += DyldInfoCmd::WIRE_SIZE as u64;
-    padded_header_size(size - HEADER_SIZE as u64, opts.header_pad)
+    padded_header_size(size - HEADER_SIZE as u64, header_pad)
 }
 
 fn segment_command(layout: &Layout, segment_name: &str) -> Result<Segment64, WriteError> {
@@ -3098,6 +3126,59 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0));
         }
+    }
+
+    #[test]
+    fn headerpad_max_install_names_reserves_space_for_each_dylib_command() {
+        let layout = layout_with_text_bytes(
+            OutputKind::Dylib,
+            vec![0x00, 0x00, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6],
+        );
+        let opts = LinkOptions {
+            header_pad: 0x200,
+            header_pad_max_install_names: true,
+            emit_uuid: false,
+            output: Some("libheaderpad.dylib".into()),
+            kind: OutputKind::Dylib,
+            ..LinkOptions::default()
+        };
+        let dylibs = [
+            DylibDependency {
+                kind: crate::macho::dylib::DylibLoadKind::Normal,
+                install_name: "/usr/lib/libfirst.dylib".into(),
+                current_version: 0x10000,
+                compatibility_version: 0x10000,
+                ordinal: 1,
+            },
+            DylibDependency {
+                kind: crate::macho::dylib::DylibLoadKind::Weak,
+                install_name: "/usr/lib/libsecond.dylib".into(),
+                current_version: 0x10000,
+                compatibility_version: 0x10000,
+                ordinal: 2,
+            },
+        ];
+        let mut bytes = Vec::new();
+        write_with_dylibs(&layout, OutputKind::Dylib, &opts, None, &dylibs, &mut bytes).unwrap();
+
+        let header = crate::macho::reader::parse_header(&bytes).unwrap();
+        let commands = crate::macho::reader::parse_commands(&header, &bytes).unwrap();
+        let text_offset = commands
+            .iter()
+            .find_map(|command| match command {
+                LoadCommand::Segment64(segment) if segment.segname_str() == "__TEXT" => segment
+                    .sections
+                    .iter()
+                    .find(|section| section.sectname_str() == "__text")
+                    .map(|section| section.offset as u64),
+                _ => None,
+            })
+            .expect("__TEXT,__text section");
+        let commands_end = HEADER_SIZE as u64 + header.sizeofcmds as u64;
+        assert_eq!(text_offset - commands_end, 3 * MACOS_MAXPATHLEN);
+        assert!(bytes[commands_end as usize..text_offset as usize]
+            .iter()
+            .all(|byte| *byte == 0));
     }
 
     #[test]

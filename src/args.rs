@@ -38,6 +38,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "-S",
     "-no_uuid",
     "-headerpad",
+    "-headerpad_max_install_names",
     "-no_loh",
     "-thunks=none",
     "-thunks=safe",
@@ -728,6 +729,9 @@ pub fn parse_preprocessed_with_force_loads(
                     .ok_or_else(|| ArgsError::MissingValue("-headerpad".into()))?;
                 opts.header_pad = parse_header_pad(value)?;
             }
+            "-headerpad_max_install_names" => {
+                opts.header_pad_max_install_names = true;
+            }
             "-no_loh" => {
                 opts.no_loh = true;
             }
@@ -944,6 +948,19 @@ mod tests {
 
         let opts = parse(&argv(&["-headerpad", "200", "foo.o"])).unwrap();
         assert_eq!(opts.header_pad, 0x200);
+    }
+
+    #[test]
+    fn headerpad_max_install_names_is_recorded() {
+        let opts = parse(&argv(&[
+            "-headerpad",
+            "200",
+            "-headerpad_max_install_names",
+            "foo.o",
+        ]))
+        .unwrap();
+        assert_eq!(opts.header_pad, 0x200);
+        assert!(opts.header_pad_max_install_names);
     }
 
     #[test]

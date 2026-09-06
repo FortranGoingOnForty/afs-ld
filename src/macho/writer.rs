@@ -299,15 +299,17 @@ fn finalize_with_linkedit(
     let mut layout = layout.clone();
     let (mut linkedit, mut timings) = build_linkedit_plan_profiled(&layout, kind, opts, inputs)?;
     apply_indirect_starts(&mut layout, &linkedit);
-    let header_size = estimate_header_size(&layout, kind, opts, dylibs, &linkedit);
+    let header_size = estimate_header_size(&layout, kind, opts, dylibs, &linkedit)?;
     layout.relayout(header_size);
 
     let (next_linkedit, next_timings) = build_linkedit_plan_profiled(&layout, kind, opts, inputs)?;
     linkedit = next_linkedit;
     timings += next_timings;
     apply_indirect_starts(&mut layout, &linkedit);
-    let exact_header_size =
-        HEADER_SIZE as u64 + exact_sizeofcmds(&layout, kind, opts, dylibs, &linkedit)? as u64;
+    let exact_header_size = padded_header_size(
+        exact_sizeofcmds(&layout, kind, opts, dylibs, &linkedit)? as u64,
+        opts.header_pad,
+    )?;
     if exact_header_size != header_size {
         layout.relayout(exact_header_size);
         let (next_linkedit, next_timings) =
@@ -336,6 +338,21 @@ fn exact_sizeofcmds(
         .iter()
         .map(LoadCommand::cmdsize)
         .sum())
+}
+
+fn padded_header_size(command_size: u64, header_pad: u64) -> Result<u64, WriteError> {
+    let size = (HEADER_SIZE as u64)
+        .checked_add(command_size)
+        .and_then(|size| size.checked_add(header_pad))
+        .ok_or(WriteError::OffsetTooLarge(
+            "Mach-O header and requested padding",
+        ))?;
+    if size > u32::MAX as u64 {
+        return Err(WriteError::OffsetTooLarge(
+            "Mach-O header and requested padding",
+        ));
+    }
+    Ok(size)
 }
 
 pub fn write_finalized_with_dylibs(
@@ -610,7 +627,7 @@ fn estimate_header_size(
     opts: &LinkOptions,
     dylibs: &[DylibDependency],
     linkedit: &LinkEditPlan,
-) -> u64 {
+) -> Result<u64, WriteError> {
     let mut size = HEADER_SIZE as u64;
     for segment in &layout.segments {
         size += (8 + 64 + 80 * segment.sections.len()) as u64;
@@ -660,7 +677,7 @@ fn estimate_header_size(
         size += 16;
     }
     size += DyldInfoCmd::WIRE_SIZE as u64;
-    size
+    padded_header_size(size - HEADER_SIZE as u64, opts.header_pad)
 }
 
 fn segment_command(layout: &Layout, segment_name: &str) -> Result<Segment64, WriteError> {
@@ -3045,6 +3062,42 @@ mod tests {
                 .any(|cmd| matches!(cmd, LoadCommand::Dylib(d) if d.cmd == LC_ID_DYLIB)),
             "expected LC_ID_DYLIB in {commands:?}"
         );
+    }
+
+    #[test]
+    fn headerpad_reserves_space_after_load_commands() {
+        for header_pad in [32, 0x200] {
+            let layout = layout_with_text_bytes(
+                OutputKind::Executable,
+                vec![0x00, 0x00, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6],
+            );
+            let opts = LinkOptions {
+                header_pad,
+                emit_uuid: false,
+                ..LinkOptions::default()
+            };
+            let mut bytes = Vec::new();
+            write(&layout, OutputKind::Executable, &opts, &mut bytes).unwrap();
+
+            let header = crate::macho::reader::parse_header(&bytes).unwrap();
+            let commands = crate::macho::reader::parse_commands(&header, &bytes).unwrap();
+            let text_offset = commands
+                .iter()
+                .find_map(|command| match command {
+                    LoadCommand::Segment64(segment) if segment.segname_str() == "__TEXT" => segment
+                        .sections
+                        .iter()
+                        .find(|section| section.sectname_str() == "__text")
+                        .map(|section| section.offset as u64),
+                    _ => None,
+                })
+                .expect("__TEXT,__text section");
+            let commands_end = HEADER_SIZE as u64 + header.sizeofcmds as u64;
+            assert_eq!(text_offset - commands_end, header_pad);
+            assert!(bytes[commands_end as usize..text_offset as usize]
+                .iter()
+                .all(|byte| *byte == 0));
+        }
     }
 
     #[test]

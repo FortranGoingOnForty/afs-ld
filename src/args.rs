@@ -37,6 +37,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "-unexported_symbol",
     "-S",
     "-no_uuid",
+    "-headerpad",
     "-no_loh",
     "-thunks=none",
     "-thunks=safe",
@@ -290,6 +291,25 @@ fn parse_jobs(value: &str) -> Result<usize, ArgsError> {
         });
     }
     Ok(jobs)
+}
+
+fn parse_header_pad(value: &str) -> Result<u64, ArgsError> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if digits.is_empty() {
+        return Err(ArgsError::InvalidValue {
+            flag: "-headerpad".into(),
+            value: value.to_string(),
+            expected: "hexadecimal byte count".into(),
+        });
+    }
+    u64::from_str_radix(digits, 16).map_err(|_| ArgsError::InvalidValue {
+        flag: "-headerpad".into(),
+        value: value.to_string(),
+        expected: "hexadecimal byte count".into(),
+    })
 }
 
 #[derive(Debug)]
@@ -702,6 +722,12 @@ pub fn parse_preprocessed_with_force_loads(
             "-no_uuid" => {
                 opts.emit_uuid = false;
             }
+            "-headerpad" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| ArgsError::MissingValue("-headerpad".into()))?;
+                opts.header_pad = parse_header_pad(value)?;
+            }
             "-no_loh" => {
                 opts.no_loh = true;
             }
@@ -909,6 +935,34 @@ mod tests {
         let opts = parse(&argv(&["-S", "-no_uuid", "foo.o"])).unwrap();
         assert!(opts.strip_debug);
         assert!(!opts.emit_uuid);
+    }
+
+    #[test]
+    fn headerpad_is_parsed_as_hexadecimal_bytes() {
+        let opts = parse(&argv(&["-headerpad", "0x200", "foo.o"])).unwrap();
+        assert_eq!(opts.header_pad, 0x200);
+
+        let opts = parse(&argv(&["-headerpad", "200", "foo.o"])).unwrap();
+        assert_eq!(opts.header_pad, 0x200);
+    }
+
+    #[test]
+    fn headerpad_rejects_missing_or_non_hex_values() {
+        let missing = parse(&argv(&["-headerpad"])).unwrap_err();
+        assert!(matches!(
+            missing,
+            ArgsError::MissingValue(ref flag) if flag == "-headerpad"
+        ));
+
+        let invalid = parse(&argv(&["-headerpad", "12g", "foo.o"])).unwrap_err();
+        assert!(matches!(
+            invalid,
+            ArgsError::InvalidValue {
+                ref flag,
+                ref value,
+                ..
+            } if flag == "-headerpad" && value == "12g"
+        ));
     }
 
     #[test]

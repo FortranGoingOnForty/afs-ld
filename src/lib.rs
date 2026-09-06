@@ -139,6 +139,8 @@ pub struct LinkOptions {
     pub strip_locals: bool,
     pub strip_debug: bool,
     pub emit_uuid: bool,
+    /// Free bytes reserved after the load-command region for later growth.
+    pub header_pad: u64,
     pub dead_strip: bool,
     pub no_loh: bool,
     pub icf_mode: IcfMode,
@@ -191,6 +193,7 @@ impl Default for LinkOptions {
             strip_locals: false,
             strip_debug: false,
             emit_uuid: true,
+            header_pad: 32,
             dead_strip: false,
             no_loh: false,
             icf_mode: IcfMode::None,

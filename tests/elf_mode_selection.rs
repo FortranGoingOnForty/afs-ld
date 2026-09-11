@@ -156,6 +156,29 @@ fn assert_linked(output: &Output, executable: &Path, status: i32) {
 }
 
 #[test]
+fn verbose_flag_prints_version_and_continues_elf_linking() {
+    let Some(gas) = gas() else {
+        eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=verbose_flag_prints_version_and_continues_elf_linking count=1 reason=\"no GNU assembler on this host\"");
+        return;
+    };
+    let dir = scratch("verbose_link");
+    std::fs::create_dir_all(&dir).unwrap();
+    let object = assemble(&gas, &dir, "entry", &exit_asm("_start", 51));
+    let executable = dir.join("verbose.out");
+
+    let output = link(&executable, &[OsStr::new("-v"), object.as_os_str()]);
+    assert_linked(&output, &executable, 51);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains(&format!("afs-ld {}", env!("CARGO_PKG_VERSION"))),
+        "verbose ELF link should print version information:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn archive_entry_is_an_extraction_root() {
     let (Some(gas), Some(ar)) = (gas(), ar()) else {
         eprintln!("\nHARNESS_SKIP suite=elf_mode_selection test=archive_entry_is_an_extraction_root count=1 reason=\"no GNU assembler or ar on this host\"");

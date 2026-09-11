@@ -63,7 +63,8 @@ Options:
   --dump-tbd <path>               Dump a TBD summary
   -t, -trace                      Print input paths as they are loaded
   -h, --help                      Show this help
-  -v, --version                   Show afs-ld version
+  -v                              Print version information and continue linking
+  --version                       Show afs-ld version and exit
 "
 }
 
@@ -101,6 +102,19 @@ fn main() -> ExitCode {
     if opts.show_version {
         println!("afs-ld {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
+    }
+
+    if opts.verbose {
+        eprintln!("afs-ld {}", env!("CARGO_PKG_VERSION"));
+        if parsed.input_specs.is_empty()
+            && opts.dump.is_none()
+            && opts.dump_archive.is_none()
+            && opts.dump_dylib.is_none()
+            && opts.dump_tbd.is_none()
+            && opts.output.is_none()
+        {
+            return ExitCode::SUCCESS;
+        }
     }
 
     if let Some(path) = &opts.dump {
@@ -237,6 +251,8 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
     let mut as_needed = false;
     let mut library_search = LibrarySearchMode::default();
     let mut elf_emulation = false;
+    let mut verbose = false;
+    let mut show_version = false;
     let mut entry = "_start".to_string();
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
@@ -282,6 +298,8 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
             // emulation are the expected mode.
             "--as-needed" => as_needed = true,
             "--no-as-needed" => as_needed = false,
+            "-v" => verbose = true,
+            "--version" => show_version = true,
             "-melf_x86_64" => elf_emulation = true,
             "-static" | "-Bstatic" | "-dn" | "-non_shared" => {
                 library_search = LibrarySearchMode::StaticOnly;
@@ -332,6 +350,13 @@ fn elf_mode(args: &[String]) -> Option<ExitCode> {
     }
     if !elf_emulation && !link_inputs_select_elf(&link_inputs, &lib_dirs, dynamic) {
         return None;
+    }
+    if show_version {
+        println!("afs-ld {}", env!("CARGO_PKG_VERSION"));
+        return Some(ExitCode::SUCCESS);
+    }
+    if verbose {
+        eprintln!("afs-ld {}", env!("CARGO_PKG_VERSION"));
     }
     if !unsupported.is_empty() {
         diag::error(&format!(

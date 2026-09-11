@@ -678,6 +678,62 @@ fn version_flag_prints_version_and_exits_successfully() {
 }
 
 #[test]
+fn verbose_flag_alone_prints_version_and_exits_successfully() {
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let out = Command::new(exe)
+        .arg("-v")
+        .output()
+        .expect("afs-ld should run");
+    assert!(out.status.success(), "verbose version query should succeed");
+    assert!(
+        out.stdout.is_empty(),
+        "-v should write diagnostics to stderr"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        format!("afs-ld {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn verbose_flag_prints_version_and_continues_linking() {
+    if !have_xcrun() {
+        harness_skip!("xcrun as unavailable");
+        return;
+    }
+
+    let exe = env!("CARGO_BIN_EXE_afs-ld");
+    let obj = require_fixture!(
+        "assembly fixture",
+        assemble_minimal_main("verbose-link-main.o")
+    );
+    let out_path = scratch("verbose-link.out");
+    let out = Command::new(exe)
+        .arg("-v")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&obj)
+        .output()
+        .expect("afs-ld should run");
+
+    assert!(
+        out.status.success(),
+        "verbose link should succeed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out_path.exists(), "verbose link must publish its output");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains(&format!("afs-ld {}", env!("CARGO_PKG_VERSION"))),
+        "verbose link should print version information:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = fs::remove_file(obj);
+    let _ = fs::remove_file(out_path);
+}
+
+#[test]
 fn overflowing_macho_versions_are_rejected_before_output_publication() {
     let output = scratch("AFSLD-073-version-overflow.out");
     let sentinel = b"previously-published-output";

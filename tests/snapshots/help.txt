@@ -56,4 +56,5 @@ Options:
   --dump-tbd <path>               Dump a TBD summary
   -t, -trace                      Print input paths as they are loaded
   -h, --help                      Show this help
-  -v, --version                   Show afs-ld version
+  -v                              Print version information and continue linking
+  --version                       Show afs-ld version and exit

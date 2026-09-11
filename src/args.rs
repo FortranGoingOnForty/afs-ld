@@ -790,7 +790,10 @@ pub fn parse_preprocessed_with_force_loads(
             "-t" | "-trace" => {
                 opts.trace_inputs = true;
             }
-            "-v" | "--version" => {
+            "-v" => {
+                opts.verbose = true;
+            }
+            "--version" => {
                 opts.show_version = true;
             }
             "-h" | "--help" => {
@@ -1587,8 +1590,10 @@ mod tests {
         assert!(opts.show_help);
         let opts = parse(&argv(&["--version"])).unwrap();
         assert!(opts.show_version);
+        assert!(!opts.verbose);
         let opts = parse(&argv(&["-v"])).unwrap();
-        assert!(opts.show_version);
+        assert!(opts.verbose);
+        assert!(!opts.show_version);
     }
 
     #[test]

@@ -98,6 +98,10 @@ struct RegularRelocContext<'a> {
 const THUNK_SIZE: u64 = 12;
 const BR_X16: u32 = 0xd61f_0200;
 const BRANCH26_MAX_FORWARD_DELTA_BYTES: u64 = ((1u64 << 25) - 1) * 4;
+// Keep an island's caller cluster comfortably inside the architectural
+// limit.  The spare half-range absorbs alignment and later thunk growth while
+// avoiding one physical Mach-O section per caller atom.
+const THUNK_ISLAND_CALLER_SPAN: u64 = BRANCH26_MAX_FORWARD_DELTA_BYTES / 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BranchTargetKey {
@@ -132,6 +136,16 @@ struct ThunkIsland {
 struct ThunkEntry {
     island: usize,
     slot_in_island: usize,
+    target: ThunkTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThunkRequest {
+    atom: crate::resolve::AtomId,
+    atom_end: u64,
+    local_offset: u32,
+    place: u64,
+    segment: String,
     target: ThunkTarget,
 }
 
@@ -620,11 +634,7 @@ pub fn plan_thunks(
         icf_redirects,
     };
 
-    let mut redirects = HashMap::new();
-    let mut island_index: HashMap<crate::resolve::AtomId, usize> = HashMap::new();
-    let mut index: HashMap<ThunkBucketKey, usize> = HashMap::new();
-    let mut islands: Vec<ThunkIsland> = Vec::new();
-    let mut entries: Vec<ThunkEntry> = Vec::new();
+    let mut requests = Vec::new();
     for (atom_id, atom) in atoms.iter() {
         let Some(obj) = input_map.get(&atom.origin) else {
             continue;
@@ -661,47 +671,82 @@ pub fn plan_thunks(
             if !needs_thunk {
                 continue;
             }
-            let island = if let Some(&existing) = island_index.get(&atom_id) {
-                existing
-            } else {
-                let next = islands.len();
-                islands.push(ThunkIsland {
-                    segment: caller_segment.clone(),
-                    after_atom: atom_id,
-                });
-                island_index.insert(atom_id, next);
-                next
-            };
-            let bucket_key = ThunkBucketKey { island, target };
-            let thunk_index = if let Some(&existing) = index.get(&bucket_key) {
-                existing
-            } else {
-                let next = entries.len();
-                let slot_in_island = entries
-                    .iter()
-                    .filter(|entry| entry.island == island)
-                    .count();
-                entries.push(ThunkEntry {
-                    island,
-                    slot_in_island,
-                    target,
-                });
-                index.insert(bucket_key, next);
-                next
-            };
-            redirects.insert((atom_id, local_offset), thunk_index);
+            requests.push(ThunkRequest {
+                atom: atom_id,
+                atom_end: resolve.atom_addrs[&atom.id] + atom.size as u64,
+                local_offset,
+                place,
+                segment: caller_segment,
+                target,
+            });
         }
     }
 
-    if entries.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(ThunkPlan {
-            redirects,
-            islands,
-            entries,
-        }))
+    if requests.is_empty() {
+        return Ok(None);
     }
+
+    // Place one island after the last caller atom in each half-range cluster.
+    // Requests are sorted by final output address rather than AtomId so input
+    // load order and section sorting cannot accidentally fragment a cluster.
+    requests.sort_by(|lhs, rhs| {
+        lhs.segment
+            .cmp(&rhs.segment)
+            .then_with(|| lhs.place.cmp(&rhs.place))
+            .then_with(|| lhs.atom.cmp(&rhs.atom))
+            .then_with(|| lhs.local_offset.cmp(&rhs.local_offset))
+    });
+
+    let mut redirects = HashMap::new();
+    let mut index: HashMap<ThunkBucketKey, usize> = HashMap::new();
+    let mut islands: Vec<ThunkIsland> = Vec::new();
+    let mut island_entry_counts = Vec::new();
+    let mut active_islands: HashMap<String, (usize, u64)> = HashMap::new();
+    let mut entries: Vec<ThunkEntry> = Vec::new();
+    for request in requests {
+        let island = match active_islands.get(&request.segment).copied() {
+            Some((island, first_place))
+                if islands[island].after_atom == request.atom
+                    || request.atom_end.saturating_sub(first_place) <= THUNK_ISLAND_CALLER_SPAN =>
+            {
+                islands[island].after_atom = request.atom;
+                island
+            }
+            _ => {
+                let next = islands.len();
+                islands.push(ThunkIsland {
+                    segment: request.segment.clone(),
+                    after_atom: request.atom,
+                });
+                island_entry_counts.push(0usize);
+                active_islands.insert(request.segment.clone(), (next, request.place));
+                next
+            }
+        };
+        let target = request.target;
+        let bucket_key = ThunkBucketKey { island, target };
+        let thunk_index = if let Some(&existing) = index.get(&bucket_key) {
+            existing
+        } else {
+            let next = entries.len();
+            let slot_in_island = island_entry_counts[island];
+            island_entry_counts[island] += 1;
+            entries.push(ThunkEntry {
+                island,
+                slot_in_island,
+                target,
+            });
+            index.insert(bucket_key, next);
+            next
+        };
+        redirects.insert((request.atom, request.local_offset), thunk_index);
+    }
+
+    Ok(Some(ThunkPlan {
+        redirects,
+        islands,
+        entries,
+    }))
 }
 
 fn apply_one(
@@ -3400,6 +3445,80 @@ mod tests {
             replan, plan,
             "expected thunk planning to converge once the intra-section islands exist"
         );
+    }
+
+    #[test]
+    fn thunk_plan_clusters_nearby_caller_atoms_into_one_island() {
+        const CALLER_COUNT: u32 = 300;
+        let target_offset = 0x0900_0000u32;
+        let caller_offsets: Vec<_> = (0..CALLER_COUNT).map(|index| index * 4).collect();
+        let raw_relocs = branch26_raw_relocs(&caller_offsets);
+        let object = thunk_test_object(raw_relocs, target_offset as u64, target_offset as u64 + 4);
+
+        let mut atoms = AtomTable::new();
+        let callers: Vec<_> = caller_offsets
+            .iter()
+            .map(|offset| atoms.push(test_atom(*offset, 4)))
+            .collect();
+        let caller_bytes = CALLER_COUNT * 4;
+        atoms.push(test_atom(caller_bytes, target_offset - caller_bytes));
+        let target = atoms.push(test_atom(target_offset, 4));
+
+        let mut sym_table = SymbolTable::new();
+        let target_name = sym_table.intern("_target");
+        sym_table
+            .insert(Symbol::Defined {
+                name: target_name,
+                origin: InputId(0),
+                atom: target,
+                value: 0,
+                weak: false,
+                private_extern: false,
+                no_dead_strip: false,
+            })
+            .unwrap();
+
+        let inputs = [LayoutInput {
+            id: InputId(0),
+            object: &object,
+            load_order: 0,
+            archive_member_offset: None,
+        }];
+        let opts = LinkOptions {
+            kind: OutputKind::Executable,
+            ..LinkOptions::default()
+        };
+        let layout = Layout::build(OutputKind::Executable, &inputs, &atoms, 0);
+        let parsed_relocs = crate::macho::writer::build_parsed_reloc_cache(&inputs).unwrap();
+        let plan = plan_thunks(
+            &opts,
+            ThunkPlanningContext {
+                layout: &layout,
+                inputs: &inputs,
+                atoms: &atoms,
+                sym_table: &sym_table,
+                synthetic_plan: None,
+                icf_redirects: None,
+                parsed_relocs: &parsed_relocs,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            plan.islands.len(),
+            1,
+            "nearby caller atoms must share one reachable island"
+        );
+        assert_eq!(
+            plan.entries.len(),
+            1,
+            "calls to one target must share one thunk within the island"
+        );
+        assert!(callers
+            .iter()
+            .all(|caller| plan.redirect_for(*caller, 0) == Some(0)));
+        assert_eq!(plan.islands[0].after_atom, callers[callers.len() - 1]);
     }
 
     #[test]

@@ -8765,7 +8765,7 @@ fn linker_run_replans_thunks_until_layout_converges() {
 }
 
 #[test]
-fn linker_run_emits_multiple_thunk_islands_within_text_segment() {
+fn linker_run_clusters_nearby_thunk_callers_within_text_segment() {
     if !have_xcrun() || !have_tool("codesign") {
         harness_skip!("xcrun or codesign unavailable");
         return;
@@ -8811,12 +8811,13 @@ fn linker_run_emits_multiple_thunk_islands_within_text_segment() {
     let thunk_sections = output_sections(&bytes, "__TEXT", "__thunks");
     assert_eq!(
         thunk_sections.len(),
-        2,
-        "expected one thunk island after each caller"
+        1,
+        "nearby callers must share one thunk island"
     );
-    assert!(
-        thunk_sections.iter().all(|(_, bytes)| bytes.len() == 12),
-        "expected one thunk per island"
+    assert_eq!(
+        thunk_sections[0].1.len(),
+        24,
+        "expected two target-specific thunks in the shared island"
     );
 
     let (text_addr, text) = output_section(&bytes, "__TEXT", "__text").unwrap();
@@ -8826,7 +8827,7 @@ fn linker_run_emits_multiple_thunk_islands_within_text_segment() {
         decode_branch_target(&mid, mid_addr, 8).unwrap(),
     ];
     actual_targets.sort_unstable();
-    let mut expected_targets = [thunk_sections[0].0, thunk_sections[1].0];
+    let mut expected_targets = [thunk_sections[0].0, thunk_sections[0].0 + 12];
     expected_targets.sort_unstable();
     assert_eq!(
         actual_targets, expected_targets,

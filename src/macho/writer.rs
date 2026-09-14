@@ -98,6 +98,7 @@ pub struct LinkMapSymbol {
 pub enum WriteError {
     MissingSegment(&'static str),
     OffsetTooLarge(&'static str),
+    OutputSectionOrdinalTooLarge(usize),
     DyldInfoSegmentIndexTooLarge(usize),
     EntryAtomMissing(crate::resolve::AtomId),
     DefinedSymbolAtomMissing(SymbolId, crate::resolve::AtomId),
@@ -120,6 +121,10 @@ impl fmt::Display for WriteError {
             WriteError::OffsetTooLarge(what) => {
                 write!(f, "{what} exceeds 32-bit Mach-O field width")
             }
+            WriteError::OutputSectionOrdinalTooLarge(ordinal) => write!(
+                f,
+                "output section ordinal {ordinal} cannot be represented in Mach-O n_sect; maximum ordinal is 255"
+            ),
             WriteError::DyldInfoSegmentIndexTooLarge(index) => write!(
                 f,
                 "output segment index {index} cannot be represented in classic dyld info; maximum index is 15"
@@ -435,6 +440,7 @@ pub(crate) fn write_finalized_with_linkedit_for_header(
     linkedit_plan: &LinkEditPlan,
     out: &mut Vec<u8>,
 ) -> Result<(), WriteError> {
+    validate_output_section_ordinals(layout)?;
     let OutputHeaderSpec { kind, cpu_subtype } = header_spec;
     let _linkedit_segment = layout
         .segment("__LINKEDIT")
@@ -972,6 +978,7 @@ fn build_linkedit_plan_profiled(
     opts: &LinkOptions,
     inputs: Option<LinkEditInputs<'_>>,
 ) -> Result<(LinkEditPlan, LinkEditBuildTimings), WriteError> {
+    validate_output_section_ordinals(layout)?;
     let mut timings = LinkEditBuildTimings::default();
     let linkedit = layout
         .segment("__LINKEDIT")
@@ -1800,7 +1807,7 @@ fn build_output_symbols_profiled(
     imports: &[ImportSymbolRecord],
 ) -> Result<(SymbolTablePlan, SymbolPlanBuildTimings), WriteError> {
     let sym_table = inputs.0.sym_table;
-    let atom_sections = atom_section_ordinals(layout);
+    let atom_sections = atom_section_ordinals(layout)?;
     let atom_addrs = atom_addresses(layout);
     let atoms_by_input_section = inputs.0.atom_table.by_input_section();
     let atom_ranges = build_atom_range_index(
@@ -2210,7 +2217,7 @@ fn collect_synthetic_local_symbols(
         name: "__dyld_private".to_string(),
         partition: OutputSymbolPartition::Local,
         n_type: N_SECT,
-        n_sect: u8::try_from(section_index + 1).expect("section index should fit in n_sect"),
+        n_sect: output_section_ordinal(section_index)?,
         n_desc: 0,
         n_value: section.addr + section.synthetic_offset,
         size: 8,
@@ -2464,15 +2471,31 @@ fn input_symbol_type(input_sym: &InputSymbol) -> u8 {
     n_type
 }
 
-fn atom_section_ordinals(layout: &Layout) -> HashMap<crate::resolve::AtomId, u8> {
+fn atom_section_ordinals(
+    layout: &Layout,
+) -> Result<HashMap<crate::resolve::AtomId, u8>, WriteError> {
     let mut out = HashMap::new();
     for (idx, section) in layout.sections.iter().enumerate() {
-        let ordinal = (idx + 1) as u8;
+        let ordinal = output_section_ordinal(idx)?;
         for placed in &section.atoms {
             out.insert(placed.atom, ordinal);
         }
     }
-    out
+    Ok(out)
+}
+
+fn validate_output_section_ordinals(layout: &Layout) -> Result<(), WriteError> {
+    if let Some(last_index) = layout.sections.len().checked_sub(1) {
+        output_section_ordinal(last_index)?;
+    }
+    Ok(())
+}
+
+fn output_section_ordinal(index: usize) -> Result<u8, WriteError> {
+    let ordinal = index
+        .checked_add(1)
+        .ok_or(WriteError::OutputSectionOrdinalTooLarge(usize::MAX))?;
+    u8::try_from(ordinal).map_err(|_| WriteError::OutputSectionOrdinalTooLarge(ordinal))
 }
 
 fn atom_addresses(layout: &Layout) -> HashMap<AtomId, u64> {
@@ -3330,6 +3353,31 @@ mod tests {
             error,
             WriteError::DyldInfoSegmentIndexTooLarge(16)
         ));
+    }
+
+    #[test]
+    fn finalized_layout_rejects_unencodable_section_ordinals() {
+        let mut layout =
+            layout_with_text_bytes(OutputKind::Executable, vec![0xd6, 0x5f, 0x03, 0xc0]);
+        let section = layout.sections[0].clone();
+        layout.sections = vec![section; usize::from(u8::MAX) + 1];
+
+        let error = finalize_layout(
+            &layout,
+            OutputKind::Executable,
+            &LinkOptions::default(),
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WriteError::OutputSectionOrdinalTooLarge(256)
+        ));
+        assert_eq!(
+            error.to_string(),
+            "output section ordinal 256 cannot be represented in Mach-O n_sect; maximum ordinal is 255"
+        );
     }
 
     #[test]

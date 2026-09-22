@@ -26,7 +26,7 @@ use afs_ld::macho::constants::{
     LC_BUILD_VERSION, LC_CODE_SIGNATURE, LC_DATA_IN_CODE, LC_DYLD_CHAINED_FIXUPS,
     LC_DYLD_EXPORTS_TRIE, LC_DYLD_INFO_ONLY, LC_DYSYMTAB, LC_FUNCTION_STARTS, LC_ID_DYLIB,
     LC_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_SEGMENT_64,
-    LC_SYMTAB, LC_UUID, N_ABS, N_SECT, N_TYPE, N_UNDF,
+    LC_SYMTAB, LC_UUID, N_ABS, N_ALT_ENTRY, N_SECT, N_TYPE, N_UNDF,
 };
 use afs_ld::macho::exports::{ExportKind, Exports};
 use afs_ld::macho::reader::{
@@ -62,6 +62,7 @@ pub enum CommandCheck {
     LoadDylibNames,
     ExportRecords,
     SymbolRecordMap,
+    SymbolRecordMapIgnoringAltEntry,
     IndirectSymbolIdentities,
     SymbolPartitionNames,
     StringTableNearParity,
@@ -642,9 +643,14 @@ pub fn compare_command_details(
                     ));
                 }
             }
-            CommandCheck::SymbolRecordMap => {
-                let ours = canonical_symbol_record_map(ours)?;
-                let theirs = canonical_symbol_record_map(theirs)?;
+            CommandCheck::SymbolRecordMap | CommandCheck::SymbolRecordMapIgnoringAltEntry => {
+                let mut ours = canonical_symbol_record_map(ours)?;
+                let mut theirs = canonical_symbol_record_map(theirs)?;
+                if matches!(check, CommandCheck::SymbolRecordMapIgnoringAltEntry) {
+                    for record in ours.values_mut().chain(theirs.values_mut()) {
+                        record.n_desc &= !N_ALT_ENTRY;
+                    }
+                }
                 if ours != theirs {
                     return Err(format!(
                         "canonical symbol record map diverged:\nours:   {ours:#?}\ntheirs: {theirs:#?}"
@@ -1515,6 +1521,7 @@ fn parse_command_check(name: &str) -> Result<CommandCheck, String> {
         "load_dylib_names" => Ok(CommandCheck::LoadDylibNames),
         "export_records" => Ok(CommandCheck::ExportRecords),
         "symbol_record_map" => Ok(CommandCheck::SymbolRecordMap),
+        "symbol_record_map_ignore_alt_entry" => Ok(CommandCheck::SymbolRecordMapIgnoringAltEntry),
         "indirect_symbol_identities" => Ok(CommandCheck::IndirectSymbolIdentities),
         "symbol_partition_names" => Ok(CommandCheck::SymbolPartitionNames),
         "string_table_near_parity" => Ok(CommandCheck::StringTableNearParity),

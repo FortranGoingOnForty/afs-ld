@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::atom::{AtomFlags, AtomSection, AtomTable};
+use crate::atom::{AtomSection, AtomTable};
 use crate::input::{DataInCodeEntry, ObjectFile};
 use crate::layout::{Layout, LayoutInput, PAGE_SIZE};
 use crate::leb::write_uleb;
@@ -1948,7 +1948,7 @@ fn build_output_symbols_profiled(
                     *weak,
                     *private_extern,
                     *no_dead_strip,
-                    is_defined_section_alias(inputs.0.atom_table, *atom, symbol_id),
+                    is_explicit_section_alias(inputs.0.atom_table, *atom, symbol_id),
                 ),
                 Symbol::Absolute {
                     name,
@@ -2234,8 +2234,7 @@ fn collect_local_symbols(
     object: &ObjectFile,
     out: &mut Vec<OutputSymbolSpec>,
 ) -> Result<(), WriteError> {
-    let last_symbol_at_location = last_section_symbol_at_each_location(object);
-    for (symbol_index, input_sym) in object.symbols.iter().enumerate() {
+    for input_sym in &object.symbols {
         if input_sym.stab_kind().is_some() {
             continue;
         }
@@ -2279,17 +2278,13 @@ fn collect_local_symbols(
                 let n_sect = *ctx.atom_sections.get(&atom_id).ok_or(
                     WriteError::DefinedSymbolSectionMissing(SymbolId(u32::MAX), atom_id),
                 )?;
-                let mut n_desc = input_sym.raw.n_desc;
-                if is_overlapping_section_alias(&last_symbol_at_location, symbol_index, input_sym) {
-                    n_desc |= N_ALT_ENTRY;
-                }
                 out.push(OutputSymbolSpec {
                     symbol: None,
                     name,
                     partition: OutputSymbolPartition::Local,
                     n_type: input_symbol_type(input_sym),
                     n_sect,
-                    n_desc,
+                    n_desc: input_sym.raw.n_desc,
                     n_value: addr,
                     size: ctx.atom_table.get(atom_id).size.saturating_sub(delta) as u64,
                     file_index: ctx.file_index,
@@ -2320,48 +2315,14 @@ fn collect_local_symbols(
     Ok(())
 }
 
-fn is_defined_section_alias(atom_table: &AtomTable, atom_id: AtomId, symbol_id: SymbolId) -> bool {
+fn is_explicit_section_alias(atom_table: &AtomTable, atom_id: AtomId, symbol_id: SymbolId) -> bool {
     if atom_id.0 == 0 {
         return false;
     }
     let atom = atom_table.get(atom_id);
-    atom.flags.has(AtomFlags::ALT_ENTRY)
-        || atom
-            .alt_entries
-            .iter()
-            .any(|entry| entry.symbol == symbol_id)
-}
-
-fn last_section_symbol_at_each_location(object: &ObjectFile) -> HashMap<(u8, u64), usize> {
-    object
-        .symbols
+    atom.alt_entries
         .iter()
-        .enumerate()
-        .filter(|(_, symbol)| {
-            symbol.stab_kind().is_none()
-                && symbol.kind() == SymKind::Sect
-                && !symbol.alt_entry()
-                && symbol.participates_in_global_resolution()
-        })
-        .map(|(index, symbol)| ((symbol.sect_idx(), symbol.value()), index))
-        .collect()
-}
-
-fn is_overlapping_section_alias(
-    last_symbol_at_location: &HashMap<(u8, u64), usize>,
-    symbol_index: usize,
-    symbol: &InputSymbol,
-) -> bool {
-    if symbol.kind() != SymKind::Sect
-        || symbol.alt_entry()
-        || !symbol.participates_in_global_resolution()
-    {
-        return false;
-    }
-
-    last_symbol_at_location
-        .get(&(symbol.sect_idx(), symbol.value()))
-        .is_some_and(|last_index| symbol_index < *last_index)
+        .any(|entry| entry.symbol == symbol_id && entry.explicit)
 }
 
 struct LocalSymbolContext<'a> {
@@ -3395,6 +3356,7 @@ mod tests {
             alt_entries: vec![AltEntry {
                 symbol: SymbolId(1),
                 offset_within_atom: 8,
+                explicit: true,
             }],
             data: vec![0; 16],
             flags: AtomFlags::NONE,

@@ -151,6 +151,9 @@ pub struct AltEntry {
     pub symbol: SymbolId,
     /// Byte offset into the containing atom where this alt entry points.
     pub offset_within_atom: u32,
+    /// Whether the input symbol explicitly carried `N_ALT_ENTRY`. Ordinary
+    /// definitions at the same address share an atom without acquiring it.
+    pub explicit: bool,
 }
 
 /// One atom. Dead-stripping, ICF, and layout all work in terms of atoms.
@@ -576,9 +579,10 @@ fn atomize_regular_section(
         let alts: Vec<_> = syms
             .iter()
             .filter(|(_, symbol, _)| symbol.participates_in_global_resolution())
-            .map(|(symbol_idx, _, offset)| AltEntry {
+            .map(|(symbol_idx, symbol, offset)| AltEntry {
                 symbol: SymbolId(*symbol_idx as u32),
                 offset_within_atom: *offset,
+                explicit: symbol.alt_entry(),
             })
             .collect();
         let atom = build_slice_atom(
@@ -607,9 +611,10 @@ fn atomize_regular_section(
         let alts: Vec<_> = syms[..first_boundary]
             .iter()
             .filter(|(_, symbol, _)| symbol.participates_in_global_resolution())
-            .map(|(symbol_idx, _, offset)| AltEntry {
+            .map(|(symbol_idx, symbol, offset)| AltEntry {
                 symbol: SymbolId(*symbol_idx as u32),
                 offset_within_atom: *offset,
+                explicit: symbol.alt_entry(),
             })
             .collect();
         let head = build_slice_atom(
@@ -674,6 +679,7 @@ fn atomize_regular_section(
             alts.push(AltEntry {
                 symbol: SymbolId(*symbol_idx as u32),
                 offset_within_atom: local,
+                explicit: symbol.alt_entry(),
             });
             alt_folded.push((*symbol_idx, local));
         }
@@ -1653,10 +1659,12 @@ mod tests {
                 AltEntry {
                     symbol: SymbolId(0),
                     offset_within_atom: 0,
+                    explicit: false,
                 },
                 AltEntry {
                     symbol: SymbolId(2),
                     offset_within_atom: 4,
+                    explicit: true,
                 },
             ]
         );

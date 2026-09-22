@@ -2460,7 +2460,7 @@ fn assert_same_address_entry_alias_output(bytes: &[u8]) {
     assert_eq!(main.n_sect, alias.n_sect);
     assert_eq!(main.value, 0);
     assert_eq!(alias.value, 0);
-    assert_eq!(main.n_desc & N_ALT_ENTRY, N_ALT_ENTRY);
+    assert_eq!(main.n_desc & N_ALT_ENTRY, 0);
     assert_eq!(alias.n_desc & N_ALT_ENTRY, 0);
     assert!(!records.contains_key("_unused"));
 
@@ -5887,7 +5887,14 @@ fn linker_run_marks_section_alias_descriptors() {
                 N_SECT | if private_alias { N_PEXT } else { N_EXT }
             );
             assert_eq!(alias.n_sect, target.n_sect);
-            assert_eq!(alias.n_desc, N_ALT_ENTRY);
+            assert_eq!(
+                alias.n_desc & N_ALT_ENTRY,
+                if matches!(encoding, SyntheticAliasEncoding::ExplicitAlternateEntry) {
+                    N_ALT_ENTRY
+                } else {
+                    0
+                }
+            );
             assert_eq!(alias.value, target.value);
             assert_eq!(target.n_desc & N_ALT_ENTRY, 0);
 

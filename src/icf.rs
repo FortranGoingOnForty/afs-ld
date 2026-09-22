@@ -1308,6 +1308,7 @@ mod tests {
         atoms.get_mut(public_alias).alt_entries.push(AltEntry {
             symbol: public,
             offset_within_atom: 0,
+            explicit: false,
         });
 
         let plan = fold_safe(&inputs, &mut atoms, &mut symbols, None).unwrap();

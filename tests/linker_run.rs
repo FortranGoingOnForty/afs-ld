@@ -2453,14 +2453,16 @@ fn canonical_symbol_record_map(bytes: &[u8]) -> HashMap<String, CanonicalSymbolR
         .collect()
 }
 
-fn assert_same_address_entry_alias_output(bytes: &[u8]) {
+fn assert_same_address_entry_alias_output(bytes: &[u8], expect_ordinary_marker_clear: bool) {
     let records = canonical_symbol_record_map(bytes);
     let main = records.get("_main").unwrap();
     let alias = records.get("_zalias").unwrap();
     assert_eq!(main.n_sect, alias.n_sect);
     assert_eq!(main.value, 0);
     assert_eq!(alias.value, 0);
-    assert_eq!(main.n_desc & N_ALT_ENTRY, 0);
+    if expect_ordinary_marker_clear {
+        assert_eq!(main.n_desc & N_ALT_ENTRY, 0);
+    }
     assert_eq!(alias.n_desc & N_ALT_ENTRY, 0);
     assert!(!records.contains_key("_unused"));
 
@@ -7763,7 +7765,7 @@ fn linker_run_dead_strip_keeps_same_address_entry_alias_bytes() {
     })
     .unwrap();
 
-    assert_same_address_entry_alias_output(&fs::read(&out).unwrap());
+    assert_same_address_entry_alias_output(&fs::read(&out).unwrap(), true);
 
     let _ = fs::remove_file(obj);
     let _ = fs::remove_file(out);
@@ -7814,13 +7816,19 @@ fn linker_run_dead_strip_keeps_same_address_entry_alias() {
 
     let our_bytes = fs::read(&our_out).unwrap();
     let apple_bytes = fs::read(&apple_out).unwrap();
-    for bytes in [&our_bytes, &apple_bytes] {
-        assert_same_address_entry_alias_output(bytes);
-    }
+    assert_same_address_entry_alias_output(&our_bytes, true);
+    // Apple ld versions disagree on whether the earlier ordinary symbol
+    // receives N_ALT_ENTRY. The address, retained code, and entry point do not.
+    assert_same_address_entry_alias_output(&apple_bytes, false);
     let our_records = canonical_symbol_record_map(&our_bytes);
     let apple_records = canonical_symbol_record_map(&apple_bytes);
     for name in ["_main", "_zalias"] {
-        assert_eq!(our_records.get(name), apple_records.get(name));
+        let ours = our_records.get(name).unwrap();
+        let apple = apple_records.get(name).unwrap();
+        assert_eq!(ours.n_type, apple.n_type);
+        assert_eq!(ours.n_sect, apple.n_sect);
+        assert_eq!(ours.value, apple.value);
+        assert_eq!(ours.n_desc & !N_ALT_ENTRY, apple.n_desc & !N_ALT_ENTRY);
     }
 
     for output in [&our_out, &apple_out] {
@@ -11820,20 +11828,24 @@ fn linker_run_routes_imported_tlv_through_got() {
     let (our_text_addr, our_text) = output_section(&our_bytes, "__TEXT", "__text").unwrap();
     let (apple_text_addr, apple_text) = output_section(&apple_bytes, "__TEXT", "__text").unwrap();
     let (our_got_addr, our_got) = output_section(&our_bytes, "__DATA_CONST", "__got").unwrap();
-    let (apple_got_addr, apple_got) =
-        output_section(&apple_bytes, "__DATA_CONST", "__got").unwrap();
+    let apple_got = output_section(&apple_bytes, "__DATA_CONST", "__got");
+    let apple_thread_ptrs = output_section(&apple_bytes, "__DATA", "__thread_ptrs");
+    // Apple ld uses a TLV pointer section on older macOS releases and a
+    // regular bound GOT slot on newer ones. Both hold the imported descriptor.
+    let apple_uses_got = apple_got.is_some();
+    assert!(apple_uses_got ^ apple_thread_ptrs.is_some());
+    let (apple_slot_addr, apple_slot) = apple_got.or(apple_thread_ptrs).unwrap();
 
     assert!(output_section(&our_bytes, "__DATA", "__thread_ptrs").is_none());
-    assert!(output_section(&apple_bytes, "__DATA", "__thread_ptrs").is_none());
     assert_eq!(our_got.len(), 8);
-    assert_eq!(our_got, apple_got);
+    assert_eq!(our_got, apple_slot);
     assert_eq!(
         decode_page_reference(&our_text, our_text_addr, 20, &PageRefKind::Load).unwrap(),
         our_got_addr
     );
     assert_eq!(
         decode_page_reference(&apple_text, apple_text_addr, 20, &PageRefKind::Load).unwrap(),
-        apple_got_addr
+        apple_slot_addr
     );
     assert_eq!(our_text.len(), apple_text.len());
     assert_eq!(
@@ -11845,10 +11857,28 @@ fn linker_run_routes_imported_tlv_through_got() {
     assert_eq!(read_insn(&our_text, 24).unwrap(), 0xf9400000);
     assert_eq!(read_insn(&our_text, 28).unwrap(), 0xf9400008);
     assert_eq!(read_insn(&our_text, 32).unwrap(), 0xd63f0100);
+    let our_binds = decode_bind_records(&our_bytes, false).unwrap();
+    let apple_binds = decode_bind_records(&apple_bytes, false).unwrap();
+    assert_eq!(our_binds.len(), 1);
+    assert_eq!(apple_binds.len(), 1);
+    assert_eq!(our_binds[0].segment, "__DATA_CONST");
+    assert_eq!(our_binds[0].section, "__got");
     assert_eq!(
-        decode_bind_records(&our_bytes, false).unwrap(),
-        decode_bind_records(&apple_bytes, false).unwrap()
+        apple_binds[0].section,
+        if apple_uses_got {
+            "__got"
+        } else {
+            "__thread_ptrs"
+        }
     );
+    for (ours, apple) in our_binds.iter().zip(apple_binds.iter()) {
+        assert_eq!(ours.symbol, "_ext_tls");
+        assert_eq!(ours.symbol, apple.symbol);
+        assert_eq!(ours.ordinal, apple.ordinal);
+        assert_eq!(ours.weak_import, apple.weak_import);
+        assert_eq!(ours.addend, apple.addend);
+        assert_eq!(ours.section_offset, apple.section_offset);
+    }
     assert_eq!(
         load_dylib_names(&our_bytes).unwrap(),
         load_dylib_names(&apple_bytes).unwrap()

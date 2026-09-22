@@ -224,8 +224,11 @@ impl SyntheticPlan {
                         if let Some(symbol_id) =
                             symbol_referent_id(obj, reloc.referent, sym_table, input_symbols)
                         {
-                            if tlv_symbol_needs_thread_pointer(sym_table, symbol_id) {
-                                thread_pointers.intern(symbol_id);
+                            if matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. }) {
+                                // An imported TLV names a descriptor pointer. Its
+                                // TLVP relocation loads a bound GOT slot, just as
+                                // current Apple ld does for external TLVs.
+                                got.intern(symbol_id, dylib_import_is_weak(sym_table, symbol_id));
                             }
                         }
                     }
@@ -582,10 +585,6 @@ fn dylib_import_is_weak(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
             ..
         }
     )
-}
-
-fn tlv_symbol_needs_thread_pointer(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
-    matches!(sym_table.get(symbol_id), Symbol::DylibImport { .. })
 }
 
 fn got_page_symbol_needs_slot(sym_table: &SymbolTable, symbol_id: SymbolId) -> bool {
@@ -1021,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_plan_routes_imported_tlvp_through_thread_pointers() {
+    fn synthetic_plan_routes_imported_tlvp_through_got() {
         let mut sym_table = SymbolTable::new();
         let name = sym_table.intern("_ext_tls");
         let input_id = InputId(0);
@@ -1089,9 +1088,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(plan.got.entries.is_empty());
-        assert_eq!(plan.thread_pointers.entries.len(), 1);
-        assert_eq!(plan.thread_pointers.entries[0].symbol, import);
+        assert_eq!(plan.got.entries.len(), 1);
+        assert_eq!(plan.got.entries[0].symbol, import);
+        assert!(plan.thread_pointers.entries.is_empty());
         assert!(plan.direct_binds.is_empty());
         assert!(plan.tlv_bootstrap_symbol.is_none());
     }

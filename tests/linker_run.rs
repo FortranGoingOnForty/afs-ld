@@ -11740,7 +11740,7 @@ fn linker_run_handles_local_tlv_descriptors() {
 }
 
 #[test]
-fn linker_run_routes_imported_tlv_through_thread_pointers() {
+fn linker_run_routes_imported_tlv_through_got() {
     if !have_xcrun() || !have_tool("codesign") {
         harness_skip!("xcrun clang or codesign unavailable");
         return;
@@ -11819,22 +11819,21 @@ fn linker_run_routes_imported_tlv_through_thread_pointers() {
     let apple_bytes = fs::read(&apple_out).unwrap();
     let (our_text_addr, our_text) = output_section(&our_bytes, "__TEXT", "__text").unwrap();
     let (apple_text_addr, apple_text) = output_section(&apple_bytes, "__TEXT", "__text").unwrap();
-    let (our_thread_ptrs_addr, our_thread_ptrs) =
-        output_section(&our_bytes, "__DATA", "__thread_ptrs").unwrap();
-    let (apple_thread_ptrs_addr, apple_thread_ptrs) =
-        output_section(&apple_bytes, "__DATA", "__thread_ptrs").unwrap();
+    let (our_got_addr, our_got) = output_section(&our_bytes, "__DATA_CONST", "__got").unwrap();
+    let (apple_got_addr, apple_got) =
+        output_section(&apple_bytes, "__DATA_CONST", "__got").unwrap();
 
-    assert!(output_section(&our_bytes, "__DATA_CONST", "__got").is_none());
-    assert!(output_section(&apple_bytes, "__DATA_CONST", "__got").is_none());
-    assert_eq!(our_thread_ptrs.len(), 8);
-    assert_eq!(our_thread_ptrs, apple_thread_ptrs);
+    assert!(output_section(&our_bytes, "__DATA", "__thread_ptrs").is_none());
+    assert!(output_section(&apple_bytes, "__DATA", "__thread_ptrs").is_none());
+    assert_eq!(our_got.len(), 8);
+    assert_eq!(our_got, apple_got);
     assert_eq!(
         decode_page_reference(&our_text, our_text_addr, 20, &PageRefKind::Load).unwrap(),
-        our_thread_ptrs_addr
+        our_got_addr
     );
     assert_eq!(
         decode_page_reference(&apple_text, apple_text_addr, 20, &PageRefKind::Load).unwrap(),
-        apple_thread_ptrs_addr
+        apple_got_addr
     );
     assert_eq!(our_text.len(), apple_text.len());
     assert_eq!(

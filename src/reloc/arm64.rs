@@ -52,7 +52,6 @@ struct ResolveView<'a> {
     section_addrs: &'a HashMap<(InputId, u8), u64>,
     stub_addrs: &'a HashMap<SymbolId, u64>,
     got_addrs: &'a HashMap<SymbolId, u64>,
-    thread_pointer_addrs: &'a HashMap<SymbolId, u64>,
     lazy_pointer_addrs: &'a HashMap<SymbolId, u64>,
     stub_helper_entry_addrs: &'a HashMap<SymbolId, u64>,
     stub_helper_header_addr: Option<u64>,
@@ -63,7 +62,6 @@ struct ResolveView<'a> {
 struct SyntheticAddressMaps {
     stub_addrs: HashMap<SymbolId, u64>,
     got_addrs: HashMap<SymbolId, u64>,
-    thread_pointer_addrs: HashMap<SymbolId, u64>,
     lazy_pointer_addrs: HashMap<SymbolId, u64>,
     stub_helper_entry_addrs: HashMap<SymbolId, u64>,
     stub_helper_header_addr: Option<u64>,
@@ -255,7 +253,6 @@ pub fn apply_layout(
         section_addrs: &section_addrs,
         stub_addrs: &synth_addrs.stub_addrs,
         got_addrs: &synth_addrs.got_addrs,
-        thread_pointer_addrs: &synth_addrs.thread_pointer_addrs,
         lazy_pointer_addrs: &synth_addrs.lazy_pointer_addrs,
         stub_helper_entry_addrs: &synth_addrs.stub_helper_entry_addrs,
         stub_helper_header_addr: synth_addrs.stub_helper_header_addr,
@@ -489,7 +486,6 @@ fn synthetic_address_maps(
         return SyntheticAddressMaps {
             stub_addrs: HashMap::new(),
             got_addrs: HashMap::new(),
-            thread_pointer_addrs: HashMap::new(),
             lazy_pointer_addrs: HashMap::new(),
             stub_helper_entry_addrs: HashMap::new(),
             stub_helper_header_addr: None,
@@ -511,16 +507,6 @@ fn synthetic_address_maps(
     if let Some(section) = layout.synthetic_section("__DATA_CONST", "__got") {
         for (idx, entry) in plan.got.entries.iter().enumerate() {
             got_addrs.insert(
-                entry.symbol,
-                section.addr + section.synthetic_offset + (idx as u64) * 8,
-            );
-        }
-    }
-
-    let mut thread_pointer_addrs = HashMap::new();
-    if let Some(section) = layout.synthetic_section("__DATA", "__thread_ptrs") {
-        for (idx, entry) in plan.thread_pointers.entries.iter().enumerate() {
-            thread_pointer_addrs.insert(
                 entry.symbol,
                 section.addr + section.synthetic_offset + (idx as u64) * 8,
             );
@@ -562,7 +548,6 @@ fn synthetic_address_maps(
     SyntheticAddressMaps {
         stub_addrs,
         got_addrs,
-        thread_pointer_addrs,
         lazy_pointer_addrs,
         stub_helper_entry_addrs,
         stub_helper_header_addr,
@@ -626,7 +611,6 @@ pub fn plan_thunks(
         section_addrs: &section_addrs,
         stub_addrs: &synth_addrs.stub_addrs,
         got_addrs: &synth_addrs.got_addrs,
-        thread_pointer_addrs: &synth_addrs.thread_pointer_addrs,
         lazy_pointer_addrs: &synth_addrs.lazy_pointer_addrs,
         stub_helper_entry_addrs: &synth_addrs.stub_helper_entry_addrs,
         stub_helper_header_addr: synth_addrs.stub_helper_header_addr,
@@ -1251,20 +1235,16 @@ fn resolve_tlvp_target(
     resolve: &ResolveView<'_>,
 ) -> Result<u64, RelocError> {
     if let Some(symbol_id) = dylib_import_symbol_id(obj, reloc.referent, resolve) {
-        return resolve
-            .thread_pointer_addrs
-            .get(&symbol_id)
-            .copied()
-            .ok_or_else(|| {
-                reloc_error(
-                    atom,
-                    &obj.path,
-                    reloc.offset.saturating_sub(atom.input_offset),
-                    reloc.kind,
-                    &describe_referent(obj, reloc.referent),
-                    "dylib import is missing synthetic thread-pointer slot".to_string(),
-                )
-            });
+        return resolve.got_addrs.get(&symbol_id).copied().ok_or_else(|| {
+            reloc_error(
+                atom,
+                &obj.path,
+                reloc.offset.saturating_sub(atom.input_offset),
+                reloc.kind,
+                &describe_referent(obj, reloc.referent),
+                "dylib import is missing synthetic GOT slot".to_string(),
+            )
+        });
     }
     resolve_referent(obj, atom, reloc.kind, reloc.referent, resolve)
 }
@@ -2965,7 +2945,6 @@ mod tests {
             section_addrs: &section_addrs,
             stub_addrs: &empty_symbol_addrs,
             got_addrs: &got_addrs,
-            thread_pointer_addrs: &empty_symbol_addrs,
             lazy_pointer_addrs: &empty_symbol_addrs,
             stub_helper_entry_addrs: &empty_symbol_addrs,
             stub_helper_header_addr: None,
@@ -3099,7 +3078,6 @@ mod tests {
             section_addrs: &section_addrs,
             stub_addrs: &empty_symbol_addrs,
             got_addrs: &empty_symbol_addrs,
-            thread_pointer_addrs: &empty_symbol_addrs,
             lazy_pointer_addrs: &empty_symbol_addrs,
             stub_helper_entry_addrs: &empty_symbol_addrs,
             stub_helper_header_addr: None,

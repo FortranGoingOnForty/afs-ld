@@ -744,7 +744,7 @@ fn resolve_reference(
                 atom: atom_id,
                 detail: format!("{label} symbol `{name}` was not resolved"),
             };
-            let interned_name = sym_table.interner.get(name).ok_or_else(&unresolved)?;
+            let interned_name = sym_table.interner.get(name).ok_or_else(unresolved)?;
             let (symbol_id, symbol) = sym_table
                 .resolve_chain(interned_name)
                 .map_err(|_| unresolved())?;

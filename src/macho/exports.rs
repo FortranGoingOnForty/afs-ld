@@ -299,7 +299,7 @@ fn terminal_bounds(trie: &[u8], node_off: usize) -> Result<(usize, usize), ReadE
         at_offset: node_off,
         reason: "export trie terminal_size overflows",
     };
-    let start = node_off.checked_add(n).ok_or_else(&overflow)?;
+    let start = node_off.checked_add(n).ok_or_else(overflow)?;
     let terminal_size = usize::try_from(terminal_size).map_err(|_| overflow())?;
     let end = start.checked_add(terminal_size).ok_or_else(overflow)?;
     if end > trie.len() {
